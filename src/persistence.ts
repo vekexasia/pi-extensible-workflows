@@ -5,9 +5,10 @@ import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFi
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
-import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord, WorkflowRunEvent } from "./index.js";
+import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord, WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord } from "./agent-execution.js";
-import { loadLaunchSnapshot, WorkflowError } from "./index.js";
+import { WorkflowError } from "./types.js";
+import { loadLaunchSnapshot } from "./utils.js";
 
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
