@@ -66,6 +66,28 @@ void test("does not mask agent failures when system prompt persistence also fail
 });
 
 
+void test("runs prioritized setup hooks with fresh retry baselines and safe attempt summaries", async () => {
+  const order: string[] = [];
+  const inputs: Array<{ prompt: string; options: Record<string, unknown>; tools: readonly string[]; cwd: string }> = [];
+  const hooks = [
+    { name: "z-last", priority: 10, async setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:z-last`); agent.prompt += " z"; agent.sessionInput.tools = ["bash"]; } },
+    { name: "a-first", priority: 10, setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:a-first`); assert.equal(Object.hasOwn(agent.options, "transient"), false); agent.prompt += " a"; agent.options.transient = context.attempt === 1 ? "discard" : "fresh"; agent.sessionInput.tools = ["grep"]; agent.sessionInput.cwd = "/hooked"; } },
+    { name: "early", priority: 1, setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:early`); agent.options.seen = true; } },
+  ];
+  let created = 0;
+  const executor = new WorkflowAgentExecutor({ ...root, agentSetupHooks: hooks }, async (input) => {
+    inputs.push({ prompt: input.options?.transient === "fresh" ? "fresh" : "baseline", options: input.options ?? {}, tools: input.tools, cwd: input.cwd });
+    const attempt = ++created;
+    return { sessionId: `hook-${String(attempt)}`, sessionFile: `/sessions/hook-${String(attempt)}.jsonl`, messages: [assistant("done")], async prompt(text) { if (attempt === 1) throw new Error(text); }, dispose() {} };
+  });
+  const result = await executor.execute("original", { label: "hooked", workflowName: "flow", retries: 1, timeoutMs: 5, agentOptions: { advisor: true } });
+  assert.equal(result.value, "done");
+  assert.deepEqual(order, ["1:early", "1:a-first", "1:z-last", "2:early", "2:a-first", "2:z-last"]);
+  assert.deepEqual(inputs.map(({ tools, cwd }) => ({ tools, cwd })), [{ tools: ["bash"], cwd: "/hooked" }, { tools: ["bash"], cwd: "/hooked" }]);
+  assert.deepEqual(result.attempts.map(({ setup }) => setup?.hookNames), [["early", "a-first", "z-last"], ["early", "a-first", "z-last"]]);
+  assert.equal(result.attempts[1]?.setup?.model.provider, "openai");
+});
+
 void test("provider limits pause and retry the same native session", async () => {
   let prompts = 0;
   let pauses = 0;
@@ -441,6 +463,26 @@ void test("nested agent roles resolve tools before scheduler spawn", async () =>
 void test("explicit null timeout remains unlimited", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "unlimited", sessionFile: "/sessions/unlimited.jsonl", messages: [assistant("done")], prompt: async () => { await new Promise((resolve) => setTimeout(resolve, 20)); }, dispose() {} }));
   assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", timeoutMs: null })).value, "done");
+});
+
+void test("setup hook errors stop later hooks and session creation", async () => {
+  let later = false;
+  let launched = false;
+  const executor = new WorkflowAgentExecutor({ ...root, agentSetupHooks: [
+    { name: "fails", priority: 1, setup() { throw new Error("hook failed"); } },
+    { name: "later", priority: 2, setup() { later = true; } },
+  ] }, async () => { launched = true; throw new Error("must not launch"); });
+  await assert.rejects(executor.execute("work", { label: "worker", workflowName: "flow", retries: 3 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "hook failed");
+  assert.equal(later, false);
+  assert.equal(launched, false);
+});
+
+void test("setup cancellation prevents native session creation", async () => {
+  const controller = new AbortController();
+  let launched = false;
+  const executor = new WorkflowAgentExecutor({ ...root, agentSetupHooks: [{ name: "cancel", priority: 10, setup() { controller.abort(); } }] }, async () => { launched = true; throw new Error("must not launch"); });
+  await assert.rejects(executor.execute("work", { label: "worker", workflowName: "flow" }, controller.signal), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  assert.equal(launched, false);
 });
 
 void test("cancelRun waits for active agents to terminate", async () => {

@@ -1442,7 +1442,6 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`agent('a',{label:' '})`, "INVALID_METADATA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
     [`agent('a',{retries:-1})`, "INVALID_METADATA"],
-    [`agent('a',{unknown:1})`, "INVALID_METADATA"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
@@ -1453,16 +1452,18 @@ void test("preflight rejects every static boundary before run creation", () => {
 
 void test("host rejects malformed dynamic agent options before launching", async () => {
   let launched = false;
-  for (const options of ["{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{unknown:1}", "{role:'reviewer',model:'openai/gpt'}", "{role:'reviewer',thinking:'low'}", "{role:'reviewer',tools:[]}"]) {
+  for (const options of ["{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{role:'reviewer',model:'openai/gpt'}", "{role:'reviewer',thinking:'low'}", "{role:'reviewer',tools:[]}"]) {
     await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
   assert.equal(launched, false);
 });
-void test("passes explicit agent labels through the workflow boundary", async () => {
+void test("passes explicit and extension agent options through the workflow boundary", async () => {
   let label: unknown;
-  const result = await runWorkflow("return agent('a', { label: 'API inspection' });", null, { agent: async (_prompt, options) => { label = options.label; return "done"; } }).result;
+  let received: unknown;
+  const result = await runWorkflow("return agent('a', { label: 'API inspection', advisor: true, nested: { enabled: true } });", null, { agent: async (_prompt, options) => { label = options.label; received = options; return "done"; } }).result;
   assert.equal(result, "done");
   assert.equal(label, "API inspection");
+  assert.deepEqual(received, { label: "API inspection", advisor: true, nested: { enabled: true } });
 });
 void test("preflight enforces object-key combinators without agent names", () => {
   const base = "return 1;";
@@ -1752,7 +1753,7 @@ void test("parallel identities do not depend on completion order", async () => {
   assert.deepEqual(identities.map(({ structuralPath, occurrence }) => ({ structuralPath, occurrence })).sort((left, right) => left.structuralPath.join("/").localeCompare(right.structuralPath.join("/"))), [{ structuralPath: ["batch", "first"], occurrence: 1 }, { structuralPath: ["batch", "second"], occurrence: 1 }]);
 });
 
-void test("aliases, reserved internals, and removed options are rejected before the agent bridge", async () => {
+void test("aliases and reserved internals are rejected before the agent bridge while extension options pass through", async () => {
   let launched = false;
   await assert.rejects(runWorkflow(`const alias=agent; return alias("no");`, null, { agent: async () => { launched = true; return null; } }).result, /direct agent.*aliases.*unsupported/i);
   assert.equal(launched, false);
@@ -1760,12 +1761,9 @@ void test("aliases, reserved internals, and removed options are rejected before 
   assert.throws(() => runWorkflow(`return __pi_extensible_workflows_agent("x", {}, "0:1")`, null, { agent: async () => { launched = true; return null; } }), /reserved for workflow agent instrumentation/);
   await assert.rejects(runWorkflow(`const internal=globalThis["__pi_extensible_workflows"+"_agent"]; return internal("x", {}, "0:1");`, null, { agent: async () => { launched = true; return null; } }).result, /not a function/);
   assert.equal(launched, false);
-  assert.throws(() => preflight(`agent("x",{name:"old"})`, capabilities), /Unknown agent option: name/);
-  assert.throws(() => preflight(`agent("x",{continueFrom:"old"})`, capabilities), /Unknown agent option: continueFrom/);
-  for (const option of ["name", "continueFrom"]) {
-    await assert.rejects(runWorkflow(`return agent("x",{[args.key]:"old"});`, { key: option }, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  }
-  assert.equal(launched, false);
+  assert.doesNotThrow(() => preflight(`agent("x",{name:"old",continueFrom:"old"})`, capabilities));
+  assert.equal(await runWorkflow(`return agent("x",{[args.key]:"old"});`, { key: "name" }, { agent: async () => { launched = true; return "ok"; } }).result, "ok");
+  assert.equal(launched, true);
 });
 
 void test("worker cancellation is immediate even for runaway synchronous code", async () => {
@@ -1873,6 +1871,12 @@ void test("freezes registries and produces a deterministic flat catalog", () => 
   assert.equal(registry.frozen, true);
   assert.throws(() => { registry.register({ namespace: "late", version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
   assert.throws(() => registry.workflow("release"), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
+});
+void test("registers setup hooks by priority and stable qualified name", () => {
+  const registry = new WorkflowRegistry();
+  registry.register({ namespace: "hooks", version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { z: { setup() {} }, a: { priority: 10, setup() {} }, early: { priority: 1, setup() {} } } });
+  assert.deepEqual(registry.agentSetupHooks().map(({ name, priority }) => ({ name, priority })), [{ name: "hooks.early", priority: 1 }, { name: "hooks.a", priority: 10 }, { name: "hooks.z", priority: 10 }]);
+  assert.throws(() => { registry.register({ namespace: "badHooks", version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { bad: { priority: Number.NaN, setup() {} } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 void test("shares the registry between package imports and Pi's jiti loader", () => {
   const script = `

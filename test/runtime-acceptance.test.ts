@@ -405,7 +405,27 @@ void test("production workflow exposes registered global functions and replays t
   assert.deepEqual(await store.replay("function/global-parallel/second/issue48Acceptance/echo/1"), { path: "function/global-parallel/second/issue48Acceptance/echo/1", value: { value: "parallel-second" } });
   assert.deepEqual(await store.replay("function/global-pipeline/first/echo/issue48Acceptance/echo/1"), { path: "function/global-pipeline/first/echo/issue48Acceptance/echo/1", value: { value: "pipeline-value" } });
 });
-
+void test("setup hooks conditionally install an inline Pi extension for one agent", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-setup-hooks-"));
+  const inputs: SessionInput[] = [];
+  const installed: string[] = [];
+  const scopedAdvisorFactory = (pi: { registerTool(tool: { name: string }): void }) => { pi.registerTool({ name: "scoped-advisor" }); };
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    for (const factory of input.extensionFactories ?? []) await (typeof factory === "function" ? factory({ registerTool(tool: { name: string }) { installed.push(tool.name); } } as never) : factory.factory({ registerTool(tool: { name: string }) { installed.push(tool.name); } } as never));
+    return { sessionId: `setup-${String(inputs.length)}`, sessionFile: `/sessions/setup-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value: unknown } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home, async () => {}, createSession);
+  registerWorkflowExtension({ namespace: "setupHookAcceptance", version: "1.0.0", headline: "Setup hooks", description: "Setup hook fixture", agentSetupHooks: { advisor: { setup(agent) { if (agent.options.advisor !== true) return; agent.sessionInput.extensionFactories ??= []; agent.sessionInput.extensionFactories.push(scopedAdvisorFactory); } } } });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "setup-hooks", script: `return parallel("agents", { marked: () => agent("marked", { advisor: true }), plain: () => agent("plain") });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(result.details.value, { marked: "done", plain: "done" });
+  assert.equal(inputs.filter(({ options }) => options?.advisor === true).length, 1);
+  assert.equal(inputs.filter(({ options }) => options?.advisor !== true).length, 1);
+  assert.deepEqual(installed, ["scoped-advisor"]);
+});
 void test("parent registry survives nested agent session lifecycle", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-registry-session-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: { value?: unknown } }> }> = [];

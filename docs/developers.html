@@ -146,6 +146,25 @@ registerWorkflowExtension(<span class="tok-punctuation">{</span>
 <span class="tok-punctuation">---</span>
 Focus on correctness and regressions.</code></pre>
         <p>When <code>role</code> is present, omit <code>model</code>, <code>thinking</code>, and <code>tools</code> from the agent call. The role body is appended to the native Pi system prompt.</p>
+        <h3>Prioritized agent setup hooks</h3>
+        <p><strong>Security:</strong> setup hooks are trusted extension code. They run after ordinary workflow model, tool, cwd, and role policy validation, but before the native Pi session is created. Hooks can bypass those boundaries by mutating the prompt, raw options, resolved session input, or session factory; never register untrusted code as a setup hook.</p>
+        <p>Register named hooks with an optional finite <code>priority</code>. Hooks run in ascending priority order (default <code>10</code>); equal priorities use the stable fully qualified hook name (<code>namespace.name</code>) as the tie-breaker. Each retry starts from a fresh baseline and runs every hook again. Hooks receive the workflow cancellation signal, and their asynchronous runtime is not charged against <code>timeoutMs</code>.</p>
+        <pre><code class="language-typescript">registerWorkflowExtension({
+  namespace: "advisor", version: "1.0.0", headline: "Advisor setup",
+  description: "Adds optional advisor behavior",
+  agentSetupHooks: {
+    advisor: {
+      priority: 10,
+      async setup(agent, context) {
+        if (agent.options.advisor !== true) return;
+        agent.sessionInput.extensionFactories ??= [];
+        agent.sessionInput.extensionFactories.push(scopedAdvisorFactory);
+        if (context.signal.aborted) return;
+      },
+    },
+  },
+});</code></pre>
+        <p>Unknown JSON-compatible agent options are preserved for setup hooks and native setup, but are not inherited by child agents. Inspection records only executed hook names and the effective model, tools, and cwd; it never serializes hook functions, opaque setup values, or raw options.</p>
       </section>
       <section id="lifecycle">
         <h2>Lifecycle, checkpoints, and worktrees</h2>

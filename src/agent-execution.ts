@@ -1,11 +1,11 @@
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type InlineExtension, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
-import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
-import { resolveModelReference, WorkflowError } from "./index.js";
+import type { AgentIdentity, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
+import { parseModelReference, resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
@@ -23,7 +23,7 @@ export interface AgentExecutionOptions {
   model?: string;
   thinking?: ThinkingLevel;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
-  onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => void | Promise<void>;
+  onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile" | "setup">) => void | Promise<void>;
   tools?: readonly string[];
   effectiveTools?: readonly string[];
   role?: string;
@@ -34,6 +34,8 @@ export interface AgentExecutionOptions {
   worktreeOwner?: string;
   cwd?: string;
   budget?: AgentBudgetHooks;
+  agentOptions?: Readonly<Record<string, JsonValue>>;
+  agentIdentity?: AgentIdentity;
 }
 export interface AgentExecutionRoot {
   cwd: string;
@@ -48,14 +50,19 @@ export interface AgentExecutionRoot {
   settingsPath?: string;
   runStore?: RunStore;
   providerPause?: () => Promise<void>;
+  agentSetupHooks?: readonly RegisteredAgentSetupHook[];
+  runContext?: Readonly<WorkflowRunContext>;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
 export interface AgentToolCallProgress { id: string; name: string; state: "running" | "completed" | "failed" }
 export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
 export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; activity?: AgentActivity; persist: boolean }
-export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
+export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting; setup?: AgentSetupSummary }
 export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
-
+export interface AgentSetup { prompt: string; options: Record<string, JsonValue>; sessionInput: SessionInput; createSession: SessionFactory }
+export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal }
+export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
+export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }
 export interface NativeSession {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
@@ -68,7 +75,7 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; agentDir?: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; options?: Record<string, JsonValue> }
 export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
@@ -114,16 +121,45 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
-  const resourceLoader = input.systemPromptAppend ? new DefaultResourceLoader({ cwd: input.cwd, agentDir, appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] }) : undefined;
+  const resourceLoader = input.systemPromptAppend || input.extensionFactories?.length ? new DefaultResourceLoader({ cwd: input.cwd, agentDir, ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) }) : undefined;
   if (resourceLoader) await resourceLoader.reload();
-  const { session } = await createAgentSession({ cwd: input.cwd, agentDir, modelRuntime, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
+  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
   return session;
 }
-
-
+function changedOption(options: Readonly<Record<string, JsonValue>>, baseline: Readonly<Record<string, JsonValue>>, key: string): boolean { return JSON.stringify(options[key]) !== JSON.stringify(baseline[key]); }
+function validThinking(value: unknown): value is ThinkingLevel { return typeof value === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value); }
+function fallbackSetupContext(root: AgentExecutionRoot, options: AgentExecutionOptions, signal: AbortSignal): { run: Readonly<WorkflowRunContext>; identity: Readonly<AgentIdentity> } {
+  const identity = options.agentIdentity ?? { structuralPath: [], callSite: options.label, occurrence: 1 };
+  const run = root.runContext ?? Object.freeze({ cwd: root.cwd, sessionId: "", runId: "", workflow: Object.freeze({ name: options.workflowName }), args: null, signal });
+  return { run, identity: Object.freeze({ ...identity, structuralPath: Object.freeze([...identity.structuralPath]) }) };
+}
+async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
+  const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
+  const baselineOptions = structuredClone(options.agentOptions ?? {});
+  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), systemPromptAppend: resolved.systemPromptAppend, options: structuredClone(baselineOptions) };
+  const setup: AgentSetup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, createSession };
+  const base = fallbackSetupContext(root, options, setupSignal);
+  const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal });
+  const hookNames: string[] = [];
+  for (const hook of [...(root.agentSetupHooks ?? [])].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))) {
+    if (setupSignal.aborted) throw new WorkflowError("CANCELLED", "Agent cancelled");
+    try { await hook.setup(setup, context); } catch (error) { if (setupSignal.reason !== undefined) throw new WorkflowError("CANCELLED", "Agent cancelled"); throw error; }
+    hookNames.push(hook.name);
+    if (setupSignal.reason !== undefined) throw new WorkflowError("CANCELLED", "Agent cancelled");
+  }
+  setup.sessionInput.options = setup.options;
+  if (changedOption(setup.options, baselineOptions, "model") && typeof setup.options.model === "string") setup.sessionInput.model = parseModel(setup.options.model, setup.sessionInput.model, validThinking(setup.options.thinking) ? setup.options.thinking : setup.sessionInput.model.thinking);
+  if (changedOption(setup.options, baselineOptions, "thinking") && validThinking(setup.options.thinking)) setup.sessionInput.model = { ...setup.sessionInput.model, thinking: setup.options.thinking };
+  if (changedOption(setup.options, baselineOptions, "tools") && Array.isArray(setup.options.tools) && setup.options.tools.every((tool) => typeof tool === "string")) setup.sessionInput.tools = [...setup.options.tools];
+  if (changedOption(setup.options, baselineOptions, "cwd") && typeof setup.options.cwd === "string") setup.sessionInput.cwd = setup.options.cwd;
+  const model = setup.sessionInput.model;
+  const summary: AgentSetupSummary = { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd };
+  return { setup, summary };
+}
 
 export class WorkflowAgentExecutor {
   constructor(private readonly root: AgentExecutionRoot, private readonly createSession: SessionFactory = createNativeAgentSession) {}
+  setRunContext(runContext: Readonly<WorkflowRunContext>): void { this.root.runContext = runContext; }
 
   resolve(options: AgentExecutionOptions, inheritedTools?: readonly string[]): { model: ModelSpec; requestedModel?: string; tools: readonly string[]; systemPromptAppend: string } {
     const role = options.role;
@@ -143,6 +179,7 @@ export class WorkflowAgentExecutor {
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
+    const executionSignal = signal ?? this.root.runContext?.signal;
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
     const resolved = this.resolve(options);
@@ -172,6 +209,10 @@ export class WorkflowAgentExecutor {
       const started = Date.now();
       let accepted = false;
       let schemaResult: JsonValue | undefined;
+      let session: NativeSession | undefined;
+      let setup: AgentSetup | undefined;
+      let setupSummary: AgentSetupSummary | undefined;
+      let setupFailed = false;
       let budgetError: WorkflowError | undefined;
       let turnStarted = false;
       const hasSchemaResult = () => schemaResult !== undefined;
@@ -185,7 +226,6 @@ export class WorkflowAgentExecutor {
           return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
         },
       } as ToolDefinition : undefined;
-      let session: NativeSession | undefined;
       const toolCalls = new Map<string, AgentToolCallProgress>();
       let activity: AgentActivity | undefined;
       let progress = Promise.resolve();
@@ -203,8 +243,15 @@ export class WorkflowAgentExecutor {
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
-        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(this.root.agentDir ? { agentDir: this.root.agentDir } : {}), ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
-        await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile) });
+        setupFailed = true;
+        const prepared = await prepareAgentSetup(this.root, this.createSession, task, options, resolved, cwd, attempt, executionSignal, customTools, resultTool);
+        setup = prepared.setup;
+        setupSummary = prepared.summary;
+        setupFailed = false;
+        if (executionSignal?.aborted) throw new WorkflowError("CANCELLED", "Agent cancelled");
+        const started = Date.now();
+        session = await setup.createSession(setup.sessionInput);
+        await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
         unsubscribe = session.subscribe?.((event) => {
           if (event.type === "agent_start" && session?.systemPrompt !== undefined && this.root.runStore) {
             systemPromptTurn += 1;
@@ -235,17 +282,17 @@ export class WorkflowAgentExecutor {
         }
         const context = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
         const instruction = options.budget?.instruction();
-        const promptText = `${context}\n\nTask:\n${task}${instruction ? `\n\n${instruction}` : ""}`;
+        const promptText = `${context}\n\nTask:\n${setup.prompt}${instruction ? `\n\n${instruction}` : ""}`;
         options.budget?.beforeTurn();
         turnStarted = true;
-        await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), signal, this.root.providerPause);
+        await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
         { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
           accepted = true;
-          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), signal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           if (!hasSchemaResult()) {
-            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), signal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
@@ -256,11 +303,11 @@ export class WorkflowAgentExecutor {
         await flushSystemPrompts();
         unsubscribe?.();
         const attemptAccounting = accounting(session.messages);
-        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting });
+        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
         session.dispose();
-        return { value, attempts, cwd };
+        return { value, attempts, cwd: setupSummary.cwd };
       } catch (error) {
-        const typed = budgetError ?? (error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error)));
+        const typed = budgetError ?? (error instanceof WorkflowError ? error : new WorkflowError(executionSignal?.aborted && setupFailed ? "CANCELLED" : "AGENT_FAILED", error instanceof Error ? error.message : String(error)));
         if (session) {
           report(true);
           await progress;
@@ -268,11 +315,11 @@ export class WorkflowAgentExecutor {
           unsubscribe?.();
           const attemptAccounting = accounting(session.messages);
           if (!budgetError && typed.code !== "BUDGET_EXHAUSTED") { try { options.budget?.afterTurn(attemptAccounting, true); } catch (budgetFailure) { budgetError ??= budgetFailure instanceof WorkflowError ? budgetFailure : new WorkflowError("BUDGET_EXHAUSTED", budgetFailure instanceof Error ? budgetFailure.message : String(budgetFailure)); } }
-          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting });
+          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length && setupSummary ? { setup: setupSummary } : {}) });
           session.dispose();
         }
         if (options.worktreeOwner && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner).catch(() => undefined);
-        if (attempt === maxAttempts || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
+        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
         beforeRetry?.();
       }
     }
@@ -293,6 +340,8 @@ export interface ScheduledAgentOptions {
   schema?: JsonSchema;
   retries?: number;
   timeoutMs?: number | null;
+  agentOptions?: Readonly<Record<string, JsonValue>>;
+  agentIdentity?: AgentIdentity;
 }
 
 export type ScheduledAgentResult =
@@ -425,11 +474,12 @@ export class FairAgentScheduler {
     if (!parent.options.tools.includes("agent")) return [];
     const agentTool = {
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
-      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()), role: Type.Optional(Type.String()), outputSchema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
-      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; thinking?: ThinkingLevel; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
+      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()), role: Type.Optional(Type.String()), outputSchema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }, { additionalProperties: true }),
+      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; thinking?: ThinkingLevel; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null; [key: string]: unknown }) => {
         if (params.role !== undefined && (params.model !== undefined || params.thinking !== undefined || params.tools !== undefined)) throw new WorkflowError("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
         const tools = (params.tools !== undefined || params.role !== undefined ? resolveTools?.(params.role, params.tools, params.model, parent.options.tools, params.thinking) : undefined) ?? params.tools ?? parent.options.tools;
-        const options = { label: params.label, requestedLabel: params.label, cwd: parent.options.cwd, tools, ...(params.model ? { model: params.model } : {}), ...(params.thinking ? { thinking: params.thinking } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
+        const agentOptions = Object.fromEntries(Object.entries(params).filter(([key]) => key !== "prompt")) as Record<string, JsonValue>;
+        const options: ScheduledAgentOptions = { label: params.label, requestedLabel: params.label, cwd: parent.options.cwd, tools, agentOptions, ...(params.model ? { model: params.model } : {}), ...(params.thinking ? { thinking: params.thinking } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
         return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
       },
@@ -471,14 +521,12 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "requestedLabel", "parentBreadcrumb", "cwd", "tools", "worktreeOwner", "model", "thinking", "role", "schema", "retries", "timeoutMs"].includes(key));
-    if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
-    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });
+    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}) });
     if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const forbidden = options.tools.find((tool) => !parent.options.tools.includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
-    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
   }
   /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
 

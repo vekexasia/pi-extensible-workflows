@@ -10,7 +10,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type SessionFactory } from "./agent-execution.js";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
 import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
@@ -42,7 +42,8 @@ export interface WorkflowErrorShape { code: WorkflowErrorCode; message: string }
 export interface ModelSpec { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
 export interface WorkflowMetadata { name: string; description?: string }
 export interface WorkflowSettings { concurrency: number; modelAliases?: Readonly<Record<string, string>> }
-export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelSpec; tools: readonly string[]; cwd: string }
+export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; setup?: AgentSetupSummary }
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; parentBreadcrumb?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: "warning"; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
@@ -65,7 +66,7 @@ export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { 
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowScriptDefinition { description: string; script: string }
-export interface WorkflowExtension { namespace: string; version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>> }
+export interface WorkflowExtension { namespace: string; version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
 export interface WorkflowJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
 export class WorkflowError extends Error {
@@ -739,12 +740,9 @@ function validateAgentOption(key: string, value: unknown, aliases?: Readonly<Rec
       break;
   }
 }
-
 function validateAgentOptions(value: unknown): Readonly<Record<string, JsonValue>> {
   if (!object(value) || !jsonValue(value)) fail("INVALID_METADATA", "agent options must be a JSON object");
-  const unknown = Object.keys(value).find((key) => !AGENT_OPTION_KEYS.has(key));
-  if (unknown) fail("INVALID_METADATA", `Unknown agent option: ${unknown}`);
-  for (const [key, option] of Object.entries(value)) validateAgentOption(key, option);
+  for (const [key, option] of Object.entries(value)) if (AGENT_OPTION_KEYS.has(key)) validateAgentOption(key, option);
   if (typeof value.role === "string" && ["model", "thinking", "tools"].some((key) => Object.prototype.hasOwnProperty.call(value, key))) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
   return value;
 }
@@ -834,19 +832,12 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
 
 function validateStaticAgentOptions(node: acorn.AnyNode | undefined, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): void {
   if (node?.type !== "ObjectExpression") return;
-  for (const property of node.properties) {
-    if (property.type === "SpreadElement" || property.computed) continue;
-    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
-    if (key && !AGENT_OPTION_KEYS.has(key)) fail("INVALID_METADATA", `Unknown agent option: ${key}`);
-  }
-  const role = propertyNode(node, "role");
-  if (role && ["model", "thinking", "tools"].some((key) => propertyNode(node, key) !== undefined)) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
+  const options = staticValue(node);
+  if (options.known && object(options.value) && typeof options.value.role === "string" && ["model", "thinking", "tools"].some((key) => Object.prototype.hasOwnProperty.call(options.value as Record<string, unknown>, key))) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
   for (const key of AGENT_OPTION_KEYS) {
     const value = staticValue(propertyNode(node, key));
     if (value.known) validateAgentOption(key, value.value, aliases, knownModels, settingsPath);
   }
-  const options = staticValue(node);
-  if (options.known && object(options.value) && typeof options.value.role === "string" && ["model", "thinking", "tools"].some((key) => Object.prototype.hasOwnProperty.call(options.value as Record<string, unknown>, key))) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
 }
 
 function validateStaticWithWorktree(call: WorkflowCall): void {
@@ -878,12 +869,13 @@ export class WorkflowRegistry {
 
   register(extension: WorkflowExtension): void {
     if (this.#frozen) fail("REGISTRY_FROZEN", "Workflow extension registration is closed after session_start");
-    if (!object(extension) || Object.keys(extension).some((key) => !["namespace", "version", "headline", "description", "functions", "variables", "workflows"].includes(key)) || typeof extension.namespace !== "string" || typeof extension.version !== "string" || !IDENTIFIER.test(extension.namespace) || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a namespace, semantic version, headline, and description");
+    if (!object(extension) || Object.keys(extension).some((key) => !["namespace", "version", "headline", "description", "functions", "variables", "workflows", "agentSetupHooks"].includes(key)) || typeof extension.namespace !== "string" || typeof extension.version !== "string" || !IDENTIFIER.test(extension.namespace) || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a namespace, semantic version, headline, and description");
     if (this.#extensions.has(extension.namespace)) fail("DUPLICATE_NAME", `Workflow extension already registered: ${extension.namespace}`);
     const functions = extension.functions ?? {};
     const variables = extension.variables ?? {};
     const workflows = extension.workflows ?? {};
-    if (!object(functions) || !object(variables) || !object(workflows) || (Object.keys(functions).length === 0 && Object.keys(variables).length === 0 && Object.keys(workflows).length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, variables, or workflows");
+    const agentSetupHooks = extension.agentSetupHooks ?? {};
+    if (!object(functions) || !object(variables) || !object(workflows) || !object(agentSetupHooks) || (Object.keys(functions).length === 0 && Object.keys(variables).length === 0 && Object.keys(workflows).length === 0 && Object.keys(agentSetupHooks).length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, variables, workflows, or agent setup hooks");
     const names = [...Object.keys(functions), ...Object.keys(variables)];
     if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", `Global name collision inside ${extension.namespace}`);
     for (const name of names) {
@@ -906,7 +898,10 @@ export class WorkflowRegistry {
       if (!IDENTIFIER.test(name) || !object(workflow) || Object.keys(workflow).some((key) => !["description", "script"].includes(key)) || typeof workflow.description !== "string" || !workflow.description.trim() || typeof workflow.script !== "string" || !workflow.script.trim()) fail("INVALID_METADATA", `Invalid workflow script: ${extension.namespace}.${name}`);
       parseWorkflow(workflow.script);
     }
-    const stored = deepFreeze({ ...extension, functions, variables, workflows });
+    for (const [name, hook] of Object.entries(agentSetupHooks)) {
+      if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "setup"].includes(key)) || typeof hook.setup !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent setup hook: ${extension.namespace}.${name}`);
+    }
+    const stored = deepFreeze({ ...extension, functions, variables, workflows, agentSetupHooks });
     this.#extensions.set(extension.namespace, stored);
     for (const name of names) this.#globals.set(name, `${extension.namespace}.${name}`);
   }
@@ -961,8 +956,11 @@ export class WorkflowRegistry {
   variables(): readonly { namespace: string; name: string; variable: WorkflowVariable }[] {
     return [...this.#extensions].flatMap(([namespace, extension]) => Object.entries(extension.variables ?? {}).map(([name, variable]) => ({ namespace, name, variable })));
   }
+  agentSetupHooks(): readonly RegisteredAgentSetupHook[] {
+    return [...this.#extensions].flatMap(([namespace, extension]) => Object.entries(extension.agentSetupHooks ?? {}).map(([name, hook]) => ({ name: `${namespace}.${name}`, priority: hook.priority ?? 10, setup: hook.setup }))).sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  }
 }
-type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "workflow" | "workflows" | "catalog" | "globals" | "invokeFunction" | "variables">;
+type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "workflow" | "workflows" | "catalog" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -977,6 +975,7 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     globals: () => registry.globals(),
     invokeFunction: (...args) => registry.invokeFunction(...args),
     variables: () => registry.variables(),
+    agentSetupHooks: () => registry.agentSetupHooks(),
   };
 }
 function workflowRegistryHost(): WorkflowRegistryHost {
@@ -1535,7 +1534,7 @@ function nativeSessionReference(attempt: Pick<AgentAttempt, "sessionId" | "sessi
   return { sessionId: attempt.sessionId, sessionFile: attempt.sessionFile };
 }
 
-export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">): Promise<void> {
+export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile" | "setup">): Promise<void> {
   await store.updateState((run) => {
     const agent = run.agents.find((candidate) => candidate.id === id);
     if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
@@ -1551,7 +1550,7 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
     const agent = run.agents.find((candidate) => candidate.id === id);
     if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
     const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-    const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting }));
+    const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting, setup }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting, ...(setup ? { setup } : {}) }));
     const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
     return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt))] };
   });
@@ -1684,8 +1683,10 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   for (const agent of prioritised) {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = agentBreadcrumb(agent, byId);
-    const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
-    const policy = [`model=${model}`, agent.requestedModel ? `requested=${agent.requestedModel}` : "", `tools=${agent.tools.join(",") || "(none)"}`, agent.role ? `role=${agent.role}` : ""];
+    const setup = agent.attemptDetails?.at(-1)?.setup;
+    const thinking = setup?.model.thinking ?? agent.model.thinking;
+    const model = `${setup?.model.provider ?? agent.model.provider}/${setup?.model.model ?? agent.model.model}${thinking ? `:${thinking}` : ""}`;
+    const policy = [`model=${model}`, agent.requestedModel ? `requested=${agent.requestedModel}` : "", `tools=${(setup?.tools ?? agent.tools).join(",") || "(none)"}`, agent.role ? `role=${agent.role}` : ""];
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
     const parts = [`${icon} ${breadcrumb}`, agent.state, ...policy, tokens].filter(Boolean);
     lines.push(parts.join(" · "));
@@ -1724,7 +1725,10 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
     const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
     lines.push(`  ${agent.label ?? agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
-    for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
+    for (const attempt of agent.attemptDetails ?? []) {
+      lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
+      if (attempt.setup) lines.push(`    setup hooks=${attempt.setup.hookNames.join(",") || "(none)"} model=${attempt.setup.model.provider}/${attempt.setup.model.model}${attempt.setup.model.thinking ? `:${attempt.setup.model.thinking}` : ""} tools=${attempt.setup.tools.join(",") || "(none)"} cwd=${attempt.setup.cwd}`);
+    }
     for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
   }
   lines.push("Checkpoints:");
@@ -1991,13 +1995,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         if (!runState.agents.some((agent) => agent.id === id)) return;
         run.update?.(workflowToolUpdate(runState));
       };
-      const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => {
+      const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile" | "setup">) => {
         await scheduler.flush();
         await persistActiveAgentAttempt(run.store, id, attempt);
         await run.store.updateState((current) => ({ ...current, ...run.budget.snapshot() }));
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       await run.store.updateState((current) => ({ ...current, ...run.budget.snapshot() }));
       return result.value;
@@ -2140,7 +2144,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const previousAliases = loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ?? {};
     const modelRegistry = context?.modelRegistry;
     const knownModels = new Set((modelRegistry?.getAll?.() ?? modelRegistry?.getAvailable?.() ?? []).map((model) => `${model.provider}/${model.id}`));
-    if (context.model) knownModels.add(`${context.model.provider}/${context.model.id}`);
     if (context?.model) knownModels.add(`${context.model.provider}/${context.model.id}`);
     const resumeModels = modelRegistry ? knownModels : new Set([...loaded.snapshot.models, ...knownModels]);
     const resumeAliases = { ...previousAliases, ...currentAliases };
@@ -2148,12 +2151,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     preflight(loaded.snapshot.script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata);
     const snapshot = createLaunchSnapshot({ ...loaded.snapshot, settingsPath, settings: { ...loaded.snapshot.settings, modelAliases: currentAliases }, modelAliases: currentAliases });
     await run.store.saveSnapshot(snapshot);
-    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); } }, createSession);
+    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks() }, createSession);
     const drift = aliasDrift(previousAliases, currentAliases);
     if (drift.length) await run.store.appendEvent({ type: "warning", message: `Model alias mappings changed on resume: ${drift.join("; ")}` });
     const controller = new AbortController();
     run.abortController = controller;
     const runContext = workflowRunContext(run.store.cwd, run.store.sessionId, run.store.runId, loaded.snapshot.metadata, loaded.snapshot.args, controller.signal);
+    run.executor.setRunContext(runContext);
     let variables: Readonly<Record<string, JsonValue>>;
     try { variables = await resolveWorkflowVariables(runContext, controller, registry); }
     catch (error) {
@@ -2179,7 +2183,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const label = displayAgentName(requestedLabel, role, resolved.model);
         const tools = resolved.tools;
         const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), agentOptions: options, agentIdentity: identity });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
@@ -2281,7 +2285,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, loaded.run.state, budgetRuntime);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController: new AbortController(), checkpointResolvers: new Map(), budgetResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks() }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController: new AbortController(), checkpointResolvers: new Map(), budgetResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -2354,7 +2358,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, "running", budgetRuntime);
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause }, createSession);
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), runContext }, createSession);
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, checkpointResolvers: new Map(), budgetResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -2374,7 +2378,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const label = displayAgentName(requestedLabel, role, resolved.model);
           const tools = resolved.tools;
           const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-          const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), agentOptions: options, agentIdentity: identity });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
@@ -2965,6 +2969,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 export { acquireSessionLease, projectStorageKey, RunStore, runsDirectory, SessionLease, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PendingWorkflowDecision, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress } from "./agent-execution.js";
+export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentSetup, AgentSetupContext, AgentSetupHook, AgentToolCallProgress, RegisteredAgentSetupHook, SessionInput } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
 export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";
