@@ -163,7 +163,7 @@ Rules:
 - Export a default factory.
 - Call `registerWorkflowExtension()` inside the factory, not at module top level.
 - Provide a strict semantic `version` and non-empty `headline`.
-- Register at least one capability: `functions`, `modelAliases`, `agentSetupHooks`, `agentAttemptActions`, or `roleDirectories`. Function descriptions remain on each registered function and power catalog discovery and CLI help.
+- Register at least one capability: `functions`, `modelAliases`, `validateSettings`, `agentSetupHooks`, `agentAttemptActions`, or `roleDirectories`. Function descriptions remain on each registered function and power catalog discovery and CLI help.
 - Treat all extension code as trusted host code.
 - Use globally unique, stable names. Registration is frozen after `session_start`; late registration fails with `REGISTRY_FROZEN`.
 - Do not use the removed `workflows` or `variables` registration formats.
@@ -284,11 +284,11 @@ contextFiles: [global, project]
 
 Focus on correctness, regressions, and concrete next checks.
 ```
-Supported core frontmatter fields include direct `tools`, `skills`, and `extensions` selector arrays. Each uses ordered Minimatch rules; positive rules enable, negated rules disable, and the last match wins.
+Supported core frontmatter fields include direct `tools`, `skills`, and `extensions` selector arrays plus `extensionSettings` JSON. Each selector uses ordered Minimatch rules; positive rules enable, negated rules disable, and the last match wins.
 
-`description`, `model`, `overrideSystemPrompt`, and `contextFiles` retain their existing meanings. Put thinking on `model` as `provider/model:thinking` or `alias:thinking`. The selector fields are composed after global and trusted project settings and before per-call selectors.
+`description`, `model`, `overrideSystemPrompt`, and `contextFiles` retain their existing meanings. Put thinking on `model` as `provider/model:thinking` or `alias:thinking`. The selector fields are composed after global and trusted project settings and before per-call selectors. Role `extensionSettings` replaces declared top-level namespaces while retaining omitted ones.
 
-The role body is prompt guidance. Role files are trusted configuration and can change model, tools, context, resources, and system-prompt behavior.
+The role body is prompt guidance. Role files are trusted configuration and can change model, tools, context, resources, extension settings, and system-prompt behavior.
 Role selection is a name string:
 
 ```js

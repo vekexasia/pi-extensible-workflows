@@ -18,7 +18,7 @@ Use the built-in subagent tools for focused, independent tasks. Use `pi-extensib
 
 - Five focused tools: run, inspect, steer, stop, and retry.
 - Background fan-out with one durable ID per run, or foreground execution with an inline terminal result.
-- Reuses workflow roles, model aliases, settings, and agent options: `label`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, `worktree`, `outputSchema`, `retries` (0 through 255), and `timeoutMs`.
+- Reuses workflow roles, model aliases, settings including extension-defined namespaces, and agent options: `label`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, `worktree`, `outputSchema`, `retries` (0 through 255), and `timeoutMs`.
 - Repeatable inspection of progress, token accounting, tool calls, results, failures, and worktrees.
 
 Built-in subagent tools are available when the core extension is installed. Use the core package's Pi extension manifest to enable them.

@@ -48,7 +48,7 @@
   <span class="tok-property">contextFiles</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"cwd"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
   <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span>
 <span class="tok-punctuation">}</span><span class="tok-punctuation">);</span></code></pre>
-        <p>Per-call <code>model</code>, <code>thinking</code>, <code>tools</code>, <code>skills</code>, <code>extensions</code>, and <code>contextFiles</code> override role-file defaults. Built-in subagent tools discover these same role files and apply the same validation to standalone agent runs.</p>
+        <p>Per-call <code>model</code>, <code>thinking</code>, <code>tools</code>, <code>skills</code>, <code>extensions</code>, and <code>contextFiles</code> override role-file defaults. Role <code>extensionSettings</code> replaces declared top-level namespaces while retaining omitted ones. Built-in subagent tools discover these same role files and apply the same validation to standalone agent runs.</p>
       </section>
       <section id="files">
         <h2>Role files</h2>
@@ -62,7 +62,7 @@
 <span class="tok-property">extensions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!**/unsafe.mjs"</span><span class="tok-punctuation">]</span>
 <span class="tok-punctuation">---</span>
 Focus on correctness and regressions.</code></pre>
-        <p>The body is prompt guidance. It is appended to the native Pi system prompt unless <code>overrideSystemPrompt: true</code> is set. Role files are trusted configuration and can affect model, tools, resource selectors, and the system prompt.</p>
+        <p>The body is prompt guidance. It is appended to the native Pi system prompt unless <code>overrideSystemPrompt: true</code> is set. Role files are trusted configuration and can affect model, tools, resource selectors, extension settings, and the system prompt.</p>
       </section>
       <section id="frontmatter">
         <h2>Frontmatter fields</h2>
@@ -72,6 +72,7 @@ Focus on correctness and regressions.</code></pre>
             <tr><td><code>description</code></td><td>Role description shown in role discovery and Pi guidance.</td></tr>
             <tr><td><code>model</code></td><td>Configured alias or concrete <code>provider/model:thinking</code>.</td></tr>
             <tr><td><code>tools</code>, <code>skills</code>, <code>extensions</code></td><td>Ordered Minimatch selectors. Positive patterns enable discovered candidates, <code>!pattern</code> disables them, later layers override earlier layers, and <code>!*</code> clears the current selection before narrower additions.</td></tr>
+            <tr><td><code>extensionSettings</code></td><td>JSON object of extension-owned namespace values. Declared top-level namespaces replace inherited values; omitted namespaces remain inherited.</td></tr>
             <tr><td><code>overrideSystemPrompt</code></td><td>When true, use the role body instead of appending it to the native system prompt.</td></tr>
             <tr><td><code>contextFiles</code></td><td>Choose which Pi context-file scopes reach the role.</td></tr>
           </tbody>
