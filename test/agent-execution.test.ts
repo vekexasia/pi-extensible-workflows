@@ -321,13 +321,12 @@ void test("nested ownership releases permits, contains child failure, and blocks
     }
     throw new WorkflowError("AGENT_FAILED", "child failed");
   }, 1);
-  scheduler.addRun("run", 1, 2);
+  scheduler.addRun("run", 1);
   const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["read"] });
   const result = await parent.result;
   assert.equal(result.ok, true);
   assert.deepEqual((result as { ok: true; value: unknown }).value, { id: "run:2", ok: false, error: { code: "AGENT_FAILED", message: "child failed" } });
   assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["completed", "failed"]);
-  assert.throws(() => scheduler.spawn("run", "extra", { label: "extra", cwd: "/repo", tools: ["read"] }), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_LIMIT_EXCEEDED");
 });
 
 void test("cancelling a parent waiting for a child releases its reacquired permit", async () => {
@@ -361,14 +360,14 @@ void test("persisted ownership restores cancellation and scoped runtime state", 
   const options = { label: "parent", cwd: "/repo", tools: ["agent"] };
   const persisted = [{ id: "run:1", label: "parent", state: "running" as const, options }, { id: "run:2", parentId: "run:1", label: "child", state: "waiting_for_child" as const, options: { ...options, label: "child" } }];
   const scheduler = new FairAgentScheduler(async () => "unused", 1);
-  scheduler.restoreRun("run", 1, 10, persisted);
+  scheduler.restoreRun("run", 1, persisted);
   assert.deepEqual(scheduler.toolsFor("run:1").map(({ name }) => name), ["agent", "get_subagent_result", "steer_subagent"]);
   scheduler.cancel("run:1");
   assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled"]);
 });
 void test("cold replacement does not consume restored logical agent slots", async () => {
   const scheduler = new FairAgentScheduler(async () => "replacement", 1);
-  scheduler.restoreRun("run", 1, 1, [{ id: "run:1", label: "restored", state: "running", options: { label: "restored", cwd: "/repo", tools: [] } }]);
+  scheduler.restoreRun("run", 1, [{ id: "run:1", label: "restored", state: "running", options: { label: "restored", cwd: "/repo", tools: [] } }]);
   await scheduler.cancelRun("run");
   const replacement = scheduler.spawn("run", "replacement", { label: "replacement", cwd: "/repo", tools: [] });
   assert.deepEqual(await replacement.result, { id: replacement.id, ok: true, value: "replacement" });

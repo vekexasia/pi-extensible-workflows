@@ -5,10 +5,32 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateBudget, validateBudgetPatch, validateCheckpoint, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
+void test("validates aggregate budgets and patches", () => {
+  const budget = validateBudget({ tokens: { soft: 5, hard: 10 }, costUsd: { soft: 1, hard: 2.5 }, durationMs: { hard: 100 }, agentLaunches: { soft: 0, hard: 1 } });
+  assert.deepEqual(budget, { tokens: { soft: 5, hard: 10 }, costUsd: { soft: 1, hard: 2.5 }, durationMs: { hard: 100 }, agentLaunches: { soft: 0, hard: 1 } });
+  assert.throws(() => validateBudget({ tokens: { soft: -1 } }), /non-negative/);
+  assert.throws(() => validateBudget({ tokens: { soft: 2, hard: 2 } }), /less than hard/);
+  assert.deepEqual(validateBudgetPatch({ tokens: null, costUsd: { hard: 3 } }), { tokens: null, costUsd: { hard: 3 } });
+  assert.deepEqual(mergeBudget(budget, { tokens: null }), { costUsd: { soft: 1, hard: 2.5 }, durationMs: { hard: 100 }, agentLaunches: { soft: 0, hard: 1 } });
+  assert.equal(budgetRelaxed(budget, mergeBudget(budget, { costUsd: { hard: 4 } })), true);
+  assert.equal(resumeBudgetAllowed({ tokens: { hard: 5 } }, { tokens: 5, costUsd: 0, durationMs: 0, agentLaunches: 0 }), false);
+});
+void test("budget runtime excludes cache tokens, records soft crossings, and tracks active duration", () => {
+  let now = 0;
+  const runtime = new WorkflowBudgetRuntime({ tokens: { soft: 5, hard: 10 }, costUsd: { hard: 1 }, durationMs: { hard: 20 }, agentLaunches: { hard: 1 } }, 1, undefined, [], { now: () => now });
+  const agent = runtime.forAgent("agent");
+  agent.beforeAttempt();
+  agent.afterTurn({ input: 2, output: 3, cacheRead: 100, cacheWrite: 100, cost: 0.5 }, true);
+  assert.deepEqual(runtime.usage, { tokens: 5, costUsd: 0.5, durationMs: 0, agentLaunches: 1 });
+  assert.equal(runtime.events[0]?.type, "soft_crossed");
+  assert.match(agent.instruction() ?? "", /Finish the requested output/);
+  now = 21;
+  assert.throws(() => { agent.beforeTurn(); }, (error: unknown) => error instanceof WorkflowError && error.code === "BUDGET_EXHAUSTED");
+});
 type OwnershipNodes = Parameters<RunStore["saveOwnership"]>[0];
 const delayedOwnership = new Map<string, { start: () => void; cleanup: Promise<void> }>();
 const failedOwnership = new Set<string>();
@@ -46,7 +68,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
     on(name: string, candidate: unknown) { if (name === "resources_discover") discover = candidate as typeof discover; },
   };
   workflowExtension(pi as never);
-  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow"]);
+  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_resume", "workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
@@ -1293,11 +1315,11 @@ void test("default settings follow the effective agent directory", () => {
   try {
     mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
     writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 4 }));
-    assert.deepEqual(loadSettings(), { concurrency: 4, maxAgentLaunches: 1000 });
+    assert.deepEqual(loadSettings(), { concurrency: 4 });
     process.env.PI_CODING_AGENT_DIR = customAgentDir;
     mkdirSync(join(customAgentDir, "pi-extensible-workflows"), { recursive: true });
-    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ maxAgentLaunches: 20 }));
-    assert.deepEqual(loadSettings(), { concurrency: 8, maxAgentLaunches: 20 });
+    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 6 }));
+    assert.deepEqual(loadSettings(), { concurrency: 6 });
   } finally {
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1308,8 +1330,8 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-"));
   assert.equal(loadSettings(join(dir, "missing.json")), DEFAULT_SETTINGS);
   const path = join(dir, "settings.json");
-  writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgentLaunches: 20 }));
-  assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgentLaunches: 20 });
+  writeFileSync(path, JSON.stringify({ concurrency: 4 }));
+  assert.deepEqual(loadSettings(path), { concurrency: 4 });
   writeFileSync(path, JSON.stringify({ agentTimeoutMs: 500 }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
   writeFileSync(path, JSON.stringify({ concurrency: 17 }));
@@ -1407,7 +1429,7 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
+  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
@@ -1891,7 +1913,6 @@ void test("presents every workflow error code as factual prose", () => {
   const composed = formatWorkflowFailure(new WorkflowError("INTERNAL_ERROR", "Nested UNKNOWN_MODEL: missing/provider"));
   assert.match(composed, /missing\/provider/);
   assert.doesNotMatch(composed, /UNKNOWN_MODEL/);
-  assert.equal(formatWorkflowFailure(new WorkflowError("RUN_LIMIT_EXCEEDED", "Run 123e4567-e89b-12d3-a456-426614174000 exceeded maxAgentLaunches")), "The workflow exceeded its agent launch limit: maxAgentLaunches.");
 });
 void test("foreground workflow failures preserve codes while returning main-agent prose", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };

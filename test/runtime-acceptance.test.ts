@@ -57,7 +57,7 @@ void test("production session_start cold-restores ownership and /workflow stop c
   const sessionId = "session-a";
   const runId = "run-a";
   const store = new RunStore(cwd, sessionId, runId, home);
-  const settings = { concurrency: 1, maxAgentLaunches: 2 };
+  const settings = { concurrency: 1 };
   await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, schemas: [] }));
   const parentOptions = { label: "parent", cwd, tools: ["agent"], model: "runtime/runtime-model" };
   await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options: parentOptions }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { label: "child", cwd, tools: [], model: "runtime/runtime-model" } }]);
@@ -83,7 +83,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const named = await agent(\"named\", { label: \"API inspection\" }); const parent = await agent(\"nested policies\"); return { role, named, parent };";
   const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"] };
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2, maxAgentLaunches: 10 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, schemas: [] });
   await store.create({ id: "run-a", workflowName: "policy-reporting", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([]);
   const inputs = new Map<string, SessionInput>();
@@ -186,7 +186,7 @@ void test("cold resume rejects obsolete identity snapshots", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-old-snapshot-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
   await store.saveOwnership([{ id: "run-a:1", label: "legacy", state: "running", options: { label: "legacy", cwd, tools: [], isolation: "worktree" } }] as never);
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
@@ -203,7 +203,7 @@ void test("cold resume rejects project roles after trust is revoked", async () =
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-untrusted-resume-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "untrusted", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return agent("review", {role:"reviewer"});`, args: null, metadata: { name: "untrusted" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "project role" } }, projectRoles: ["reviewer"], schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "untrusted", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return agent("review", {role:"reviewer"});`, args: null, metadata: { name: "untrusted" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "project role" } }, projectRoles: ["reviewer"], schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const ctx = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, isProjectTrusted: () => false };
@@ -221,7 +221,7 @@ void test("cold resume replays completed agents by hidden structural identity", 
   assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; } }).result, "original");
   assert.ok(replayPath);
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.complete(replayPath, "replayed");
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -240,7 +240,7 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -268,7 +268,7 @@ void test("production restart recovery and graceful shutdown persist durable com
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lifecycle-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -315,7 +315,7 @@ void test("concurrency-1 cancellation and nested containment retain accounting a
   const r3 = scheduler.spawn("run", "r3", { label: "r3", cwd: "/repo", tools: [] });
   scheduler.cancel(r2.id); release(); await Promise.all([r1.result, r2.result, r3.result]);
   assert.deepEqual(started, ["r1", "r3"]);
-  scheduler.addRun("nested", 1, 2);
+  scheduler.addRun("nested", 1);
   const parent = scheduler.spawn("nested", "parent", { label: "parent", cwd: "/repo", tools: [] });
   assert.equal((await parent.result).ok, true);
   assert.deepEqual(scheduler.snapshot().slice(-2).map(({ state }) => state), ["completed", "failed"]);
@@ -373,7 +373,7 @@ void test("terminal failed attempts remain persisted", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-attempts-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
   await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" });
   const active = (await store.load()).run;
   assert.equal(active.agents[0]?.attemptDetails?.[0]?.sessionFile, "/sessions/failed.jsonl");
@@ -499,7 +499,7 @@ void test("shared worktree scopes persist one owner across production agents and
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const script = `const values = await withWorktree("shared", async () => parallel("top", { retry: () => agent("retry", { retries: 1 }), direct: () => agent("direct"), inherited: () => inherited({}), scoped: () => scoped({}) })); return { values, outside: await agent("outside") };`;
-  const started = await workflow.execute("id", { name: "shared-worktree", script, maxAgentLaunches: 10 }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const started = await workflow.execute("id", { name: "shared-worktree", script }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   const runId = started.details.runId;
   const store = new RunStore(cwd, "session", runId, home);
   for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
@@ -576,7 +576,7 @@ void test("cold resume recomputes variables and marks resolver failures", { time
   const cwd = join(home, "project");
   const cold = new RunStore(cwd, "session", "cold-run", home);
   const failed = new RunStore(cwd, "session", "failed-run", home);
-  const snapshot = (name: string, script: string) => createLaunchSnapshot({ script, args: null, metadata: { name }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["workflow_catalog"], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = (name: string, script: string) => createLaunchSnapshot({ script, args: null, metadata: { name }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: ["workflow_catalog"], agentTypes: [], roles: {}, schemas: [] });
   await cold.create({ id: "cold-run", workflowName: "cold-variable", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("cold-variable", "return coldVariable;"));
   await failed.create({ id: "failed-run", workflowName: "resume-variable-failure", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("resume-variable-failure", "return true;"));
   const stopped = new RunStore(cwd, "session", "stop-run", home);
@@ -610,7 +610,7 @@ void test("restart recovers every persisted nonterminal run state", async () => 
   const stores = states.map((state, index) => new RunStore(cwd, "session-a", `run-${String(index)}`, home));
   for (const [index, state] of states.entries()) {
     const id = `run-${String(index)}`;
-    await stores[index]?.create({ id, workflowName: id, cwd, sessionId: "session-a", state, agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return '${id}';`, args: null, metadata: { name: id }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await stores[index]?.create({ id, workflowName: id, cwd, sessionId: "session-a", state, agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return '${id}';`, args: null, metadata: { name: id }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   }
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -633,7 +633,7 @@ void test("cold-resumed failures deliver custom errors as prose while persistenc
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const message = "The restored approval gate rejected the release.";
-  await store.create({ id: "run-a", workflowName: "restored-failure", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `throw new Error(${JSON.stringify(message)});`, args: null, metadata: { name: "restored-failure" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "restored-failure", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `throw new Error(${JSON.stringify(message)});`, args: null, metadata: { name: "restored-failure" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const messages: string[] = [];

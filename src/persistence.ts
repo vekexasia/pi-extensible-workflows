@@ -4,7 +4,7 @@ import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFi
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
-import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
+import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
 import type { OwnershipRecord } from "./agent-execution.js";
 import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
@@ -13,8 +13,9 @@ export interface EffectiveSystemPrompt { sessionId: string; attempt: number; tur
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
+export type PendingWorkflowDecision = BudgetApprovalRequest
 export type PersistedOwnershipNode = OwnershipRecord
-type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint> };
+type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint>; decisions?: Record<string, PendingWorkflowDecision> };
 export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
 
 const execute = promisify(execFile);
@@ -178,7 +179,7 @@ export class RunStore {
     await mkdir(temporary, { mode: 0o700 });
     try {
       await atomicJson(join(temporary, "snapshot.json"), snapshot);
-      await atomicJson(join(temporary, "journal.json"), { completed: {}, awaiting: {} });
+      await atomicJson(join(temporary, "journal.json"), { completed: {}, awaiting: {}, decisions: {} });
       await atomicJson(join(temporary, "ownership.json"), []);
       await atomicJson(join(temporary, "worktrees.json"), []);
       await atomicJson(join(temporary, "state.json"), run);
@@ -291,13 +292,30 @@ export class RunStore {
     const journal = await json<Journal>(join(this.directory, "journal.json"));
     return Object.values(journal.awaiting ?? {});
   }
+  async requestWorkflowDecision(request: PendingWorkflowDecision): Promise<void> {
+    await this.updateJournal((journal) => { journal.decisions ??= {}; journal.decisions[request.proposalId] = request; });
+  }
+  async pendingWorkflowDecisions(): Promise<readonly PendingWorkflowDecision[]> {
+    await this.journalWrite;
+    const journal = await json<Journal>(join(this.directory, "journal.json"));
+    return Object.values(journal.decisions ?? {});
+  }
+  async answerWorkflowDecision(proposalId: string, approved: boolean): Promise<PendingWorkflowDecision | undefined> {
+    return this.updateJournal((journal) => {
+      const request = journal.decisions?.[proposalId];
+      if (!request) return undefined;
+      journal.completed[`decision/${proposalId}`] = { path: `decision/${proposalId}`, value: approved };
+      delete journal.decisions?.[proposalId];
+      return request;
+    });
+  }
 
   async answerCheckpoint(name: string, approved: boolean): Promise<AwaitingCheckpoint | undefined> {
     return this.updateJournal((journal) => {
-      const checkpoint = Object.values(journal.awaiting as Record<string, AwaitingCheckpoint>).find((item) => item.name === name);
+      const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
       if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
       journal.completed[checkpoint.path] = { path: checkpoint.path, value: approved };
-      journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting as Record<string, AwaitingCheckpoint>).filter(([path]) => path !== checkpoint.path));
+      journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting ?? {}).filter(([path]) => path !== checkpoint.path));
       return checkpoint;
     });
   }

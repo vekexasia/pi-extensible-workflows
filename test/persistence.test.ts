@@ -125,13 +125,13 @@ void test("cold reload restores persisted ownership for cascading cancellation",
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
   const first = new FairAgentScheduler(async ({ signal }) => new Promise((_resolve, reject) => { signal.addEventListener("abort", () => { reject(new WorkflowError("CANCELLED", "cancelled")); }, { once: true }); }), 1, (_runId, ownership) => store.saveOwnership(ownership));
-  first.restoreRun("run-a", 1, 10, [{ id: "run-a:1", label: "parent", state: "waiting_for_child", options: { label: "parent", cwd, tools: ["agent"] } }]);
+  first.restoreRun("run-a", 1, [{ id: "run-a:1", label: "parent", state: "waiting_for_child", options: { label: "parent", cwd, tools: ["agent"] } }]);
   const child = first.spawn("run-a", "child", { label: "child", cwd, tools: [] }, "run-a:1");
   await first.flush();
 
   const reloaded = await new RunStore(cwd, "session-a", "run-a", home).loadOwnership();
   const second = new FairAgentScheduler(async () => "unused", 1);
-  second.restoreRun("run-a", 1, 10, reloaded);
+  second.restoreRun("run-a", 1, reloaded);
   second.cancel("run-a:1");
   assert.deepEqual(second.snapshot().map(({ state }) => state), ["cancelled", "cancelled"]);
 

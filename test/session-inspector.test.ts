@@ -41,7 +41,7 @@ void test("loads workflow scripts, runtime prompts, models, and costs from stati
     id: runId, workflowName: "audit", cwd, sessionId, state: "completed",
     agents: [{ id: `${runId}:1`, name: "scout", path: "scout", state: "completed", role: "scout", model: { provider: "openai-codex", model: "gpt-5.6-luna", thinking: "high" }, tools: ["read"], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "child-session", sessionFile: childPath, accounting: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.25 } }], accounting: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.25 } }],
     nativeSessions: [{ sessionId: "child-session", sessionFile: childPath }],
-  }, createLaunchSnapshot({ script, args: null, metadata: { name: "audit", description: "Audit code" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai-codex/gpt-5.6-luna"], tools: ["read"], agentTypes: ["scout"], schemas: [] }));
+  }, createLaunchSnapshot({ script, args: null, metadata: { name: "audit", description: "Audit code" }, settings: { concurrency: 1 }, models: ["openai-codex/gpt-5.6-luna"], tools: ["read"], agentTypes: ["scout"], schemas: [] }));
 
   const report = await loadSessionReport(parentPath, home);
   assert.equal(report.cost, 0.1);
@@ -99,7 +99,7 @@ void test("reports transcript policy per attempt and persisted fallback policy",
     { id: `${runId}:2`, name: "nested-label", path: "nested", parentId: `${runId}:1`, state: "completed", role: "shared", model: { provider: "persisted", model: "nested-fallback", thinking: "medium" }, tools: [], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "missing", sessionFile: missingPath, accounting: account(0.4) }], accounting: account(0.4) },
     { id: `${runId}:3`, name: "corrupt-label", path: "corrupt", state: "failed", model: { provider: "persisted", model: "corrupt-fallback", thinking: "low" }, tools: [], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "corrupt", sessionFile: corruptPath, accounting: account(0.5) }], accounting: account(0.5) },
     { id: `${runId}:4`, name: "default-label", path: "default", state: "completed", model: { provider: "persisted", model: "default-fallback", thinking: "off" }, tools: [], attempts: 0, accounting: account(0.6) },
-  ], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "policy" }, settings: { concurrency: 1, maxAgentLaunches: 4 }, models: ["persisted/fallback", "persisted/nested-fallback", "persisted/corrupt-fallback", "persisted/default-fallback"], tools: [], agentTypes: ["shared"], roles: {}, schemas: [] }));
+  ], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "policy" }, settings: { concurrency: 1 }, models: ["persisted/fallback", "persisted/nested-fallback", "persisted/corrupt-fallback", "persisted/default-fallback"], tools: [], agentTypes: ["shared"], roles: {}, schemas: [] }));
   const report = await loadSessionReport(parentPath, home);
   const workflow = report.workflows[0];
   assert.ok(workflow);

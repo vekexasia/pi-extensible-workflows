@@ -8,6 +8,12 @@ import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
 import { parseModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
+export interface AgentBudgetHooks {
+  beforeAttempt(): void;
+  beforeTurn(): void;
+  afterTurn(accounting: AgentAccounting, final: boolean): void;
+  instruction(): string | undefined;
+}
 export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
 export interface AgentExecutionOptions {
   label: string;
@@ -27,6 +33,7 @@ export interface AgentExecutionOptions {
   retryState?: string;
   worktreeOwner?: string;
   cwd?: string;
+  budget?: AgentBudgetHooks;
 }
 export interface AgentExecutionRoot {
   cwd: string;
@@ -73,14 +80,23 @@ function text(messages: readonly AgentMessage[]): string {
   return message.content.filter((part: unknown): part is { type: "text"; text: string } => typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string").map((part) => part.text).join("");
 }
 
+function hasToolCall(message: unknown): boolean {
+  return typeof message === "object" && message !== null && Array.isArray((message as { content?: unknown }).content) && (message as { content: unknown[] }).content.some((part) => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "toolCall");
+}
+
+function latestAssistantHasToolCall(messages: readonly AgentMessage[]): boolean {
+  const message = [...messages].reverse().find((item) => item.role === "assistant");
+  return hasToolCall(message);
+}
+
 function accounting(messages: readonly AgentMessage[]): AgentAccounting {
   const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   for (const message of messages) if (message.role === "assistant" && message.usage) {
-    total.input += message.usage.input;
-    total.output += message.usage.output;
-    total.cacheRead += message.usage.cacheRead;
-    total.cacheWrite += message.usage.cacheWrite;
-    total.cost += message.usage.cost.total;
+    total.input += typeof message.usage.input === "number" && Number.isFinite(message.usage.input) ? message.usage.input : 0;
+    total.output += typeof message.usage.output === "number" && Number.isFinite(message.usage.output) ? message.usage.output : 0;
+    total.cacheRead += typeof message.usage.cacheRead === "number" && Number.isFinite(message.usage.cacheRead) ? message.usage.cacheRead : 0;
+    total.cacheWrite += typeof message.usage.cacheWrite === "number" && Number.isFinite(message.usage.cacheWrite) ? message.usage.cacheWrite : 0;
+    total.cost += typeof message.usage.cost?.total === "number" && Number.isFinite(message.usage.cost.total) ? message.usage.cost.total : 0;
   }
   return total;
 }
@@ -145,9 +161,12 @@ export class WorkflowAgentExecutor {
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      options.budget?.beforeAttempt();
       const started = Date.now();
       let accepted = false;
       let schemaResult: JsonValue | undefined;
+      let budgetError: WorkflowError | undefined;
+      let turnStarted = false;
       const hasSchemaResult = () => schemaResult !== undefined;
       const resultTool = options.schema ? {
         name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: Type.Unsafe(options.schema),
@@ -185,8 +204,20 @@ export class WorkflowAgentExecutor {
             const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
             systemPromptWrite = systemPromptWrite.then(() => this.root.runStore?.recordSystemPrompt(entry)).then(() => undefined).catch((error: unknown) => { systemPromptWriteError ??= error; });
           }
-          if (event.type === "message_start" && event.message.role === "assistant") { activity = { kind: "text", text: "responding" }; report(false); }
-          if (event.type === "message_end") { activity = undefined; if (event.message.role === "assistant") report(true); }
+          if (event.type === "message_start" && event.message.role === "assistant") {
+            if (!turnStarted) { try { options.budget?.beforeTurn(); turnStarted = true; } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
+            activity = { kind: "text", text: "responding" }; report(false);
+          }
+          if (event.type === "message_end") {
+            activity = undefined;
+            if (event.message.role === "assistant") {
+              const needsMoreWork = hasToolCall(event.message);
+              const final = !needsMoreWork || (options.schema !== undefined && accepted);
+              if (!budgetError) { try { options.budget?.afterTurn(accounting(session?.messages ?? []), final); if (!final) { const instruction = options.budget?.instruction(); if (instruction) void session?.steer?.(instruction); } } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
+              turnStarted = false;
+              report(true);
+            }
+          }
           if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; report(false); }
           if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; report(false); }
         });
@@ -196,14 +227,18 @@ export class WorkflowAgentExecutor {
           setSteer((message) => session?.steer?.(message));
         }
         const context = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
-        await promptWithProviderPause(session, `${context}\n\nTask:\n${task}`, remaining(options.timeoutMs, started), signal, this.root.providerPause);
+        const instruction = options.budget?.instruction();
+        const promptText = `${context}\n\nTask:\n${task}${instruction ? `\n\n${instruction}` : ""}`;
+        options.budget?.beforeTurn();
+        turnStarted = true;
+        await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), signal, this.root.providerPause);
+        { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
+        if (budgetError) throw budgetError;
         if (options.schema) {
           accepted = true;
-          try { await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), signal, this.root.providerPause); }
-          catch (error) { if (!hasSchemaResult()) throw error; }
+          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), signal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           if (!hasSchemaResult()) {
-            try { await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), signal, this.root.providerPause); }
-            catch (error) { if (!hasSchemaResult()) throw error; }
+            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), signal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
@@ -218,13 +253,14 @@ export class WorkflowAgentExecutor {
         session.dispose();
         return { value, attempts, cwd };
       } catch (error) {
-        const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
+        const typed = budgetError ?? (error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error)));
         if (session) {
           report(true);
           await progress;
           try { await flushSystemPrompts(); } catch { /* Preserve the agent failure that prompted this cleanup. */ }
           unsubscribe?.();
           const attemptAccounting = accounting(session.messages);
+          if (!budgetError && typed.code !== "BUDGET_EXHAUSTED") { try { options.budget?.afterTurn(attemptAccounting, true); } catch (budgetFailure) { budgetError ??= budgetFailure instanceof WorkflowError ? budgetFailure : new WorkflowError("BUDGET_EXHAUSTED", budgetFailure instanceof Error ? budgetFailure.message : String(budgetFailure)); } }
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting });
           session.dispose();
         }
@@ -284,7 +320,7 @@ type ScheduledNode = {
   steer?: (message: string) => void | Promise<void>;
 };
 
-type ScheduledRun = { limit: number; maxAgentLaunches: number; logical: number; active: number; queue: Array<() => void> };
+type ScheduledRun = { limit: number; beforeLaunch?: () => void; logical: number; active: number; queue: Array<{ node?: ScheduledNode; start: () => void }> };
 export type OwnershipRecord = { id: string; parentId?: string; label: string; state: ScheduledNode["state"]; options: Readonly<ScheduledAgentOptions> };
 type OwnershipWriter = (runId: string, ownership: readonly OwnershipRecord[]) => void | Promise<void>;
 
@@ -301,10 +337,10 @@ export class FairAgentScheduler {
     if (!Number.isInteger(sessionLimit) || sessionLimit < 1 || sessionLimit > 16) throw new WorkflowError("INVALID_SETTINGS", "Session concurrency must be an integer from 1 to 16");
   }
 
-  addRun(runId: string, limit = 8, maxAgentLaunches = 1000): void {
+  addRun(runId: string, limit = 8, beforeLaunch?: () => void): void {
     if (this.#runs.has(runId)) throw new WorkflowError("DUPLICATE_NAME", `Scheduler run already exists: ${runId}`);
-    if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit || !Number.isInteger(maxAgentLaunches) || maxAgentLaunches < 1) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency or maxAgentLaunches");
-    this.#runs.set(runId, { limit, maxAgentLaunches, logical: 0, active: 0, queue: [] });
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency");
+    this.#runs.set(runId, { limit, ...(beforeLaunch ? { beforeLaunch } : {}), logical: 0, active: 0, queue: [] });
     this.#runOrder.push(runId);
   }
 
@@ -314,7 +350,6 @@ export class FairAgentScheduler {
     const parent = parentId ? this.#nodes.get(parentId) : undefined;
     if (parentId && (!parent || parent.runId !== runId)) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Parent agent is not owned by this run");
     const effective = this.#inherit(parent, options);
-    if (++run.logical > run.maxAgentLaunches) { run.logical -= 1; throw new WorkflowError("RUN_LIMIT_EXCEEDED", `Run ${runId} exceeded maxAgentLaunches`); }
     const id = `${runId}:${String(++this.#nextId)}`;
     let resolveResult: (result: ScheduledAgentResult) => void = () => undefined;
     const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
@@ -334,7 +369,7 @@ export class FairAgentScheduler {
     this.#nodes.set(id, node);
     parent?.children.add(id);
     this.#persist(runId);
-    this.#enqueue(runId, () => { void node.task(); });
+    this.#enqueue(runId, node, () => { void node.task(); });
     return { id, result: promise };
   }
 
@@ -347,7 +382,7 @@ export class FairAgentScheduler {
     this.#persist(parent.runId);
     this.#release(parent.runId);
     const outcome = await child.promise;
-    await new Promise<void>((resolve) => { this.#enqueue(parent.runId, () => { resolve(); }); });
+    await new Promise<void>((resolve) => { this.#enqueue(parent.runId, undefined, () => { resolve(); }); });
     parent.state = "running";
     if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
     this.#persist(parent.runId);
@@ -395,7 +430,7 @@ export class FairAgentScheduler {
     const resultTool = {
       name: "get_subagent_result", label: "Child Result", description: "Wait for a direct child and return its result",
       parameters: Type.Object({ id: Type.String() }),
-      execute: async (_id: string, params: { id: string }) => { const value = await this.result(parentId, params.id); return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value }; },
+      execute: async (_id: string, params: { id: string }) => { const value = await this.result(parentId, params.id); if (!value.ok && value.error.code === "BUDGET_EXHAUSTED") throw new WorkflowError("BUDGET_EXHAUSTED", value.error.message); return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value }; },
     } as ToolDefinition;
     const steerTool = {
       name: "steer_subagent", label: "Steer Child", description: "Steer a running direct child",
@@ -409,8 +444,8 @@ export class FairAgentScheduler {
     return [...this.#nodes.values()].map(({ id, parentId, options, state }) => ({ id, ...(parentId ? { parentId } : {}), label: options.label, state, options }));
   }
 
-  restoreRun(runId: string, limit: number, maxAgentLaunches: number, ownership: readonly OwnershipRecord[]): void {
-    this.addRun(runId, limit, maxAgentLaunches);
+  restoreRun(runId: string, limit: number, ownership: readonly OwnershipRecord[], beforeLaunch?: () => void): void {
+    this.addRun(runId, limit, beforeLaunch);
     const run = this.#runs.get(runId) as ScheduledRun;
     for (const record of ownership) {
       if (record.id.split(":").slice(0, -1).join(":") !== runId) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted agent belongs to another run: ${record.id}`);
@@ -440,7 +475,7 @@ export class FairAgentScheduler {
   }
   /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
 
-  #enqueue(runId: string, start: () => void): void { this.#runs.get(runId)?.queue.push(start); this.#dispatch(); }
+  #enqueue(runId: string, node: ScheduledNode | undefined, start: () => void): void { this.#runs.get(runId)?.queue.push({ ...(node ? { node } : {}), start }); this.#dispatch(); }
 
   #dispatch(): void {
     while (this.#active < this.sessionLimit && this.#runOrder.length) {
@@ -453,8 +488,12 @@ export class FairAgentScheduler {
       }
       if (!selected) return;
       const run = this.#runs.get(selected) as ScheduledRun;
-      const start = run.queue.shift() as () => void;
-      run.active += 1; this.#active += 1; start();
+      const item = run.queue.shift() as { node?: ScheduledNode; start: () => void };
+      if (item.node) {
+        try { run.beforeLaunch?.(); }
+        catch (error) { const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error)); this.#settle(item.node, { id: item.node.id, ok: false, error: { code: typed.code, message: typed.message } }); continue; }
+      }
+      run.active += 1; this.#active += 1; item.start();
     }
   }
 

@@ -261,7 +261,7 @@ export function formatDoctorReport(report: DoctorReport): string {
     `- CWD: \`${report.cwd}\``,
     `- Agent dir: \`${report.agentDir}\``,
     `- Workflow settings: \`${report.settingsPath}\``,
-    `- Limits: concurrency=${String(report.settings.concurrency)}, maxAgentLaunches=${String(report.settings.maxAgentLaunches)}`,
+    `- Limits: concurrency=${String(report.settings.concurrency)}`,
     "",
     "## Trust/resources",
     `- [${report.trust.trusted ? "ok" : "warning"}] ${report.trust.source}`,

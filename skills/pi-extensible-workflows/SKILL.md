@@ -101,7 +101,7 @@ Registered extension functions receive `withWorktree` in their context, so they 
 - Preserve item metadata in workflow code between pipeline stages instead of requiring agents to echo it through `outputSchema`.
 - Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
-- Omit `maxAgentLaunches` unless an explicit total launch budget is required.
+- Add `budget` only when the run needs aggregate token, cost, duration, or launch limits; each dimension accepts optional `soft` and `hard` values.
 - `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
 - Use `outputSchema` only when another phase must compare, aggregate, or validate the result. Never add it to a final agent whose prose is returned directly. Keep only fields the consumer needs, and avoid repeating the same evidence in multiple schemas.

@@ -4,13 +4,13 @@ import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { highlightCode, initTheme, SessionManager, truncateToVisualLines, type SessionEntry, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { inspectWorkflowScript, type ModelSpec, type StaticWorkflowCall } from "./index.js";
+import { formatBudgetStatus, inspectWorkflowScript, type ModelSpec, type StaticWorkflowCall } from "./index.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 
 export interface ModelUsage { model: string; cost: number }
 export interface AttemptReport { attempt: number; prompt: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; models: readonly ModelUsage[]; error?: string }
 export interface AgentReport { name: string; label?: string; state: string; role?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
-export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[] }
+export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[]; budget?: PersistedRun["budget"]; budgetVersion?: number; usage?: PersistedRun["usage"]; budgetEvents?: PersistedRun["budgetEvents"] }
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
 
@@ -229,6 +229,10 @@ export async function loadSessionReport(path: string, home = homedir()): Promise
       cost: agents.reduce((sum, agent) => sum + agent.cost, 0),
       models,
       agents,
+      ...(loaded?.run.budget ? { budget: loaded.run.budget } : {}),
+      ...(loaded?.run.budgetVersion !== undefined ? { budgetVersion: loaded.run.budgetVersion } : {}),
+      ...(loaded?.run.usage ? { usage: loaded.run.usage } : {}),
+      ...(loaded?.run.budgetEvents ? { budgetEvents: loaded.run.budgetEvents } : {}),
     });
   }
   const workflowCost = workflows.reduce((sum, workflow) => sum + workflow.cost, 0);
@@ -254,6 +258,7 @@ function detailLines(workflow: WorkflowReport): string[] {
     `${workflow.status} · ${money(workflow.cost)}${workflow.runId ? ` · ${workflow.runId}` : ""}`,
     workflow.description ?? "",
     "",
+    ...(workflow.budget ? formatBudgetStatus({ budget: workflow.budget, ...(workflow.budgetVersion !== undefined ? { budgetVersion: workflow.budgetVersion } : {}), ...(workflow.usage ? { usage: workflow.usage } : {}), ...(workflow.budgetEvents ? { budgetEvents: workflow.budgetEvents } : {}) }).map((line) => `Budget ${line}`) : []),
     style(ansi.bold, "Models"),
     modelSummary(workflow.models),
     "",
