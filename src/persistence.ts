@@ -4,7 +4,7 @@ import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFi
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
-import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
+import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord, WorkflowRunEvent } from "./index.js";
 import type { OwnershipRecord } from "./agent-execution.js";
 import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
@@ -165,6 +165,7 @@ export class RunStore {
   private stateWrite: Promise<void> = Promise.resolve();
   private worktreeWrite: Promise<void> = Promise.resolve();
   private snapshotWrite: Promise<void> = Promise.resolve();
+  private launchSnapshotWrite: Promise<void> = Promise.resolve();
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptWrite: Promise<void> = Promise.resolve();
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
@@ -224,6 +225,16 @@ export class RunStore {
     this.stateWrite = write.catch(() => undefined);
     await write;
     return result;
+  }
+
+  async saveSnapshot(snapshot: Readonly<LaunchSnapshot>): Promise<void> {
+    const write = this.launchSnapshotWrite.then(() => atomicJson(join(this.directory, "snapshot.json"), snapshot));
+    this.launchSnapshotWrite = write.catch(() => undefined);
+    await write;
+  }
+
+  async appendEvent(event: WorkflowRunEvent): Promise<void> {
+    await this.updateState((run) => ({ ...run, events: [...(run.events ?? []), ...(run.events?.some((current) => current.message === event.message) ? [] : [event])] }));
   }
 
   async saveOwnership(nodes: readonly PersistedOwnershipNode[]): Promise<void> {

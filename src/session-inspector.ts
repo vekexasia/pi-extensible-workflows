@@ -9,8 +9,8 @@ import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 
 export interface ModelUsage { model: string; cost: number }
 export interface AttemptReport { attempt: number; prompt: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; models: readonly ModelUsage[]; error?: string }
-export interface AgentReport { name: string; label?: string; state: string; role?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
-export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[]; budget?: PersistedRun["budget"]; budgetVersion?: number; usage?: PersistedRun["usage"]; budgetEvents?: PersistedRun["budgetEvents"] }
+export interface AgentReport { name: string; label?: string; state: string; role?: string; requestedModel?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
+export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[]; budget?: PersistedRun["budget"]; budgetVersion?: number; usage?: PersistedRun["usage"]; budgetEvents?: PersistedRun["budgetEvents"]; events?: readonly { type: string; message: string }[] }
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
 
@@ -182,7 +182,7 @@ async function agentReport(agent: PersistedRun["agents"][number]): Promise<Agent
     attempts.push({ attempt: 1, prompt: "(transcript unavailable)", model: fallbackModel, ...(fallbackThinking !== undefined ? { thinking: fallbackThinking } : {}), cost, models: [{ model: fallbackModel, cost }] });
   }
   const latest = attempts[attempts.length - 1];
-  return { name: agent.name, ...(agent.label ? { label: agent.label } : {}), state: agent.state, ...(agent.role ? { role: agent.role } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
+  return { name: agent.name, ...(agent.label ? { label: agent.label } : {}), state: agent.state, ...(agent.role ? { role: agent.role } : {}), ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
 }
 
 export function matchSession(query: string, sessions: readonly SessionInfo[]): SessionInfo {
@@ -233,6 +233,7 @@ export async function loadSessionReport(path: string, home = homedir()): Promise
       ...(loaded?.run.budgetVersion !== undefined ? { budgetVersion: loaded.run.budgetVersion } : {}),
       ...(loaded?.run.usage ? { usage: loaded.run.usage } : {}),
       ...(loaded?.run.budgetEvents ? { budgetEvents: loaded.run.budgetEvents } : {}),
+      ...(loaded?.run.events?.length ? { events: loaded.run.events } : {})
     });
   }
   const workflowCost = workflows.reduce((sum, workflow) => sum + workflow.cost, 0);
@@ -257,6 +258,7 @@ function detailLines(workflow: WorkflowReport): string[] {
     style(ansi.bold + ansi.cyan, workflow.name),
     `${workflow.status} · ${money(workflow.cost)}${workflow.runId ? ` · ${workflow.runId}` : ""}`,
     workflow.description ?? "",
+    ...(workflow.events?.length ? ["", style(ansi.bold, "Run events"), ...workflow.events.map((event) => `${event.type}: ${event.message}`)] : []),
     "",
     ...(workflow.budget ? formatBudgetStatus({ budget: workflow.budget, ...(workflow.budgetVersion !== undefined ? { budgetVersion: workflow.budgetVersion } : {}), ...(workflow.usage ? { usage: workflow.usage } : {}), ...(workflow.budgetEvents ? { budgetEvents: workflow.budgetEvents } : {}) }).map((line) => `Budget ${line}`) : []),
     style(ansi.bold, "Models"),
@@ -272,7 +274,7 @@ function detailLines(workflow: WorkflowReport): string[] {
   ];
   if (!workflow.agents.length) lines.push("(no agent run was persisted)");
   for (const agent of workflow.agents) {
-    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
+    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.requestedModel ? `requested=${agent.requestedModel} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
     for (const attempt of agent.attempts) {
       lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`);
     }

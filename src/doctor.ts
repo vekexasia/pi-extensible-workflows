@@ -14,6 +14,7 @@ import {
   DEFAULT_SETTINGS,
   loadSettings,
   parseModelReference,
+  resolveModelReference,
   parseRoleMarkdown,
   preflight,
   registeredWorkflowDefinitions,
@@ -148,9 +149,9 @@ function diagnostic(severity: DoctorSeverity, code: string, message: string, sou
   return { severity, code, message, ...(source ? { source } : {}), ...(hint ? { hint } : {}) };
 }
 
-function validateModel(value: string, known: ReadonlySet<string>, available: ReadonlySet<string>, source: string, diagnostics: DoctorDiagnostic[]): void {
+function validateModel(value: string, known: ReadonlySet<string>, available: ReadonlySet<string>, source: string, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, settingsPath: string): void {
   try {
-    const parsed = parseModelReference(value);
+    const parsed = resolveModelReference(value, aliases, known, settingsPath);
     const name = `${parsed.provider}/${parsed.model}`;
     if (!known.has(name) || !available.has(name)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${name}`, source));
   } catch (error) {
@@ -158,7 +159,7 @@ function validateModel(value: string, known: ReadonlySet<string>, available: Rea
   }
 }
 
-function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[]): AgentDefinition | undefined {
+function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, settingsPath: string): AgentDefinition | undefined {
   let definition: AgentDefinition;
   try { definition = parseRoleMarkdown(readFileSync(path, "utf8"), true); }
   catch (error) {
@@ -169,7 +170,7 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
   if (body.trim() === "") diagnostics.push(diagnostic("warning", "ROLE_BODY_EMPTY", "Role body is empty", path));
   if (Buffer.byteLength(body) > 50 * 1024) diagnostics.push(diagnostic("warning", "ROLE_BODY_LARGE", "Role body exceeds 50KB", path));
   if (/{{\s*[^{}]+\s*}}/.test(body)) diagnostics.push(diagnostic("warning", "ROLE_PLACEHOLDER", "Role body contains an unsupported placeholder-looking token", path));
-  if (definition.model) validateModel(definition.model, knownModels, availableModels, path, diagnostics);
+  if (definition.model) validateModel(definition.model, knownModels, availableModels, path, diagnostics, aliases, settingsPath);
   for (const tool of definition.tools ?? []) if (!activeTools.has(tool)) diagnostics.push(diagnostic("error", "ROLE_TOOL_INACTIVE", `Tool is unknown or inactive: ${tool}`, path, "Use a tool listed under Active tools or enable its Pi extension."));
   return definition;
 }
@@ -200,6 +201,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const activeTools = new Set(pi.activeTools);
   const knownModels = new Set(pi.knownModels);
   const availableModels = new Set(pi.availableModels);
+  const aliases = settings.modelAliases ?? {};
   const roles: DoctorRole[] = [];
   const definitions = new Map<string, AgentDefinition>();
   const globalPaths = new Map<string, string>();
@@ -208,7 +210,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     const name = basename(path, ".md");
     roles.push({ name, path, scope: "global", active: true });
     globalPaths.set(name, path);
-    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics);
+    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, settingsPath);
     if (definition) definitions.set(name, definition);
   }
   for (const path of roleFilesFrom([join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
@@ -221,7 +223,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
       const global = roles.find((role) => role.path === globalPath);
       if (global) { global.active = false; global.overriddenBy = path; }
     }
-    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics);
+    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, settingsPath);
     if (definition) definitions.set(name, definition); else definitions.delete(name);
   }
 
@@ -233,6 +235,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
         models: new DoctorModelSet(pi.knownModels),
         tools: activeTools,
         agentTypes: new Set(definitions.keys()),
+        modelAliases: aliases,
+        knownModels,
+        settingsPath,
       }, [], { name, description: workflow.description });
       for (const model of checked.referenced.models) if (!knownModels.has(model) || !availableModels.has(model)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${model}`, name));
     } catch (error) {

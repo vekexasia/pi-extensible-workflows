@@ -5,7 +5,7 @@ import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, S
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
-import { parseModelReference, WorkflowError } from "./index.js";
+import { resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
@@ -42,6 +42,10 @@ export interface AgentExecutionRoot {
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
   agentDir?: string;
   availableModels?: ReadonlySet<string>;
+  knownModels?: ReadonlySet<string>;
+  modelAliases?: Readonly<Record<string, string>>;
+  blockedAliases?: ReadonlySet<string>;
+  settingsPath?: string;
   runStore?: RunStore;
   providerPause?: () => Promise<void>;
 }
@@ -67,9 +71,9 @@ export interface NativeSession {
 export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; agentDir?: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
 export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
-function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
+function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
   if (!value) return { ...fallback, ...(thinking ? { thinking } : {}) };
-  const parsed = parseModelReference(value);
+  const parsed = resolveModelReference(value, aliases, knownModels, settingsPath);
   return { ...parsed, ...(thinking ? { thinking } : !parsed.thinking && fallback.thinking ? { thinking: fallback.thinking } : {}) };
 }
 function modelCapability(model: ModelSpec): string { return `${model.provider}/${model.model}`; }
@@ -121,7 +125,7 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
 export class WorkflowAgentExecutor {
   constructor(private readonly root: AgentExecutionRoot, private readonly createSession: SessionFactory = createNativeAgentSession) {}
 
-  resolve(options: AgentExecutionOptions, inheritedTools?: readonly string[]): { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string } {
+  resolve(options: AgentExecutionOptions, inheritedTools?: readonly string[]): { model: ModelSpec; requestedModel?: string; tools: readonly string[]; systemPromptAppend: string } {
     const role = options.role;
     const definition = role ? this.root.agentDefinitions?.[role] : undefined;
     if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
@@ -129,10 +133,13 @@ export class WorkflowAgentExecutor {
     const requested = options.tools !== undefined ? options.tools : definition?.tools !== undefined ? definition.tools : options.effectiveTools !== undefined ? options.effectiveTools : inheritedTools !== undefined ? inheritedTools : [...this.root.tools];
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
-    const model = parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking);
-    const availableModels = this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
-    if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${modelCapability(model)}`);
-    return { model, tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
+    const requestedModel = options.model ?? definition?.model;
+    const hasAlias = requestedModel !== undefined && Object.prototype.hasOwnProperty.call(this.root.modelAliases ?? {}, requestedModel);
+    if (requestedModel !== undefined && this.root.blockedAliases?.has(requestedModel) && !hasAlias) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
+    const model = parseModel(requestedModel, this.root.model, options.thinking ?? definition?.thinking, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
+    const availableModels = this.root.knownModels ?? this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
+    if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model${requestedModel ? ` ${requestedModel} resolved to ${modelCapability(model)}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
+    return { model, ...(hasAlias ? { requestedModel } : {}), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
