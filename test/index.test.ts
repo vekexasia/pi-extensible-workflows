@@ -20,7 +20,7 @@ RunStore.prototype.saveOwnership = async function (nodes: OwnershipNodes) {
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
 };
-const valid = `phase("check"); agent("do it", { model: "openai/gpt", tools: ["read"], role: "reviewer" });`;
+const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt", tools: ["read"] });`;
 
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
@@ -110,6 +110,26 @@ void test("registered extension workflows can run by name", async () => {
   assert.ok(execute);
   const result = await execute("id", { workflow: "reuseTest.hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(result.content[0]?.text, '"Andrea"');
+});
+void test("inline workflow args cross the production tool boundary and omitted args become null", async () => {
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-inline-home-"));
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never, home);
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
+  assert.ok(execute);
+  const context = { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-inline-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const withArgs = await execute("id", { name: "with-args", script: "return args.answer;", args: { answer: 42 }, foreground: true }, new AbortController().signal, undefined, context);
+  assert.equal(withArgs.content[0]?.text, "42");
+  const omitted = await execute("id", { name: "without-args", script: "return args;", foreground: true }, new AbortController().signal, undefined, context);
+  assert.equal(omitted.content[0]?.text, "null");
+});
+void test("navigator renders effective agent policy separately from launch metadata", () => {
+  const run = { id: "run", workflowName: "policy", cwd: "/repo", sessionId: "session", state: "running", agents: [{ id: "run:1", name: "review", path: "run:1", state: "running", role: "reviewer", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"], attempts: 1 }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const dashboard = formatNavigatorDashboard(run, [], []);
+  assert.match(dashboard, /model=anthropic\/opus:high/);
+  assert.match(dashboard, /tools=read,grep/);
+  assert.match(dashboard, /role=reviewer/);
+  assert.doesNotMatch(dashboard, /Launch models/);
 });
 
 void test("streams foreground workflow progress into its tool card", async () => {
@@ -636,7 +656,9 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /1\/2 agents/);
   assert.match(dashB, /37 tok/);
   assert.match(dashB, /reasoning: checking source/);
-  assert.doesNotMatch(dashB, /cache read|transcript attempt|openai\//);
+  assert.match(dashB, /model=openai\/gpt:high/);
+  assert.match(dashB, /tools=read/);
+  assert.match(dashB, /role=custom/);
 
   const dashC = formatNavigatorDashboard((await storeC.load()).run, [], []);
   assert.match(dashC, /error: AGENT_FAILED: timeout/);
@@ -1095,6 +1117,9 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`agent('a',{model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
     [`agent('a',{tools:['bash']})`, "UNKNOWN_TOOL"],
     [`agent('a',{role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
+    [`agent('a',{role:'reviewer',model:'openai/gpt'})`, "INVALID_METADATA"],
+    [`agent('a',{role:'reviewer',thinking:'low'})`, "INVALID_METADATA"],
+    [`agent('a',{role:'reviewer',tools:[]})`, "INVALID_METADATA"],
     [`agent('a',{outputSchema:[]})`, "INVALID_SCHEMA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
     [`agent('a',{retries:-1})`, "INVALID_METADATA"],
@@ -1109,7 +1134,7 @@ void test("preflight rejects every static boundary before run creation", () => {
 
 void test("host rejects malformed dynamic agent options before launching", async () => {
   let launched = false;
-  for (const options of ["{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{isolation:'typo'}"]) {
+  for (const options of ["{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{isolation:'typo'}", "{role:'reviewer',model:'openai/gpt'}", "{role:'reviewer',thinking:'low'}", "{role:'reviewer',tools:[]}"]) {
     await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
   assert.equal(launched, false);
@@ -1132,8 +1157,8 @@ void test("AST preflight ignores DSL-looking non-executable text and member call
     object.agent('member'); object.checkpoint({}); object.phase('ghost'); object.parallel([]); object.pipeline([]);
     const unrelated = {model:'missing', tools:['bash'], role:'writer'};
     phase('real');
-    agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {model:'openai/gpt',tools:['read'],role:'reviewer'});`;
-  assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+    agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {model:'openai/gpt',tools:['read']});`;
+  assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: ["openai/gpt"], tools: ["read"], agentTypes: [] });
 });
 
 void test("AST preflight distinguishes executable calls from prompt text", () => {

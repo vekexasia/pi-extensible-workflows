@@ -6,16 +6,25 @@ import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { WorkflowError } from "../src/index.js";
 import type { RunStore } from "../src/persistence.js";
 
-const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(["read", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", tools: ["read"] } } };
+const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, availableModels: new Set(["openai/gpt", "anthropic/opus", "google/gemini"]), tools: new Set(["read", "grep", "find", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", model: "anthropic/opus", thinking: "high", tools: ["read"] }, scout: { prompt: "Inspect broadly", model: "google/gemini", thinking: "low", tools: ["read", "grep"] } } };
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: { total: 0.25 } };
 function assistant(text: string) { return { role: "assistant", content: [{ type: "text", text }], usage }; }
 
-void test("resolves root-bounded definitions and model specs", () => {
+void test("resolves explicit capabilities without widening least privilege", () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("unused"); });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", model: "anthropic/opus:high" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }).systemPromptAppend, "Review carefully");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "scout" }).tools, ["read", "grep"]);
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "google/gemini" }), { model: { provider: "google", model: "gemini", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPromptAppend: "" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "google/gemini", tools: [] }).tools, []);
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["read", "grep"] }).tools, ["read", "grep"]);
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["read", "write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "missing/model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", model: "google/gemini" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", thinking: "low" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", tools: [] }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  const broken = new WorkflowAgentExecutor({ ...root, agentDefinitions: { broken: { tools: ["write"] } } }, async () => { throw new Error("must not launch"); });
+  assert.throws(() => broken.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "broken" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
 });
 
 void test("passes role prompt as system append, not task text", async () => {
@@ -96,7 +105,7 @@ void test("keeps workflow_result present, delays acceptance, and allows one repa
       if (result !== undefined) { calls.push({ prompt, result }); await resultTool.execute("id", result, new AbortController().signal, () => {}, {} as never); }
     }, dispose() {} };
   });
-  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", workflowDescription: "desc", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
+  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", workflowDescription: "desc", role: "reviewer", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
   assert.deepEqual(result.value, { answer: 9 });
   assert.equal(calls.length, 3);
   assert.match(calls[1]?.prompt ?? "", /Submit the final result/);

@@ -28,6 +28,18 @@ pi --no-extensions --extension /absolute/path/to/pi-workflows/src/index.ts
 
 The package registers two tools, `workflow` and the narrow checkpoint response tool `workflow_respond`, plus one singular `/workflow` command.
 
+## Session inspector
+
+Open the read-only terminal inspector with a session ID, or omit it to be prompted:
+
+```sh
+npx pi-workflows inspect [session-id]
+# From this checkout after npm run build:
+npm run inspect -- [session-id]
+```
+
+Use the arrow keys and Enter to select a workflow. The detail view shows cost, models, agents, retries, and each runtime prompt; press `s` for the syntax-highlighted workflow script and `q` to quit.
+
 ## Doctor
 
 Run the read-only, non-interactive health check after opening and trusting the project in Pi:
@@ -347,7 +359,7 @@ Direct calls and combinators return bare values. Failures propagate automaticall
 
 ## Deliberate non-goals
 
-- Transcript rendering or a built-in transcript viewer
+- Full conversation replay or live session tailing
 - Nested workflow calls, runtime workflow editing/restart/save-as-command, or model-tier/phase-routing abstractions
 - Shared mutable stores between agents
 - Token/phase budgets, rate sampling, or automatic spend enforcement
@@ -356,6 +368,38 @@ Direct calls and combinators return bare values. Failures propagate automaticall
 - Tracking or terminating OS processes launched by agents
 - Project/folder settings or cross-session/parent-folder run discovery
 - Always-visible task panels or a settings editor
+## Prompt-to-workflow evaluations
+
+Deterministic eval helpers run captured inline workflow scripts through `runWorkflow` with a fake bridge, so `npm test` and `npm run check` make zero model calls. They assert only the parent Pi session: ordered assistant batches, ordered content parts, parent tool sequences, workflow-call counts, and parent token/cost usage. Captured scripts never launch real workflow agents.
+
+The gated model runner starts one isolated OS process per case, records JSON artifacts under `.tmp/workflow-evals`, enforces per-case timeouts/costs plus a run spend ceiling, and prints a compact summary. It uses Pi print/JSON mode with an isolated `HOME`, cwd, and session directory. Configure the provider and model explicitly; neither is guessed:
+
+```sh
+npm run evals -- --provider "$PROVIDER" --model "$MODEL" --case direct-answer,parallel
+npm run evals -- --provider "$PROVIDER" --model "$MODEL" --spend-ceiling 0.50
+```
+
+The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent the safe `read`, `grep`, and `find` alternatives. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files are copied with mode `0600` into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--timeout-ms`, `--case`, `--artifacts`, and `--pi` are supported.
+
+The capture extension exposes the production workflow tool contract but is a no-op with a zero launch budget. Captured scripts are replayed with fake agents; retries greater than zero are rejected. Cases cover role-owned policy, explicit custom models, omitted versus empty tools, exact tool subsets, parallel/pipeline composition, and structured results.
+
+### Controlled Tier C
+
+```sh
+npm run evals:controlled
+```
+
+Tier C currently emits a deterministic JSON `skipped` result with zero launches. Real-agent execution is refused until `maxAgentLaunches` can be clamped independently of model-supplied workflow arguments at the actual production tool boundary. This entrypoint documents and tests the safety gate without spending tokens or pretending real E2E ran.
+
+### Ambient Tier D
+
+The ambient harness is separately opt-in and prepares execution against the launching user's normal Pi home and discovered resources. It creates one temporary committed fixture repository and a disposable git worktree per case; fixtures contain harmless `test` and `lint` scripts, source, tests, config, and a deliberate bug. Artifacts are JSON and cleanup is recorded:
+
+```sh
+PI_WORKFLOW_EVAL_AMBIENT=1 npm run evals:ambient -- --provider "$PROVIDER" --model "$MODEL"
+```
+
+Tier D keeps normal extension, skill, context, prompt-template, and tool discovery enabled. It explicitly loads the capture extension; Pi 0.80.6 orders CLI extensions before discovered extensions and resolves duplicate tools by first registration, so `workflow` stays capture-only while the rest of the ambient tool surface remains available. Parent tool order, skill reads, workflow calls, cost, and git changes are recorded. No workflow agents launch in this tier; real-agent E2E remains disabled until launch-count clamping is guaranteed. Ambient worktrees and fixture repositories are removed in `finally`, including process failure and timeout paths.
 
 ## Development verification
 

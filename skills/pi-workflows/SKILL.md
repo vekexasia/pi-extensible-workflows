@@ -10,15 +10,26 @@ Use `workflow` exclusively for genuinely multi-agent orchestration. For one agen
 ## Pattern
 
 ```js
-const reports = await parallel("parallel-work", {
-  scan: () => agent("Read the target; return concise facts.", { role: "scout", tools: ["read"] }),
-  check: () => agent("Run the requested command.", { tools: ["bash"] }),
+const reportSchema = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    findings: { type: "array", items: { type: "string" } },
+  },
+  required: ["summary", "findings"],
+  additionalProperties: false,
+};
+
+const reports = await parallel("research", {
+  first: () => agent("Research the first target.", { role: "scout", outputSchema: reportSchema }),
+  second: () => agent("Research the second target.", { role: "scout", outputSchema: reportSchema }),
 });
-const summary = await agent(
-  prompt("Use only these reports:\n\n{reports}", { reports }),
-  { tools: [] },
+
+// Add a downstream agent only when synthesis or independent review is a real phase.
+return agent(
+  prompt("Review these reports:\n\n{reports}", { reports }),
+  { role: "reviewer", outputSchema: reportSchema },
 );
-return summary;
 ```
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
@@ -43,14 +54,18 @@ Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-si
 ## Rules
 
 - Do not create a workflow for one agent. Phases must have distinct work.
-- `parallel(operationName, tasksRecord)` task keys and `pipeline(operationName, itemsRecord, stagesRecord)` item/stage keys are names.
+- Use `log(messageString)` in the script to surface brief status messages to the operator.
+- A role owns its execution policy. When `role` is present, do not also set `model`, `thinking`, or `tools`; only task-specific options such as `outputSchema`, retries, timeout, or isolation may accompany it.
+- Use `parallel()` for independent tasks with different flows. Use `pipeline()` when each keyed item passes through the same ordered stages; do not duplicate identical stage chains inside `parallel()` branches.
+- Call shapes are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; object keys are stable task, item, and stage names.
+- Preserve item metadata in workflow code between pipeline stages instead of requiring agents to echo it through `outputSchema`.
 - Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
 - Omit `maxAgentLaunches` unless an explicit total launch budget is required.
 - `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
-- Select the narrowest role and minimum tools. Pure synthesis can use `tools: []`.
-- With `outputSchema`, agents must call `workflow_result`. Retry only idempotent work.
+- Use `outputSchema` when another phase must compare, aggregate, or validate agent results; omit it for terminal prose. Keep only fields the consumer needs, and avoid repeating the same evidence in multiple schemas.
+- With `outputSchema`, agents must call `workflow_result`; one repair prompt is built in. Omit `retries` unless an additional retry is justified and the work is idempotent.
 - Put `isolation: "worktree"` on top-level file-changing agents. Use `checkpoint()` only for human gates.
 
 If a top-level agent includes `agent` in its effective tools, it can create nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Put one isolated coordinator in a worktree when agents must collaborate on shared files, and have that coordinator use nested children; per-agent worktree isolation remains enabled.

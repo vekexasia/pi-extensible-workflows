@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { AuthStorage, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRegistry, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -34,6 +35,8 @@ export interface AgentExecutionRoot {
   model: ModelSpec;
   tools: ReadonlySet<string>;
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
+  agentDir?: string;
+  availableModels?: ReadonlySet<string>;
   runStore?: RunStore;
   providerPause?: () => Promise<void>;
 }
@@ -55,14 +58,15 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; agentDir?: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
 type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
   if (!value) return { ...fallback, ...(thinking ? { thinking } : {}) };
   const parsed = parseModelReference(value);
-  return { ...parsed, ...(thinking ? { thinking } : {}) };
+  return { ...parsed, ...(thinking ? { thinking } : !parsed.thinking && fallback.thinking ? { thinking: fallback.thinking } : {}) };
 }
+function modelCapability(model: ModelSpec): string { return `${model.provider}/${model.model}`; }
 
 function text(messages: readonly AgentMessage[]): string {
   const message = [...messages].reverse().find((item) => item.role === "assistant");
@@ -83,16 +87,18 @@ function accounting(messages: readonly AgentMessage[]): AgentAccounting {
 }
 
 export async function createNativeAgentSession(input: SessionInput): Promise<NativeSession> {
-  const manager = SessionManager.create(input.cwd);
+  const agentDir = input.agentDir ?? getAgentDir();
+  const manager = input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd);
   manager.appendSessionInfo(input.sessionLabel);
-  const registry = ModelRegistry.create(AuthStorage.create());
+  const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
+  const registry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
   const model = registry.find(input.model.provider, input.model.model);
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
-  const resourceLoader = input.systemPromptAppend ? new DefaultResourceLoader({ cwd: input.cwd, agentDir: getAgentDir(), appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] }) : undefined;
+  const resourceLoader = input.systemPromptAppend ? new DefaultResourceLoader({ cwd: input.cwd, agentDir, appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] }) : undefined;
   if (resourceLoader) await resourceLoader.reload();
-  const { session } = await createAgentSession({ cwd: input.cwd, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
+  const { session } = await createAgentSession({ cwd: input.cwd, agentDir, authStorage, modelRegistry: registry, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
   return session;
 }
 
@@ -105,15 +111,20 @@ export class WorkflowAgentExecutor {
     const role = options.role;
     const definition = role ? this.root.agentDefinitions?.[role] : undefined;
     if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
-    const requested = options.tools ?? definition?.tools ?? inheritedTools ?? [...this.root.tools];
+    if (role && (options.model !== undefined || options.thinking !== undefined || options.tools !== undefined)) throw new WorkflowError("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
+    const requested = options.tools !== undefined ? options.tools : definition?.tools !== undefined ? definition.tools : inheritedTools !== undefined ? inheritedTools : [...this.root.tools];
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
-    return { model: parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
+    const model = parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking);
+    const availableModels = this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
+    if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${modelCapability(model)}`);
+    return { model, tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
+    const resolved = this.resolve(options);
     let cwd: string;
     if (options.parent) {
       if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Only top-level agents may request worktree isolation");
@@ -135,7 +146,6 @@ export class WorkflowAgentExecutor {
         cwd = worktree.cwd;
       }
     }
-    const resolved = this.resolve(options);
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -167,7 +177,7 @@ export class WorkflowAgentExecutor {
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
-        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
+        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(this.root.agentDir ? { agentDir: this.root.agentDir } : {}), ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
         await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile) });
         unsubscribe = session.subscribe?.((event) => {
           if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; }

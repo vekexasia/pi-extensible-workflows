@@ -38,7 +38,7 @@ export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description?: string; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgentLaunches: number }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; role?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 1;
 export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
@@ -403,6 +403,7 @@ function validateAgentOptions(value: unknown): Readonly<Record<string, JsonValue
   const unknown = Object.keys(value).find((key) => !AGENT_OPTION_KEYS.has(key));
   if (unknown) fail("INVALID_METADATA", `Unknown agent option: ${unknown}`);
   for (const [key, option] of Object.entries(value)) validateAgentOption(key, option);
+  if (typeof value.role === "string" && ["model", "thinking", "tools"].some((key) => Object.prototype.hasOwnProperty.call(value, key))) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
   return value;
 }
 
@@ -439,6 +440,44 @@ function staticValue(node: acorn.AnyNode | undefined): StaticValue {
   return { known: false };
 }
 
+export interface StaticWorkflowCall {
+  kind: "agent" | "parallel" | "pipeline" | "checkpoint" | "phase";
+  start: number;
+  end: number;
+  name: string | null;
+  prompt: string | null;
+  model: string | null;
+  role: string | null;
+  retries?: number | null;
+  outputSchema?: JsonSchema | null;
+}
+
+function callArgument(call: WorkflowCall, index: number): acorn.AnyNode | undefined {
+  const argument = call.arguments[index];
+  return argument?.type === "SpreadElement" ? undefined : argument;
+}
+
+function staticString(node: acorn.AnyNode | undefined): string | null {
+  const value = staticValue(node);
+  return value.known && typeof value.value === "string" ? value.value : null;
+}
+
+export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
+  return workflowCalls(parseWorkflow(script)).map((call) => {
+    const kind = call.callee.name as StaticWorkflowCall["kind"];
+    const first = callArgument(call, 0);
+    const options = callArgument(call, 1);
+    if (kind === "agent") {
+      const retries = staticValue(propertyNode(options, "retries"));
+      const outputSchema = staticValue(propertyNode(options, "outputSchema"));
+      const base = { kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), role: staticString(propertyNode(options, "role")) };
+      return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(outputSchema.known && object(outputSchema.value) ? { outputSchema: outputSchema.value as JsonSchema } : {}) };
+    }
+    if (kind === "checkpoint") return { kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
+    return { kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null, role: null };
+  });
+}
+
 function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {
   if (node?.type !== "ObjectExpression") return;
   for (const property of node.properties) {
@@ -446,10 +485,14 @@ function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {
     const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
     if (key && !AGENT_OPTION_KEYS.has(key)) fail("INVALID_METADATA", `Unknown agent option: ${key}`);
   }
+  const role = propertyNode(node, "role");
+  if (role && ["model", "thinking", "tools"].some((key) => propertyNode(node, key) !== undefined)) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
   for (const key of AGENT_OPTION_KEYS) {
     const value = staticValue(propertyNode(node, key));
     if (value.known) validateAgentOption(key, value.value);
   }
+  const options = staticValue(node);
+  if (options.known && object(options.value) && typeof options.value.role === "string" && ["model", "thinking", "tools"].some((key) => Object.prototype.hasOwnProperty.call(options.value as Record<string, unknown>, key))) fail("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
 }
 
 export class WorkflowDslRegistry {
@@ -536,6 +579,26 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
   const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : typeof args.workflow === "string" && args.workflow.trim() ? args.workflow : "workflow";
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
+}
+export const WORKFLOW_TOOL_LABEL = "Workflow";
+export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered workflows use their workflow name. Runs in the background by default; completion arrives as a follow-up message.";
+export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
+  name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
+  description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
+  extensions: Type.Optional(Type.Array(Type.Object({ name: Type.String(), version: Type.String() }, { additionalProperties: false }))),
+  script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
+  workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as namespace.name" })),
+  args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
+  foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
+  concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+  maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including nested agents; not concurrency" })),
+});
+export const CONTROLLED_EVAL_MAX_CONCURRENCY = 2;
+export const CONTROLLED_EVAL_MAX_AGENT_LAUNCHES = 2;
+export const PRODUCTION_EVAL_CAPTURE_IDENTITY = "pi-workflows-eval-production-capture-v1";
+export function controlledEvalSettings(concurrency: number | undefined, maxAgentLaunches: number | undefined): WorkflowSettings {
+  return { concurrency: Math.min(concurrency ?? DEFAULT_SETTINGS.concurrency, CONTROLLED_EVAL_MAX_CONCURRENCY), maxAgentLaunches: Math.min(maxAgentLaunches ?? DEFAULT_SETTINGS.maxAgentLaunches, CONTROLLED_EVAL_MAX_AGENT_LAUNCHES) };
 }
 
 function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
@@ -1092,9 +1155,10 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   for (const agent of prioritised) {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = agentBreadcrumb(agent, byId);
-    const model = `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const policy = [`model=${model}`, `tools=${agent.tools.join(",") || "(none)"}`, `role=${agent.role ?? "custom"}`];
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
-    const parts = [`${icon} ${breadcrumb}`, agent.state, model, tokens].filter(Boolean);
+    const parts = [`${icon} ${breadcrumb}`, agent.state, ...policy, tokens].filter(Boolean);
     lines.push(parts.join(" · "));
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
@@ -1124,7 +1188,8 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   for (const agent of run.agents) {
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
-    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
+    const policy = `role=${agent.role ?? "custom"} tools=${agent.tools.join(",") || "(none)"}`;
+    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))} ${policy}${accounting}`);
     for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
     for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
   }
@@ -1332,7 +1397,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1348,7 +1413,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const existing = new Map(current.agents.map((agent) => [agent.id, agent]));
       const agents = ownership.map((node) => {
         const previous = existing.get(node.id);
-        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+        const requested = node.options.role ? { label: node.options.label, workflowName: run.metadata.name, role: node.options.role } : { label: node.options.label, workflowName: run.metadata.name, tools: node.options.tools, ...(node.options.model ? { model: node.options.model } : {}), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) };
+        const resolved = run.executor.resolve(requested);
+        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.role ? { role: node.options.role } : {}), model: resolved.model, tools: resolved.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
       });
       return { ...current, agents };
     });
@@ -1466,7 +1533,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), availableModels: new Set(loaded.snapshot.models), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgentLaunches, await store.loadOwnership());
     }
@@ -1495,21 +1562,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   });
   pi.registerTool({
     name: "workflow",
-    label: "Workflow",
-    description: "Run a deterministic JavaScript workflow",
-    promptSnippet:
-      "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered workflows use their workflow name. Runs in the background by default; completion arrives as a follow-up message.",
-    parameters: Type.Object({
-      name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
-      description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
-      extensions: Type.Optional(Type.Array(Type.Object({ name: Type.String(), version: Type.String() }, { additionalProperties: false }))),
-      script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
-      workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as namespace.name" })),
-      args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
-      foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
-      concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
-      maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including nested agents; not concurrency" })),
-    }),
+    label: WORKFLOW_TOOL_LABEL,
+    description: WORKFLOW_TOOL_DESCRIPTION,
+    promptSnippet: WORKFLOW_TOOL_PROMPT_SNIPPET,
+    parameters: WORKFLOW_TOOL_PARAMETERS,
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const defaults = loadSettings();
@@ -1538,12 +1594,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;
       const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
-      const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model)] : []; });
+      const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models, ...roleModels])];
+      const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
       const lifecycle = lifecycleFor(store, "running");
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), agentDefinitions, runStore: store, providerPause });
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, agentDefinitions, runStore: store, providerPause });
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgentLaunches);

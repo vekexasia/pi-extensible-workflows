@@ -105,7 +105,7 @@ void test("doctor respects untrusted projects and does not mutate fixtures", asy
   assert.equal(doctorExitCode(report), 0);
 });
 
-void test("package bin and CLI expose only the doctor command shape", async () => {
+void test("package bin and CLI expose doctor and inspector commands", async () => {
   const pkg = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { bin?: Record<string, string> };
   assert.equal(pkg.bin?.["pi-workflows"], "./dist/src/cli.js");
   const paths = fixture();
@@ -113,9 +113,12 @@ void test("package bin and CLI expose only the doctor command shape", async () =
   const exit = await runCli(["doctor"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; });
   assert.equal(exit, 0);
   for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Reusable workflows", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
+  let inspected: string | undefined;
+  assert.equal(await runCli(["inspect", "session-a"], { inspect: async (sessionId) => { inspected = sessionId; } }), 0);
+  assert.equal(inspected, "session-a");
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: pi-workflows doctor\n");
+  assert.equal(output, "Usage: pi-workflows doctor | inspect [session-id]\n");
   const bin = join(paths.root, "pi-workflows");
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
   const linkedOutput = execFileSync(bin, ["doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root }, encoding: "utf8" });
