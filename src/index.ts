@@ -242,11 +242,11 @@ function astToValue(node: acorn.AnyNode, depth = 0): unknown {
   }
 }
 
-function parseMetadata(source: string): WorkflowMetadata {
+function parseMetadata(source: string, parsed?: acorn.Program): WorkflowMetadata {
   const match = /^\s*export\s+const\s+meta\s*=\s*/.exec(source);
   if (!match) fail("INVALID_METADATA", "First statement must export const meta");
   let program: acorn.Program;
-  try { program = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true }); }
+  try { program = parsed ?? acorn.parse(source, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true }); }
   catch (error) { fail("INVALID_METADATA", `Invalid workflow metadata: ${(error as Error).message}`); }
   const first = program.body[0];
   if (!first || first.type !== "ExportNamedDeclaration" || !first.declaration || first.declaration.type !== "VariableDeclaration" || first.declaration.kind !== "const") fail("INVALID_METADATA", "First statement must export const meta");
@@ -271,15 +271,68 @@ function parseMetadata(source: string): WorkflowMetadata {
   return { name: value.name.trim(), description: value.description.trim(), phases: Object.freeze([...validPhases]), extensions: Object.freeze(validExtensions.map(({ name, version }) => Object.freeze({ name, version }))) };
 }
 
-function stringsFor(source: string, key: string): string[] {
-  const values: string[] = [];
-  const pattern = new RegExp(`\\b${key}\\s*:\\s*(["'])((?:\\\\.|(?!\\1).)*)\\1`, "g");
-  for (const match of source.matchAll(pattern)) if (match[2] !== undefined) values.push(match[2]);
-  return values;
+type WorkflowCall = acorn.CallExpression & { callee: acorn.Identifier };
+
+function astNode(value: unknown): value is acorn.AnyNode {
+  return typeof value === "object" && value !== null && "type" in value && typeof value.type === "string";
+}
+function workflowCalls(program: acorn.Program): WorkflowCall[] {
+  const calls: WorkflowCall[] = [];
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "CallExpression" && node.callee.type === "Identifier" && ["agent", "parallel", "pipeline", "checkpoint", "phase"].includes(node.callee.name)) calls.push(node as WorkflowCall);
+    for (const value of Object.values(node) as unknown[]) {
+      if (Array.isArray(value)) {
+        for (const child of value as unknown[]) if (astNode(child)) visit(child);
+      } else if (astNode(value)) visit(value);
+    }
+  };
+  visit(program);
+  return calls.sort((left, right) => left.start - right.start);
 }
 
-function phaseCalls(source: string): string[] {
-  return [...source.matchAll(/\bphase\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1/g)].map((match) => match[2] ?? "");
+function literalString(node: acorn.AnyNode | undefined): string | undefined {
+  return node?.type === "Literal" && typeof node.value === "string" ? node.value : undefined;
+}
+
+function propertyNode(node: acorn.AnyNode | undefined, name: string): acorn.AnyNode | undefined {
+  if (node?.type !== "ObjectExpression") return undefined;
+  for (let index = node.properties.length - 1; index >= 0; index -= 1) {
+    const property = node.properties[index];
+    if (!property || property.type === "SpreadElement" || property.computed) return undefined;
+    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    if (key === name) return property.value;
+  }
+  return undefined;
+}
+
+function stableName(node: acorn.AnyNode | undefined): boolean | undefined {
+  if (!node) return false;
+  if (node.type !== "ObjectExpression") {
+    if (["Literal", "ArrayExpression", "ArrowFunctionExpression", "FunctionExpression", "ClassExpression", "TemplateLiteral", "UnaryExpression", "UpdateExpression", "BinaryExpression"].includes(node.type)) return false;
+    return undefined;
+  }
+  let result: boolean | undefined = false;
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement" || property.computed) { result = undefined; continue; }
+    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    if (key !== "name") continue;
+    const value = literalString(property.value);
+    result = value === undefined ? property.value.type === "Literal" ? false : undefined : value.trim() !== "";
+  }
+  return result;
+}
+
+function stableNames(node: acorn.AnyNode | undefined): boolean | undefined {
+  if (!node) return false;
+  if (node.type !== "ArrayExpression") return undefined;
+  let unknown = false;
+  for (const element of node.elements) {
+    if (!element || element.type === "SpreadElement") { unknown = true; continue; }
+    const named = stableName(element);
+    if (named === false) return false;
+    if (named === undefined) unknown = true;
+  }
+  return unknown ? undefined : true;
 }
 
 function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
@@ -381,54 +434,6 @@ function versionCompatible(required: string, actual: string): boolean {
   const upperChanged = compare(installed, upper);
   return upperChanged >= 0 && (installed[upperChanged] ?? 0) < (upper[upperChanged] ?? 0);
 }
-function callsFor(source: string, name: string): string[] {
-  const calls: string[] = [];
-  const pattern = new RegExp(`\\b${name}\\s*\\(`, "g");
-  for (const match of source.matchAll(pattern)) {
-    const start = match.index + match[0].length;
-    let depth = 1;
-    let quote = "";
-    let escaped = false;
-    for (let index = start; index < source.length; index += 1) {
-      const char = source[index] ?? "";
-      if (quote) {
-        if (escaped) escaped = false;
-        else if (char === "\\") escaped = true;
-        else if (char === quote) quote = "";
-      } else if (char === "\"" || char === "'" || char === "`") quote = char;
-      else if (char === "(") depth += 1;
-      else if (char === ")" && --depth === 0) { calls.push(source.slice(start, index)); break; }
-    }
-  }
-  return calls;
-}
-
-function splitTopLevel(source: string): string[] {
-  const parts: string[] = [];
-  let start = 0;
-  let depth = 0;
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index] ?? "";
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === quote) quote = "";
-    } else if (char === "\"" || char === "'" || char === "`") quote = char;
-    else if ("([{ ".includes(char) && char !== " ") depth += 1;
-    else if (")] }".includes(char) && char !== " ") depth -= 1;
-    else if (char === "," && depth === 0) { parts.push(source.slice(start, index)); start = index + 1; }
-  }
-  parts.push(source.slice(start));
-  return parts.filter((part) => part.trim() !== "");
-}
-
-function named(part: string): boolean { return /\b(?:name|label)\s*:\s*["'][^"']+["']/.test(part); }
-function namedArray(argument: string): boolean {
-  const value = argument.trim();
-  return value.startsWith("[") && value.endsWith("]") && splitTopLevel(value.slice(1, -1)).every(named);
-}
 
 export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown }): string {
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${typeof args.workflow === "string" ? args.workflow : "workflow"}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
@@ -440,32 +445,40 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
 
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
   if (typeof script !== "string" || script.trim() === "") fail("INVALID_SYNTAX", "Workflow script must be non-empty");
-  try { new Script(`(async()=>{${script.replace(/^\s*export\s+const\s+meta/, "const meta")}\n})`); }
-  catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
-  const metadata = parseMetadata(script);
+  let program: acorn.Program;
+  try {
+    new Script(`(async()=>{${script.replace(/^\s*export\s+const\s+meta/, "const meta")}\n})`);
+    program = acorn.parse(script, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true });
+  } catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
+  const metadata = parseMetadata(script, program);
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
-  const phases = phaseCalls(script);
+  const calls = workflowCalls(program);
+  const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
   const declared = new Set(metadata.phases);
   const unknownPhase = phases.find((phase) => !declared.has(phase));
   if (unknownPhase) fail("UNKNOWN_PHASE", `Undeclared phase: ${unknownPhase}`);
-  const namedCalls = ["agent", "parallel", "pipeline", "checkpoint"].flatMap((operation) => callsFor(script, operation).map((body) => ({ operation, body })));
-  const unnamed = namedCalls.filter(({ operation }) => operation === "agent" || operation === "checkpoint").find(({ body }) => !named(body));
-  if (unnamed) fail("INVALID_METADATA", `${unnamed.operation} requires a stable explicit name`);
-  for (const body of callsFor(script, "parallel")) {
-    const [tasks = "", operation = "", ...extra] = splitTopLevel(body);
-    if (!namedArray(tasks)) fail("INVALID_METADATA", "Every parallel task requires a stable explicit name");
-    if (!named(operation) || extra.length > 0) fail("INVALID_METADATA", "parallel requires a stable explicit name");
+  for (const call of calls) {
+    const operation = call.callee.name;
+    if ((operation === "agent" && stableName(call.arguments[1]) === false) || (operation === "checkpoint" && stableName(call.arguments[0]) === false)) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
+    if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
+    if (operation === "parallel") {
+      if (stableNames(call.arguments[0]) === false) fail("INVALID_METADATA", "Every parallel task requires a stable explicit name");
+      if (call.arguments.length !== 2 || stableName(call.arguments[1]) === false) fail("INVALID_METADATA", "parallel requires a stable explicit name");
+    }
+    if (operation === "pipeline") {
+      if (stableNames(call.arguments[0]) === false) fail("INVALID_METADATA", "Every pipeline item requires a stable explicit name");
+      const stages = call.arguments.slice(1, -1);
+      if (stages.length === 0 || stages.some((stage) => stableName(stage) === false)) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
+      if (stableName(call.arguments.at(-1)) === false) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
+    }
   }
-  for (const body of callsFor(script, "pipeline")) {
-    const [items = "", ...stages] = splitTopLevel(body);
-    const operation = stages.pop() ?? "";
-    if (!namedArray(items)) fail("INVALID_METADATA", "Every pipeline item requires a stable explicit name");
-    if (stages.length === 0 || stages.some((stage) => !named(stage))) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
-    if (!named(operation)) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
-  }
-  const models = stringsFor(script, "model").map(modelCapability);
-  const tools = [...script.matchAll(/\btools\s*:\s*\[([^\]]*)\]/g)].flatMap((match) => [...((match[1] ?? "").matchAll(/(["'])((?:\\.|(?!\1).)*)\1/g))].map((item) => item[2] ?? ""));
-  const agentTypes = callsFor(script, "agent").flatMap((body) => [...stringsFor(body, "agentType"), ...stringsFor(body, "role")]);
+  const agentCalls = calls.filter((call) => call.callee.name === "agent");
+  const models = agentCalls.flatMap((call) => { const value = literalString(propertyNode(call.arguments[1], "model")); return value === undefined ? [] : [modelCapability(value)]; });
+  const tools = agentCalls.flatMap((call) => {
+    const value = propertyNode(call.arguments[1], "tools");
+    return value?.type === "ArrayExpression" ? value.elements.flatMap((element) => { const tool = element && element.type !== "SpreadElement" ? literalString(element) : undefined; return tool === undefined ? [] : [tool]; }) : [];
+  });
+  const agentTypes = agentCalls.flatMap((call) => ["agentType", "role"].flatMap((key) => { const value = literalString(propertyNode(call.arguments[1], key)); return value === undefined ? [] : [value]; }));
   const missingModel = models.find((model) => !capabilities.models.has(model));
   if (missingModel) fail("UNKNOWN_MODEL", `Unknown model: ${missingModel}`);
   const missingTool = tools.find((tool) => !capabilities.tools.has(tool));

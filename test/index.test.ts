@@ -501,6 +501,34 @@ void test("preflight rejects non-JSON schemas, incompatible extension versions, 
   preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'}); pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities);
 });
 
+void test("AST preflight ignores DSL-looking non-executable text and member calls", () => {
+  const script = `export const meta={name:'x',description:'x',phases:['real']};
+    const text = "agent() checkpoint({}) phase('ghost') name: 'fake' model: 'missing' tools: ['bash'] role: 'writer'";
+    const pattern = /agent() checkpoint({}) phase('ghost') model:'missing'/;
+    const template = \`parallel() pipeline() agent() phase('ghost') model: 'missing'\`;
+    // agent('comment') checkpoint({name:'comment'}) phase('ghost') model:'missing' tools:['bash'] role:'writer'
+    object.agent('member'); object.checkpoint({}); object.phase('ghost'); object.parallel([]); object.pipeline([]);
+    const unrelated = {model:'missing', tools:['bash'], role:'writer'};
+    phase('real');
+    agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {name:'actual',model:'openai/gpt',tools:['read'],role:'reviewer'});`;
+  assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+});
+
+void test("AST preflight detects executable template expressions and false prompt names", () => {
+  const base = `export const meta={name:'x',description:'x'};`;
+  assert.throws(() => preflight(`${base} agent("name: 'fake'")`, capabilities), /agent requires a stable explicit name/);
+  assert.throws(() => preflight(`${base} checkpoint({prompt:"name: 'fake'",context:null})`, capabilities), /checkpoint requires a stable explicit name/);
+  assert.throws(() => preflight(`${base} const text = \`\${agent("name: 'fake'")}\`;`, capabilities), /agent requires a stable explicit name/);
+});
+
+void test("AST preflight validates combinator names from their arguments", () => {
+  const base = `export const meta={name:'x',description:'x'};`;
+  assert.throws(() => preflight(`${base} parallel([{run:()=>agent("name: 'fake'",{name:'inner'})}], {name:'batch'})`, capabilities), /Every parallel task/);
+  assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}], {label:'fake'})`, capabilities), /parallel requires/);
+  assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {label:'fake'})`, capabilities), /pipeline requires/);
+  preflight(`${base} agent('x', options); agent('x', {name:'x',model:'missing',tools:['bash'],role:'writer',...options}); checkpoint(input); parallel(...batch); pipeline(...pipe);`, capabilities);
+});
+
 void test("AST meta parsing rejects non-literal constructs and accepts valid meta", () => {
   const valid = (s: string) => { preflight(s, capabilities); };
   const invalid = (s: string) => { assert.throws(() => preflight(s, capabilities), (e: unknown) => e instanceof WorkflowError && e.code === "INVALID_METADATA"); };
