@@ -623,11 +623,12 @@ void test("workflow_catalog is excluded from child tools", async () => {
     return { sessionId: `catalog-child-${String(++nextSession)}`, sessionFile: "/tmp/catalog-child.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats, prompt: async () => {}, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog", "read"] } as never, home, async () => {}, createSession);
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog", "workflow_stop", "read"] } as never, home, async () => {}, createSession);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   await workflow.execute("id", { name: "catalog-child", script: "return await agent('child');", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(inputs[0]?.tools.includes("workflow_catalog"), false);
+  assert.equal(inputs[0].tools.includes("workflow_stop"), false);
 });
 void test("cold resume recomputes variables and marks resolver failures", { timeout: 5000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-variable-resume-"));

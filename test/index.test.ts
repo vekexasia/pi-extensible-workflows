@@ -68,7 +68,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
     on(name: string, candidate: unknown) { if (name === "resources_discover") discover = candidate as typeof discover; },
   };
   workflowExtension(pi as never);
-  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_resume", "workflow"]);
+  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_stop", "workflow_resume", "workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
@@ -270,6 +270,42 @@ void test("run control lifecycle events cover pause, resume, and stop", async ()
   } finally {
     await shutdown?.();
   }
+});
+void test("workflow_stop reports unknown and terminal runs and persists cancellation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-tool-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  let agentStarted!: () => void;
+  const started = new Promise<void>((resolve) => { agentStarted = resolve; });
+  const createSession = async (): Promise<NativeSession> => ({ sessionId: "stop-tool-session", sessionFile: "/sessions/stop-tool.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { agentStarted(); await new Promise<void>(() => {}); }, steer: async () => {}, abort: async () => {}, dispose() {} });
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const stop = tools.find(({ name }) => name === "workflow_stop");
+  assert.ok(workflow && stop);
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const result = (await stop.execute("id", { runId: "missing" })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(result.content[0].text), { runId: "missing", state: "unknown", stopped: false, reason: "unknown_run" });
+  const foreignStore = new RunStore(home, "other-session", "foreign", home);
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "foreign" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  await foreignStore.create({ id: "foreign", workflowName: "foreign", cwd: home, sessionId: "other-session", state: "running", agents: [], nativeSessions: [] }, snapshot);
+  const foreignResult = (await stop.execute("id", { runId: "foreign" })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(foreignResult.content[0].text), { runId: "foreign", state: "unknown", stopped: false, reason: "unknown_run" });
+  assert.equal((await foreignStore.load()).run.state, "running");
+  const terminalStore = new RunStore(home, "session", "terminal", home);
+  await terminalStore.create({ id: "terminal", workflowName: "terminal", cwd: home, sessionId: "session", state: "completed", agents: [], nativeSessions: [] }, snapshot);
+  assert.ok(start);
+  await start({}, context);
+  const terminalResult = (await stop.execute("id", { runId: "terminal" })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(terminalResult.content[0].text), { runId: "terminal", state: "completed", stopped: false, reason: "already_terminal" });
+  const running = await workflow.execute("id", { name: "active-stop", script: "return await agent('wait');" }, new AbortController().signal, undefined, context) as { content: [{ text: string }] };
+  const activeRunId = (JSON.parse(running.content[0].text) as { runId: string }).runId;
+  await started;
+  const stopped = (await stop.execute("id", { runId: activeRunId })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(stopped.content[0].text), { runId: activeRunId, state: "stopped", stopped: true });
+  const activeStore = new RunStore(home, "session", activeRunId, home);
+  const persisted = await activeStore.load();
+  assert.equal(persisted.run.state, "stopped");
+  assert.deepEqual(persisted.run.agents.map(({ state }) => state), ["cancelled"]);
 });
 void test("session recovery emits interruption as state change only", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-interruption-events-"));
