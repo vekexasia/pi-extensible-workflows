@@ -1387,6 +1387,30 @@ void test("workflow catalog exposes aliases without guidance metadata", () => {
   try { assert.deepEqual(new WorkflowRegistry().catalog().modelAliases, { reviewer: "anthropic/opus:high" }); } finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
 });
 
+void test("workflow catalog and session_start tolerate malformed settings", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-malformed-"));
+  const agentDir = join(dir, "agent");
+  const path = join(agentDir, "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(path, "{");
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    assert.deepEqual(new WorkflowRegistry().catalog(), { functions: [], variables: [], workflows: [] });
+    const tools: Array<{ name: string }> = [];
+    let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+    let shutdown: (() => Promise<void>) | undefined;
+    workflowExtension({ registerTool(tool: { name: string }) { tools.push(tool); }, registerCommand() {}, getActiveTools: () => ["workflow"], on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; } } as never, dir);
+    registerWorkflowExtension({ namespace: "malformedCatalog", version: "1.0.0", headline: "Malformed settings", description: "Malformed settings test", workflows: { verify: { description: "Verify", script: "return true;" } } });
+    assert.ok(start && shutdown);
+    await start({}, { cwd: dir, sessionManager: { getSessionId: () => "malformed" } });
+    assert.equal(tools.some(({ name }) => name === "workflow_catalog"), true);
+    await shutdown();
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
+
 void test("preflight accepts the complete static contract", () => {
   const metadata = { name: "review", description: "Review code" };
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);

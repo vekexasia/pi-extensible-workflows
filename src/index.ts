@@ -932,7 +932,8 @@ export class WorkflowRegistry {
       for (const [name, variable] of Object.entries(extension.variables ?? {})) variables.push({ name, namespace, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: variable.description, schema: structuredClone(variable.schema) });
       for (const [name, workflow] of Object.entries(extension.workflows ?? {})) workflows.push({ name: `${namespace}.${name}`, namespace, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: workflow.description });
     }
-    const aliases = loadSettings().modelAliases;
+    let aliases: Readonly<Record<string, string>> | undefined;
+    try { aliases = loadSettings().modelAliases; } catch { aliases = undefined; }
     const sort = (left: { namespace: string; name: string }, right: { namespace: string; name: string }) => left.namespace.localeCompare(right.namespace) || left.name.localeCompare(right.name);
     return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), workflows: workflows.sort((left, right) => left.name.localeCompare(right.name)), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
   }
