@@ -42,6 +42,17 @@ export type AgentState = (typeof AGENT_STATES)[number];
 export type WorkflowErrorCode = (typeof ERROR_CODES)[number];
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonSchema = { [key: string]: JsonValue };
+export interface AgentOptions {
+  label?: string;
+  model?: string;
+  thinking?: NonNullable<ModelSpec["thinking"]>;
+  tools?: string[];
+  role?: string;
+  outputSchema?: JsonSchema;
+  retries?: number;
+  timeoutMs?: number | null;
+  [key: string]: JsonValue;
+}
 export interface ShellOptions { timeoutMs?: number; env?: Record<string, string> }
 export interface ShellResult { exitCode: number | null; stdout: string; stderr: string }
 export type BudgetDimension = "tokens" | "costUsd" | "durationMs" | "agentLaunches";
@@ -83,7 +94,7 @@ export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
 export interface WorkflowOrchestrationContext {
-  agent: (...args: readonly unknown[]) => Promise<JsonValue>;
+  agent: (prompt: string, options?: Readonly<AgentOptions>) => Promise<JsonValue>;
   shell: (command: string, options?: ShellOptions) => Promise<ShellResult>;
   prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string;
   parallel: (...args: readonly unknown[]) => Promise<JsonValue>;
@@ -2464,15 +2475,15 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         const nestedPath = operationPath("function", "nested", path, ...inherited, targetName, `occurrence:${String(occurrence)}`);
         return invokeFunction(targetName, targetInput, nestedPath, signal, scopedWorktreeOwner, inherited, `${functionBreadcrumb} > ${targetName}`);
       },
-      agent: async (...args: readonly unknown[]) => {
-        if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
-        const options = validateAgentOptions(args[1] === undefined ? {} : args[1]);
+      agent: async (prompt: string, options: Readonly<AgentOptions> = {}) => {
+        if (!bridge.agent || typeof prompt !== "string") fail("AGENT_FAILED", "No agent bridge is available");
+        const validatedOptions = validateAgentOptions(options);
         const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
         const inherited = inheritedHostAgentPath.getStore() ?? [];
         const key = `${path}\0${JSON.stringify(inherited)}`;
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
         functionAgentOccurrences.set(key, occurrence);
-        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: functionBreadcrumb, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
+        return bridge.agent(prompt, validatedOptions, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: functionBreadcrumb, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
       },
       shell: async (...args: readonly unknown[]) => {
         if (!bridge.shell) fail("SHELL_FAILED", "No shell bridge is available");

@@ -6,9 +6,22 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentOptions, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext, type WorkflowOrchestrationContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
+
+const typeCheckAgentContext = (context: WorkflowOrchestrationContext): void => {
+  void context.agent("prompt");
+  void context.agent("prompt", { advisor: true, nested: { enabled: true } });
+  void context.agent("prompt", { model: "openai/gpt", tools: ["read"] });
+  const options: Readonly<AgentOptions> = { advisor: true };
+  void context.agent("prompt", options);
+  // @ts-expect-error agent requires a prompt
+  void context.agent();
+  // @ts-expect-error agent prompt must be a string
+  void context.agent(42);
+};
+void typeCheckAgentContext;
 
 void test("validates aggregate budgets and patches", () => {
   const budget = validateBudget({ tokens: { soft: 5, hard: 10 }, costUsd: { soft: 1, hard: 2.5 }, durationMs: { hard: 100 }, agentLaunches: { soft: 0, hard: 1 } });
