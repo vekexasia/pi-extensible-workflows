@@ -2180,7 +2180,7 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
   return bounded;
 }
 
-function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMetadata, error: unknown, run: PersistedRun): WorkflowFailureDiagnostics {
+async function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMetadata, error: unknown, run: PersistedRun): Promise<WorkflowFailureDiagnostics> {
   const rawFailedAt = error && typeof error === "object" ? (error as { failedAt?: unknown }).failedAt : undefined;
   const failedAt = typeof rawFailedAt === "string" && rawFailedAt ? rawFailedAt : null;
   const failedAgents = run.agents.filter((agent) => agent.state === "failed");
@@ -2208,11 +2208,13 @@ function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMet
     structuralPath: [...(agent.structuralPath ?? [])],
   } satisfies WorkflowSiblingAgent));
   const completedSiblingPaths = completedSiblingAgents.map((agent) => [...agent.structuralPath]);
-  const completedPaths = run.retry?.completedPaths ?? run.agents.filter((agent) => agent.state === "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])));
+  let journalCompletedPaths: readonly string[] = [];
+  try { journalCompletedPaths = (await store.replayableOperations()).map(({ path }) => path); } catch { /* Preserve failure diagnostics when retry history is unavailable. */ }
+  const completedPaths = run.retry ? [...new Set([...run.retry.completedPaths, ...journalCompletedPaths])] : journalCompletedPaths.length ? journalCompletedPaths : run.agents.filter((agent) => agent.state === "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])));
   const retry = run.state === "failed" ? {
     sourceRunId: run.id,
     completedPaths,
-    incompletePaths: run.retry?.incompletePaths ?? (failedAt ? [failedAt] : []),
+    incompletePaths: [...new Set([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])])],
     namedWorktrees: run.retry?.namedWorktrees ?? [],
     warning: "Retry re-executes incomplete operations; external side effects before failure are not guaranteed exactly once.",
   } : undefined;
@@ -3055,7 +3057,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const state = run.lifecycle.state === "stopped" || run.lifecycle.state === "interrupted" || run.lifecycle.state === "budget_exhausted" ? run.lifecycle.state : "failed";
       await eventPublisher.runFailed(run.store, run.metadata, typed, state);
       run.update?.(workflowToolUpdate(persisted));
-      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) deliverFailure(pi, createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted));
+      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) void createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted).then((diagnostic) => { deliverFailure(pi, diagnostic); }).catch(() => undefined);
     }).finally(() => cleanupTerminalRun(run.store.runId));
     run.completion = completion;
     void completion;
@@ -3156,6 +3158,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata, true);
       const completedPaths = (await sourceStore.replayableOperations()).map(({ path }) => path);
       const incompletePaths = [...(loaded.run.retry?.incompletePaths ?? []), ...loaded.run.agents.filter((agent) => agent.state !== "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])))];
+      await sourceStore.validateNamedWorktrees();
+      for (const name of loaded.run.retry?.namedWorktrees ?? []) await sourceStore.resolveNamedWorktree(name);
       const namedWorktrees = [...new Set([...(loaded.run.retry?.namedWorktrees ?? []), ...(await sourceStore.worktrees()).filter(({ owner }) => owner.startsWith(`${operationPath("worktree", "named")}/`)).map(({ owner }) => decodeURIComponent(owner.split("/").at(-1) ?? owner))])];
       const budget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
       const childRunId = randomUUID();
@@ -3360,7 +3364,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const persisted = await persistRunState(store, checked.metadata, (current) => ({ ...current, ...budgetRuntime.snapshot(), error: { code: typed.code, message: typed.message } }));
         const state = lifecycle.state === "stopped" || lifecycle.state === "interrupted" || lifecycle.state === "budget_exhausted" ? lifecycle.state : "failed";
         await eventPublisher.runFailed(store, checked.metadata, typed, state);
-        const diagnostic = createWorkflowFailureDiagnostics(store, checked.metadata, typed, persisted);
+        const diagnostic = await createWorkflowFailureDiagnostics(store, checked.metadata, typed, persisted);
         Object.defineProperty(typed, WORKFLOW_FAILURE_DIAGNOSTICS, { value: diagnostic });
         if (params.foreground) pendingFailureDiagnostics.set(toolCallId, diagnostic);
         throw typed;

@@ -459,7 +459,11 @@ export class RunStore {
       if (!retry) return;
       if (typeof retry.sourceRunId !== "string" || !retry.sourceRunId || retry.sourceRunId === current.runId || typeof retry.lineageRootRunId !== "string" || !retry.lineageRootRunId || !Array.isArray(retry.completedPaths) || retry.completedPaths.some((path) => typeof path !== "string") || !Array.isArray(retry.incompletePaths) || retry.incompletePaths.some((path) => typeof path !== "string") || !Array.isArray(retry.namedWorktrees) || retry.namedWorktrees.some((name) => typeof name !== "string")) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance is incomplete");
       const source = await current.sourceRun(retry.sourceRunId);
-      if ((await source.load()).run.state !== "failed") throw new WorkflowError("RESUME_INCOMPATIBLE", `Retry source run ${retry.sourceRunId} is not failed`);
+      const sourceRun = (await source.load()).run;
+      if (loaded.run.parentRunId !== retry.sourceRunId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry parent run does not match its source run");
+      if (sourceRun.state !== "failed") throw new WorkflowError("RESUME_INCOMPATIBLE", `Retry source run ${retry.sourceRunId} is not failed`);
+      const expectedLineageRoot = sourceRun.retry?.lineageRootRunId ?? sourceRun.id;
+      if (retry.lineageRootRunId !== expectedLineageRoot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry lineage root does not match its source run");
       await validate(source, nextSeen);
     };
     try { await validate(this, new Set()); }
@@ -533,6 +537,17 @@ export class RunStore {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
     }
   }
+  async validateNamedWorktrees(): Promise<void> {
+    try {
+      const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+      for (const record of records) {
+        const owner = record && typeof record === "object" && typeof (record as Partial<WorktreeReference>).owner === "string" ? (record as Partial<WorktreeReference>).owner : undefined;
+        if (owner && this.worktreeName(owner)) await this.validateWorktree(owner);
+      }
+    } catch (error) {
+      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
 
   async ownsWorktree(owner: string): Promise<boolean> {
     const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
@@ -591,6 +606,7 @@ export class RunStore {
           return resolved.reference;
         }
       }
+      if (name && Array.isArray(loaded.run.retry?.namedWorktrees) && loaded.run.retry.namedWorktrees.includes(name)) throw new WorkflowError("WORKTREE_FAILED", `Missing inherited named worktree ${name}`);
       const existing = records.find((record) => record.owner === owner);
       if (existing) return this.validateWorktree(owner);
       const { path, branch } = this.expectedWorktree(owner);

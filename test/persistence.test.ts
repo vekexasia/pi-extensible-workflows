@@ -345,6 +345,28 @@ void test("reuses named worktrees through durable follow-up bindings without del
   await second.delete(true);
 });
 
+void test("retry named worktrees fail closed when an inherited record disappears", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-stale-worktree-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const owner = structuralPath("worktree", "named", "banana");
+  const source = new RunStore(repo, "session-a", "source", home);
+  await source.create({ ...run(repo), id: "source", state: "failed" }, snapshot);
+  const worktree = await source.worktree(owner);
+  rmSync(worktree.path, { recursive: true });
+  await assert.rejects(source.validateNamedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  writeFileSync(join(source.directory, "worktrees.json"), "[]\n");
+  const child = new RunStore(repo, "session-a", "child", home);
+  await child.create({ ...run(repo), id: "child", state: "failed", parentRunId: "source", retry: { sourceRunId: "source", lineageRootRunId: "source", completedPaths: [], incompletePaths: [], namedWorktrees: ["banana"] } }, snapshot);
+  await assert.rejects(child.worktree(owner), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  assert.deepEqual(JSON.parse(readFileSync(join(child.directory, "worktrees.json"), "utf8")), []);
+});
 void test("preserves a pre-existing deterministic branch when creation fails", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-branch-collision-"));
   const repo = join(home, "repo");
