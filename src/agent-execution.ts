@@ -96,7 +96,7 @@ function accounting(messages: readonly AgentMessage[]): AgentAccounting {
     total.output += typeof message.usage.output === "number" && Number.isFinite(message.usage.output) ? message.usage.output : 0;
     total.cacheRead += typeof message.usage.cacheRead === "number" && Number.isFinite(message.usage.cacheRead) ? message.usage.cacheRead : 0;
     total.cacheWrite += typeof message.usage.cacheWrite === "number" && Number.isFinite(message.usage.cacheWrite) ? message.usage.cacheWrite : 0;
-    total.cost += typeof message.usage.cost?.total === "number" && Number.isFinite(message.usage.cost.total) ? message.usage.cost.total : 0;
+    total.cost += typeof message.usage.cost.total === "number" && Number.isFinite(message.usage.cost.total) ? message.usage.cost.total : 0;
   }
   return total;
 }

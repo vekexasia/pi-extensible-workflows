@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateBudget, validateBudgetPatch, validateCheckpoint, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateBudget, validateBudgetPatch, validateCheckpoint, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -1960,4 +1960,199 @@ void test("workflow_respond keeps asynchronous failures on the prose delivery pa
   for (let attempt = 0; attempt < 100 && !delivered.some((message) => message.includes("The release was rejected after approval.")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(delivered.some((message) => message.includes("The release was rejected after approval.")));
   assert.ok(delivered.every((message) => !message.includes("INTERNAL_ERROR")));
+});
+
+type BudgetMessage = { role: string; content: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
+type BudgetResponse = { content: unknown; usage?: BudgetMessage["usage"] };
+
+function budgetUsage(input: number, output: number, cost = 0): NonNullable<BudgetMessage["usage"]> { return { input, output, cacheRead: 100, cacheWrite: 200, cost: { total: cost } }; }
+
+function budgetSession(responses: readonly BudgetResponse[], steered: string[] = [], aborted = { value: false }): NativeSession {
+  let listener: ((event: never) => void) | undefined;
+  let responseIndex = 0;
+  const messages: BudgetMessage[] = [];
+  return {
+    sessionId: `budget-session-${String(Math.random())}`,
+    sessionFile: "/sessions/budget.jsonl",
+    messages,
+    subscribe(candidate) { listener = candidate; return () => { listener = undefined; }; },
+    async prompt() {
+      while (responseIndex < responses.length && !aborted.value) {
+        const response = responses[responseIndex++];
+        if (!response) throw new Error("No mock response");
+        const start = { role: "assistant", content: response.content };
+        listener?.({ type: "message_start", message: start } as never);
+        const message = { ...start, ...(response.usage ? { usage: response.usage } : {}) };
+        messages.push(message);
+        listener?.({ type: "message_end", message } as never);
+      }
+    },
+    async steer(message) { steered.push(message); },
+    async abort() { aborted.value = true; },
+    dispose() {},
+  };
+}
+
+function budgetExecutor(session: NativeSession): WorkflowAgentExecutor {
+  return new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => session);
+}
+
+void test("budget validation covers zero, all dimensions, and invalid patches", () => {
+  assert.deepEqual(validateBudget({ tokens: { soft: 0, hard: 1 }, costUsd: { soft: 0, hard: 0.5 }, durationMs: { soft: 0, hard: 1 }, agentLaunches: { soft: 0, hard: 1 } }), { tokens: { soft: 0, hard: 1 }, costUsd: { soft: 0, hard: 0.5 }, durationMs: { soft: 0, hard: 1 }, agentLaunches: { soft: 0, hard: 1 } });
+  for (const dimension of ["tokens", "durationMs", "agentLaunches"] as const) {
+    assert.throws(() => validateBudget({ [dimension]: { hard: 1.5 } }), /integer/);
+  }
+  assert.throws(() => validateBudget({ costUsd: { hard: Infinity } }), /finite/);
+  assert.throws(() => validateBudget({ tokens: { soft: null } }), /non-negative/);
+  assert.throws(() => validateBudget({ tokens: { hard: 1 }, extra: { hard: 2 } }), /Unknown budget dimension/);
+  assert.throws(() => validateBudgetPatch({ tokens: { soft: 2, hard: 2 } }), /less than hard/);
+  assert.throws(() => validateBudgetPatch({ tokens: { hard: "later" } }), /integer/);
+});
+
+void test("budget runtime aggregates nested attempts, retries, cache exclusion, and versioned soft events", () => {
+  let now = 0;
+  const limits = { tokens: { soft: 3, hard: 100 }, costUsd: { soft: 0.5, hard: 100 }, durationMs: { soft: 4, hard: 100 }, agentLaunches: { soft: 1, hard: 10 } };
+  const runtime = new WorkflowBudgetRuntime(limits, 1, undefined, [], { now: () => now });
+  const parent = runtime.forAgent("parent");
+  parent.beforeAttempt();
+  parent.afterTurn({ input: 1, output: 1, cacheRead: 50, cacheWrite: 50, cost: 0.25 }, true);
+  parent.beforeAttempt();
+  parent.afterTurn({ input: 2, output: 2, cacheRead: 500, cacheWrite: 500, cost: 0.75 }, true);
+  const child = runtime.forAgent("parent:child");
+  child.beforeAttempt();
+  child.afterTurn({ input: 1, output: 0, cacheRead: 999, cacheWrite: 999, cost: 0.1 }, true);
+  assert.deepEqual(runtime.usage, { tokens: 7, costUsd: 1.1, durationMs: 0, agentLaunches: 3 });
+  assert.equal(runtime.events.filter((event) => event.budgetVersion === 1 && event.type === "soft_crossed").length, 1);
+  assert.ok(parent.instruction());
+  assert.equal(parent.instruction(), undefined);
+  assert.ok(child.instruction());
+  runtime.transition("paused");
+  now = 100;
+  assert.equal(runtime.usage.durationMs, 0);
+  runtime.transition("running");
+  now = 104;
+  assert.equal(runtime.usage.durationMs, 4);
+  const next = new WorkflowBudgetRuntime(limits, 2, runtime.usage, runtime.events, { now: () => now, active: false });
+  assert.equal(next.events.filter((event) => event.budgetVersion === 2).length, 0);
+  assert.ok(next.forAgent("later").instruction());
+});
+
+void test("agent launch budgets are checked at the concurrent dispatch boundary", async () => {
+  const runtime = new WorkflowBudgetRuntime({ agentLaunches: { hard: 1 } });
+  const scheduler = new FairAgentScheduler(async ({ id }) => { runtime.forAgent(id).beforeAttempt(); return id; }, 2);
+  scheduler.addRun("budget", 2, () => { runtime.checkAgentLaunch(); });
+  const first = scheduler.spawn("budget", "first", { label: "first", cwd: "/repo", tools: [] });
+  const second = scheduler.spawn("budget", "second", { label: "second", cwd: "/repo", tools: [] });
+  assert.equal((await first.result).ok, true);
+  const rejected = await second.result;
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.error.code, "BUDGET_EXHAUSTED");
+  assert.equal(runtime.usage.agentLaunches, 1);
+});
+
+void test("agent executor injects soft guidance and preserves final overrun but cuts off non-final work", async () => {
+  const guidance: string[] = [];
+  const soft = new WorkflowBudgetRuntime({ tokens: { soft: 1, hard: 100 } });
+  const softSession = budgetSession([
+    { content: [{ type: "toolCall", id: "tool-1", name: "read", arguments: {} }], usage: budgetUsage(1, 1) },
+    { content: [{ type: "text", text: "done" }], usage: budgetUsage(2, 2) },
+  ], guidance);
+  const softResult = await budgetExecutor(softSession).execute("soft", { label: "soft", workflowName: "budget", budget: soft.forAgent("soft") });
+  assert.equal(softResult.value, "done");
+  assert.equal(guidance.length, 1);
+  assert.match(guidance[0] ?? "", /Finish the requested output/);
+
+  const finalRuntime = new WorkflowBudgetRuntime({ tokens: { hard: 1 } });
+  const final = await budgetExecutor(budgetSession([{ content: [{ type: "text", text: "accepted" }], usage: budgetUsage(2, 0) }])).execute("final", { label: "final", workflowName: "budget", budget: finalRuntime.forAgent("final") });
+  assert.equal(final.value, "accepted");
+  assert.equal(finalRuntime.events.at(-1)?.type, "hard_overrun");
+  assert.equal(finalRuntime.hardExhausted, false);
+
+  const aborted = { value: false };
+  const nonFinalRuntime = new WorkflowBudgetRuntime({ tokens: { hard: 1 } });
+  const nonFinalSession = budgetSession([{ content: [{ type: "toolCall", id: "tool-2", name: "read", arguments: {} }], usage: budgetUsage(2, 0) }], [], aborted);
+  await assert.rejects(budgetExecutor(nonFinalSession).execute("non-final", { label: "non-final", workflowName: "budget", budget: nonFinalRuntime.forAgent("non-final") }), (error: unknown) => error instanceof WorkflowError && error.code === "BUDGET_EXHAUSTED");
+  assert.equal(aborted.value, true);
+  assert.equal(nonFinalRuntime.hardExhausted, true);
+});
+
+void test("budget persistence retains usage, versions, events, and replay history across reload", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-persistence-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session", "run", home);
+  const budget = { tokens: { soft: 2, hard: 4 }, costUsd: { hard: 1 } };
+  const usage = { tokens: 4, costUsd: 1.2, durationMs: 8, agentLaunches: 2 };
+  const event = { type: "hard_exhausted" as const, budgetVersion: 1, dimensions: ["tokens"] as const, usage, limits: budget, at: 8 };
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "budget" }, settings: DEFAULT_SETTINGS, budget, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  await store.create({ id: "run", workflowName: "budget", cwd, sessionId: "session", state: "budget_exhausted", agents: [], nativeSessions: [], budget, budgetVersion: 1, usage, budgetEvents: [event] }, snapshot);
+  await store.complete("agent/replayed", "historical");
+  const reloaded = await new RunStore(cwd, "session", "run", home).load();
+  assert.deepEqual(reloaded.run.usage, usage);
+  assert.deepEqual(reloaded.run.budget, budget);
+  assert.deepEqual(reloaded.run.budgetEvents, [event]);
+  assert.deepEqual(await new RunStore(cwd, "session", "run", home).replay("agent/replayed"), { path: "agent/replayed", value: "historical" });
+});
+
+void test("completed final overruns complete, while later budgeted work reaches budget_exhausted", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-boundaries-"));
+  const cwd = join(home, "project");
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  let sessionCount = 0;
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], } as never, home, async () => {}, async () => { sessionCount += 1; return budgetSession([{ content: [{ type: "text", text: "done" }], usage: budgetUsage(2, 0) }]); });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const completed = await workflow.execute("id", { name: "final-overrun", script: "return await agent('one');", budget: { tokens: { hard: 1 } }, foreground: true }, new AbortController().signal, undefined, context);
+  const completedRun = (await new RunStore(cwd, "session", (await listRunIds(cwd, "session", home))[0] ?? "", home).load()).run;
+  assert.equal(completedRun.state, "completed");
+  assert.equal(completedRun.budgetEvents?.filter(({ type }) => type === "hard_overrun").length, 1);
+  assert.match(JSON.stringify(completed), /done/);
+  const second = workflow.execute("id", { name: "exhausted", script: "return {one: await agent('one'), two: await agent('two')};", budget: { tokens: { hard: 1 } }, foreground: true }, new AbortController().signal, undefined, context);
+  await assert.rejects(second, (error: unknown) => error instanceof WorkflowError && error.code === "BUDGET_EXHAUSTED");
+  const states = await Promise.all((await listRunIds(cwd, "session", home)).map(async (id) => (await new RunStore(cwd, "session", id, home).load()).run));
+  const exhausted = states.find((run) => run.state === "budget_exhausted");
+  assert.ok(exhausted);
+  assert.equal(exhausted.error?.code, "BUDGET_EXHAUSTED");
+  assert.ok(sessionCount >= 2);
+});
+
+void test("workflow_resume persists exact proposals and approval or rejection controls exhausted runs", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-resume-"));
+  const cwd = join(home, "project");
+  const runId = "budget-run";
+  const budget = { tokens: { soft: 2, hard: 4 } };
+  const usage = { tokens: 4, costUsd: 0, durationMs: 0, agentLaunches: 1 };
+  const exhausted = { type: "hard_exhausted" as const, budgetVersion: 1, dimensions: ["tokens"] as const, usage, limits: budget, at: 0 };
+  const store = new RunStore(cwd, "session", runId, home);
+  await store.create({ id: runId, workflowName: "resume-budget", cwd, sessionId: "session", state: "budget_exhausted", agents: [], nativeSessions: [], budget, budgetVersion: 1, usage, budgetEvents: [exhausted] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "resume-budget" }, settings: { concurrency: 1 }, budget, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"] } as never, home);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  assert.ok(start);
+  await start({}, context);
+  const resume = tools.find(({ name }) => name === "workflow_resume");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(resume && respond);
+  await assert.rejects(resume.execute("id", { runId: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await assert.rejects(resume.execute("id", { runId, budget: { tokens: { hard: 4 } } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /exhausted hard budget/.test(error.message));
+  const waitDecision = async () => { for (let attempt = 0; attempt < 100; attempt += 1) { const pending = await store.pendingWorkflowDecisions(); if (pending[0]) return pending[0]; await new Promise((resolve) => setImmediate(resolve)); } throw new Error("budget decision did not persist"); };
+  const rejectedResume = resume.execute("id", { runId, budget: { tokens: { hard: 10 } } });
+  const firstProposal = await waitDecision();
+  const wrong = await respond.execute("id", { runId, proposalId: "wrong-proposal", approved: true });
+  assert.deepEqual((wrong as { details: unknown }).details, { state: "budget_exhausted", approved: false, reason: "proposal_not_pending" });
+  const rejected = await respond.execute("id", { runId, proposalId: firstProposal.proposalId, approved: false });
+  assert.deepEqual((rejected as { details: unknown }).details, { state: "budget_exhausted", approved: false, reason: "rejected" });
+  assert.deepEqual((await rejectedResume as { details: unknown }).details, { state: "budget_exhausted" });
+  assert.equal((await store.load()).run.state, "budget_exhausted");
+  const approvedResume = resume.execute("id", { runId, budget: { tokens: { hard: 10 } } });
+  const secondProposal = await waitDecision();
+  const approved = await respond.execute("id", { runId, proposalId: secondProposal.proposalId, approved: true });
+  assert.deepEqual((approved as { details: unknown }).details, { state: "running", approved: true, reason: "approved" });
+  assert.deepEqual((await approvedResume as { details: unknown }).details, { state: "running" });
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  const loaded = await store.load();
+  assert.equal(loaded.run.state, "completed");
+  assert.equal(loaded.run.budgetVersion, 2);
+  assert.deepEqual(loaded.run.budget, { tokens: { soft: 2, hard: 10 } });
 });
