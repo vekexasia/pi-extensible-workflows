@@ -214,16 +214,19 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const unknownPhase = phases.find((phase) => !declared.has(phase));
   if (unknownPhase) fail("UNKNOWN_PHASE", `Undeclared phase: ${unknownPhase}`);
   const namedCalls = ["agent", "parallel", "pipeline", "checkpoint"].flatMap((operation) => callsFor(script, operation).map((body) => ({ operation, body })));
-  const unnamed = namedCalls.find(({ body }) => !named(body));
+  const unnamed = namedCalls.filter(({ operation }) => operation === "agent" || operation === "checkpoint").find(({ body }) => !named(body));
   if (unnamed) fail("INVALID_METADATA", `${unnamed.operation} requires a stable explicit name`);
   for (const body of callsFor(script, "parallel")) {
-    const tasks = splitTopLevel(body)[0] ?? "";
+    const [tasks = "", operation = "", ...extra] = splitTopLevel(body);
     if (!namedArray(tasks)) fail("INVALID_METADATA", "Every parallel task requires a stable explicit name");
+    if (!named(operation) || extra.length > 0) fail("INVALID_METADATA", "parallel requires a stable explicit name");
   }
   for (const body of callsFor(script, "pipeline")) {
     const [items = "", ...stages] = splitTopLevel(body);
+    const operation = stages.pop() ?? "";
     if (!namedArray(items)) fail("INVALID_METADATA", "Every pipeline item requires a stable explicit name");
     if (stages.length === 0 || stages.some((stage) => !named(stage))) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
+    if (!named(operation)) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
   }
   const names = namedCalls.flatMap(({ body }) => stringsFor(body, "name").concat(stringsFor(body, "label")));
   const duplicate = names.find((name, index) => names.indexOf(name) !== index);
