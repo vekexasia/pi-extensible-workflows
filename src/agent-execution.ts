@@ -252,8 +252,8 @@ export class FairAgentScheduler {
     this.#release(parent.runId);
     const outcome = await child.promise;
     await new Promise<void>((resolve) => { this.#enqueue(parent.runId, () => { resolve(); }); });
-    if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
     parent.state = "running";
+    if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
     this.#persist(parent.runId);
     return outcome;
   }

@@ -123,6 +123,33 @@ void test("nested ownership releases permits, contains child failure, and blocks
   assert.throws(() => scheduler.spawn("run", "extra", { label: "extra", cwd: "/repo", tools: ["read"] }), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_LIMIT_EXCEEDED");
 });
 
+void test("cancelling a parent waiting for a child releases its reacquired permit", async () => {
+  let scheduler: FairAgentScheduler;
+  let childStarted!: () => void;
+  const started = new Promise<void>((resolve) => { childStarted = resolve; });
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options, signal }) => {
+    if (prompt === "parent") {
+      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: [] }, id);
+      return scheduler.result(id, child.id);
+    }
+    if (prompt === "child") {
+      childStarted();
+      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+      throw new WorkflowError("CANCELLED", "cancelled");
+    }
+    return "later completed";
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  await started;
+  scheduler.cancel(parent.id);
+  assert.equal((await parent.result).ok, false);
+  const later = scheduler.spawn("run", "later", { label: "later", cwd: "/repo", tools: [] });
+  assert.deepEqual(await later.result, { id: later.id, ok: true, value: "later completed" });
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled", "completed"]);
+});
+
 void test("scoped tools honor the root capability boundary and cancel orphan descendants", async () => {
   let scheduler: FairAgentScheduler;
   let orphanId = "";
