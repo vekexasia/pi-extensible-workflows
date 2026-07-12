@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -120,4 +120,43 @@ void test("worker enforces 10 MB boundaries on individual and final JSON values"
   assert.throws(() => runWorkflow(`export const meta={name:'x',description:'x'};`, oversized), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; return 'x'.repeat(${String(RPC_LIMIT_BYTES)});`);
   await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+});
+
+void test("registers namespaced DSL extensions and replays each call as one validated macro", async () => {
+  const registry = new WorkflowDslRegistry();
+  let calls = 0;
+  let receivedContext: unknown;
+  registry.register({
+    name: "git", version: "1.2.3", headline: "Git operations", description: "Orchestrate Git work",
+    methods: {
+      status: {
+        description: "Read status",
+        input: { type: "object", properties: { short: { type: "boolean" } }, required: ["short"], additionalProperties: false },
+        output: { type: "object", properties: { clean: { type: "boolean" } }, required: ["clean"], additionalProperties: false },
+        run: (input, context) => { calls += 1; receivedContext = context; return { clean: input.short === true }; },
+      },
+    },
+  });
+  const saved = new Map<string, JsonValue>();
+  const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
+  const context = { agent: async () => null, parallel: async () => null, pipeline: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {}, privateScheduler: true };
+  assert.deepEqual(registry.versions(), { git: "1.2.3" });
+  assert.deepEqual(Object.keys(registry.namespaces().git ?? {}), ["status"]);
+  assert.deepEqual(await registry.invoke("git", "status", { short: true }, context, "root/git.status", journal), { clean: true });
+  assert.deepEqual(await registry.invoke("git", "status", { short: false }, context, "root/git.status", journal), { clean: true });
+  assert.equal(calls, 1);
+  assert.deepEqual(Object.keys(receivedContext as object), ["agent", "parallel", "pipeline", "checkpoint", "phase", "log"]);
+});
+
+void test("rejects extension collisions, invalid metadata, schemas, input, and output", async () => {
+  const registry = new WorkflowDslRegistry();
+  const extension = { name: "demo", version: "1.0.0", headline: "Demo", description: "Demo methods", methods: { run: { description: "Run", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, output: { type: "string" }, run: () => 1 } } };
+  registry.register(extension);
+  assert.throws(() => { registry.register(extension); }, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+  assert.throws(() => { new WorkflowDslRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowDslRegistry().register({ ...extension, methods: { run: { ...extension.methods.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
+  const journal = { get: () => undefined, put: () => {} };
+  const context = { agent: async () => null, parallel: async () => null, pipeline: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  await assert.rejects(registry.invoke("demo", "run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(registry.invoke("demo", "run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });
