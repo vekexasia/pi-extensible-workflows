@@ -117,19 +117,90 @@ function phaseCalls(source: string): string[] {
   return [...source.matchAll(/\bphase\s*\(\s*(["'])((?:\\.|(?!\1).)*)\1/g)].map((match) => match[2] ?? "");
 }
 
+function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || seen.has(value)) return false;
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  if (keys.some((key) => typeof key !== "string")) return false;
+  seen.add(value);
+  const values = Array.isArray(value) ? Array.from(value) : keys.map((key) => (value as Record<string, unknown>)[key as string]);
+  const valid = values.every((item) => jsonValue(item, seen));
+  seen.delete(value);
+  return valid;
+}
+
 function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonSchema {
-  if (!object(schema)) fail("INVALID_SCHEMA", `${at} must be a plain JSON Schema object`);
-  try { JSON.stringify(schema); } catch { fail("INVALID_SCHEMA", `${at} must be JSON-compatible`); }
+  if (!object(schema) || Object.getPrototypeOf(schema) !== Object.prototype || !jsonValue(schema)) fail("INVALID_SCHEMA", `${at} must be a plain JSON-compatible Schema object`);
   if (typeof schema.type !== "string" && !Array.isArray(schema.type) && schema.$ref === undefined && schema.anyOf === undefined && schema.oneOf === undefined && schema.allOf === undefined && schema.const === undefined && schema.enum === undefined) fail("INVALID_SCHEMA", `${at} has no JSON Schema shape`);
   if (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((key) => typeof key !== "string"))) fail("INVALID_SCHEMA", `${at}.required must be an array of strings`);
   if (schema.properties !== undefined && !object(schema.properties)) fail("INVALID_SCHEMA", `${at}.properties must be an object`);
 }
 
 function versionCompatible(required: string, actual: string): boolean {
-  if (required === actual) return true;
-  if (/^\d+\.x$/.test(required)) return actual.startsWith(`${required.split(".")[0] ?? ""}.`);
-  if (/^\^\d+\.\d+\.\d+$/.test(required)) return actual.split(".")[0] === required.slice(1).split(".")[0];
-  return false;
+  const parse = (version: string) => /^(\d+)\.(\d+)\.(\d+)$/.exec(version)?.slice(1).map(Number);
+  const installed = parse(actual);
+  if (!installed) return false;
+  if (/^\d+\.x$/.test(required)) return installed[0] === Number(required.split(".")[0]);
+  const wanted = parse(required.startsWith("^") ? required.slice(1) : required);
+  if (!wanted) return false;
+  if (!required.startsWith("^")) return installed.every((part, index) => part === wanted[index]);
+  const compare = (left: number[], right: number[]) => left.findIndex((part, index) => part !== right[index]);
+  const changed = compare(installed, wanted);
+  if (changed >= 0 && (installed[changed] ?? 0) < (wanted[changed] ?? 0)) return false;
+  const [major = 0, minor = 0, patch = 0] = wanted;
+  const upper = major ? [major + 1, 0, 0] : minor ? [0, minor + 1, 0] : [0, 0, patch + 1];
+  const upperChanged = compare(installed, upper);
+  return upperChanged >= 0 && (installed[upperChanged] ?? 0) < (upper[upperChanged] ?? 0);
+}
+function callsFor(source: string, name: string): string[] {
+  const calls: string[] = [];
+  const pattern = new RegExp(`\\b${name}\\s*\\(`, "g");
+  for (const match of source.matchAll(pattern)) {
+    const start = match.index + match[0].length;
+    let depth = 1;
+    let quote = "";
+    let escaped = false;
+    for (let index = start; index < source.length; index += 1) {
+      const char = source[index] ?? "";
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === quote) quote = "";
+      } else if (char === "\"" || char === "'" || char === "`") quote = char;
+      else if (char === "(") depth += 1;
+      else if (char === ")" && --depth === 0) { calls.push(source.slice(start, index)); break; }
+    }
+  }
+  return calls;
+}
+
+function splitTopLevel(source: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index] ?? "";
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = "";
+    } else if (char === "\"" || char === "'" || char === "`") quote = char;
+    else if ("([{ ".includes(char) && char !== " ") depth += 1;
+    else if (")] }".includes(char) && char !== " ") depth -= 1;
+    else if (char === "," && depth === 0) { parts.push(source.slice(start, index)); start = index + 1; }
+  }
+  parts.push(source.slice(start));
+  return parts.filter((part) => part.trim() !== "");
+}
+
+function named(part: string): boolean { return /\b(?:name|label)\s*:\s*["'][^"']+["']/.test(part); }
+function namedArray(argument: string): boolean {
+  const value = argument.trim();
+  return value.startsWith("[") && value.endsWith("]") && splitTopLevel(value.slice(1, -1)).every(named);
 }
 
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
@@ -142,10 +213,19 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const declared = new Set(metadata.phases);
   const unknownPhase = phases.find((phase) => !declared.has(phase));
   if (unknownPhase) fail("UNKNOWN_PHASE", `Undeclared phase: ${unknownPhase}`);
-  const namedCalls = [...script.matchAll(/\b(agent|parallel|pipeline|checkpoint)\s*\(([^;]*)\)/g)];
-  const unnamed = namedCalls.find((match) => !/\b(?:name|label)\s*:\s*["'][^"']+["']/.test(match[2] ?? ""));
-  if (unnamed) fail("INVALID_METADATA", `${unnamed[1] ?? "Operation"} requires a stable explicit name`);
-  const names = namedCalls.flatMap((match) => stringsFor(match[2] ?? "", "name").concat(stringsFor(match[2] ?? "", "label")));
+  const namedCalls = ["agent", "parallel", "pipeline", "checkpoint"].flatMap((operation) => callsFor(script, operation).map((body) => ({ operation, body })));
+  const unnamed = namedCalls.find(({ body }) => !named(body));
+  if (unnamed) fail("INVALID_METADATA", `${unnamed.operation} requires a stable explicit name`);
+  for (const body of callsFor(script, "parallel")) {
+    const tasks = splitTopLevel(body)[0] ?? "";
+    if (!namedArray(tasks)) fail("INVALID_METADATA", "Every parallel task requires a stable explicit name");
+  }
+  for (const body of callsFor(script, "pipeline")) {
+    const [items = "", ...stages] = splitTopLevel(body);
+    if (!namedArray(items)) fail("INVALID_METADATA", "Every pipeline item requires a stable explicit name");
+    if (stages.length === 0 || stages.some((stage) => !named(stage))) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
+  }
+  const names = namedCalls.flatMap(({ body }) => stringsFor(body, "name").concat(stringsFor(body, "label")));
   const duplicate = names.find((name, index) => names.indexOf(name) !== index);
   if (duplicate) fail("DUPLICATE_NAME", `Duplicate stable name: ${duplicate}`);
   const models = stringsFor(script, "model");
