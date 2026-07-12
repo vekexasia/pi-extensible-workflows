@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
 import { WorkflowError } from "../src/index.js";
 
 const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(["read", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", tools: ["read"] } } };
@@ -56,4 +56,69 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
 void test("per-attempt timeout is typed and terminal", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "slow", sessionFile: "/sessions/slow.jsonl", messages: [], prompt: () => new Promise(() => {}), dispose() {} }));
   await assert.rejects(executor.execute("slow", { label: "slow", workflowName: "flow", workflowDescription: "desc", timeoutMs: 10 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && Array.isArray((error as WorkflowError & { attempts: unknown[] }).attempts));
+});
+
+void test("fair scheduler enforces session/run ceilings and round-robins runs", async () => {
+  const order: string[] = [];
+  const releases: Array<() => void> = [];
+  const scheduler = new FairAgentScheduler(async ({ prompt }) => { order.push(prompt); await new Promise<void>((resolve) => releases.push(resolve)); return prompt; }, 1);
+  scheduler.addRun("a", 1);
+  scheduler.addRun("b", 1);
+  const a1 = scheduler.spawn("a", "a1", { label: "a1", cwd: "/repo", tools: ["read"] });
+  const a2 = scheduler.spawn("a", "a2", { label: "a2", cwd: "/repo", tools: ["read"] });
+  const b1 = scheduler.spawn("b", "b1", { label: "b1", cwd: "/repo", tools: ["read"] });
+  await Promise.resolve();
+  assert.deepEqual(order, ["a1"]);
+  releases.shift()?.(); await a1.result; await Promise.resolve();
+  assert.deepEqual(order, ["a1", "b1"]);
+  releases.shift()?.(); await b1.result; await Promise.resolve();
+  assert.deepEqual(order, ["a1", "b1", "a2"]);
+  releases.shift()?.(); await a2.result;
+});
+
+void test("nested ownership releases permits, contains child failure, and blocks escalation", async () => {
+  let scheduler: FairAgentScheduler;
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options }) => {
+    if (prompt === "parent") {
+      assert.throws(() => scheduler.spawn("run", "bad", { label: "bad", cwd: options.cwd, tools: ["bash"] }, id), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: options.tools }, id);
+      return scheduler.result(id, child.id);
+    }
+    throw new WorkflowError("AGENT_FAILED", "child failed");
+  }, 1);
+  scheduler.addRun("run", 1, 2);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["read"] });
+  const result = await parent.result;
+  assert.equal(result.ok, true);
+  assert.deepEqual((result as { ok: true; value: unknown }).value, { id: "run:2", ok: false, error: { code: "AGENT_FAILED", message: "child failed" } });
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["completed", "failed"]);
+  assert.throws(() => scheduler.spawn("run", "extra", { label: "extra", cwd: "/repo", tools: ["read"] }), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_LIMIT_EXCEEDED");
+});
+
+void test("scoped tools reject sibling access and parent completion cancels orphan descendants", async () => {
+  let scheduler: FairAgentScheduler;
+  let orphanId = "";
+  // eslint-disable-next-line prefer-const, @typescript-eslint/unbound-method
+  scheduler = new FairAgentScheduler(async ({ id, prompt, signal, setSteer, options }) => {
+    if (prompt === "parent") {
+      const orphan = scheduler.spawn("run", "orphan", { label: "orphan", cwd: options.cwd, tools: options.tools }, id);
+      orphanId = orphan.id;
+      return "done";
+    }
+    setSteer(() => {});
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 2);
+  scheduler.addRun("run", 2);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["read"] });
+  await parent.result;
+  await Promise.resolve();
+  assert.equal(scheduler.snapshot().find(({ id }) => id === orphanId)?.state, "cancelled");
+  const outsider = scheduler.spawn("run", "outsider", { label: "outsider", cwd: "/repo", tools: ["read"] });
+  const resultTool = scheduler.toolsFor(outsider.id)[1];
+  assert.ok(resultTool);
+  await assert.rejects(resultTool.execute("x", { id: orphanId }, undefined, undefined, {} as never), /direct children/);
+  scheduler.cancel(outsider.id);
+  await outsider.result;
 });

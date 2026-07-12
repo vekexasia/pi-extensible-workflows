@@ -148,6 +148,203 @@ export class WorkflowAgentExecutor {
   }
 }
 
+export interface ScheduledAgentOptions {
+  label: string;
+  cwd: string;
+  tools: readonly string[];
+  model?: string;
+  schema?: JsonSchema;
+}
+
+export type ScheduledAgentResult =
+  | { id: string; ok: true; value: JsonValue }
+  | { id: string; ok: false; error: { code: string; message: string } };
+
+export interface ScheduledAgentInput {
+  id: string;
+  parentId?: string;
+  prompt: string;
+  options: Readonly<ScheduledAgentOptions>;
+  signal: AbortSignal;
+  setSteer(handler: (message: string) => void | Promise<void>): void;
+}
+
+export type ScheduledAgentRunner = (input: ScheduledAgentInput) => Promise<JsonValue>;
+
+type ScheduledNode = {
+  id: string;
+  runId: string;
+  parentId?: string;
+  options: Readonly<ScheduledAgentOptions>;
+  children: Set<string>;
+  collected: boolean;
+  state: "queued" | "running" | "waiting_for_child" | "completed" | "failed" | "cancelled";
+  controller: AbortController;
+  promise: Promise<ScheduledAgentResult>;
+  resolve: (result: ScheduledAgentResult) => void;
+  task: () => Promise<void>;
+  steer?: (message: string) => void | Promise<void>;
+};
+
+type ScheduledRun = { limit: number; maxAgents: number; logical: number; active: number; queue: Array<() => void> };
+
+export class FairAgentScheduler {
+  readonly #runs = new Map<string, ScheduledRun>();
+  readonly #nodes = new Map<string, ScheduledNode>();
+  #runOrder: string[] = [];
+  #cursor = 0;
+  #active = 0;
+  #nextId = 0;
+
+  constructor(private readonly runner: ScheduledAgentRunner, readonly sessionLimit = 16) {
+    if (!Number.isInteger(sessionLimit) || sessionLimit < 1 || sessionLimit > 16) throw new WorkflowError("INVALID_SETTINGS", "Session concurrency must be an integer from 1 to 16");
+  }
+
+  addRun(runId: string, limit = 8, maxAgents = 1000): void {
+    if (this.#runs.has(runId)) throw new WorkflowError("DUPLICATE_NAME", `Scheduler run already exists: ${runId}`);
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit || !Number.isInteger(maxAgents) || maxAgents < 1) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency or maxAgents");
+    this.#runs.set(runId, { limit, maxAgents, logical: 0, active: 0, queue: [] });
+    this.#runOrder.push(runId);
+  }
+
+  spawn(runId: string, prompt: string, options: ScheduledAgentOptions, parentId?: string): { id: string; result: Promise<ScheduledAgentResult> } {
+    const run = this.#runs.get(runId);
+    if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown scheduler run: ${runId}`);
+    const parent = parentId ? this.#nodes.get(parentId) : undefined;
+    if (parentId && (!parent || parent.runId !== runId)) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Parent agent is not owned by this run");
+    const effective = this.#inherit(parent, options);
+    if (++run.logical > run.maxAgents) { run.logical -= 1; throw new WorkflowError("RUN_LIMIT_EXCEEDED", `Run ${runId} exceeded maxAgents`); }
+    const id = `${runId}:${String(++this.#nextId)}`;
+    let resolveResult: (result: ScheduledAgentResult) => void = () => undefined;
+    const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
+    const node: ScheduledNode = { id, runId, ...(parentId ? { parentId } : {}), options: effective, children: new Set<string>(), collected: false, state: "queued", controller: new AbortController(), promise, resolve: resolveResult, task: async () => undefined };
+    node.task = async () => {
+      if (node.controller.signal.aborted) { this.#settle(node, { id, ok: false, error: { code: "CANCELLED", message: "Agent cancelled" } }); return; }
+      node.state = "running";
+      try {
+        const value = await this.runner({ id, ...(parentId ? { parentId } : {}), prompt, options: effective, signal: node.controller.signal, setSteer: (handler) => { node.steer = handler; } });
+        this.#settle(node, { id, ok: true, value });
+      } catch (error) {
+        const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
+        this.#settle(node, { id, ok: false, error: { code: typed.code, message: typed.message } });
+      }
+    };
+    this.#nodes.set(id, node);
+    parent?.children.add(id);
+    this.#enqueue(runId, () => { void node.task(); });
+    return { id, result: promise };
+  }
+
+  async result(parentId: string, childId: string): Promise<ScheduledAgentResult> {
+    const parent = this.#node(parentId);
+    const child = this.#node(childId);
+    if (child.parentId !== parentId) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Results are scoped to direct children");
+    child.collected = true;
+    parent.state = "waiting_for_child";
+    this.#release(parent.runId);
+    const outcome = await child.promise;
+    await new Promise<void>((resolve) => { this.#enqueue(parent.runId, () => { resolve(); }); });
+    if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
+    parent.state = "running";
+    return outcome;
+  }
+
+  async steer(parentId: string, childId: string, message: string): Promise<void> {
+    const child = this.#node(childId);
+    if (child.parentId !== parentId) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Steering is scoped to direct children");
+    if (child.state !== "running" && child.state !== "waiting_for_child") throw new WorkflowError("AGENT_FAILED", "Child is not running");
+    await child.steer?.(message);
+  }
+
+  cancel(id: string): void { this.#cancelTree(this.#node(id)); }
+
+  /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
+  toolsFor(parentId: string): ToolDefinition[] {
+    const parent = this.#node(parentId);
+    const agentTool = {
+      name: "agent", label: "Child Agent", description: "Start a direct child agent",
+      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), schema: Type.Optional(Type.Unsafe<JsonSchema>({})) }),
+      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; schema?: JsonSchema }) => {
+        const options = { label: params.label, cwd: parent.options.cwd, tools: params.tools ?? parent.options.tools, ...(params.model ? { model: params.model } : {}), ...(params.schema ? { schema: params.schema } : {}) };
+        const child = this.spawn(parent.runId, params.prompt, options, parentId);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
+      },
+    } as ToolDefinition;
+    const resultTool = {
+      name: "get_subagent_result", label: "Child Result", description: "Wait for a direct child and return its result",
+      parameters: Type.Object({ id: Type.String() }),
+      execute: async (_id: string, params: { id: string }) => { const value = await this.result(parentId, params.id); return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value }; },
+    } as ToolDefinition;
+    const steerTool = {
+      name: "steer_subagent", label: "Steer Child", description: "Steer a running direct child",
+      parameters: Type.Object({ id: Type.String(), message: Type.String() }),
+      execute: async (_id: string, params: { id: string; message: string }) => { await this.steer(parentId, params.id, params.message); return { content: [{ type: "text" as const, text: "Steering delivered." }], details: {} }; },
+    } as ToolDefinition;
+    return [agentTool, resultTool, steerTool];
+  }
+
+  snapshot(): readonly { id: string; parentId?: string; state: ScheduledNode["state"] }[] {
+    return [...this.#nodes.values()].map(({ id, parentId, state }) => ({ id, ...(parentId ? { parentId } : {}), state }));
+  }
+
+  #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
+    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "model", "schema"].includes(key));
+    if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
+    if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
+    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });
+    if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
+    const forbidden = options.tools.find((tool) => !parent.options.tools.includes(tool));
+    if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]) });
+  }
+  /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
+
+  #enqueue(runId: string, start: () => void): void { this.#runs.get(runId)?.queue.push(start); this.#dispatch(); }
+
+  #dispatch(): void {
+    while (this.#active < this.sessionLimit && this.#runOrder.length) {
+      let selected: string | undefined;
+      for (let checked = 0; checked < this.#runOrder.length; checked += 1) {
+        const index = (this.#cursor + checked) % this.#runOrder.length;
+        const id = this.#runOrder[index];
+        const run = id ? this.#runs.get(id) : undefined;
+        if (id && run && run.active < run.limit && run.queue.length) { selected = id; this.#cursor = (index + 1) % this.#runOrder.length; break; }
+      }
+      if (!selected) return;
+      const run = this.#runs.get(selected) as ScheduledRun;
+      const start = run.queue.shift() as () => void;
+      run.active += 1; this.#active += 1; start();
+    }
+  }
+
+  #release(runId: string): void {
+    const run = this.#runs.get(runId);
+    if (run && run.active > 0) { run.active -= 1; this.#active -= 1; this.#dispatch(); }
+  }
+
+  #settle(node: ScheduledNode, result: ScheduledAgentResult): void {
+    if (["completed", "failed", "cancelled"].includes(node.state)) return;
+    const heldPermit = node.state === "running";
+    node.state = result.ok ? "completed" : result.error.code === "CANCELLED" ? "cancelled" : "failed";
+    if (heldPermit) this.#release(node.runId);
+    for (const childId of node.children) { const child = this.#nodes.get(childId); if (child && !child.collected) this.#cancelTree(child); }
+    node.resolve(result);
+  }
+
+  #cancelTree(node: ScheduledNode): void {
+    if (["completed", "failed", "cancelled"].includes(node.state)) return;
+    node.controller.abort();
+    for (const childId of node.children) { const child = this.#nodes.get(childId); if (child) this.#cancelTree(child); }
+    if (node.state === "queued") this.#settle(node, { id: node.id, ok: false, error: { code: "CANCELLED", message: "Agent cancelled" } });
+  }
+
+  #node(id: string): ScheduledNode {
+    const node = this.#nodes.get(id);
+    if (!node) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown owned agent: ${id}`);
+    return node;
+  }
+}
+
 function requiredFile(file: string | undefined): string {
   if (!file) throw new WorkflowError("INTERNAL_ERROR", "Workflow agents require persisted native Pi sessions");
   return file;
