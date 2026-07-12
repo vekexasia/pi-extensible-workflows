@@ -277,3 +277,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
     handler: async (_args, ctx) => { ctx.ui.notify("No workflow runs in this session.", "info"); },
   });
 }
+
+export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
+export type { CompletedOperation, NativeSessionReference, PersistedRun } from "./persistence.js";
