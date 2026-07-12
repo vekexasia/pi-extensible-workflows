@@ -1,0 +1,35 @@
+{
+  "name": "pi-workflows",
+  "version": "0.1.0",
+  "description": "Deterministic multi-agent workflow orchestration for Pi",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "exports": "./dist/src/index.js",
+  "files": ["dist", "src"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "npm run build && node --test 'dist/test/*.test.js'",
+    "check": "npm run lint && npm test"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.12.4",
+    "eslint": "10.0.3",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.63.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "license": "MIT"
+}
