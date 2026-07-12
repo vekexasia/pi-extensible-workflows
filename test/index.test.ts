@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, preflight, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowError } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -83,4 +83,41 @@ void test("launch snapshots are detached and deeply immutable", () => {
   assert.deepEqual(snapshot.args, { nested: [1] });
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
+});
+
+void test("worker exposes deterministic core globals and JSON RPC only", async () => {
+  const phases: string[] = [];
+  const script = `export const meta={name:'x',description:'x'};
+    if (typeof process !== 'undefined' || typeof require !== 'undefined' || typeof console !== 'undefined' || typeof Date !== 'undefined' || typeof setTimeout !== 'undefined' || typeof Math.random !== 'undefined') throw new Error('unsafe global');
+    await phase('build'); if (!await checkpoint({name:'gate'})) throw new Error('rejected'); return await agent('echo', {name:'echo', value: args});`;
+  const run = runWorkflow(script, { n: 2 }, {
+    phase(name) { phases.push(name); },
+    checkpoint() { return true; },
+    agent(prompt, options) { return Promise.resolve({ prompt, options }); },
+  });
+  assert.deepEqual(await run.result, { prompt: "echo", options: { name: "echo", value: { n: 2 } } });
+  assert.deepEqual(phases, ["build"]);
+});
+
+void test("worker cancellation is immediate even for runaway synchronous code", async () => {
+  const run = runWorkflow(`export const meta={name:'x',description:'x'}; while(true){}`);
+  const started = performance.now();
+  run.cancel();
+  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  assert.ok(performance.now() - started < 1000);
+});
+
+void test("worker watchdog terminates a synchronous heartbeat stall after five seconds", { timeout: 7000 }, async () => {
+  const run = runWorkflow(`export const meta={name:'x',description:'x'}; while(true){}`);
+  const started = performance.now();
+  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "WORKER_UNRESPONSIVE");
+  const elapsed = performance.now() - started;
+  assert.ok(elapsed >= 4900 && elapsed < 6500, `watchdog fired after ${String(elapsed)}ms`);
+});
+
+void test("worker enforces 10 MB boundaries on individual and final JSON values", async () => {
+  const oversized = "x".repeat(RPC_LIMIT_BYTES);
+  assert.throws(() => runWorkflow(`export const meta={name:'x',description:'x'};`, oversized), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  const run = runWorkflow(`export const meta={name:'x',description:'x'}; return 'x'.repeat(${String(RPC_LIMIT_BYTES)});`);
+  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
 });

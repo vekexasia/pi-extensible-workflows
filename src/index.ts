@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { Worker } from "node:worker_threads";
 import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -258,6 +259,139 @@ function deepFreeze<T>(value: T): T {
 
 export function createLaunchSnapshot(input: LaunchSnapshot): Readonly<LaunchSnapshot> {
   return deepFreeze(structuredClone(input));
+}
+
+export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
+export const HEARTBEAT_TIMEOUT_MS = 5000;
+
+export interface WorkflowBridge {
+  agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<JsonValue>;
+  checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
+  phase?: (name: string) => void | Promise<void>;
+  log?: (message: string) => void | Promise<void>;
+}
+
+export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
+
+const workerSource = String.raw`
+const { parentPort, workerData } = require("node:worker_threads");
+const vm = require("node:vm");
+const LIMIT = workerData.limit;
+let nextId = 0;
+let cancelled = false;
+const pending = new Map();
+function send(value) {
+  const json = JSON.stringify(value);
+  if (json === undefined || Buffer.byteLength(json) > LIMIT) throw Object.assign(new Error("RPC value exceeds the 10 MB JSON boundary"), { code: "RPC_LIMIT_EXCEEDED" });
+  parentPort.postMessage(json);
+}
+function rpc(method, args) {
+  if (cancelled) throw Object.assign(new Error("Workflow cancelled"), { code: "CANCELLED" });
+  const id = ++nextId;
+  send({ type: "rpc", id, method, args });
+  return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+}
+parentPort.on("message", raw => {
+  let message;
+  try {
+    if (typeof raw !== "string" || Buffer.byteLength(raw) > LIMIT) throw Object.assign(new Error("RPC value exceeds the 10 MB JSON boundary"), { code: "RPC_LIMIT_EXCEEDED" });
+    message = JSON.parse(raw);
+  } catch (error) { send({ type: "error", error: { code: error.code || "INTERNAL_ERROR", message: error.message } }); return; }
+  if (message.type === "cancel") { cancelled = true; for (const { reject } of pending.values()) reject(Object.assign(new Error("Workflow cancelled"), { code: "CANCELLED" })); pending.clear(); return; }
+  if (message.type !== "rpcResult") return;
+  const request = pending.get(message.id);
+  if (!request) return;
+  pending.delete(message.id);
+  if (message.ok) request.resolve(message.value);
+  else request.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
+});
+const heartbeat = setInterval(() => send({ type: "heartbeat" }), 1000);
+send({ type: "heartbeat" });
+const failure = (name, failedAt, error) => ({ name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message } });
+const agent = (prompt, options = {}) => rpc("agent", [prompt, options]);
+const checkpoint = input => rpc("checkpoint", [input]);
+const phase = name => rpc("phase", [name]);
+const log = message => rpc("log", [message]);
+const parallel = async tasks => Promise.all(tasks.map(async task => { try { return { name: task.name, ok: true, value: await task.run() }; } catch (error) { if (error.code === "CANCELLED") throw error; return failure(task.name, task.name, error); } }));
+const pipeline = async (items, ...stages) => Promise.all(items.map(async item => { let value = item.value; let failedAt = item.name; try { for (const stage of stages) { failedAt = stage.name; value = await stage.run(value); } return { name: item.name, ok: true, value }; } catch (error) { if (error.code === "CANCELLED") throw error; return failure(item.name, failedAt, error); } }));
+const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
+const sandbox = { agent, checkpoint, parallel, pipeline, phase, log, args: workerData.args, Promise, JSON, Math: Object.freeze(safeMath) };
+for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
+const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+const body = workerData.script.replace(/^\s*export\s+const\s+meta/, "const meta");
+Promise.resolve().then(() => new vm.Script("(async()=>{" + body + "\n})()", { filename: "workflow.js" }).runInContext(context))
+  .then(value => send({ type: "result", value: value === undefined ? null : value }))
+  .catch(error => send({ type: "error", error: { code: error.code || "INTERNAL_ERROR", message: error.message } }))
+  .finally(() => clearInterval(heartbeat));
+`;
+
+function encoded(value: unknown): string {
+  if (!jsonValue(value)) fail("RPC_LIMIT_EXCEEDED", "RPC values must be JSON-compatible");
+  const json = JSON.stringify(value);
+  if (Buffer.byteLength(json) > RPC_LIMIT_BYTES) fail("RPC_LIMIT_EXCEEDED", "RPC value exceeds the 10 MB JSON boundary");
+  return json;
+}
+
+export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
+  encoded(args);
+  const worker = new Worker(workerSource, { eval: true, execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")), workerData: { script, args: structuredClone(args), limit: RPC_LIMIT_BYTES } });
+  const controller = new AbortController();
+  let settled = false;
+  let rejectResult: (error: WorkflowError) => void = () => undefined;
+  let watchdog = setTimeout(() => { stop("WORKER_UNRESPONSIVE", "Workflow worker missed its five-second heartbeat"); }, HEARTBEAT_TIMEOUT_MS);
+  const result = new Promise<JsonValue>((resolve, reject) => {
+    rejectResult = reject;
+    worker.on("message", (raw: unknown) => {
+      try {
+        if (typeof raw !== "string" || Buffer.byteLength(raw) > RPC_LIMIT_BYTES) fail("RPC_LIMIT_EXCEEDED", "RPC value exceeds the 10 MB JSON boundary");
+        const message = JSON.parse(raw) as { type?: string; id?: number; method?: string; args?: JsonValue[]; ok?: boolean; value?: JsonValue; error?: WorkflowErrorShape };
+        if (!jsonValue(message)) fail("RPC_LIMIT_EXCEEDED", "Worker RPC must contain JSON-compatible values");
+        if (message.type === "heartbeat") { clearTimeout(watchdog); watchdog = setTimeout(() => { stop("WORKER_UNRESPONSIVE", "Workflow worker missed its five-second heartbeat"); }, HEARTBEAT_TIMEOUT_MS); return; }
+        if (message.type === "result") { encoded(message.value); finish(); resolve(message.value ?? null); return; }
+        if (message.type === "error") { finish(); reject(new WorkflowError(message.error?.code ?? "INTERNAL_ERROR", message.error?.message ?? "Worker failed")); return; }
+        if (message.type === "rpc" && message.id !== undefined) void handleRpc(message.id, message.method ?? "", message.args ?? []);
+      } catch (error) { stop(error instanceof WorkflowError ? error.code : "INTERNAL_ERROR", error instanceof Error ? error.message : String(error)); }
+    });
+    worker.on("error", (error: Error) => { stop("INTERNAL_ERROR", error.message); });
+    worker.on("exit", (code) => { if (!settled && code !== 0) stop("INTERNAL_ERROR", `Workflow worker exited with code ${String(code)}`); });
+  });
+  function finish() { settled = true; clearTimeout(watchdog); signal?.removeEventListener("abort", cancel); void worker.terminate(); }
+  function stop(code: WorkflowErrorCode, message: string) { if (settled) return; controller.abort(); finish(); rejectResult(new WorkflowError(code, message)); }
+  async function handleRpc(id: number, method: string, values: JsonValue[]) {
+    try {
+      encoded(values);
+      let value: JsonValue = null;
+      if (method === "agent") {
+        if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
+        if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
+        value = await bridge.agent(values[0], object(values[1]) ? values[1] : {}, controller.signal);
+      } else if (method === "checkpoint") {
+        if (!bridge.checkpoint || !object(values[0])) fail("INTERNAL_ERROR", "checkpoint requires an available bridge and object input");
+        value = await bridge.checkpoint(values[0], controller.signal);
+        if (typeof value !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
+      } else if (method === "phase") {
+        if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
+        await bridge.phase?.(values[0]);
+      } else if (method === "log") {
+        if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "log message must be a string");
+        await bridge.log?.(values[0]);
+      }
+      else fail("INTERNAL_ERROR", `Unknown worker RPC method: ${method}`);
+      encoded(value);
+      worker.postMessage(encoded({ type: "rpcResult", id, ok: true, value }));
+    } catch (error) {
+      const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+      worker.postMessage(encoded({ type: "rpcResult", id, ok: false, error: { code: typed.code, message: typed.message } }));
+    }
+  }
+  function cancel() {
+    if (settled) return;
+    controller.abort();
+    worker.postMessage(encoded({ type: "cancel" }));
+    stop("CANCELLED", "Workflow cancelled");
+  }
+  if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
+  return { result, cancel };
 }
 
 export default function workflowExtension(pi: ExtensionAPI) {
