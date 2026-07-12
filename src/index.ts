@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
+import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
@@ -33,6 +34,17 @@ export interface RunRecord { id: string; workflowName: string; cwd: string; sess
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[] }
+export interface WorkflowOrchestrationContext {
+  agent: (...args: readonly unknown[]) => Promise<JsonValue>;
+  parallel: (...args: readonly unknown[]) => Promise<JsonValue>;
+  pipeline: (...args: readonly unknown[]) => Promise<JsonValue>;
+  checkpoint: (...args: readonly unknown[]) => Promise<boolean>;
+  phase: (name: string) => void;
+  log: (message: string) => void;
+}
+export interface WorkflowDslMethod { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowOrchestrationContext>) => Promise<JsonValue> | JsonValue }
+export interface WorkflowDslExtension { name: string; version: string; headline: string; description: string; methods: Readonly<Record<string, WorkflowDslMethod>> }
+export interface WorkflowMacroJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
 export class WorkflowError extends Error {
   constructor(public readonly code: WorkflowErrorCode, message: string) { super(message); this.name = "WorkflowError"; }
@@ -137,6 +149,51 @@ function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonS
   if (schema.required !== undefined && (!Array.isArray(schema.required) || schema.required.some((key) => typeof key !== "string"))) fail("INVALID_SCHEMA", `${at}.required must be an array of strings`);
   if (schema.properties !== undefined && !object(schema.properties)) fail("INVALID_SCHEMA", `${at}.properties must be an object`);
 }
+
+export class WorkflowDslRegistry {
+  readonly #extensions = new Map<string, Readonly<WorkflowDslExtension>>();
+
+  register(extension: WorkflowDslExtension): void {
+    if (!object(extension) || !/^[A-Za-z_$][\w$]*$/.test(extension.name) || !/^\d+\.\d+\.\d+$/.test(extension.version) || !extension.headline.trim() || !extension.description.trim() || !object(extension.methods) || Object.keys(extension.methods).length === 0) fail("INVALID_METADATA", "Workflow DSL extensions require a name, semantic version, headline, description, and methods");
+    if (this.#extensions.has(extension.name)) fail("DUPLICATE_NAME", `Workflow DSL extension already registered: ${extension.name}`);
+    for (const [name, method] of Object.entries(extension.methods)) {
+      if (!/^[A-Za-z_$][\w$]*$/.test(name) || !object(method) || typeof method.description !== "string" || method.description.trim() === "" || typeof method.run !== "function") fail("INVALID_METADATA", `Invalid workflow DSL method: ${extension.name}.${name}`);
+      validateSchema(method.input, `${extension.name}.${name} input`);
+      validateSchema(method.output, `${extension.name}.${name} output`);
+      if (method.input.type !== "object") fail("INVALID_SCHEMA", `${extension.name}.${name} input must describe one object`);
+    }
+    this.#extensions.set(extension.name, deepFreeze(extension));
+  }
+
+  versions(): Readonly<Record<string, string>> {
+    return Object.freeze(Object.fromEntries([...this.#extensions].map(([name, extension]) => [name, extension.version])));
+  }
+
+  namespaces(): Readonly<Record<string, Readonly<Record<string, WorkflowDslMethod>>>> {
+    return Object.freeze(Object.fromEntries([...this.#extensions].map(([name, extension]) => [name, extension.methods])));
+  }
+
+  async invoke(extensionName: string, methodName: string, input: unknown, context: WorkflowOrchestrationContext, path: string, journal: WorkflowMacroJournal): Promise<JsonValue> {
+    const extension = this.#extensions.get(extensionName);
+    const method = extension?.methods[methodName];
+    if (!method) fail("MISSING_EXTENSION", `Workflow DSL method is unavailable: ${extensionName}.${methodName}`);
+    if (!object(input) || !jsonValue(input) || !Value.Check(method.input, input)) fail("RESULT_INVALID", `Invalid input for ${extensionName}.${methodName}`);
+    const replayed = journal.get(path);
+    if (replayed !== undefined) {
+      if (!jsonValue(replayed) || !Value.Check(method.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${extensionName}.${methodName}`);
+      return structuredClone(replayed);
+    }
+    const publicContext = Object.freeze({ agent: context.agent, parallel: context.parallel, pipeline: context.pipeline, checkpoint: context.checkpoint, phase: context.phase, log: context.log });
+    const result: unknown = await method.run(deepFreeze(structuredClone(input)), publicContext);
+    if (!jsonValue(result) || !Value.Check(method.output, result)) fail("RESULT_INVALID", `Invalid output from ${extensionName}.${methodName}`);
+    const stored = structuredClone(result);
+    journal.put(path, stored);
+    return structuredClone(stored);
+  }
+}
+
+export const workflowDslRegistry = new WorkflowDslRegistry();
+export function registerWorkflowDslExtension(extension: WorkflowDslExtension): void { workflowDslRegistry.register(extension); }
 
 function versionCompatible(required: string, actual: string): boolean {
   const parse = (version: string) => /^(\d+)\.(\d+)\.(\d+)$/.exec(version)?.slice(1).map(Number);
