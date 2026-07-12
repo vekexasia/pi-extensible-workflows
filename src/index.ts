@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,8 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
+import { RunStore } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
@@ -452,6 +455,13 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
 }
 
 export default function workflowExtension(pi: ExtensionAPI) {
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null }>();
+  const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal }) => {
+    const run = runs.get(runId);
+    if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
+    const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), timeoutMs: run.timeoutMs }, signal, scheduler.toolsFor(id));
+    return result.value;
+  }, 16, (runId, ownership) => runs.get(runId)?.store.saveOwnership(ownership));
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
@@ -461,7 +471,31 @@ export default function workflowExtension(pi: ExtensionAPI) {
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
     }),
-    async execute() { throw new Error("Workflow execution is not implemented yet"); },
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
+      const settings = loadSettings();
+      const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
+      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow");
+      const checked = preflight(params.script, { models: new Set([`${rootModel.provider}/${rootModel.model}`]), tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
+      const runId = randomUUID();
+      const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId);
+      const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools) });
+      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs });
+      scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
+      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options) => {
+        const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
+        const spawned = scheduler.spawn(runId, prompt, { label: typeof options.label === "string" ? options.label : "agent", cwd: ctx.cwd, tools: requestedTools, ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}) });
+        const outcome = await spawned.result;
+        if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+        return outcome.value;
+      } }, signal);
+      const finish = execution.result.then(async (value) => { await scheduler.flush(); const loaded = await store.load(); await store.saveState({ ...loaded.run, state: "completed" }); return value; }, async (error: unknown) => { await scheduler.flush(); const loaded = await store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await store.saveState({ ...loaded.run, state: typed.code === "CANCELLED" ? "stopped" : "failed", error: { code: typed.code, message: typed.message } }); throw typed; });
+      if (!params.foreground) { void finish.catch(() => undefined); return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } }; }
+      const value = await finish;
+      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
+    },
   });
   pi.registerCommand("workflow", {
     description: "Inspect and control workflows for this Pi session",
@@ -470,6 +504,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
-export type { CompletedOperation, NativeSessionReference, PersistedRun } from "./persistence.js";
-export { WorkflowAgentExecutor } from "./agent-execution.js";
+export type { CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun } from "./persistence.js";
+export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";

@@ -12,18 +12,20 @@ const valid = `export const meta = { name: "review", description: "Review code",
 phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], agentType: "reviewer" });`;
 
 void test("registers the workflow tool and singular command", async () => {
-  const tools: Array<{ name: string; execute: () => Promise<unknown> }> = [];
+  const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
   const commands: Array<{ name: string; options: { handler: (args: string, ctx: unknown) => Promise<void> } }> = [];
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
     registerCommand(name: string, options: (typeof commands)[number]["options"]) { commands.push({ name, options }); },
+    getThinkingLevel() { return "medium"; },
+    getActiveTools() { return ["read", "workflow"]; },
   };
   workflowExtension(pi as never);
   assert.deepEqual(tools.map(({ name }) => name), ["workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools[0];
   assert.ok(tool);
-  await assert.rejects(tool.execute(), /not implemented/);
+  await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
 void test("strict settings use defaults and reject unknown or unsafe values", () => {

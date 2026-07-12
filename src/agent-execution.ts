@@ -40,7 +40,7 @@ interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; resultTool?: ToolDefinition }
+interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition }
 type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
@@ -78,8 +78,9 @@ async function nativeSession(input: SessionInput): Promise<NativeSession> {
   const registry = ModelRegistry.create(AuthStorage.create());
   const model = registry.find(input.model.provider, input.model.model);
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
-  const tools = [...input.tools, ...(input.resultTool ? ["workflow_result"] : [])];
-  const { session } = await createAgentSession({ cwd: input.cwd, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, customTools: input.resultTool ? [input.resultTool] : [], sessionManager: manager });
+  const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
+  const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
+  const { session } = await createAgentSession({ cwd: input.cwd, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), sessionManager: manager });
   return session;
 }
 
@@ -95,7 +96,7 @@ export class WorkflowAgentExecutor {
     return { model: parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking), tools: [...requested], rolePrompt: definition?.prompt ?? "" };
   }
 
-  async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal): Promise<AgentExecutionResult> {
+  async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = []): Promise<AgentExecutionResult> {
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
     const resolved = this.resolve(options);
@@ -118,7 +119,7 @@ export class WorkflowAgentExecutor {
       } as ToolDefinition : undefined;
       let session: NativeSession | undefined;
       try {
-        session = await this.createSession({ cwd: this.root.cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(resultTool ? { resultTool } : {}) });
+        session = await this.createSession({ cwd: this.root.cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}) });
         const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", resolved.rolePrompt, attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
         await withTimeout(session.prompt(`${context}\n\nTask:\n${task}`), remaining(options.timeoutMs, started), signal, session);
         if (options.schema) {
@@ -162,6 +163,7 @@ export type ScheduledAgentResult =
 
 export interface ScheduledAgentInput {
   id: string;
+  runId: string;
   parentId?: string;
   prompt: string;
   options: Readonly<ScheduledAgentOptions>;
@@ -187,6 +189,8 @@ type ScheduledNode = {
 };
 
 type ScheduledRun = { limit: number; maxAgents: number; logical: number; active: number; queue: Array<() => void> };
+type OwnershipRecord = { id: string; parentId?: string; label: string; state: ScheduledNode["state"] };
+type OwnershipWriter = (runId: string, ownership: readonly OwnershipRecord[]) => void | Promise<void>;
 
 export class FairAgentScheduler {
   readonly #runs = new Map<string, ScheduledRun>();
@@ -195,8 +199,9 @@ export class FairAgentScheduler {
   #cursor = 0;
   #active = 0;
   #nextId = 0;
+  #persistence = Promise.resolve();
 
-  constructor(private readonly runner: ScheduledAgentRunner, readonly sessionLimit = 16) {
+  constructor(private readonly runner: ScheduledAgentRunner, readonly sessionLimit = 16, private readonly writeOwnership?: OwnershipWriter) {
     if (!Number.isInteger(sessionLimit) || sessionLimit < 1 || sessionLimit > 16) throw new WorkflowError("INVALID_SETTINGS", "Session concurrency must be an integer from 1 to 16");
   }
 
@@ -219,10 +224,11 @@ export class FairAgentScheduler {
     const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
     const node: ScheduledNode = { id, runId, ...(parentId ? { parentId } : {}), options: effective, children: new Set<string>(), collected: false, state: "queued", controller: new AbortController(), promise, resolve: resolveResult, task: async () => undefined };
     node.task = async () => {
-      if (node.controller.signal.aborted) { this.#settle(node, { id, ok: false, error: { code: "CANCELLED", message: "Agent cancelled" } }); return; }
+      if (node.controller.signal.aborted) { this.#release(node.runId); return; }
       node.state = "running";
+      this.#persist(runId);
       try {
-        const value = await this.runner({ id, ...(parentId ? { parentId } : {}), prompt, options: effective, signal: node.controller.signal, setSteer: (handler) => { node.steer = handler; } });
+        const value = await this.runner({ id, runId, ...(parentId ? { parentId } : {}), prompt, options: effective, signal: node.controller.signal, setSteer: (handler) => { node.steer = handler; } });
         this.#settle(node, { id, ok: true, value });
       } catch (error) {
         const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
@@ -231,6 +237,7 @@ export class FairAgentScheduler {
     };
     this.#nodes.set(id, node);
     parent?.children.add(id);
+    this.#persist(runId);
     this.#enqueue(runId, () => { void node.task(); });
     return { id, result: promise };
   }
@@ -241,11 +248,13 @@ export class FairAgentScheduler {
     if (child.parentId !== parentId) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Results are scoped to direct children");
     child.collected = true;
     parent.state = "waiting_for_child";
+    this.#persist(parent.runId);
     this.#release(parent.runId);
     const outcome = await child.promise;
     await new Promise<void>((resolve) => { this.#enqueue(parent.runId, () => { resolve(); }); });
     if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
     parent.state = "running";
+    this.#persist(parent.runId);
     return outcome;
   }
 
@@ -283,9 +292,11 @@ export class FairAgentScheduler {
     return [agentTool, resultTool, steerTool];
   }
 
-  snapshot(): readonly { id: string; parentId?: string; state: ScheduledNode["state"] }[] {
-    return [...this.#nodes.values()].map(({ id, parentId, state }) => ({ id, ...(parentId ? { parentId } : {}), state }));
+  snapshot(): readonly OwnershipRecord[] {
+    return [...this.#nodes.values()].map(({ id, parentId, options, state }) => ({ id, ...(parentId ? { parentId } : {}), label: options.label, state }));
   }
+
+  async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
     const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "model", "schema"].includes(key));
@@ -326,6 +337,7 @@ export class FairAgentScheduler {
     if (["completed", "failed", "cancelled"].includes(node.state)) return;
     const heldPermit = node.state === "running";
     node.state = result.ok ? "completed" : result.error.code === "CANCELLED" ? "cancelled" : "failed";
+    this.#persist(node.runId);
     if (heldPermit) this.#release(node.runId);
     for (const childId of node.children) { const child = this.#nodes.get(childId); if (child && !child.collected) this.#cancelTree(child); }
     node.resolve(result);
@@ -342,6 +354,12 @@ export class FairAgentScheduler {
     const node = this.#nodes.get(id);
     if (!node) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown owned agent: ${id}`);
     return node;
+  }
+
+  #persist(runId: string): void {
+    if (!this.writeOwnership) return;
+    const ownership = this.snapshot().filter(({ id }) => id.startsWith(`${runId}:`));
+    this.#persistence = this.#persistence.then(() => this.writeOwnership?.(runId, ownership)).then(() => undefined);
   }
 }
 

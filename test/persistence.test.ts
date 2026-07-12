@@ -26,6 +26,16 @@ void test("stores exact cwd and Pi session snapshots atomically and rejects cros
   assert.deepEqual(readFileSync(join(store.directory, "state.json"), "utf8").trim().startsWith("{"), true);
 });
 
+void test("persists and reloads the recursive ownership tree", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-ownership-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const ownership = [{ id: "run-a:1", label: "parent", state: "waiting_for_child" }, { id: "run-a:2", parentId: "run-a:1", label: "child", state: "running" }];
+  await store.saveOwnership(ownership);
+  assert.deepEqual(await new RunStore(cwd, "session-a", "run-a", home).loadOwnership(), ownership);
+});
+
 void test("journals stable structural paths and replays only completed operations", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-journal-"));
   const cwd = join(home, "project");

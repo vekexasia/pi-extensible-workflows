@@ -76,6 +76,33 @@ void test("fair scheduler enforces session/run ceilings and round-robins runs", 
   releases.shift()?.(); await a2.result;
 });
 
+void test("cancelling a queued agent releases its eventual permit so later work starts", async () => {
+  const started: string[] = [];
+  let release!: () => void;
+  const scheduler = new FairAgentScheduler(async ({ prompt }) => { started.push(prompt); if (prompt === "r1") await new Promise<void>((resolve) => { release = resolve; }); return prompt; }, 1);
+  scheduler.addRun("r", 1);
+  const r1 = scheduler.spawn("r", "r1", { label: "r1", cwd: "/repo", tools: [] });
+  const r2 = scheduler.spawn("r", "r2", { label: "r2", cwd: "/repo", tools: [] });
+  const r3 = scheduler.spawn("r", "r3", { label: "r3", cwd: "/repo", tools: [] });
+  scheduler.cancel(r2.id);
+  release();
+  await r1.result;
+  assert.equal((await r2.result).ok, false);
+  assert.equal((await r3.result).ok, true);
+  assert.deepEqual(started, ["r1", "r3"]);
+});
+
+void test("writes each ownership-tree transition to persistence", async () => {
+  const writes: Array<readonly unknown[]> = [];
+  const scheduler = new FairAgentScheduler(async () => "done", 1, (_run, ownership) => { writes.push(structuredClone(ownership)); });
+  scheduler.addRun("r", 1);
+  const child = scheduler.spawn("r", "work", { label: "worker", cwd: "/repo", tools: [] });
+  await child.result;
+  await scheduler.flush();
+  assert.equal(writes.at(-1)?.[0] && (writes.at(-1)?.[0] as { state: string }).state, "completed");
+  assert.equal((writes.at(-1)?.[0] as { label: string }).label, "worker");
+});
+
 void test("nested ownership releases permits, contains child failure, and blocks escalation", async () => {
   let scheduler: FairAgentScheduler;
   // eslint-disable-next-line prefer-const
