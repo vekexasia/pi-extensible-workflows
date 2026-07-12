@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,6 +40,150 @@ void test("journals stable structural paths and replays only completed operation
   assert.deepEqual(await store.replay(sibling), { path: sibling, value: 2 });
   assert.equal(await store.replay(structuralPath("interrupted-parent")), undefined);
   await assert.rejects(store.complete(path, null), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+});
+
+void test("creates deterministic snapshot worktrees, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-"));
+  const repo = join(home, "repo");
+  const cwd = join(repo, "packages", "app");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  writeFileSync(join(cwd, "deleted.txt"), "remove before launch");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  writeFileSync(join(cwd, "tracked.txt"), "changed");
+  rmSync(join(cwd, "deleted.txt"));
+  writeFileSync(join(cwd, "untracked.txt"), "new");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const first = await store.worktree("agent/path");
+  const second = await store.worktree("agent/path");
+  assert.deepEqual(second, first);
+  assert.equal(readFileSync(join(first.cwd, "tracked.txt"), "utf8"), "changed");
+  assert.equal(readFileSync(join(first.cwd, "untracked.txt"), "utf8"), "new");
+  assert.equal(existsSync(join(first.cwd, "deleted.txt")), false);
+  assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
+  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%s"], { encoding: "utf8" }).trim(), "pi-workflows|pi-workflows@localhost|pi-workflows runtime snapshot");
+  writeFileSync(join(first.cwd, "agent.txt"), "post-creation");
+  await store.snapshotWorktree("agent/path");
+  assert.equal(execFileSync("git", ["-C", first.path, "show", "HEAD:packages/app/agent.txt"], { encoding: "utf8" }), "post-creation");
+  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI|%s"], { encoding: "utf8" }).trim(), "pi-workflows|pi-workflows@localhost|pi-workflows|pi-workflows@localhost|2000-01-01T00:00:00+00:00|2000-01-01T00:00:00+00:00|pi-workflows runtime snapshot");
+  assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
+  await assert.rejects(store.delete(false), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  assert.equal(existsSync(first.path), true);
+  await store.delete(true);
+  assert.equal(existsSync(first.path), false);
+  assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", first.branch], { stdio: "ignore" }));
+});
+
+void test("preserves a pre-existing deterministic branch when creation fails", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-branch-collision-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
+  const branch = `pi-workflows/run-a/${key}`;
+  execFileSync("git", ["-C", repo, "branch", branch]);
+  const commit = execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim();
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  assert.equal(execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim(), commit);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+});
+
+void test("cleans a created branch when worktree add fails before cwd exists", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-add-fail-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
+  const path = join(store.directory, "worktrees", key);
+  const branch = `pi-workflows/run-a/${key}`;
+  mkdirSync(path, { recursive: true });
+  writeFileSync(join(path, "block"), "worktree add");
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", branch], { stdio: "ignore" }));
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+});
+
+void test("worktree creation failures are typed and never fall back", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-fail-"));
+  const cwd = join(home, "not-a-repo");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+});
+
+void test("stale persisted worktree records fail as WORKTREE_FAILED", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stale-worktree-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("agent");
+  rmSync(worktree.path, { recursive: true });
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+});
+
+void test("malicious worktree metadata cannot trigger deletion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-malicious-worktree-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  execFileSync("git", ["-C", repo, "branch", "keep-me"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("agent");
+  writeFileSync(join(store.directory, "worktrees.json"), `${JSON.stringify([{ ...worktree, path: repo, branch: "keep-me", cwd: repo }])}\n`);
+  await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  assert.equal(existsSync(repo), true);
+  assert.doesNotThrow(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", "keep-me"], { stdio: "ignore" }));
+  assert.equal(existsSync(worktree.path), true);
+});
+
+void test("snapshot git failures are typed as WORKTREE_FAILED", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-snapshot-fail-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("agent");
+  rmSync(worktree.path, { recursive: true });
+  await assert.rejects(store.snapshotWorktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
 });
 
 void test("deletion requires confirmation, verifies ownership, and removes only the run directory", async () => {

@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { access, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
+import { promisify } from "node:util";
 import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
 import { createLaunchSnapshot, WorkflowError } from "./index.js";
 
@@ -9,6 +11,13 @@ export interface NativeSessionReference { sessionId: string; sessionFile: string
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 type Journal = { completed: Record<string, CompletedOperation> };
+export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string }
+
+const execute = promisify(execFile);
+const gitIdentity = {
+  GIT_AUTHOR_NAME: "pi-workflows", GIT_AUTHOR_EMAIL: "pi-workflows@localhost", GIT_COMMITTER_NAME: "pi-workflows", GIT_COMMITTER_EMAIL: "pi-workflows@localhost",
+  GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
+};
 
 function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
@@ -38,6 +47,7 @@ async function json<T>(path: string): Promise<T> { return JSON.parse(await readF
 export class RunStore {
   readonly directory: string;
   private journalWrite: Promise<void> = Promise.resolve();
+  private worktreeWrite: Promise<void> = Promise.resolve();
 
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
     this.cwd = resolve(cwd);
@@ -80,9 +90,113 @@ export class RunStore {
     return (await json<Journal>(join(this.directory, "journal.json"))).completed[path];
   }
 
+  private expectedWorktree(owner: string): Pick<WorktreeReference, "path" | "branch"> {
+    const key = createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16);
+    return { path: join(this.directory, "worktrees", key), branch: `pi-workflows/${safePart(this.runId)}/${key}` };
+  }
+
+  private structuralWorktree(owner: string, record: unknown): WorktreeReference {
+    if (!record || typeof record !== "object") throw new Error(`Invalid worktree record for ${owner}`);
+    const candidate = record as Partial<WorktreeReference>;
+    const expected = this.expectedWorktree(owner);
+    const relativePath = typeof candidate.path === "string" ? relative(this.directory, candidate.path) : "..";
+    const relativeCwd = typeof candidate.path === "string" && typeof candidate.cwd === "string" ? relative(candidate.path, candidate.cwd) : "..";
+    if (candidate.owner !== owner || typeof candidate.path !== "string" || typeof candidate.branch !== "string" || typeof candidate.cwd !== "string" || resolve(candidate.path) !== expected.path || candidate.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
+    return candidate as WorktreeReference;
+  }
+
+  async validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
+    try {
+      await this.load();
+      const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+      const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
+      if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`);
+      const record = this.structuralWorktree(owner, matches[0]);
+      if (cwd !== undefined && resolve(cwd) !== resolve(record.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
+      await access(record.cwd);
+      return record;
+    } catch (error) {
+      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async worktree(owner: string): Promise<WorktreeReference> {
+    const write = this.worktreeWrite.then(async () => {
+      await this.load();
+      const recordsPath = join(this.directory, "worktrees.json");
+      let records = await json<WorktreeReference[]>(recordsPath).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+      const existing = records.find((record) => record.owner === owner);
+      if (existing) return this.validateWorktree(owner);
+      const { path, branch } = this.expectedWorktree(owner);
+      const index = join(this.directory, `index-${basename(path)}`);
+      let branchCreated = false;
+      let worktreeCreated = false;
+      try {
+        const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
+        const launchRelative = relative(root, this.cwd);
+        if (launchRelative.startsWith("..")) throw new Error("launch cwd is outside the repository");
+        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+        await git(root, ["read-tree", "HEAD"], { GIT_INDEX_FILE: index });
+        await git(root, ["add", "-A"], { GIT_INDEX_FILE: index });
+        const tree = (await git(root, ["write-tree"], { GIT_INDEX_FILE: index })).trim();
+        const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
+        const record = { owner, path, branch, cwd: join(path, launchRelative) };
+        await atomicJson(recordsPath, [...records, record]);
+        await git(root, ["branch", branch, commit]);
+        branchCreated = true;
+        await git(root, ["worktree", "add", "--no-checkout", path, branch]);
+        worktreeCreated = true;
+        await git(path, ["checkout", "--force", branch]);
+        await rm(index, { force: true });
+        return record;
+      } catch (error) {
+        try {
+          const persisted = await json<unknown[]>(recordsPath);
+          const matches = persisted.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
+          if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`, { cause: error });
+          this.structuralWorktree(owner, matches[0]);
+          await rm(index, { force: true });
+          if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
+          if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
+          records = persisted.filter((candidate) => candidate !== matches[0]) as WorktreeReference[];
+          await atomicJson(recordsPath, records);
+        } catch { /* Ownership changed or disappeared: do not delete anything. */ }
+        throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+      }
+    });
+    this.worktreeWrite = write.then(() => undefined, () => undefined);
+    return write;
+  }
+
+  async snapshotWorktree(owner: string): Promise<string> {
+    try {
+      const record = await this.worktree(owner);
+      const write = this.worktreeWrite.then(async () => {
+        await git(record.path, ["add", "-A"]);
+        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-workflows runtime snapshot"], gitIdentity);
+        return (await git(record.path, ["rev-parse", "HEAD"])).trim();
+      });
+      this.worktreeWrite = write.then(() => undefined, () => undefined);
+      return await write;
+    } catch (error) {
+      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
   async delete(confirmed: boolean): Promise<void> {
     if (!confirmed) throw new WorkflowError("CANCELLED", "Run deletion requires confirmation");
     await this.load();
+    const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+    const validated = await Promise.all(records.map((record) => this.validateWorktree(record.owner)));
+    for (const record of validated) {
+      await git(this.cwd, ["worktree", "remove", "--force", record.path]);
+      await git(this.cwd, ["branch", "-D", record.branch]);
+    }
     await rm(this.directory, { recursive: true, force: false });
   }
+}
+
+async function git(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<string> {
+  const { stdout } = await execute("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd, env: { ...process.env, ...extraEnv }, encoding: "utf8" });
+  return stdout;
 }

@@ -5,6 +5,7 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
 import { WorkflowError } from "./index.js";
+import type { RunStore } from "./persistence.js";
 
 export interface AgentDefinition { prompt?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
 export interface AgentExecutionOptions {
@@ -13,6 +14,7 @@ export interface AgentExecutionOptions {
   workflowDescription: string;
   phase?: string;
   parent?: string;
+  parentIsolation?: "worktree";
   model?: string;
   thinking?: ThinkingLevel;
   tools?: readonly string[];
@@ -21,16 +23,19 @@ export interface AgentExecutionOptions {
   retries?: number;
   timeoutMs?: number | null;
   retryState?: string;
+  isolation?: "worktree";
+  cwd?: string;
 }
 export interface AgentExecutionRoot {
   cwd: string;
   model: ModelSpec;
   tools: ReadonlySet<string>;
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
+  runStore?: RunStore;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
-export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[] }
+export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
 
 interface NativeSession {
   readonly sessionId: string;
@@ -98,6 +103,25 @@ export class WorkflowAgentExecutor {
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal): Promise<AgentExecutionResult> {
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
+    let cwd: string;
+    if (options.parent) {
+      if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Only top-level agents may request worktree isolation");
+      if (!options.cwd) throw new WorkflowError("INVALID_METADATA", "Child agents require their parent cwd");
+      if (options.parentIsolation) {
+        if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree inheritance requires a persisted run");
+        cwd = (await this.root.runStore.validateWorktree(options.parent, options.cwd)).cwd;
+      } else {
+        if (options.cwd !== this.root.cwd) throw new WorkflowError("INVALID_METADATA", "Shared-tree children must inherit the root cwd");
+        cwd = this.root.cwd;
+      }
+    } else {
+      if (options.cwd || options.parentIsolation) throw new WorkflowError("INVALID_METADATA", "Only child agents may inherit a cwd");
+      if (!options.isolation) cwd = this.root.cwd;
+      else {
+        if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree isolation requires a persisted run");
+        cwd = (await this.root.runStore.worktree(options.label)).cwd;
+      }
+    }
     const resolved = this.resolve(options);
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
@@ -118,7 +142,7 @@ export class WorkflowAgentExecutor {
       } as ToolDefinition : undefined;
       let session: NativeSession | undefined;
       try {
-        session = await this.createSession({ cwd: this.root.cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(resultTool ? { resultTool } : {}) });
+        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(resultTool ? { resultTool } : {}) });
         const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", resolved.rolePrompt, attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
         await withTimeout(session.prompt(`${context}\n\nTask:\n${task}`), remaining(options.timeoutMs, started), signal, session);
         if (options.schema) {
@@ -132,16 +156,18 @@ export class WorkflowAgentExecutor {
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
         const value = options.schema ? schemaResult as JsonValue : text(session.messages);
+        if (options.isolation) await this.root.runStore?.snapshotWorktree(options.label);
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: accounting(session.messages) });
         session.dispose();
-        return { value, attempts };
+        return { value, attempts, cwd };
       } catch (error) {
         const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
         if (session) {
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: accounting(session.messages) });
           session.dispose();
         }
-        if (attempt === maxAttempts || typed.code === "CANCELLED") throw Object.assign(typed, { attempts });
+        if (options.isolation && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.label).catch(() => undefined);
+        if (attempt === maxAttempts || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
       }
     }
     throw new WorkflowError("AGENT_FAILED", "Agent execution failed");

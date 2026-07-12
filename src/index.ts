@@ -470,6 +470,6 @@ export default function workflowExtension(pi: ExtensionAPI) {
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
-export type { CompletedOperation, NativeSessionReference, PersistedRun } from "./persistence.js";
+export type { CompletedOperation, NativeSessionReference, PersistedRun, WorktreeReference } from "./persistence.js";
 export { WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";
