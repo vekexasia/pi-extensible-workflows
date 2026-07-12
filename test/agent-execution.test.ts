@@ -123,7 +123,7 @@ void test("nested ownership releases permits, contains child failure, and blocks
   assert.throws(() => scheduler.spawn("run", "extra", { label: "extra", cwd: "/repo", tools: ["read"] }), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_LIMIT_EXCEEDED");
 });
 
-void test("scoped tools reject sibling access and parent completion cancels orphan descendants", async () => {
+void test("scoped tools honor the root capability boundary and cancel orphan descendants", async () => {
   let scheduler: FairAgentScheduler;
   let orphanId = "";
   // eslint-disable-next-line prefer-const, @typescript-eslint/unbound-method
@@ -138,12 +138,18 @@ void test("scoped tools reject sibling access and parent completion cancels orph
     throw new WorkflowError("CANCELLED", "cancelled");
   }, 2);
   scheduler.addRun("run", 2);
-  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["read"] });
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent"] });
   await parent.result;
   await Promise.resolve();
   assert.equal(scheduler.snapshot().find(({ id }) => id === orphanId)?.state, "cancelled");
-  const outsider = scheduler.spawn("run", "outsider", { label: "outsider", cwd: "/repo", tools: ["read"] });
-  const resultTool = scheduler.toolsFor(outsider.id)[1];
+  const denied = scheduler.spawn("run", "denied", { label: "denied", cwd: "/repo", tools: ["read"] });
+  assert.deepEqual(scheduler.toolsFor(denied.id), []);
+  scheduler.cancel(denied.id);
+  await denied.result;
+  const outsider = scheduler.spawn("run", "outsider", { label: "outsider", cwd: "/repo", tools: ["agent"] });
+  const scopedTools = scheduler.toolsFor(outsider.id);
+  assert.deepEqual(scopedTools.map(({ name }) => name), ["agent", "get_subagent_result", "steer_subagent"]);
+  const resultTool = scopedTools[1];
   assert.ok(resultTool);
   await assert.rejects(resultTool.execute("x", { id: orphanId }, undefined, undefined, {} as never), /direct children/);
   scheduler.cancel(outsider.id);

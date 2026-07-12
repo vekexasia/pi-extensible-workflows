@@ -270,6 +270,7 @@ export class FairAgentScheduler {
   /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
   toolsFor(parentId: string): ToolDefinition[] {
     const parent = this.#node(parentId);
+    if (!parent.options.tools.includes("agent")) return [];
     const agentTool = {
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
       parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), schema: Type.Optional(Type.Unsafe<JsonSchema>({})) }),

@@ -484,14 +484,18 @@ export default function workflowExtension(pi: ExtensionAPI) {
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools) });
       runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
-      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options) => {
+      const topLevel = new Set<Promise<unknown>>();
+      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
         const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
         const spawned = scheduler.spawn(runId, prompt, { label: typeof options.label === "string" ? options.label : "agent", cwd: ctx.cwd, tools: requestedTools, ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}) });
-        const outcome = await spawned.result;
+        topLevel.add(spawned.result);
+        const cancel = () => { scheduler.cancel(spawned.id); };
+        if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
+        const outcome = await spawned.result.finally(() => { topLevel.delete(spawned.result); agentSignal.removeEventListener("abort", cancel); });
         if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
         return outcome.value;
       } }, signal);
-      const finish = execution.result.then(async (value) => { await scheduler.flush(); const loaded = await store.load(); await store.saveState({ ...loaded.run, state: "completed" }); return value; }, async (error: unknown) => { await scheduler.flush(); const loaded = await store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await store.saveState({ ...loaded.run, state: typed.code === "CANCELLED" ? "stopped" : "failed", error: { code: typed.code, message: typed.message } }); throw typed; });
+      const finish = execution.result.then(async (value) => { await scheduler.flush(); const loaded = await store.load(); await store.saveState({ ...loaded.run, state: "completed" }); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const loaded = await store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await store.saveState({ ...loaded.run, state: typed.code === "CANCELLED" ? "stopped" : "failed", error: { code: typed.code, message: typed.message } }); throw typed; });
       if (!params.foreground) { void finish.catch(() => undefined); return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } }; }
       const value = await finish;
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
