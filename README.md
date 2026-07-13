@@ -176,7 +176,7 @@ Checkpoints return only `true` or `false`. Prompt size is limited to 1 KB UTF-8 
 { "runId": "...", "name": "ship", "approved": true }
 ```
 
-through `workflow_respond`. The first valid response wins. Responses and completed checkpoints are journaled and replay after cold recovery. Foreground checkpoints require an interactive or RPC UI.
+through `workflow_respond`. The first valid response wins. Responses and completed checkpoints are journaled and replay after cold recovery. Foreground checkpoints require a Pi UI that provides `select` (interactive picker); without it the checkpoint fails with `RESUME_INCOMPATIBLE`, and `workflow_respond` alone does not satisfy that requirement.
 
 ## DSL extensions
 
@@ -266,7 +266,7 @@ await agent("Implement the fix", { name: "implementation", isolation: "worktree"
 The runtime creates a deterministic owned branch/worktree, preserves the launch cwd's relative subdirectory, and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the worktree. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
 ## Delivery
 
-Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, duration, cost, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, ownership tree, agent states, model/thinking level, token accounting, and tool calls.
+Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, cost, model, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, the ownership tree, agent states, and each agent's current activity or running tool call.
 
 ## Global settings
 

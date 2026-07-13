@@ -435,7 +435,7 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
   try {
     const metadata = parseMetadata(args.script);
     return [`workflow ${metadata.name}`, metadata.description].filter(Boolean).join("\n");
-  } catch { return "workflow (invalid script)"; }
+  } catch { return "workflow composing..."; }
 }
 
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
@@ -1258,8 +1258,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           const resultPath = await store.saveResult(value);
           deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
         }, (error: unknown) => { deliver(pi, `Workflow ${checked.metadata.name} failed: ${error instanceof Error ? error.message : String(error)}`); });
-        const run = (await store.load()).run;
-        return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, run } };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` } };
       }
       const value = await finish;
       const run = (await store.load()).run;
@@ -1269,7 +1268,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       return textBlock(formatWorkflowPreview(args));
     },
     renderResult(result, { isPartial }, _theme, context) {
-      const details = result.details as { run?: PersistedRun; value?: JsonValue } | undefined;
+      const details = result.details as { run?: PersistedRun; value?: JsonValue; preview?: string } | undefined;
       const state = context.state as { workflowSpinner?: ReturnType<typeof setInterval> };
       if (details?.run && isPartial && details.run.state === "running" && !state.workflowSpinner) {
         state.workflowSpinner = setInterval(context.invalidate, 80);
@@ -1280,7 +1279,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       }
       if (details?.run) return workflowProgressBlock(details.run);
       const content = result.content[0];
-      return textBlock(isPartial ? "Workflow starting..." : content?.type === "text" ? content.text : "Workflow finished");
+      return textBlock(isPartial ? "Workflow starting..." : details?.preview ?? (content?.type === "text" ? content.text : "Workflow finished"));
     },
   });
   pi.registerCommand("workflow", {

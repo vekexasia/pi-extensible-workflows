@@ -17,7 +17,7 @@ void test("workflow call preview summarizes inline and registered workflows safe
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
   assert.equal(formatWorkflowPreview({ workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
   assert.equal(formatWorkflowPreview({ script: "", workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
-  assert.equal(formatWorkflowPreview({ script: "not javascript" }), "workflow (invalid script)");
+  assert.equal(formatWorkflowPreview({ script: "not javascript" }), "workflow composing...");
 });
 
 void test("registers the workflow tool and singular command", async () => {
@@ -258,8 +258,8 @@ void test("production checkpoints resolve in foreground navigator and background
   assert.deepEqual((await duplicateStore.awaitingCheckpoints()).map((checkpoint) => checkpoint.name).sort(), ["same", "same#2"]);
   assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same", approved: true }) as { details: { accepted: boolean } }).details.accepted, true);
   assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same#2", approved: false }) as { details: { accepted: boolean } }).details.accepted, true);
-  const background = await workflow.execute("id", { script }, new AbortController().signal, undefined, base) as { content: Array<{ text: string }> };
-  const { runId } = JSON.parse(background.content[0]?.text ?? "") as { runId: string };
+  const background = await workflow.execute("id", { script }, new AbortController().signal, undefined, base) as { details: { runId: string } };
+  const { runId } = background.details;
   let first: { details: { accepted: boolean } } | undefined;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     first = await respond.execute("id", { runId, name: "ship", approved: false }) as { details: { accepted: boolean } };
@@ -333,7 +333,7 @@ void test("a checkpoint answer persisted before resolver registration cannot han
 
 void test("background delivery is minimal and capped while foreground stays inline", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-delivery-"));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId: string } }> }> = [];
   const messages: Array<{ message: { content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
   let markDelivered!: () => void;
   const delivered = new Promise<void>((resolve) => { markDelivered = resolve; });
