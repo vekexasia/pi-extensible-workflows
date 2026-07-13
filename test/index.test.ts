@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -22,16 +22,121 @@ void test("registers the workflow tool and singular command", async () => {
     on() {},
   };
   workflowExtension(pi as never);
-  assert.deepEqual(tools.map(({ name }) => name), ["workflow"]);
+  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
-  const tool = tools[0];
+  const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
+void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
+  const accepted: unknown[] = [];
+  assert.equal(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, false);
+  assert.deepEqual(accepted, [{ name: "ship", prompt: "Ship?", context: { sha: "abc" } }]);
+  assert.throws(() => validateCheckpoint({ name: "x", prompt: "😀".repeat(257), context: null }), /1024/);
+  assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: "😀".repeat(1025) }), /4096/);
+  assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: null, default: true }), /only name/);
+});
+
+void test("production checkpoints resolve in foreground navigator and background tool paths", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-runtime-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const pi = {
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"],
+    sendMessage() {},
+  };
+  workflowExtension(pi as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(workflow && respond);
+  const base = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const script = `export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
+  let selections = 0;
+  const foreground = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, mode: "rpc", hasUI: true, ui: { select: async () => ++selections === 1 ? undefined : "Approve" } }) as { content: Array<{ text: string }> };
+  assert.equal(foreground.content[0]?.text, "true");
+  assert.equal(selections, 2);
+  await assert.rejects(workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: false }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  const teardown = new AbortController();
+  await assert.rejects(workflow.execute("id", { script, foreground: true }, teardown.signal, undefined, { ...base, hasUI: true, ui: { select: async () => { teardown.abort(); throw new Error("UI closed"); } } }), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  const duplicateScript = `export const meta={name:'duplicate-gate',description:'duplicate'}; return Promise.all([checkpoint({name:'first',prompt:'?',context:null,...{name:args.name}}),checkpoint({name:'second',prompt:'?',context:null,...{name:args.name}})]);`;
+  await assert.rejects(workflow.execute("id", { script: duplicateScript, args: { name: "same" }, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: true, ui: { select: async () => new Promise<string | undefined>(() => {}) } }), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+  const background = await workflow.execute("id", { script }, new AbortController().signal, undefined, base) as { content: Array<{ text: string }> };
+  const { runId } = JSON.parse(background.content[0]?.text ?? "") as { runId: string };
+  let first: { details: { accepted: boolean } } | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    first = await respond.execute("id", { runId, name: "ship", approved: false }) as { details: { accepted: boolean } };
+    if (first.details.accepted) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(first?.details.accepted, true);
+  const second = await respond.execute("id", { runId, name: "ship", approved: true }) as { details: { accepted: boolean } };
+  assert.equal(second.details.accepted, false);
+});
+
+void test("two concurrent checkpoints keep the run awaiting until both are answered", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-concurrent-checkpoints-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const pi = { registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], sendMessage() {} };
+  workflowExtension(pi as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(workflow && respond);
+  const script = `export const meta={name:'gates',description:'gates'}; return Promise.all([checkpoint({name:'one',prompt:'One?',context:null}),checkpoint({name:'two',prompt:'Two?',context:null})]);`;
+  const launched = await workflow.execute("id", { script }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
+  const store = new RunStore(home, "session", launched.details.runId, home);
+  for (let attempt = 0; attempt < 100 && (await store.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "awaiting_input"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await store.awaitingCheckpoints()).length, 2);
+  assert.equal((await respond.execute("id", { runId: launched.details.runId, name: "one", approved: true }) as { details: { accepted: boolean } }).details.accepted, true);
+  assert.equal((await store.load()).run.state, "awaiting_input");
+  assert.equal((await respond.execute("id", { runId: launched.details.runId, name: "two", approved: false }) as { details: { accepted: boolean } }).details.accepted, true);
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await store.load()).run.state, "completed");
+});
+
+void test("a checkpoint answer persisted before resolver registration cannot hang", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-race-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  let completed!: () => void;
+  const completion = new Promise<void>((resolve) => { completed = resolve; });
+  const pi = {
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"],
+    sendMessage(message: { content: string }) { if (message.content.startsWith("Workflow race-gate completed:")) completed(); },
+  };
+  workflowExtension(pi as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(workflow && respond);
+  let releaseRunId!: (runId: string) => void;
+  const runIdReady = new Promise<string>((resolve) => { releaseRunId = resolve; });
+  const saveState = Object.getOwnPropertyDescriptor(RunStore.prototype, "saveState")?.value as RunStore["saveState"];
+  let answered = false;
+  RunStore.prototype.saveState = async function (run) {
+    await saveState.call(this, run);
+    if (!answered && run.state === "awaiting_input" && this.cwd === home) {
+      answered = true;
+      const response = await respond.execute("id", { runId: await runIdReady, name: "ship", approved: false }) as { details: { accepted: boolean } };
+      assert.equal(response.details.accepted, true);
+    }
+  };
+  const timeout = setTimeout(() => { completed(); }, 2000);
+  try {
+    const result = await workflow.execute("id", { script: `export const meta={name:'race-gate',description:'race gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:null});` }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
+    releaseRunId(result.details.runId);
+    await completion;
+    assert.equal(answered, true);
+    assert.equal((await new RunStore(home, "session", result.details.runId, home).load()).run.state, "completed");
+  } finally {
+    clearTimeout(timeout);
+    RunStore.prototype.saveState = saveState;
+  }
+});
+
 void test("background delivery is minimal and capped while foreground stays inline", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-delivery-"));
-  const tools: Array<{ execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
   const messages: Array<{ message: { content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
   let markDelivered!: () => void;
   const delivered = new Promise<void>((resolve) => { markDelivered = resolve; });
@@ -41,7 +146,7 @@ void test("background delivery is minimal and capped while foreground stays inli
     sendMessage(message: { content: string }, options: { deliverAs: string; triggerTurn: boolean }) { messages.push({ message, options }); markDelivered(); }
   };
   workflowExtension(pi as never, home);
-  const execute = tools[0]?.execute;
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
   const ctx = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   const background = await execute("id", { script: `export const meta={name:"large",description:"large"}; return "😀".repeat(5000);` }, new AbortController().signal, undefined, ctx);
@@ -76,6 +181,32 @@ void test("run lifecycle pauses cooperatively, resumes waiters, and keeps termin
   await lifecycle.terminal("stopped");
   await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   assert.deepEqual(states, ["pausing", "paused", "running", "stopped"]);
+});
+
+void test("run lifecycle waits for resume before awaiting input and wakes on resolution", async () => {
+  const pausedStates: string[] = [];
+  const paused = new RunLifecycle("running", (state) => { pausedStates.push(state); });
+  await paused.pause();
+  let awaiting = false;
+  const transition = paused.enterAwaitingInput().then(() => { awaiting = true; });
+  assert.equal(awaiting, false);
+  await paused.resume();
+  await transition;
+  assert.equal(paused.state, "awaiting_input");
+  assert.deepEqual(pausedStates, ["pausing", "paused", "running", "awaiting_input"]);
+
+  const states: string[] = [];
+  const lifecycle = new RunLifecycle("running", (state) => { states.push(state); });
+  await lifecycle.enterAwaitingInput();
+  await lifecycle.enterAwaitingInput();
+  let entered = false;
+  const waiting = lifecycle.enter().then(() => { entered = true; });
+  await assert.rejects(lifecycle.pause(), /Cannot pause awaiting_input/);
+  assert.equal(entered, false);
+  await lifecycle.resolveAwaitingInput();
+  await waiting;
+  await lifecycle.leave();
+  assert.deepEqual(states, ["awaiting_input", "running"]);
 });
 
 void test("interrupted lifecycle can cold-resume while completed and failed cannot", async () => {

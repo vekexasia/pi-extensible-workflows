@@ -33,6 +33,33 @@ void test("production session_start cold-restores ownership and /workflow stop c
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
 });
 
+void test("cold recovery delivers a persisted checkpoint only once before replay", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-recovery-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
+  const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const messages: string[] = [];
+  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool(tool: never) { tools.push(tool); }, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], sendMessage(message: { content: string }) { messages.push(message.content); } } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  assert.match(messages[0] ?? "", /Ship\?/);
+  await command("resume run-a", ctx);
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "awaiting_input"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.length, 1);
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(respond);
+  assert.equal((await respond.execute(undefined as never, { runId: "run-a", name: "ship", approved: true } as never)).details.accepted, true);
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await store.load()).run.state, "completed");
+  assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
+});
+
 void test("production lifecycle commands persist pause, resume, and Pi-close interruption", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
   const cwd = join(home, "project");

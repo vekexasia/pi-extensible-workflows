@@ -62,6 +62,21 @@ void test("journals stable structural paths and replays only completed operation
   await assert.rejects(store.complete(path, null), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
 });
 
+void test("persists awaiting checkpoints and atomically accepts only the first answer", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const checkpoint = { path: structuralPath("checkpoint", "ship"), name: "ship", prompt: "Ship?", context: { sha: "abc" } };
+  assert.equal(await store.awaitCheckpoint(checkpoint), undefined);
+  assert.deepEqual(await new RunStore(cwd, "session-a", "run-a", home).awaitingCheckpoints(), [checkpoint]);
+  const answers = await Promise.all([store.answerCheckpoint("ship", true), store.answerCheckpoint("ship", false)]);
+  assert.equal(answers.filter(Boolean).length, 1);
+  assert.deepEqual(await store.replay(checkpoint.path), { path: checkpoint.path, value: true });
+  assert.equal(await store.awaitCheckpoint(checkpoint), true);
+  assert.deepEqual(await store.awaitingCheckpoints(), []);
+});
+
 void test("creates deterministic snapshot worktrees, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-"));
   const repo = join(home, "repo");

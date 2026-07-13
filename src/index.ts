@@ -63,7 +63,7 @@ export class RunLifecycle {
   get state(): RunState { return this.#state; }
 
   async enter(): Promise<void> {
-    while (this.#state === "pausing" || this.#state === "paused") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
+    while (this.#state === "pausing" || this.#state === "paused" || this.#state === "awaiting_input") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
     if (this.#state !== "running") throw new WorkflowError("CANCELLED", `Run is ${this.#state}`);
     this.#active += 1;
   }
@@ -71,6 +71,19 @@ export class RunLifecycle {
   async leave(): Promise<void> {
     if (this.#active > 0) this.#active -= 1;
     if (this.#state === "pausing" && this.#active === 0) await this.#set("paused");
+  }
+
+  async enterAwaitingInput(): Promise<void> {
+    while (this.#state === "pausing" || this.#state === "paused") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
+    if (this.#state === "awaiting_input") return;
+    if (this.#state !== "running") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot await input for ${this.#state} run`);
+    await this.#set("awaiting_input");
+  }
+
+  async resolveAwaitingInput(): Promise<void> {
+    if (this.#state !== "awaiting_input") return;
+    await this.#set("running");
+    for (const resolve of this.#waiters.splice(0)) resolve();
   }
 
   async pause(): Promise<void> {
@@ -105,6 +118,14 @@ export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ conc
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function positiveInteger(value: unknown): value is number { return Number.isInteger(value) && (value as number) > 0; }
+
+export interface CheckpointInput { name: string; prompt: string; context: JsonValue }
+export function validateCheckpoint(value: unknown): CheckpointInput {
+  if (!object(value) || Object.keys(value).some((key) => !["name", "prompt", "context"].includes(key)) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.prompt !== "string" || !jsonValue(value.context)) fail("INVALID_METADATA", "checkpoint requires only name, prompt, and JSON context");
+  if (Buffer.byteLength(value.prompt) > 1024) fail("INVALID_METADATA", "checkpoint prompt exceeds 1024 UTF-8 bytes");
+  if (Buffer.byteLength(JSON.stringify(value.context)) > 4096) fail("INVALID_METADATA", "checkpoint context exceeds 4096 UTF-8 bytes");
+  return { name: value.name, prompt: value.prompt, context: value.context };
+}
 
 export function loadSettings(path = join(homedir(), ".pi", "workflows", "settings.json")): Readonly<WorkflowSettings> {
   let parsed: unknown;
@@ -564,7 +585,7 @@ function deliver(pi: ExtensionAPI, content: string): void {
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution }>();
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void> }>();
   const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => { const loaded = await store.load(); await store.saveState({ ...loaded.run, state: next }); });
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
@@ -590,6 +611,58 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     });
     await run.store.saveState({ ...loaded.run, agents });
   });
+  const answerCheckpoint = async (runId: string, name: string, approved: boolean) => {
+    const run = runs.get(runId);
+    if (!run) return false;
+    const checkpoint = await run.store.answerCheckpoint(name, approved);
+    if (!checkpoint) return false;
+    if ((await run.store.awaitingCheckpoints()).length === 0) await run.lifecycle.resolveAwaitingInput();
+    run.checkpointResolvers.get(checkpoint.path)?.(approved);
+    run.checkpointResolvers.delete(checkpoint.path);
+    deliver(pi, `Workflow ${run.metadata.name} checkpoint ${name}: ${approved ? "Approved" : "Rejected"}.`);
+    return true;
+  };
+  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
+    const input = validateCheckpoint(raw);
+    const path = operationPath("checkpoint", input.name);
+    if (foreground && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
+    const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
+    const replayed = await store.awaitCheckpoint({ path, ...input });
+    if (replayed !== undefined) return replayed;
+    const run = runs.get(runId);
+    await run?.lifecycle.enterAwaitingInput();
+    if (run?.checkpointResolvers.has(path)) fail("DUPLICATE_NAME", `Checkpoint ${input.name} is already active`);
+    if (!alreadyAwaiting) deliver(pi, `Workflow ${metadata.name} checkpoint ${input.name}: ${input.prompt}\nContext: ${JSON.stringify(input.context)}\nRespond with workflow_respond.`);
+    const decision = new Promise<boolean>((resolve, reject) => {
+      run?.checkpointResolvers.set(path, resolve);
+      if (signal.aborted) reject(new WorkflowError("CANCELLED", "Workflow cancelled"));
+      else signal.addEventListener("abort", () => { run?.checkpointResolvers.delete(path); reject(new WorkflowError("CANCELLED", "Workflow cancelled")); }, { once: true });
+    });
+    const answered = await store.awaitCheckpoint({ path, ...input });
+    if (answered !== undefined) {
+      if ((await store.awaitingCheckpoints()).length === 0) await run?.lifecycle.resolveAwaitingInput();
+      run?.checkpointResolvers.get(path)?.(answered);
+      run?.checkpointResolvers.delete(path);
+    }
+    if (ui?.select) void (async () => {
+      while (!signal.aborted && run?.checkpointResolvers.has(path)) {
+        const choice = await ui.select?.(input.prompt, ["Approve", "Reject"]);
+        if (choice && await answerCheckpoint(runId, input.name, choice === "Approve")) return;
+      }
+    })().catch(() => undefined);
+    return decision;
+  };
+
+  pi.registerTool({
+    name: "workflow_respond",
+    label: "Workflow Respond",
+    description: "Approve or reject one pending workflow checkpoint",
+    parameters: Type.Object({ runId: Type.String(), name: Type.String(), approved: Type.Boolean() }, { additionalProperties: false }),
+    async execute(_id, params) {
+      const accepted = await answerCheckpoint(params.runId, params.name, params.approved);
+      return { content: [{ type: "text" as const, text: accepted ? "Checkpoint response accepted." : "Checkpoint is not awaiting a response." }], details: { accepted } };
+    },
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     for (const runId of await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)) {
@@ -600,7 +673,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle, checkpointResolvers: new Map() });
+      for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
   });
@@ -622,7 +696,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const defaults = loadSettings();
       const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents, agentTimeoutMs: params.agentTimeoutMs === undefined ? defaults.agentTimeoutMs : params.agentTimeoutMs });
       const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
-      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow");
+      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
       const checked = preflight(params.script, { models: new Set([`${rootModel.provider}/${rootModel.model}`]), tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
@@ -632,7 +706,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store, providerPause });
-      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle });
+      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map() });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
       const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
@@ -654,7 +728,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { await lifecycle.leave(); }
-      }, phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, signal);
+      }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
       if (background) {
@@ -677,7 +751,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (action === "resume" && run) {
         if (run.lifecycle.state === "interrupted") {
           const loaded = await run.store.load();
-          const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow"));
+          const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond"));
           const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
           if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
           preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
@@ -701,8 +775,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
               await run.store.complete(path, outcome.value);
               return outcome.value;
             } finally { await run.lifecycle.leave(); }
-          }, phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } });
-          run.execution = execution;
+          }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } });
           void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
         } else await run.lifecycle.resume();
         ctx.ui.notify(`Resumed workflow ${run.store.runId}.`, "info"); return;
@@ -731,6 +804,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
-export type { CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
+export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";

@@ -11,8 +11,9 @@ import { createLaunchSnapshot, WorkflowError } from "./index.js";
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
+export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
 export type PersistedOwnershipNode = OwnershipRecord
-type Journal = { completed: Record<string, CompletedOperation> };
+type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint> };
 export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
 
 const execute = promisify(execFile);
@@ -66,7 +67,7 @@ export class RunStore {
     await mkdir(dirname(this.directory), { recursive: true, mode: 0o700 });
     await mkdir(this.directory, { mode: 0o700 });
     await atomicJson(join(this.directory, "snapshot.json"), snapshot);
-    await atomicJson(join(this.directory, "journal.json"), { completed: {} });
+    await atomicJson(join(this.directory, "journal.json"), { completed: {}, awaiting: {} });
     await atomicJson(join(this.directory, "ownership.json"), []);
     await atomicJson(join(this.directory, "state.json"), run);
   }
@@ -90,20 +91,55 @@ export class RunStore {
     return json<readonly PersistedOwnershipNode[]>(join(this.directory, "ownership.json"));
   }
 
-  async complete(path: string, value: JsonValue): Promise<void> {
+  private async updateJournal<T>(update: (journal: Journal) => T | Promise<T>): Promise<T> {
+    let result!: T;
     const write = this.journalWrite.then(async () => {
       const journalPath = join(this.directory, "journal.json");
       const journal = await json<Journal>(journalPath);
-      if (journal.completed[path]) throw new WorkflowError("DUPLICATE_NAME", `Completed structural path already exists: ${path}`);
-      journal.completed[path] = { path, value };
+      journal.awaiting ??= {};
+      result = await update(journal);
       await atomicJson(journalPath, journal);
     });
     this.journalWrite = write.catch(() => undefined);
-    return write;
+    await write;
+    return result;
+  }
+
+  async complete(path: string, value: JsonValue): Promise<void> {
+    await this.updateJournal((journal) => {
+      if (journal.completed[path]) throw new WorkflowError("DUPLICATE_NAME", `Completed structural path already exists: ${path}`);
+      journal.completed[path] = { path, value };
+    });
   }
 
   async replay(path: string): Promise<CompletedOperation | undefined> {
+    await this.journalWrite;
     return (await json<Journal>(join(this.directory, "journal.json"))).completed[path];
+  }
+
+  async awaitCheckpoint(checkpoint: AwaitingCheckpoint): Promise<boolean | undefined> {
+    return this.updateJournal((journal) => {
+      const completed = journal.completed[checkpoint.path];
+      if (completed) return completed.value as boolean;
+      (journal.awaiting as Record<string, AwaitingCheckpoint>)[checkpoint.path] = checkpoint;
+      return undefined;
+    });
+  }
+
+  async awaitingCheckpoints(): Promise<readonly AwaitingCheckpoint[]> {
+    await this.journalWrite;
+    const journal = await json<Journal>(join(this.directory, "journal.json"));
+    return Object.values(journal.awaiting ?? {});
+  }
+
+  async answerCheckpoint(name: string, approved: boolean): Promise<AwaitingCheckpoint | undefined> {
+    return this.updateJournal((journal) => {
+      const checkpoint = Object.values(journal.awaiting as Record<string, AwaitingCheckpoint>).find((item) => item.name === name);
+      if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
+      journal.completed[checkpoint.path] = { path: checkpoint.path, value: approved };
+      journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting as Record<string, AwaitingCheckpoint>).filter(([path]) => path !== checkpoint.path));
+      return checkpoint;
+    });
   }
 
   private expectedWorktree(owner: string): Pick<WorktreeReference, "path" | "branch"> {
