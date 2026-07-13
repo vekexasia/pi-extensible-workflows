@@ -33,6 +33,29 @@ void test("production session_start cold-restores ownership and /workflow stop c
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
 });
 
+void test("production lifecycle commands persist pause, resume, and Pi-close interruption", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const ctx = { cwd, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; if (name === "session_shutdown") shutdown = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && shutdown && command);
+  await start({}, ctx);
+  await command("pause run-a", ctx);
+  assert.equal((await store.load()).run.state, "paused");
+  await command("resume run-a", ctx);
+  assert.equal((await store.load()).run.state, "running");
+  await shutdown();
+  assert.equal((await store.load()).run.state, "interrupted");
+  await command("resume run-a", ctx);
+  for (let attempt = 0; attempt < 20 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await store.load()).run.state, "completed");
+});
+
 void test("production Pi seam installs child tools and registers native steering", async () => {
   const childTool = { name: "agent", label: "Child", description: "child", parameters: Type.Object({}), async execute() { return { content: [{ type: "text" as const, text: "ok" }], details: {} }; } };
   const session = await createNativeAgentSession({ cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], customTools: [childTool], sessionLabel: "issue-9-acceptance" });

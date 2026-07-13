@@ -33,6 +33,7 @@ export interface AgentExecutionRoot {
   tools: ReadonlySet<string>;
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
   runStore?: RunStore;
+  providerPause?: () => Promise<void>;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
@@ -154,13 +155,13 @@ export class WorkflowAgentExecutor {
           setSteer((message) => session?.steer?.(message));
         }
         const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", resolved.rolePrompt, attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
-        await withTimeout(session.prompt(`${context}\n\nTask:\n${task}`), remaining(options.timeoutMs, started), signal, session);
+        await promptWithProviderPause(session, `${context}\n\nTask:\n${task}`, remaining(options.timeoutMs, started), signal, this.root.providerPause);
         if (options.schema) {
           accepted = true;
-          try { await withTimeout(session.prompt("Submit the final result now by calling workflow_result exactly once. Do not return prose."), remaining(options.timeoutMs, started), signal, session); }
+          try { await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), signal, this.root.providerPause); }
           catch (error) { if (!hasSchemaResult()) throw error; }
           if (!hasSchemaResult()) {
-            try { await withTimeout(session.prompt("Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value."), remaining(options.timeoutMs, started), signal, session); }
+            try { await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), signal, this.root.providerPause); }
             catch (error) { if (!hasSchemaResult()) throw error; }
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
@@ -443,6 +444,19 @@ function requiredFile(file: string | undefined): string {
 
 function remaining(timeoutMs: number | null | undefined, started: number): number | null | undefined {
   return timeoutMs === null || timeoutMs === undefined ? timeoutMs : Math.max(1, timeoutMs - (Date.now() - started));
+}
+
+function providerLimited(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { status?: unknown; code?: unknown };
+  return candidate.status === 429 || candidate.code === 429 || candidate.code === "rate_limit_exceeded" || candidate.code === "RATE_LIMITED";
+}
+
+async function promptWithProviderPause(session: NativeSession, text: string, timeoutMs: number | null | undefined, signal: AbortSignal | undefined, pause?: () => Promise<void>): Promise<void> {
+  for (;;) {
+    try { await withTimeout(session.prompt(text), timeoutMs, signal, session); return; }
+    catch (error) { if (!pause || !providerLimited(error)) throw error; await pause(); }
+  }
 }
 
 async function withTimeout(work: Promise<void>, timeoutMs: number | null | undefined, signal: AbortSignal | undefined, session: NativeSession): Promise<void> {
