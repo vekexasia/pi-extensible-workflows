@@ -102,6 +102,44 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   assert.deepEqual(phases, ["build"]);
 });
 
+void test("named parallel and pipeline preserve order, contain failures, and expose stable paths", async () => {
+  const pending = new Map<string, (value: JsonValue) => void>();
+  const started: string[] = [];
+  const bridge = {
+    agent(prompt: string) {
+      started.push(prompt);
+      if (prompt === "fail") throw new WorkflowError("AGENT_FAILED", "expected failure");
+      return new Promise<JsonValue>((resolve) => { pending.set(prompt, resolve); });
+    },
+  };
+  const parallelRun = runWorkflow(`export const meta={name:'x',description:'x'};
+    return parallel([
+      {name:'first/item',run:()=>agent('slow',{name:'slow'})},
+      {name:'second',run:()=>agent('fast',{name:'fast'})},
+      {name:'broken',run:()=>agent('fail',{name:'fail'})}
+    ],{name:'batch'});`, null, bridge);
+  while (started.length < 3) await new Promise((resolve) => setImmediate(resolve));
+  pending.get("fast")?.(2); pending.get("slow")?.(1);
+  assert.deepEqual(await parallelRun.result, [
+    { name: "first/item", ok: true, value: 1 },
+    { name: "second", ok: true, value: 2 },
+    { name: "broken", ok: false, failedAt: "batch/broken", error: { code: "AGENT_FAILED", message: "expected failure" } },
+  ]);
+
+  const pipelineRun = runWorkflow(`export const meta={name:'x',description:'x'};
+    return pipeline([{name:'one',value:1},{name:'two',value:2}],
+      {name:'double',run:value=>value*2},
+      {name:'reject odd',run:value=>{if(value===2)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value+1}},
+      {name:'pipe/name'});`);
+  assert.deepEqual(await pipelineRun.result, [
+    { name: "one", ok: false, failedAt: "pipe%2Fname/one/reject%20odd", error: { code: "AGENT_FAILED", message: "no" } },
+    { name: "two", ok: true, value: 5 },
+  ]);
+
+  const duplicate = runWorkflow(`export const meta={name:'x',description:'x'}; return parallel([{name:'same',run:()=>1},{name:'same',run:()=>2}],{name:'batch'});`);
+  await assert.rejects(duplicate.result, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+});
+
 void test("worker cancellation is immediate even for runaway synchronous code", async () => {
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; while(true){}`);
   const started = performance.now();

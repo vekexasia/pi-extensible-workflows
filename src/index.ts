@@ -367,13 +367,46 @@ parentPort.on("message", raw => {
 });
 const heartbeat = setInterval(() => send({ type: "heartbeat" }), 1000);
 send({ type: "heartbeat" });
+const workError = (code, message) => Object.assign(new Error(message), { code });
 const failure = (name, failedAt, error) => ({ name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message } });
+const named = (value, kind) => { if (!value || typeof value.name !== "string" || !value.name.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value.name; };
+const unique = (values, kind) => { const names = values.map(value => named(value, kind)); if (new Set(names).size !== names.length) throw workError("DUPLICATE_NAME", "Duplicate " + kind + " name"); return names; };
+const path = (...names) => names.map(encodeURIComponent).join("/");
 const agent = (prompt, options = {}) => rpc("agent", [prompt, options]);
 const checkpoint = input => rpc("checkpoint", [input]);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
-const parallel = async tasks => Promise.all(tasks.map(async task => { try { return { name: task.name, ok: true, value: await task.run() }; } catch (error) { if (error.code === "CANCELLED") throw error; return failure(task.name, task.name, error); } }));
-const pipeline = async (items, ...stages) => Promise.all(items.map(async item => { let value = item.value; let failedAt = item.name; try { for (const stage of stages) { failedAt = stage.name; value = await stage.run(value); } return { name: item.name, ok: true, value }; } catch (error) { if (error.code === "CANCELLED") throw error; return failure(item.name, failedAt, error); } }));
+const parallel = async (tasks, operation) => {
+  const operationName = named(operation, "parallel");
+  if (!Array.isArray(tasks)) throw workError("INVALID_METADATA", "parallel tasks must be an array");
+  const taskNames = unique(tasks, "parallel task");
+  return Promise.all(tasks.map(async (task, index) => {
+    const name = taskNames[index];
+    const failedAt = path(operationName, name);
+    try { return { name, ok: true, value: await task.run() }; }
+    catch (error) { if (error.code === "CANCELLED") throw error; return failure(name, failedAt, error); }
+  }));
+};
+const pipeline = async (items, ...parts) => {
+  const operation = parts.pop();
+  const operationName = named(operation, "pipeline");
+  if (!Array.isArray(items)) throw workError("INVALID_METADATA", "pipeline items must be an array");
+  const itemNames = unique(items, "pipeline item");
+  const stageNames = unique(parts, "pipeline stage");
+  if (!stageNames.length) throw workError("INVALID_METADATA", "pipeline requires at least one named stage");
+  return Promise.all(items.map(async (item, index) => {
+    const name = itemNames[index];
+    let value = item.value;
+    let failedAt = path(operationName, name);
+    try {
+      for (let stageIndex = 0; stageIndex < parts.length; stageIndex += 1) {
+        failedAt = path(operationName, name, stageNames[stageIndex]);
+        value = await parts[stageIndex].run(value);
+      }
+      return { name, ok: true, value };
+    } catch (error) { if (error.code === "CANCELLED") throw error; return failure(name, failedAt, error); }
+  }));
+};
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
 const sandbox = { agent, checkpoint, parallel, pipeline, phase, log, args: workerData.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
 
@@ -73,6 +73,23 @@ void test("concurrency-1 cancellation and nested containment retain accounting a
   const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => { const current = ++attempt; return { sessionId: `s${String(current)}`, sessionFile: `/s${String(current)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } } }], prompt: async () => { if (current === 1) throw new Error("retry"); }, dispose() {} }; });
   const retried = await executor.execute("retry", { label: "retry", workflowName: "flow", workflowDescription: "flow", retries: 1, timeoutMs: 100 }, undefined, [], undefined, () => { cleaned += 1; });
   assert.equal(cleaned, 1); assert.equal(retried.attempts.length, 2); assert.deepEqual(retried.attempts.map(({ accounting }) => accounting.cost), [0.5, 0.5]);
+});
+
+void test("production worker runs named combinators with railway lifecycle semantics", async () => {
+  const controller = new AbortController();
+  let cancelStarted!: () => void;
+  const started = new Promise<void>((resolve) => { cancelStarted = resolve; });
+  const run = runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
+    return parallel([{name:'waiting',run:()=>agent('wait',{name:'wait'})},{name:'failure',run:()=>{throw Object.assign(new Error('branch failed'),{code:'AGENT_FAILED'})}}],{name:'batch'});`, null, {
+    agent: async (_prompt, _options, signal) => { cancelStarted(); await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); }); throw new WorkflowError("CANCELLED", "cancelled"); },
+  }, controller.signal);
+  await started;
+  controller.abort();
+  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+
+  assert.deepEqual(await runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
+    return pipeline([{name:'first',value:1},{name:'second',value:2}],{name:'double',run:value=>value*2},{name:'fail-two',run:value=>{if(value===4)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value}},{name:'pipe'});`).result,
+  [{ name: "first", ok: true, value: 2 }, { name: "second", ok: false, failedAt: "pipe/second/fail-two", error: { code: "AGENT_FAILED", message: "no" } }]);
 });
 
 void test("terminal failed attempts remain persisted", async () => {
