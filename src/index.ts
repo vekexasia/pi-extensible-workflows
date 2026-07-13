@@ -1,14 +1,14 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { Script } from "node:vm";
 import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt, type AgentProgress } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -50,7 +50,8 @@ export interface WorkflowOrchestrationContext {
   log: (message: string) => void;
 }
 export interface WorkflowDslMethod { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowOrchestrationContext>) => Promise<JsonValue> | JsonValue }
-export interface WorkflowDslExtension { name: string; version: string; headline: string; description: string; methods: Readonly<Record<string, WorkflowDslMethod>> }
+export interface WorkflowScriptDefinition { description: string; script: string }
+export interface WorkflowDslExtension { name: string; version: string; headline: string; description: string; methods?: Readonly<Record<string, WorkflowDslMethod>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>> }
 export interface WorkflowMacroJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
 export class WorkflowError extends Error {
@@ -157,6 +158,40 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
   return Object.freeze({ concurrency, maxAgents, agentTimeoutMs });
 }
 
+function parseRoleMarkdown(content: string): AgentDefinition {
+  if (!content.startsWith("---\n")) return { prompt: content };
+  const end = content.indexOf("\n---", 4);
+  if (end < 0) return { prompt: content };
+  const meta: Record<string, string> = {};
+  for (const line of content.slice(4, end).split("\n")) {
+    const match = /^(model|thinking|tools)\s*:\s*(.+)$/.exec(line.trim());
+    if (match?.[1] && match[2]) meta[match[1]] = match[2].trim();
+  }
+  const tools = meta.tools ? meta.tools.replace(/^\[|\]$/g, "").split(",").map((tool) => tool.trim().replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "")).filter(Boolean) : undefined;
+  const thinking = meta.thinking?.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
+  if (thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) fail("INVALID_METADATA", `Invalid role thinking level: ${thinking}`);
+  const definition: AgentDefinition = { prompt: content.slice(end + 4).replace(/^\n/, "") };
+  if (meta.model) definition.model = meta.model.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
+  if (thinking) definition.thinking = thinking as NonNullable<AgentDefinition["thinking"]>;
+  if (tools) definition.tools = tools;
+  return definition;
+}
+
+function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
+  try {
+    return Object.fromEntries(readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && extname(entry.name) === ".md")
+      .map((entry) => [basename(entry.name, ".md"), parseRoleMarkdown(readFileSync(join(dir, entry.name), "utf8"))]));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+export function loadAgentDefinitions(cwd: string, agentDir = join(homedir(), ".pi", "agent")): Readonly<Record<string, AgentDefinition>> {
+  return deepFreeze({ ...readAgentDefinitions(join(agentDir, "agents")), ...readAgentDefinitions(join(cwd, ".pi", "agents")) });
+}
+
 const AST_DEPTH_LIMIT = 8;
 
 function astToValue(node: acorn.AnyNode, depth = 0): unknown {
@@ -255,15 +290,32 @@ export class WorkflowDslRegistry {
   readonly #extensions = new Map<string, Readonly<WorkflowDslExtension>>();
 
   register(extension: WorkflowDslExtension): void {
-    if (!object(extension) || !/^[A-Za-z_$][\w$]*$/.test(extension.name) || !/^\d+\.\d+\.\d+$/.test(extension.version) || !extension.headline.trim() || !extension.description.trim() || !object(extension.methods) || Object.keys(extension.methods).length === 0) fail("INVALID_METADATA", "Workflow DSL extensions require a name, semantic version, headline, description, and methods");
+    if (!object(extension) || !/^[A-Za-z_$][\w$]*$/.test(extension.name) || !/^\d+\.\d+\.\d+$/.test(extension.version) || !extension.headline.trim() || !extension.description.trim()) fail("INVALID_METADATA", "Workflow DSL extensions require a name, semantic version, headline, and description");
+    const methods = extension.methods ?? {};
+    const workflows = extension.workflows ?? {};
+    if (!object(methods) || !object(workflows) || (Object.keys(methods).length === 0 && Object.keys(workflows).length === 0)) fail("INVALID_METADATA", "Workflow DSL extensions require methods or workflows");
     if (this.#extensions.has(extension.name)) fail("DUPLICATE_NAME", `Workflow DSL extension already registered: ${extension.name}`);
-    for (const [name, method] of Object.entries(extension.methods)) {
+    for (const [name, method] of Object.entries(methods)) {
       if (!/^[A-Za-z_$][\w$]*$/.test(name) || !object(method) || typeof method.description !== "string" || method.description.trim() === "" || typeof method.run !== "function") fail("INVALID_METADATA", `Invalid workflow DSL method: ${extension.name}.${name}`);
       validateSchema(method.input, `${extension.name}.${name} input`);
       validateSchema(method.output, `${extension.name}.${name} output`);
       if (method.input.type !== "object") fail("INVALID_SCHEMA", `${extension.name}.${name} input must describe one object`);
     }
-    this.#extensions.set(extension.name, deepFreeze(extension));
+    for (const [name, workflow] of Object.entries(workflows)) {
+      if (!/^[A-Za-z0-9][\w.-]*$/.test(name) || !object(workflow) || typeof workflow.description !== "string" || workflow.description.trim() === "" || typeof workflow.script !== "string" || workflow.script.trim() === "") fail("INVALID_METADATA", `Invalid workflow script: ${extension.name}.${name}`);
+      parseMetadata(workflow.script);
+    }
+    this.#extensions.set(extension.name, deepFreeze({ ...extension, methods, workflows }));
+  }
+
+  workflows(): Readonly<Record<string, WorkflowScriptDefinition>> {
+    return Object.freeze(Object.fromEntries([...this.#extensions].flatMap(([extensionName, extension]) => Object.entries(extension.workflows ?? {}).map(([name, workflow]) => [`${extensionName}.${name}`, workflow]))));
+  }
+
+  workflow(name: string): WorkflowScriptDefinition {
+    const workflow = this.workflows()[name];
+    if (!workflow) fail("MISSING_EXTENSION", `Workflow script is unavailable: ${name}`);
+    return workflow;
   }
 
   versions(): Readonly<Record<string, string>> {
@@ -271,12 +323,12 @@ export class WorkflowDslRegistry {
   }
 
   namespaces(): Readonly<Record<string, Readonly<Record<string, WorkflowDslMethod>>>> {
-    return Object.freeze(Object.fromEntries([...this.#extensions].map(([name, extension]) => [name, extension.methods])));
+    return Object.freeze(Object.fromEntries([...this.#extensions].map(([name, extension]) => [name, extension.methods ?? {}])));
   }
 
   async invoke(extensionName: string, methodName: string, input: unknown, context: WorkflowOrchestrationContext, path: string, journal: WorkflowMacroJournal): Promise<JsonValue> {
     const extension = this.#extensions.get(extensionName);
-    const method = extension?.methods[methodName];
+    const method = extension?.methods?.[methodName];
     if (!method) fail("MISSING_EXTENSION", `Workflow DSL method is unavailable: ${extensionName}.${methodName}`);
     if (!object(input) || !jsonValue(input) || !Value.Check(method.input, input)) fail("RESULT_INVALID", `Invalid input for ${extensionName}.${methodName}`);
     const replayed = journal.get(path);
@@ -386,12 +438,9 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (stages.length === 0 || stages.some((stage) => !named(stage))) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
     if (!named(operation)) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
   }
-  const names = namedCalls.flatMap(({ body }) => stringsFor(body, "name").concat(stringsFor(body, "label")));
-  const duplicate = names.find((name, index) => names.indexOf(name) !== index);
-  if (duplicate) fail("DUPLICATE_NAME", `Duplicate stable name: ${duplicate}`);
   const models = stringsFor(script, "model").map(modelCapability);
   const tools = [...script.matchAll(/\btools\s*:\s*\[([^\]]*)\]/g)].flatMap((match) => [...((match[1] ?? "").matchAll(/(["'])((?:\\.|(?!\1).)*)\1/g))].map((item) => item[2] ?? ""));
-  const agentTypes = stringsFor(script, "agentType");
+  const agentTypes = callsFor(script, "agent").flatMap((body) => [...stringsFor(body, "agentType"), ...stringsFor(body, "role")]);
   const missingModel = models.find((model) => !capabilities.models.has(model));
   if (missingModel) fail("UNKNOWN_MODEL", `Unknown model: ${missingModel}`);
   const missingTool = tools.find((tool) => !capabilities.tools.has(tool));
@@ -481,7 +530,8 @@ const BRAND = "${WORK_RESULT_BRAND}";
 const workError = (code, message) => Object.assign(new Error(message), { code });
 const isBranded = value => value && typeof value === "object" && value[BRAND] === true;
 const named = (value, kind) => { if (!value || typeof value.name !== "string" || !value.name.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value.name; };
-const unique = (values, kind) => { const names = values.map(value => named(value, kind)); if (new Set(names).size !== names.length) throw workError("DUPLICATE_NAME", "Duplicate " + kind + " name"); return names; };
+const names = (values, kind) => values.map(value => named(value, kind));
+const occurrenceLabels = values => { const seen = new Map(); return values.map(value => { const count = (seen.get(value) || 0) + 1; seen.set(value, count); return count === 1 ? value : value + "#" + count; }); };
 const path = (...names) => names.map(encodeURIComponent).join("/");
 const agent = (prompt, options = {}) => rpc("agent", [prompt, options]);
 const checkpoint = input => rpc("checkpoint", [input]);
@@ -491,13 +541,14 @@ const extensions = Object.freeze(Object.fromEntries(Object.entries(config.extens
 const parallel = async (tasks, operation) => {
   const operationName = named(operation, "parallel");
   if (!Array.isArray(tasks)) throw workError("INVALID_METADATA", "parallel tasks must be an array");
-  const taskNames = unique(tasks, "parallel task");
+  const taskNames = names(tasks, "parallel task");
+  const taskPaths = occurrenceLabels(taskNames);
   return Promise.all(tasks.map(async (task, index) => {
     const name = taskNames[index];
-    const failedAt = path(operationName, name);
+    const failedAt = path(operationName, taskPaths[index]);
     try {
       const result = await task.run();
-      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, result.failedAt), error: result.error, [BRAND]: true };
+      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, taskPaths[index], result.failedAt), error: result.error, [BRAND]: true };
       return { name, ok: true, value: isBranded(result) ? result.value : result, [BRAND]: true };
     }
     catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
@@ -507,18 +558,20 @@ const pipeline = async (items, ...parts) => {
   const operation = parts.pop();
   const operationName = named(operation, "pipeline");
   if (!Array.isArray(items)) throw workError("INVALID_METADATA", "pipeline items must be an array");
-  const itemNames = unique(items, "pipeline item");
-  const stageNames = unique(parts, "pipeline stage");
+  const itemNames = names(items, "pipeline item");
+  const itemPaths = occurrenceLabels(itemNames);
+  const stageNames = names(parts, "pipeline stage");
+  const stagePaths = occurrenceLabels(stageNames);
   if (!stageNames.length) throw workError("INVALID_METADATA", "pipeline requires at least one named stage");
   return Promise.all(items.map(async (item, index) => {
     const name = itemNames[index];
     let value = item.value;
-    let failedAt = path(operationName, name);
+    let failedAt = path(operationName, itemPaths[index]);
     try {
       for (let stageIndex = 0; stageIndex < parts.length; stageIndex += 1) {
-        failedAt = path(operationName, name, stageNames[stageIndex]);
+        failedAt = path(operationName, itemPaths[index], stagePaths[stageIndex]);
         const result = await parts[stageIndex].run(value);
-        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, stageNames[stageIndex], result.failedAt), error: result.error, [BRAND]: true };
+        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, itemPaths[index], stagePaths[stageIndex], result.failedAt), error: result.error, [BRAND]: true };
         value = isBranded(result) ? result.value : result;
       }
       return { name, ok: true, value, [BRAND]: true };
@@ -682,10 +735,9 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): stri
     for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat(depth + 1);
-    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]`);
-    lines.push(`${indent}  Model: ${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`);
-    if (agent.accounting) lines.push(`${indent}  Tokens: ${String(agent.accounting.input + agent.accounting.output)} (in ${String(agent.accounting.input)}, out ${String(agent.accounting.output)}, cache ${String(agent.accounting.cacheRead + agent.accounting.cacheWrite)})`);
-    for (const call of agent.toolCalls ?? []) lines.push(`${indent}  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : spinner} ${call.name}`);
+    const lastTool = agent.toolCalls?.at(-1);
+    const toolText = lastTool ? ` ${lastTool.state === "completed" ? "✓" : lastTool.state === "failed" ? "✗" : spinner} ${lastTool.name}` : "";
+    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]${toolText}`);
   }
   return lines.join("\n");
 }
@@ -715,24 +767,73 @@ function workflowProgressBlock(run: PersistedRun) {
   };
 }
 
-function formatDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
-  const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : "◆";
-  const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
-  const lines = [`${glyph} ${run.workflowName}`, `${run.state}${run.phase ? ` · phase: ${run.phase}` : ""}${cost > 0 ? ` · $${cost.toFixed(2)}` : ""}`];
+const ATTENTION_ORDER: Record<string, number> = { awaiting_input: 0, running: 1, pausing: 2, paused: 3, interrupted: 4, failed: 5, queued: 6, stopped: 7, completed: 8 };
+
+function navigatorAttentionSort<T extends { loaded: { run: PersistedRun } }>(entries: readonly T[]): T[] {
+  return [...entries].sort((a, b) => (ATTENTION_ORDER[a.loaded.run.state] ?? 9) - (ATTENTION_ORDER[b.loaded.run.state] ?? 9));
+}
+
+function navigatorRunLabels(entries: readonly { store: RunStore; loaded: { run: PersistedRun } }[]): string[] {
+  const nameCount = new Map<string, number>();
+  for (const { loaded: { run } } of entries) nameCount.set(run.workflowName, (nameCount.get(run.workflowName) ?? 0) + 1);
+  const settled = new Set(["completed", "failed", "cancelled"]);
+  return entries.map(({ store, loaded: { run } }) => {
+    const done = run.agents.filter((a) => settled.has(a.state)).length;
+    const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
+    const suffix = (nameCount.get(run.workflowName) ?? 0) > 1 ? ` ${store.runId.slice(0, 8)}` : "";
+    const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
+    const costStr = cost > 0 ? ` $${cost.toFixed(2)}` : "";
+    return `${glyph} ${run.workflowName}${suffix}  ${run.state}  ${run.phase ?? ""}  ${String(done)}/${String(run.agents.length)} agents${costStr}`;
+  });
+}
+
+function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): string {
+  const parts: string[] = [agent.name];
+  const seen = new Set<string>([agent.id]);
+  for (let parentId = agent.parentId; parentId; parentId = byId.get(parentId)?.parentId) {
+    if (seen.has(parentId)) break; // ponytail: cycle guard for corrupt data
+    seen.add(parentId);
+    const parent = byId.get(parentId);
+    if (parent) parts.unshift(parent.name);
+    else break;
+  }
+  return parts.length > 1 ? parts.join(" > ") : agent.name;
+}
+
+export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
+  const settled = new Set(["completed", "failed", "cancelled"]);
+  const done = run.agents.filter((a) => settled.has(a.state)).length;
+  const totalTokens = run.agents.reduce((sum, a) => sum + (a.accounting ? a.accounting.input + a.accounting.output : 0), 0);
+  const totalCost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
+  const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
+  const header = `${glyph} ${run.workflowName}`;
+  const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, totalTokens > 0 ? `${String(totalTokens)} tok` : "", totalCost > 0 ? `$${totalCost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
+  const lines = [header, meta];
   if (run.error) lines.push(`Error: ${run.error.code}: ${run.error.message}`);
   lines.push("");
-  const settled = new Set(["completed", "failed", "cancelled"]);
-  for (const agent of run.agents) {
+  const byId = new Map(run.agents.map((a) => [a.id, a]));
+  const activeStates = new Set(["running", "waiting_for_child", "queued", "retrying", "paused"]);
+  const prioritised = [...run.agents].sort((a, b) => {
+    const aActive = activeStates.has(a.state) || a.state === "failed" ? 0 : 1;
+    const bActive = activeStates.has(b.state) || b.state === "failed" ? 0 : 1;
+    return aActive - bActive;
+  });
+  for (const agent of prioritised) {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
+    const breadcrumb = agentBreadcrumb(agent, byId);
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
     const tokens = agent.accounting ? `${String(agent.accounting.input + agent.accounting.output)} tok` : "";
-    const retries = agent.attempts > 1 ? ` ${String(agent.attempts - 1)} retries` : "";
-    lines.push(`${icon} ${agent.name}  ${model}  ${tokens}${retries}`);
+    const parts = [`${icon} ${breadcrumb}`, agent.state, model, tokens].filter(Boolean);
+    lines.push(parts.join("  "));
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
       if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
     }
-    if (!settled.has(agent.state)) for (const call of agent.toolCalls ?? []) lines.push(`  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : "⠦"} ${call.name}`);
+    if (!settled.has(agent.state)) {
+      for (const call of agent.toolCalls ?? []) {
+        if (call.state === "running" || call.state === "failed") lines.push(`  ${call.state === "failed" ? "✗" : "⠦"} ${call.name}`);
+      }
+    }
   }
   if (checkpoints.length) { lines.push(""); for (const cp of checkpoints) lines.push(`● checkpoint ${cp.name}: ${cp.prompt}`); }
   if (worktrees.length) { lines.push(""); for (const wt of worktrees) lines.push(`branch ${wt.branch} (${wt.path})`); }
@@ -803,21 +904,29 @@ function isBrandedResult(value: unknown): value is Record<string, JsonValue> & {
   return object(value) && value[WORK_RESULT_BRAND] === true;
 }
 
+function occurrenceLabels(names: readonly string[]): string[] {
+  const seen = new Map<string, number>();
+  return names.map((name) => {
+    const count = (seen.get(name) ?? 0) + 1;
+    seen.set(name, count);
+    return count === 1 ? name : `${name}#${String(count)}`;
+  });
+}
 async function hostParallel(rawTasks: unknown, rawOperation: unknown): Promise<JsonValue> {
   if (!Array.isArray(rawTasks)) fail("INVALID_METADATA", "parallel tasks must be an array");
   const operation = namedHostOperation(rawOperation, "parallel");
   const tasks = rawTasks.map((task) => namedHostOperation(task, "parallel task"));
-  if (new Set(tasks.map(({ name }) => name)).size !== tasks.length) fail("DUPLICATE_NAME", "Duplicate parallel task name");
-  return Promise.all(tasks.map(async ({ name, run }) => {
+  const taskPaths = occurrenceLabels(tasks.map(({ name }) => name));
+  return Promise.all(tasks.map(async ({ name, run }, index) => {
     try {
       if (!run) fail("INVALID_METADATA", "parallel tasks require run functions");
       const result: unknown = await run();
-      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, taskPaths[index] ?? name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
       return { name, ok: true, value: (isBrandedResult(result) ? result.value : result) as JsonValue, [WORK_RESULT_BRAND]: true };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt: operationPath(operation.name, name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
+      return { name, ok: false, failedAt: operationPath(operation.name, taskPaths[index] ?? name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
     }
   }));
 }
@@ -828,16 +937,17 @@ async function hostPipeline(rawItems: unknown, ...parts: unknown[]): Promise<Jso
   const items = rawItems.map((item) => namedHostOperation(item, "pipeline item"));
   const stages = parts.map((stage) => namedHostOperation(stage, "pipeline stage"));
   if (!stages.length) fail("INVALID_METADATA", "pipeline requires at least one named stage");
-  if (new Set(items.map(({ name }) => name)).size !== items.length || new Set(stages.map(({ name }) => name)).size !== stages.length) fail("DUPLICATE_NAME", "Duplicate pipeline item or stage name");
-  return Promise.all(items.map(async ({ name, value }) => {
+  const itemPaths = occurrenceLabels(items.map(({ name }) => name));
+  const stagePaths = occurrenceLabels(stages.map(({ name }) => name));
+  return Promise.all(items.map(async ({ name, value }, index) => {
     let current = value ?? null;
-    let failedAt = operationPath(operation.name, name);
+    let failedAt = operationPath(operation.name, itemPaths[index] ?? name);
     try {
-      for (const stage of stages) {
-        failedAt = operationPath(operation.name, name, stage.name);
+      for (const [stageIndex, stage] of stages.entries()) {
+        failedAt = operationPath(operation.name, itemPaths[index] ?? name, stagePaths[stageIndex] ?? stage.name);
         if (!stage.run) fail("INVALID_METADATA", "pipeline stages require run functions");
         const result: unknown = await stage.run(current);
-        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, name, stage.name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, itemPaths[index] ?? name, stagePaths[stageIndex] ?? stage.name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
         current = (isBrandedResult(result) ? result.value : result) as JsonValue;
       }
       return { name, ok: true, value: current, [WORK_RESULT_BRAND]: true };
@@ -847,6 +957,12 @@ async function hostPipeline(rawItems: unknown, ...parts: unknown[]): Promise<Jso
       return { name, ok: false, failedAt, error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
     }
   }));
+}
+
+function nextStructuralLabel(counters: Map<string, number>, label: string): string {
+  const count = (counters.get(label) ?? 0) + 1;
+  counters.set(label, count);
+  return count === 1 ? label : `${label}#${String(count)}`;
 }
 
 function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge {
@@ -896,7 +1012,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (progress.persist) await run.store.saveState(runState);
         run.update?.(workflowToolUpdate(runState));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -918,7 +1034,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     await run.store.saveState(runState);
     run.update?.(workflowToolUpdate(runState));
   });
-  const answerCheckpoint = async (runId: string, name: string, approved: boolean) => {
+  const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
     const run = runs.get(runId);
     if (!run) return false;
     const checkpoint = await run.store.answerCheckpoint(name, approved);
@@ -926,26 +1042,28 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     if ((await run.store.awaitingCheckpoints()).length === 0) await run.lifecycle.resolveAwaitingInput();
     run.checkpointResolvers.get(checkpoint.path)?.(approved);
     run.checkpointResolvers.delete(checkpoint.path);
-    deliver(pi, `Workflow ${run.metadata.name} checkpoint ${name}: ${approved ? "Approved" : "Rejected"}.`);
+    if (!silent) deliver(pi, `Workflow ${run.metadata.name} checkpoint ${name}: ${approved ? "Approved" : "Rejected"}.`);
     return true;
   };
-  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
+  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => {
+    const checkpointCounters = new Map<string, number>();
+    return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
     const input = validateCheckpoint(raw);
-    const path = operationPath("checkpoint", input.name);
+    const label = nextStructuralLabel(checkpointCounters, input.name);
+    const path = operationPath("checkpoint", label);
     if (foreground && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
     const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
-    const replayed = await store.awaitCheckpoint({ path, ...input });
+    const replayed = await store.awaitCheckpoint({ ...input, name: label, path });
     if (replayed !== undefined) return replayed;
     const run = runs.get(runId);
     await run?.lifecycle.enterAwaitingInput();
-    if (run?.checkpointResolvers.has(path)) fail("DUPLICATE_NAME", `Checkpoint ${input.name} is already active`);
-    if (!alreadyAwaiting) deliver(pi, `Workflow ${metadata.name} checkpoint ${input.name}: ${input.prompt}\nContext: ${JSON.stringify(input.context)}\nRespond with workflow_respond.`);
+    if (!alreadyAwaiting && !ui?.select) deliver(pi, `Workflow ${metadata.name} checkpoint ${label}: ${input.prompt}\nContext: ${JSON.stringify(input.context)}\nRespond with workflow_respond.`);
     const decision = new Promise<boolean>((resolve, reject) => {
       run?.checkpointResolvers.set(path, resolve);
       if (signal.aborted) reject(new WorkflowError("CANCELLED", "Workflow cancelled"));
       else signal.addEventListener("abort", () => { run?.checkpointResolvers.delete(path); reject(new WorkflowError("CANCELLED", "Workflow cancelled")); }, { once: true });
     });
-    const answered = await store.awaitCheckpoint({ path, ...input });
+    const answered = await store.awaitCheckpoint({ ...input, name: label, path });
     if (answered !== undefined) {
       if ((await store.awaitingCheckpoints()).length === 0) await run?.lifecycle.resolveAwaitingInput();
       run?.checkpointResolvers.get(path)?.(answered);
@@ -954,10 +1072,17 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     if (ui?.select) void (async () => {
       while (!signal.aborted && run?.checkpointResolvers.has(path)) {
         const choice = await ui.select?.(input.prompt, ["Approve", "Reject"]);
-        if (choice && await answerCheckpoint(runId, input.name, choice === "Approve")) return;
+        if (!choice) {
+          if (foreground) continue; // foreground: retry until answered
+          // Background resume: user dismissed UI, fall back to LLM
+          deliver(pi, `Workflow ${metadata.name} checkpoint ${label}: ${input.prompt}\nContext: ${JSON.stringify(input.context)}\nRespond with workflow_respond.`);
+          return;
+        }
+        if (await answerCheckpoint(runId, label, choice === "Approve", true)) return;
       }
     })().catch(() => undefined);
     return decision;
+  };
   };
 
   pi.registerTool({
@@ -980,7 +1105,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle, checkpointResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: loadAgentDefinitions(ctx.cwd), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
@@ -994,13 +1119,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Runs in the background by default; completion arrives as a follow-up message.",
     promptGuidelines: [
       "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-      "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
+      "For workflow, pass either one raw JavaScript string in script or a registered reusable workflow name in workflow; do not include Markdown fences or prose around script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
       "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
-      "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case, unique). Names drive journaling, replay after recovery, and live status; duplicates are rejected in preflight.",
-      "For workflow, agent options are { name, model, tools, schema, retries, timeoutMs, isolation: 'worktree' }. Omitted model and tools inherit the launch session and cannot escalate beyond it.",
+      "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case recommended). Names drive journaling, replay after recovery, and live status; duplicate names are disambiguated by occurrence order.",
+      "For workflow, agent options are { name, model, role, agentType, tools, schema, retries, timeoutMs, isolation: 'worktree' }. role/agentType reference .pi/agents/<name>.md or global ~/.pi/agent/agents/<name>.md role prompts.",
       "For workflow, parallel(tasks, operation) takes named tasks plus a named operation: await parallel([{ name: 'lint', run: () => agent('...', { name: 'lint-agent' }) }], { name: 'verification' }). Results preserve input order.",
       "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
       "For workflow, agent() never throws; it returns { name, ok: true, value } or { name, ok: false, failedAt, error: { code, message } }. Branch on ok instead of try/catch. checkpoint() returns { name, ok: true, value: 'approved'|'rejected' }. In combinators, a failed agent fails its branch automatically.",
@@ -1012,7 +1137,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "For workflow, runs are backgrounded by default and return a runId immediately; completion arrives as a follow-up message, so do not poll. Set foreground: true only when the result is needed inline.",
     ],
     parameters: Type.Object({
-      script: Type.String({ description: "Immutable JavaScript workflow source" }),
+      script: Type.Optional(Type.String({ description: "Immutable JavaScript workflow source" })),
+      workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as namespace.name" })),
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
       concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
@@ -1029,30 +1155,36 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const availableModels = new Set((modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
-      const checked = preflight(params.script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
+      const script = typeof params.script === "string" && params.script.trim() ? params.script : typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow).script : "";
+      if (!script) throw new WorkflowError("INVALID_SYNTAX", "Provide script or registered workflow");
+      const agentDefinitions = loadAgentDefinitions(ctx.cwd);
+      const checked = preflight(script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() });
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
-      const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: checked.referenced.agentTypes, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
       const lifecycle = lifecycleFor(store, "running");
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store, providerPause });
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), agentDefinitions, runStore: store, providerPause });
       runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
-      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal) => {
+      const agentCounters = new Map<string, number>();
+      const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal) => {
         await lifecycle.enter();
         try {
         const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
         const label = typeof options.name === "string" ? options.name : "agent";
-        const path = operationPath("agent", label);
+        const structuralLabel = nextStructuralLabel(agentCounters, label);
+        const path = operationPath("agent", structuralLabel);
         const replayed = await store.replay(path);
         if (replayed) return replayed.value;
         const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
-        const cwd = isolation ? (await store.worktree(label)).cwd : ctx.cwd;
-        const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner: label } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const cwd = isolation ? (await store.worktree(structuralLabel)).cwd : ctx.cwd;
+        const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
+        const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         topLevel.add(spawned.result);
         const cancel = () => { scheduler.cancel(spawned.id); };
         if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
@@ -1086,7 +1218,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     },
     renderCall(args) {
       let name: string;
-      try { name = parseMetadata(args.script).name; } catch { name = "workflow"; }
+      try { name = typeof args.script === "string" ? parseMetadata(args.script).name : typeof args.workflow === "string" ? args.workflow : "workflow"; } catch { name = "workflow"; }
       return textBlock(`workflow ${name}`);
     },
     renderResult(result, { isPartial }, _theme, context) {
@@ -1118,33 +1250,37 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           const details = await Promise.all(stores.map(async ({ store, loaded }) => formatNavigatorRun(loaded, await store.awaitingCheckpoints(), await store.worktrees())));
           ctx.ui.notify(details.join("\n\n"), "info"); return;
         }
-        const settled = new Set(["completed", "failed", "cancelled"]);
-        const rows = stores.map(({ loaded: { run } }) => {
-          const done = run.agents.filter((a) => settled.has(a.state)).length;
-          const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
-          const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
-          const costStr = cost > 0 ? ` $${cost.toFixed(2)}` : "";
-          return `${glyph} ${run.workflowName}  ${run.state}  ${run.phase ?? ""}  ${String(done)}/${String(run.agents.length)} agents${costStr}`;
-        });
-        const runChoice = await ctx.ui.select("Workflows\n", [...rows, "Close"]);
+        const sorted = navigatorAttentionSort(stores);
+        const labels = navigatorRunLabels(sorted);
+        const terminalStates = new Set(["completed", "failed", "stopped"]);
+        const hasCompleted = sorted.some(({ loaded: { run } }) => run.state === "completed");
+        const pickerOptions = [...labels, ...(hasCompleted ? ["Delete all completed"] : []), "Close"];
+        const runChoice = await ctx.ui.select("Workflows\n", pickerOptions);
         if (!runChoice || runChoice === "Close") return;
-        const runIndex = rows.indexOf(runChoice);
+        if (runChoice === "Delete all completed") {
+          if (!await ctx.ui.confirm("Delete completed runs?", "Delete all completed workflow runs and their artifacts? This cannot be undone.")) return;
+          for (const entry of sorted) {
+            if (entry.loaded.run.state === "completed") { await entry.store.delete(true); runs.delete(entry.store.runId); }
+          }
+          ctx.ui.notify("Deleted all completed workflow runs.", "info"); return;
+        }
+        const runIndex = labels.indexOf(runChoice);
         if (runIndex < 0) return;
-        const selected = stores[runIndex];
+        const selected = sorted[runIndex];
         if (!selected) return;
         const { store, loaded } = selected;
         const checkpoints = await store.awaitingCheckpoints();
-        const dashboard = formatDashboard(loaded.run, checkpoints, await store.worktrees());
+        const dashboard = formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees());
         const actions = new Map<string, string>();
         const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
         if (loaded.run.state === "running") add("Pause", "pause");
         if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
-        if (!["completed", "failed", "stopped"].includes(loaded.run.state)) add("Stop", "stop");
+        if (!terminalStates.has(loaded.run.state)) add("Stop", "stop");
         for (const cp of checkpoints) {
           actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
           actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
         }
-        if (["completed", "failed", "stopped"].includes(loaded.run.state)) add("Delete", "delete");
+        if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
         const actionChoice = await ctx.ui.select(dashboard, [...actions.keys(), "Back", "Close"]);
         if (!actionChoice || actionChoice === "Close") return;
         if (actionChoice === "Back") { await ctx.ui.select("Returning to run list. Run /workflow again.", ["OK"]); return; }
@@ -1154,7 +1290,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const run = runId ? runs.get(runId) : undefined;
       const stored = runId ? stores.find(({ store }) => store.runId === runId) : undefined;
       if ((action === "approve" || action === "reject") && runId && rest.length) {
-        const accepted = await answerCheckpoint(runId, rest.join(" "), action === "approve");
+        const accepted = await answerCheckpoint(runId, rest.join(" "), action === "approve", true);
         ctx.ui.notify(accepted ? `${action === "approve" ? "Approved" : "Rejected"} checkpoint ${rest.join(" ")}.` : "Checkpoint is not awaiting a response.", accepted ? "info" : "warning"); return;
       }
       if (action === "delete" && stored) {
@@ -1172,17 +1308,20 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
           await scheduler.cancelRun(run.store.runId);
           await run.lifecycle.resume();
+          const agentCounters = new Map<string, number>();
           const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal) => {
             await run.lifecycle.enter();
             try {
               const label = typeof options.name === "string" ? options.name : "agent";
-              const path = operationPath("agent", label);
+              const structuralLabel = nextStructuralLabel(agentCounters, label);
+              const path = operationPath("agent", structuralLabel);
               const replayed = await run.store.replay(path);
               if (replayed) return replayed.value;
               const tools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools;
               const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
-              const cwd = isolation ? (await run.store.worktree(label)).cwd : run.store.cwd;
-              const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: label } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+              const cwd = isolation ? (await run.store.worktree(structuralLabel)).cwd : run.store.cwd;
+              const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
+              const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
               const cancel = () => { scheduler.cancel(spawned.id); };
               signal.addEventListener("abort", cancel, { once: true });
               const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });

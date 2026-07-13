@@ -20,6 +20,7 @@ export interface AgentExecutionOptions {
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
   tools?: readonly string[];
   agentType?: string;
+  role?: string;
   schema?: JsonSchema;
   retries?: number;
   timeoutMs?: number | null;
@@ -101,8 +102,9 @@ export class WorkflowAgentExecutor {
   constructor(private readonly root: AgentExecutionRoot, private readonly createSession: SessionFactory = createNativeAgentSession) {}
 
   resolve(options: AgentExecutionOptions): { model: ModelSpec; tools: readonly string[]; rolePrompt: string } {
-    const definition = options.agentType ? this.root.agentDefinitions?.[options.agentType] : undefined;
-    if (options.agentType && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent type: ${options.agentType}`);
+    const role = options.role ?? options.agentType;
+    const definition = role ? this.root.agentDefinitions?.[role] : undefined;
+    if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
     const requested = options.tools ?? definition?.tools ?? [...this.root.tools];
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
@@ -217,6 +219,7 @@ export interface ScheduledAgentOptions {
   isolation?: "worktree";
   worktreeOwner?: string;
   model?: string;
+  role?: string;
   schema?: JsonSchema;
   retries?: number;
   timeoutMs?: number | null;
@@ -351,9 +354,9 @@ export class FairAgentScheduler {
     if (!parent.options.tools.includes("agent")) return [];
     const agentTool = {
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
-      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), schema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
-      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; schema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
-        const options = { label: params.label, cwd: parent.options.cwd, tools: params.tools ?? parent.options.tools, ...(params.model ? { model: params.model } : {}), ...(params.schema ? { schema: params.schema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
+      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), role: Type.Optional(Type.String()), schema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
+      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; role?: string; schema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
+        const options = { label: params.label, cwd: parent.options.cwd, tools: params.tools ?? parent.options.tools, ...(params.model ? { model: params.model } : {}), ...(params.role ? { role: params.role } : {}), ...(params.schema ? { schema: params.schema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
         return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
       },
@@ -395,7 +398,7 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "schema", "retries", "timeoutMs"].includes(key));
+    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "role", "schema", "retries", "timeoutMs"].includes(key));
     if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });

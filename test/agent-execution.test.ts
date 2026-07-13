@@ -13,6 +13,7 @@ function assistant(text: string) { return { role: "assistant", content: [{ type:
 void test("resolves root-bounded definitions and model specs", () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("unused"); });
   assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "reviewer", model: "anthropic/opus:high" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], rolePrompt: "Review carefully" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }).rolePrompt, "Review carefully");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
 });

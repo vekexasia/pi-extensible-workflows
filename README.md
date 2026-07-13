@@ -45,7 +45,8 @@ Invocation options:
 
 | Option | Type | Meaning |
 | --- | --- | --- |
-| `script` | string | Required immutable workflow source |
+| `script` | string | Immutable workflow source; required unless `workflow` is provided |
+| `workflow` | string | Registered reusable workflow name as `namespace.name`; required unless `script` is provided |
 | `args` | JSON value | Available to the script as `args`; defaults to `null` |
 | `foreground` | boolean | Wait for completion instead of returning the run ID |
 | `concurrency` | integer 1-16 | Per-run active-agent cap |
@@ -69,7 +70,7 @@ export const meta = {
 
 `name` and `description` are required non-empty strings. `phases` is optional, unique, and exhaustive: `phase(name)` rejects undeclared phases. `extensions` declares required registered DSL extension versions.
 
-Preflight is synchronous and runs before a run directory is created. It rejects syntax errors, malformed metadata or schemas, missing stable names, duplicate names, undeclared phases, unavailable models/tools/agent types, and missing or incompatible DSL extensions.
+Preflight is synchronous and runs before a run directory is created. It rejects syntax errors, malformed metadata or schemas, missing stable names, undeclared phases, unavailable models/tools/agent types, and missing or incompatible DSL extensions. Duplicate workflow call names are allowed and disambiguated by occurrence order for structural replay.
 
 The worker exposes only deterministic data operations plus:
 
@@ -82,7 +83,7 @@ The worker exposes only deterministic data operations plus:
 - `checkpoint({ name, prompt, context })`
 - `extensions.<namespace>.<method>(input)`
 
-Clocks, random numbers, timers, environment/process access, imports, `require`, dynamic code generation, filesystem, and network globals are unavailable. Workflow source runs in a dedicated worker thread. Cancellation is immediate; a missing heartbeat for five seconds fails with `WORKER_UNRESPONSIVE`.
+Clocks, random numbers, timers, environment/process access, imports, `require`, dynamic code generation, filesystem, and network globals are unavailable. Workflow source runs in a permissioned child process with a VM sandbox. Cancellation is immediate; a missing heartbeat for five seconds fails with `WORKER_UNRESPONSIVE`.
 
 ## Agents
 
@@ -90,13 +91,14 @@ Clocks, random numbers, timers, environment/process access, imports, `require`, 
 const text = await agent("Review the implementation", {
   name: "review",
   model: "openai-codex/gpt-5.6-sol:high",
+  role: "reviewer",
   tools: ["read", "grep", "find", "ls"],
   retries: 1,
   timeoutMs: 120000,
 });
 ```
 
-`name` is required and stable. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
+`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role prompt is prepended to the task. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
 
 Without `schema`, an agent returns its final text. With a plain JSON Schema:
 
@@ -195,10 +197,16 @@ registerWorkflowDslExtension({
       },
     },
   },
+  workflows: {
+    releaseCheck: {
+      description: "Reusable release check workflow",
+      script: `export const meta={name:'release-check',description:'Check a release'}; return agent('Check release', {name:'release', role:'reviewer'});`,
+    },
+  },
 });
 ```
 
-A workflow declaring `{ name: "git", version: "^1.0.0" }` can call `extensions.git.status({})`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, and output schema. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. Duplicate namespaces fail extension load.
+A workflow declaring `{ name: "git", version: "^1.0.0" }` can call `extensions.git.status({})`. A caller can also run the registered script directly with `{ "workflow": "git.releaseCheck" }`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, output schema, and valid workflow scripts with literal metadata. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. Duplicate namespaces fail extension load.
 
 ## Lifecycle and recovery
 
@@ -246,7 +254,6 @@ await agent("Implement the fix", { name: "implementation", isolation: "worktree"
 ```
 
 The runtime creates a deterministic owned branch/worktree, preserves the launch cwd's relative subdirectory, and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the worktree. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
-
 ## Delivery
 
 Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, duration, cost, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, ownership tree, agent states, model/thinking level, token accounting, and tool calls.
@@ -282,7 +289,7 @@ Direct `agent()` and extension calls return bare values or throw typed failures.
 ## Deliberate non-goals
 
 - Transcript rendering or a built-in transcript viewer
-- Nested workflow calls, saved workflows, restart, or save-as-command
+- Nested workflow calls, runtime workflow editing/restart/save-as-command, or model-tier/phase-routing abstractions
 - Shared mutable stores between agents
 - Token/phase budgets, rate sampling, or automatic spend enforcement
 - Built-in quality helpers or generic retry/gate abstractions

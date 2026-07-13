@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorRun, formatWorkflowProgress, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -29,6 +29,19 @@ void test("registers the workflow tool and singular command", async () => {
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
+void test("registered extension workflows can run by name", async () => {
+  registerWorkflowDslExtension({
+    name: "reuseTest", version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", methods: {},
+    workflows: { hello: { description: "Say hello", script: `export const meta={name:'hello',description:'hello'}; return args.name;` } },
+  });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never);
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
+  assert.ok(execute);
+  const result = await execute("id", { workflow: "reuseTest.hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.equal(result.content[0]?.text, '"Andrea"');
+});
+
 void test("streams foreground workflow progress into its tool card", async () => {
   type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string } } };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
@@ -46,14 +59,14 @@ void test("streams foreground workflow progress into its tool card", async () =>
   assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
 });
 
-void test("workflow progress surfaces model, thinking, tokens, and tool calls", () => {
-  const run = { id: "run", workflowName: "live", cwd: "/repo", sessionId: "session", state: "running", phase: "work", agents: [{ id: "run:1", name: "review", path: "run:1", state: "running", model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" }, tools: ["read"], attempts: 1, accounting: { input: 120, output: 30, cacheRead: 40, cacheWrite: 0, cost: 0.01 }, toolCalls: [{ id: "call", name: "read", state: "running" }] }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+void test("workflow progress keeps each agent to one line with latest tool", () => {
+  const run = { id: "run", workflowName: "live", cwd: "/repo", sessionId: "session", state: "running", phase: "work", agents: [{ id: "run:1", name: "review", path: "run:1", state: "running", model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" }, tools: ["read"], attempts: 1, accounting: { input: 120, output: 30, cacheRead: 40, cacheWrite: 0, cost: 0.01 }, toolCalls: [{ id: "call-1", name: "ls", state: "completed" }, { id: "call-2", name: "read", state: "running" }] }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
   const rendered = formatWorkflowProgress(run);
-  assert.match(rendered, /#1 ◇ review \[running\]/);
-  assert.match(rendered, /Model: openai-codex\/gpt-5\.6-sol:high/);
-  assert.match(rendered, /Tokens: 150 \(in 120, out 30, cache 40\)/);
-  assert.match(rendered, /◇ read/);
-  assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review[\s\S]*⠙ read/);
+  assert.match(rendered, /#1 ◇ review \[running\] ◇ read/);
+  assert.doesNotMatch(rendered, /Model:/);
+  assert.doesNotMatch(rendered, /Tokens:/);
+  assert.doesNotMatch(rendered, /✓ ls/);
+  assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review \[running\] ⠙ read/);
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
@@ -99,6 +112,65 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.equal(existsSync(store.directory), false);
 });
 
+void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-v2-"));
+  const cwd = join(home, "project");
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'build',description:'b'}", args: null, metadata: { name: "build", description: "b" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
+  const storeA = new RunStore(cwd, "s", "aaaa-1111-2222-3333", home);
+  await storeA.create({ id: "aaaa-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "completed", agents: [{ id: "a:1", name: "scout", path: "a:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: ["read"], attempts: 1, accounting: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01 } }], nativeSessions: [] }, snapshot);
+  const storeB = new RunStore(cwd, "s", "bbbb-1111-2222-3333", home);
+  await storeB.create({ id: "bbbb-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "running", phase: "review", agents: [{ id: "b:1", name: "root", path: "b:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }, { id: "b:2", name: "child", path: "b:2", state: "running", parentId: "b:1", model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], attempts: 1, toolCalls: [{ id: "tc1", name: "read", state: "running" }] }], nativeSessions: [] }, snapshot);
+  const storeC = new RunStore(cwd, "s", "cccc-1111-2222-3333", home);
+  await storeC.create({ id: "cccc-1111-2222-3333", workflowName: "deploy", cwd, sessionId: "s", state: "failed", agents: [{ id: "c:1", name: "deployer", path: "c:1", state: "failed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 2, sessionId: "n", sessionFile: "/n", error: { code: "AGENT_FAILED", message: "timeout" }, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
+
+  // Dashboard with breadcrumbs and inline errors
+  const dashB = formatNavigatorDashboard((await storeB.load()).run, [], []);
+  assert.match(dashB, /root > child/);
+  assert.match(dashB, /phase: review/);
+  assert.match(dashB, /1\/2 agents/);
+  assert.match(dashB, /⠦ read/);
+
+  const dashC = formatNavigatorDashboard((await storeC.load()).run, [], []);
+  assert.match(dashC, /error: AGENT_FAILED: timeout/);
+
+  // Interactive: attention order + name disambiguation + bulk delete
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  const prompts: string[] = [];
+  const selections: string[][] = [];
+  const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] };
+  workflowExtension(pi as never, home);
+  let selectCall = 0;
+  const confirmResult = true;
+  const notified: string[] = [];
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "s" }, ui: { notify(msg: string) { notified.push(msg); }, select: async (_prompt: string, options: string[]) => { prompts.push(_prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return "Delete all completed"; return "Close"; }, confirm: async () => confirmResult } };
+  const command = commands[0]?.handler;
+  assert.ok(command);
+  await command("", ctx as never);
+
+  // Verify attention order: running (build bbbb) before failed (deploy) before completed (build aaaa)
+  const pickerOptions = selections[0] ?? [];
+  assert.ok(pickerOptions.length >= 4);
+  const runningIdx = pickerOptions.findIndex((o) => o.includes("running"));
+  const failedIdx = pickerOptions.findIndex((o) => o.includes("failed"));
+  const completedIdx = pickerOptions.findIndex((o) => o.includes("completed"));
+  assert.ok(runningIdx < failedIdx, `running (${String(runningIdx)}) should come before failed (${String(failedIdx)})`);
+  assert.ok(failedIdx < completedIdx, `failed (${String(failedIdx)}) should come before completed (${String(completedIdx)})`);
+
+  // Verify name disambiguation: both 'build' runs get 8-char suffix
+  const buildRows = pickerOptions.filter((o) => o.includes("build"));
+  assert.equal(buildRows.length, 2);
+  assert.ok(buildRows.every((r) => r.includes("aaaa-111") || r.includes("bbbb-111")), `Build rows should have suffixes: ${buildRows.join("; ")}`);
+
+  // Verify 'Delete all completed' was offered
+  assert.ok(pickerOptions.includes("Delete all completed"));
+
+  // Verify bulk delete removed the completed run
+  assert.ok(notified.some((n) => n.includes("Deleted all completed")));
+  assert.equal(existsSync(storeA.directory), false);
+  assert.equal(existsSync(storeB.directory), true);
+  assert.equal(existsSync(storeC.directory), true);
+});
+
 void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
   const accepted: unknown[] = [];
   assert.deepEqual(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, { name: "ship", ok: true, value: "rejected", __workResult: true });
@@ -130,14 +202,19 @@ void test("production checkpoints resolve in foreground navigator and background
   const teardown = new AbortController();
   await assert.rejects(workflow.execute("id", { script, foreground: true }, teardown.signal, undefined, { ...base, hasUI: true, ui: { select: async () => { teardown.abort(); throw new Error("UI closed"); } } }), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   const duplicateScript = `export const meta={name:'duplicate-gate',description:'duplicate'}; return Promise.all([checkpoint({name:'first',prompt:'?',context:null,...{name:args.name}}),checkpoint({name:'second',prompt:'?',context:null,...{name:args.name}})]);`;
-  await assert.rejects(workflow.execute("id", { script: duplicateScript, args: { name: "same" }, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: true, ui: { select: async () => new Promise<string | undefined>(() => {}) } }), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+  const duplicate = await workflow.execute("id", { script: duplicateScript, args: { name: "same" } }, new AbortController().signal, undefined, base) as { details: { runId: string } };
+  const duplicateStore = new RunStore(home, "session", duplicate.details.runId, home);
+  for (let attempt = 0; attempt < 1000 && (await duplicateStore.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual((await duplicateStore.awaitingCheckpoints()).map((checkpoint) => checkpoint.name).sort(), ["same", "same#2"]);
+  assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same", approved: true }) as { details: { accepted: boolean } }).details.accepted, true);
+  assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same#2", approved: false }) as { details: { accepted: boolean } }).details.accepted, true);
   const background = await workflow.execute("id", { script }, new AbortController().signal, undefined, base) as { content: Array<{ text: string }> };
   const { runId } = JSON.parse(background.content[0]?.text ?? "") as { runId: string };
   let first: { details: { accepted: boolean } } | undefined;
   for (let attempt = 0; attempt < 100; attempt += 1) {
     first = await respond.execute("id", { runId, name: "ship", approved: false }) as { details: { accepted: boolean } };
     if (first.details.accepted) break;
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(first?.details.accepted, true);
   const second = await respond.execute("id", { runId, name: "ship", approved: true }) as { details: { accepted: boolean } };
@@ -155,13 +232,13 @@ void test("two concurrent checkpoints keep the run awaiting until both are answe
   const script = `export const meta={name:'gates',description:'gates'}; return Promise.all([checkpoint({name:'one',prompt:'One?',context:null}),checkpoint({name:'two',prompt:'Two?',context:null})]);`;
   const launched = await workflow.execute("id", { script }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
   const store = new RunStore(home, "session", launched.details.runId, home);
-  for (let attempt = 0; attempt < 100 && (await store.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "awaiting_input"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; attempt < 1000 && (await store.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "awaiting_input"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal((await store.awaitingCheckpoints()).length, 2);
   assert.equal((await respond.execute("id", { runId: launched.details.runId, name: "one", approved: true }) as { details: { accepted: boolean } }).details.accepted, true);
   assert.equal((await store.load()).run.state, "awaiting_input");
   assert.equal((await respond.execute("id", { runId: launched.details.runId, name: "two", approved: false }) as { details: { accepted: boolean } }).details.accepted, true);
-  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.equal((await store.load()).run.state, "completed");
 });
 
@@ -279,6 +356,25 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
   assert.deepEqual(states, ["awaiting_input", "running"]);
 });
 
+void test("loads markdown agent roles with frontmatter from global and project directories", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-roles-"));
+  const cwd = join(home, "project");
+  mkdirSync(join(home, "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  writeFileSync(join(home, "agents", "global.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
+  writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "Review role");
+  const roles = loadAgentDefinitions(cwd, home);
+  assert.deepEqual(roles.global, { prompt: "Global role", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
+  assert.equal(roles.reviewer?.prompt, "Review role");
+});
+
+void test("interrupted resume path preserves workflow agent roles", () => {
+  const source = readFileSync(join(process.cwd(), "src", "index.ts"), "utf8");
+  const resumeBlock = source.slice(source.indexOf("runWorkflow(loaded.snapshot.script"), source.indexOf("checkpoint: checkpointBridge", source.indexOf("runWorkflow(loaded.snapshot.script")));
+  assert.match(resumeBlock, /const role = typeof options\.role/);
+  assert.match(resumeBlock, /\.\.\.\(role \? \{ role \}/);
+});
+
 void test("interrupted lifecycle can cold-resume while completed and failed cannot", async () => {
   const interrupted = new RunLifecycle("interrupted");
   await interrupted.resume();
@@ -302,6 +398,7 @@ void test("preflight accepts the complete static contract", () => {
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }]);
   assert.equal(result.metadata.name, "review");
   assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+  assert.deepEqual(preflight(valid.replace("agentType", "role"), capabilities).referenced.agentTypes, ["reviewer"]);
   assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities).referenced.models, ["openai/gpt"]);
   assert.ok(Object.isFrozen(result.metadata));
 });
@@ -320,7 +417,6 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
     [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',agentType:'writer'})`, "UNKNOWN_AGENT_TYPE"],
     [`export const meta={name:'x',description:'x',extensions:[{name:'nope',version:'1.0.0'}]};`, "MISSING_EXTENSION"],
-    [`export const meta={name:'x',description:'x'}; agent('a',{name:'same'}); agent('b',{name:'same'})`, "DUPLICATE_NAME"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
@@ -427,7 +523,10 @@ void test("named parallel and pipeline preserve order, contain failures, and exp
   assert.equal(ppTwo.value, 5);
 
   const duplicate = runWorkflow(`export const meta={name:'x',description:'x'}; return parallel([{name:'same',run:()=>1},{name:'same',run:()=>2}],{name:'batch'});`);
-  await assert.rejects(duplicate.result, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+  assert.deepEqual(await duplicate.result, [
+    { name: "same", ok: true, value: 1, __workResult: true },
+    { name: "same", ok: true, value: 2, __workResult: true },
+  ]);
 });
 
 void test("worker cancellation is immediate even for runaway synchronous code", async () => {
