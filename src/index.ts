@@ -550,12 +550,17 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   const childFile = join(childDir, "child.cjs");
   writeFileSync(childFile, childSource);
   const child: ChildProcess = fork(childFile, [String(RPC_LIMIT_BYTES), config], {
-    execArgv: [
-      ...process.execArgv.filter((a) => !a.startsWith("--input-type")),
-      "--max-old-space-size=128",
-      "--permission",
-      `--allow-fs-read=${childDir}`,
-    ],
+    execArgv: (() => {
+      const filtered: string[] = [];
+      const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
+      let skipNext = false;
+      for (const arg of process.execArgv) {
+        if (skipNext) { skipNext = false; continue; }
+        if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
+        filtered.push(arg);
+      }
+      return [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
+    })(),
     stdio: ["ignore", "ignore", "ignore", "ipc"],
     serialization: "advanced",
   });
@@ -601,7 +606,8 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           const result = await bridge.agent(values[0], opts, controller.signal);
           value = branded({ name, ok: true, value: result ?? null });
         } catch (error) {
-          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          const code = (error instanceof WorkflowError ? error.code : typeof (error as Record<string, unknown>).code === "string" ? (error as Record<string, unknown>).code as string : "INTERNAL_ERROR") as WorkflowErrorCode;
+          const typed = new WorkflowError(code, (error as Error).message);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
           value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
         }
@@ -613,7 +619,8 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           if (typeof result !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
           value = branded({ name, ok: true, value: result ? "approved" : "rejected" });
         } catch (error) {
-          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          const code = (error instanceof WorkflowError ? error.code : typeof (error as Record<string, unknown>).code === "string" ? (error as Record<string, unknown>).code as string : "INTERNAL_ERROR") as WorkflowErrorCode;
+          const typed = new WorkflowError(code, (error as Error).message);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
           value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
         }
@@ -624,7 +631,8 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           const result = await bridge.extension(values[0], values[1], values[2], values[3], controller.signal);
           value = branded({ name, ok: true, value: result ?? null });
         } catch (error) {
-          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          const code = (error instanceof WorkflowError ? error.code : typeof (error as Record<string, unknown>).code === "string" ? (error as Record<string, unknown>).code as string : "INTERNAL_ERROR") as WorkflowErrorCode;
+          const typed = new WorkflowError(code, (error as Error).message);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
           value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
         }
