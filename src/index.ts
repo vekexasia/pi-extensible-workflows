@@ -312,7 +312,7 @@ function namedArray(argument: string): boolean {
 
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
   if (typeof script !== "string" || script.trim() === "") fail("INVALID_SYNTAX", "Workflow script must be non-empty");
-  try { new Script(script.replace(/^\s*export\s+const\s+meta/, "const meta")); }
+  try { new Script(`(async()=>{${script.replace(/^\s*export\s+const\s+meta/, "const meta")}\n})`); }
   catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
   const metadata = parseMetadata(script);
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
@@ -540,6 +540,29 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
   await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
 }
 
+const DELIVERY_LIMIT_BYTES = 4 * 1024;
+
+function completionDelivery(name: string, value: JsonValue, resultPath: string, worktrees: readonly { branch: string; path: string }[]): string {
+  const locations = worktrees.length ? ` Changes: ${worktrees.map(({ branch, path }) => `${branch} (${path})`).join(", ")}.` : "";
+  const message = `Workflow ${name} completed: ${JSON.stringify(value)}${locations}`;
+  if (Buffer.byteLength(message) <= DELIVERY_LIMIT_BYTES) return message;
+  const suffix = `... Full result: ${resultPath}${locations}`;
+  const suffixBytes = Buffer.byteLength(suffix);
+  if (suffixBytes >= DELIVERY_LIMIT_BYTES) return utf8Prefix(suffix, DELIVERY_LIMIT_BYTES);
+  return utf8Prefix(message, DELIVERY_LIMIT_BYTES - suffixBytes) + suffix;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value);
+  let end = Math.min(bytes.length, maxBytes);
+  while (end < bytes.length && end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+function deliver(pi: ExtensionAPI, content: string): void {
+  pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
+}
+
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution }>();
   const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => { const loaded = await store.load(); await store.saveState({ ...loaded.run, state: next }); });
@@ -576,7 +599,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (["completed", "failed", "stopped"].includes(loaded.run.state)) continue;
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
-      const providerPause = () => lifecycle.providerPause();
+      const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle });
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
@@ -606,7 +629,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
       const lifecycle = lifecycleFor(store, "running");
-      const providerPause = () => lifecycle.providerPause();
+      const background = !params.foreground;
+      const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store, providerPause });
       runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
@@ -633,7 +657,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       }, phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
-      if (!params.foreground) { void finish.catch(() => undefined); return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } }; }
+      if (background) {
+        void finish.then(async (value) => {
+          const resultPath = await store.saveResult(value);
+          deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
+        }, (error: unknown) => { deliver(pi, `Workflow ${checked.metadata.name} failed: ${error instanceof Error ? error.message : String(error)}`); });
+        return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } };
+      }
       const value = await finish;
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
     },
