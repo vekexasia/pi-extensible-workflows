@@ -12,10 +12,20 @@ function assistant(text: string) { return { role: "assistant", content: [{ type:
 
 void test("resolves root-bounded definitions and model specs", () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("unused"); });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "reviewer", model: "anthropic/opus:high" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], rolePrompt: "Review carefully" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }).rolePrompt, "Review carefully");
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "reviewer", model: "anthropic/opus:high" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }).systemPromptAppend, "Review carefully");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
+});
+
+void test("passes role prompt as system append, not task text", async () => {
+  let input: unknown;
+  let prompt = "";
+  const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { input = sessionInput; return { sessionId: "role", sessionFile: "/sessions/role.jsonl", messages: [assistant("done")], prompt: async (text) => { prompt = text; }, dispose() {} }; });
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", role: "reviewer" });
+  assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "Review carefully");
+  assert.doesNotMatch(prompt, /Review carefully/);
+  assert.match(prompt, /Task:\nDo work/);
 });
 
 void test("provider limits pause and retry the same native session", async () => {

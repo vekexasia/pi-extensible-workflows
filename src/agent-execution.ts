@@ -1,6 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { AuthStorage, createAgentSession, ModelRegistry, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRegistry, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
@@ -54,7 +54,7 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
 type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
@@ -89,21 +89,23 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
-  const { session } = await createAgentSession({ cwd: input.cwd, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), sessionManager: manager });
+  const resourceLoader = input.systemPromptAppend ? new DefaultResourceLoader({ cwd: input.cwd, agentDir: getAgentDir(), appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] }) : undefined;
+  if (resourceLoader) await resourceLoader.reload();
+  const { session } = await createAgentSession({ cwd: input.cwd, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
   return session;
 }
 
 export class WorkflowAgentExecutor {
   constructor(private readonly root: AgentExecutionRoot, private readonly createSession: SessionFactory = createNativeAgentSession) {}
 
-  resolve(options: AgentExecutionOptions): { model: ModelSpec; tools: readonly string[]; rolePrompt: string } {
+  resolve(options: AgentExecutionOptions): { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string } {
     const role = options.role ?? options.agentType;
     const definition = role ? this.root.agentDefinitions?.[role] : undefined;
     if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
     const requested = options.tools ?? definition?.tools ?? [...this.root.tools];
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
-    return { model: parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking), tools: [...requested], rolePrompt: definition?.prompt ?? "" };
+    return { model: parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
@@ -158,7 +160,7 @@ export class WorkflowAgentExecutor {
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
-        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}) });
+        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
         unsubscribe = session.subscribe?.((event) => {
           if (event.type === "tool_execution_start") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" });
           if (event.type === "tool_execution_end") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" });
@@ -169,7 +171,7 @@ export class WorkflowAgentExecutor {
           if (!session.steer) throw new WorkflowError("INTERNAL_ERROR", "Native Pi session does not support steering");
           setSteer((message) => session?.steer?.(message));
         }
-        const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", resolved.rolePrompt, attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
+        const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
         await promptWithProviderPause(session, `${context}\n\nTask:\n${task}`, remaining(options.timeoutMs, started), signal, this.root.providerPause);
         if (options.schema) {
           accepted = true;

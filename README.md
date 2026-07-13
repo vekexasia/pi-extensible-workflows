@@ -108,7 +108,7 @@ const text = await agent("Review the implementation", {
 });
 ```
 
-`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role prompt is prepended to the task. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
+`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
 
 Without `schema`, an agent returns its final text. With a plain JSON Schema:
 
