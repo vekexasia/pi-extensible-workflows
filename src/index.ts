@@ -7,7 +7,7 @@ import { Script } from "node:vm";
 import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
@@ -122,12 +122,17 @@ export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ conc
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function positiveInteger(value: unknown): value is number { return Number.isInteger(value) && (value as number) > 0; }
+export function parseModelReference(value: string): ModelSpec {
+  const match = /^([^/:\s]+)\/([^:\s]+)(?::([^:\s]+))?$/.exec(value);
+  if (!match?.[1] || !match[2]) fail("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
+  const thinking = match[3];
+  if (thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) fail("UNKNOWN_MODEL", `Invalid thinking level: ${thinking}`);
+  return { provider: match[1], model: match[2], ...(thinking ? { thinking: thinking as NonNullable<ModelSpec["thinking"]> } : {}) };
+}
+
 function modelCapability(value: string): string {
-  const slash = value.indexOf("/");
-  const colon = value.lastIndexOf(":");
-  if (colon <= slash) return value;
-  if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.slice(colon + 1))) fail("UNKNOWN_MODEL", `Invalid thinking level: ${value.slice(colon + 1)}`);
-  return value.slice(0, colon);
+  const parsed = parseModelReference(value);
+  return `${parsed.provider}/${parsed.model}`;
 }
 
 export interface CheckpointInput { name: string; prompt: string; context: JsonValue }
@@ -158,23 +163,36 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
   return Object.freeze({ concurrency, maxAgents, agentTimeoutMs });
 }
 
-function parseRoleMarkdown(content: string): AgentDefinition {
-  if (!content.startsWith("---\n")) return { prompt: content };
-  const end = content.indexOf("\n---", 4);
-  if (end < 0) return { prompt: content };
-  const meta: Record<string, string> = {};
-  for (const line of content.slice(4, end).split("\n")) {
-    const match = /^(model|thinking|tools)\s*:\s*(.+)$/.exec(line.trim());
-    if (match?.[1] && match[2]) meta[match[1]] = match[2].trim();
+export function parseRoleMarkdown(content: string, strict = false): AgentDefinition {
+  if (!strict) {
+    if (!content.startsWith("---\n")) return { prompt: content };
+    const end = content.indexOf("\n---", 4);
+    if (end < 0) return { prompt: content };
+    const meta: Record<string, string> = {};
+    for (const line of content.slice(4, end).split("\n")) {
+      const match = /^(model|thinking|tools)\s*:\s*(.+)$/.exec(line.trim());
+      if (match?.[1] && match[2]) meta[match[1]] = match[2].trim();
+    }
+    const tools = meta.tools ? meta.tools.replace(/^\[|\]$/g, "").split(",").map((tool) => tool.trim().replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "")).filter(Boolean) : undefined;
+    const thinking = meta.thinking?.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
+    if (thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) fail("INVALID_METADATA", `Invalid role thinking level: ${thinking}`);
+    const definition: AgentDefinition = { prompt: content.slice(end + 4).replace(/^\n/, "") };
+    if (meta.model) definition.model = meta.model.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
+    if (thinking) definition.thinking = thinking as NonNullable<AgentDefinition["thinking"]>;
+    if (tools) definition.tools = tools;
+    return definition;
   }
-  const tools = meta.tools ? meta.tools.replace(/^\[|\]$/g, "").split(",").map((tool) => tool.trim().replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "")).filter(Boolean) : undefined;
-  const thinking = meta.thinking?.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
-  if (thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) fail("INVALID_METADATA", `Invalid role thinking level: ${thinking}`);
-  const definition: AgentDefinition = { prompt: content.slice(end + 4).replace(/^\n/, "") };
-  if (meta.model) definition.model = meta.model.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
-  if (thinking) definition.thinking = thinking as NonNullable<AgentDefinition["thinking"]>;
-  if (tools) definition.tools = tools;
-  return definition;
+  const normalized = content.replace(/\r\n?/g, "\n");
+  if (normalized.startsWith("---\n") && normalized.indexOf("\n---", 3) < 0) fail("INVALID_METADATA", "Role frontmatter is missing its closing delimiter");
+  let parsed: ReturnType<typeof parseFrontmatter>;
+  try { parsed = parseFrontmatter(content); }
+  catch (error) { fail("INVALID_METADATA", `Invalid role frontmatter: ${(error as Error).message}`); }
+  if (!object(parsed.frontmatter)) fail("INVALID_METADATA", "Role frontmatter must be an object");
+  const { model, thinking, tools } = parsed.frontmatter;
+  if (model !== undefined && (typeof model !== "string" || model.trim() === "")) fail("INVALID_METADATA", "Role model must be a non-empty string");
+  if (thinking !== undefined && (typeof thinking !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking))) fail("INVALID_METADATA", `Invalid role thinking level: ${typeof thinking === "string" ? thinking : typeof thinking}`);
+  if (tools !== undefined && (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string" || tool.trim() === ""))) fail("INVALID_METADATA", "Role tools must be an array of non-empty strings");
+  return { prompt: parsed.body, ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}) };
 }
 
 function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
@@ -1366,3 +1384,5 @@ export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./pe
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress } from "./agent-execution.js";
+export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
+export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";

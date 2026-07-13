@@ -4,7 +4,7 @@ import { AuthStorage, createAgentSession, ModelRegistry, SessionManager, type Ag
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
-import { WorkflowError } from "./index.js";
+import { parseModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentDefinition { prompt?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
@@ -59,13 +59,8 @@ type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
   if (!value) return { ...fallback, ...(thinking ? { thinking } : {}) };
-  const slash = value.indexOf("/");
-  if (slash < 1 || slash === value.length - 1) throw new WorkflowError("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
-  const colon = value.lastIndexOf(":");
-  const hasThinking = colon > slash;
-  const level = thinking ?? (hasThinking ? value.slice(colon + 1) : undefined);
-  if (level && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)) throw new WorkflowError("UNKNOWN_MODEL", `Invalid thinking level: ${level}`);
-  return { provider: value.slice(0, slash), model: value.slice(slash + 1, hasThinking ? colon : undefined), ...(level ? { thinking: level as ThinkingLevel } : {}) };
+  const parsed = parseModelReference(value);
+  return { ...parsed, ...(thinking ? { thinking } : {}) };
 }
 
 function text(messages: readonly AgentMessage[]): string {

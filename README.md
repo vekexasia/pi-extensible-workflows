@@ -28,6 +28,16 @@ pi --no-extensions --extension /absolute/path/to/pi-workflows/src/index.ts
 
 The package registers two tools, `workflow` and the narrow checkpoint response tool `workflow_respond`, plus one singular `/workflow` command.
 
+## Doctor
+
+Run the read-only, non-interactive health check after opening and trusting the project in Pi:
+
+```sh
+npx pi-workflows doctor
+```
+
+Doctor validates Pi trust/resources, active tools, global and project roles, settings, extension load failures, and registered reusable workflows. It is verbose by default and exits nonzero only for errors. It never installs packages or changes trust; configured extensions still execute as trusted Pi code while being inspected.
+
 ## Run a workflow
 
 Call the `workflow` tool with immutable JavaScript source:

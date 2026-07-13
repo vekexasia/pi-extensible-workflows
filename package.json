@@ -7,6 +7,9 @@
     "pi-package"
   ],
   "exports": "./dist/src/index.js",
+  "bin": {
+    "pi-workflows": "./dist/src/cli.js"
+  },
   "files": [
     "dist/src",
     "src"
@@ -16,7 +19,8 @@
     "lint": "eslint .",
     "test": "npm run build && node --test 'dist/test/*.test.js'",
     "acceptance": "npm run build && node --test dist/test/runtime-acceptance.test.js",
-    "check": "npm run lint && npm test"
+    "check": "npm run lint && npm test",
+    "prepack": "npm run build"
   },
   "pi": {
     "extensions": [
