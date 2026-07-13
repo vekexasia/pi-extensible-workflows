@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
 
@@ -14,7 +14,7 @@ void test("production session_start cold-restores ownership and /workflow stop c
   const sessionId = "session-a";
   const runId = "run-a";
   const store = new RunStore(cwd, sessionId, runId, home);
-  const settings = { concurrency: 1, maxAgents: 2, agentTimeoutMs: 25 };
+  const settings = { concurrency: 1, maxAgents: 2 };
   await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], extensions: {}, schemas: [] }));
   const options = { label: "parent", cwd, tools: ["agent"] };
   await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { ...options, label: "child" } }]);
@@ -38,7 +38,7 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -64,7 +64,7 @@ void test("production lifecycle commands persist pause, resume, and Pi-close int
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -146,7 +146,11 @@ void test("terminal failed attempts remain persisted", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-attempts-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed", description: "failed" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed", description: "failed" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" });
+  const active = (await store.load()).run;
+  assert.equal(active.agents[0]?.attemptDetails?.[0]?.sessionFile, "/sessions/failed.jsonl");
+  assert.deepEqual(active.nativeSessions, [{ sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" }]);
   await persistAgentAttempts(store, "run-a:1", [{ attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl", error: { code: "AGENT_FAILED", message: "failed" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
   const persisted = (await store.load()).run;
   assert.deepEqual(persisted.agents.map(({ attempts, accounting }) => ({ attempts, accounting })), [{ attempts: 1, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);

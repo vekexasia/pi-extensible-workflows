@@ -47,6 +47,20 @@ void test("returns final text and captures persisted native session accounting",
   assert.deepEqual(result.attempts[0], { attempt: 1, sessionId: "s1", sessionFile: "/sessions/s1.jsonl", result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 } });
 });
 
+void test("exposes native attempt metadata before the prompt completes", async () => {
+  let finish!: () => void;
+  let promptStarted!: () => void;
+  const started = new Promise<void>((resolve) => { promptStarted = resolve; });
+  let exposed!: (value: { attempt: number; sessionId: string; sessionFile: string }) => void;
+  const exposure = new Promise<{ attempt: number; sessionId: string; sessionFile: string }>((resolve) => { exposed = resolve; });
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "active", sessionFile: "/sessions/active.jsonl", messages: [assistant("done")], prompt: () => new Promise<void>((resolve) => { finish = resolve; promptStarted(); }), dispose() {} }));
+  const running = executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onAttempt: (attempt) => { exposed(attempt); } });
+  assert.deepEqual(await exposure, { attempt: 1, sessionId: "active", sessionFile: "/sessions/active.jsonl" });
+  await started;
+  finish();
+  await running;
+});
+
 void test("streams live token and tool-call progress", async () => {
   let listener: ((event: AgentSessionEvent) => void) | undefined;
   const messages = [assistant("")];
@@ -55,16 +69,18 @@ void test("streams live token and tool-call progress", async () => {
     sessionId: "progress", sessionFile: "/sessions/progress.jsonl", messages,
     subscribe(next) { listener = next; return () => { listener = undefined; }; },
     async prompt() {
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Checking state", partial: messages[0] } } as AgentSessionEvent);
       listener?.({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
       messages[0] = assistant("done");
-      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: {} } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done", partial: messages[0] } } as AgentSessionEvent);
       listener?.({ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false });
     },
     dispose() {},
   }));
   await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onProgress: (update) => { updates.push(update); } });
-  assert.ok(updates.some(({ toolCalls }) => toolCalls.some(({ name, state }) => name === "read" && state === "running")));
-  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], persist: true });
+  assert.ok(updates.some(({ activity }) => activity?.kind === "reasoning" && activity.text === "Checking state"));
+  assert.ok(updates.some(({ toolCalls, activity }) => activity?.kind === "tool" && toolCalls.some(({ name, state }) => name === "read" && state === "running")));
+  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], activity: { kind: "text", text: "done" }, persist: true });
 });
 
 void test("keeps workflow_result present, delays acceptance, and allows one repair", async () => {

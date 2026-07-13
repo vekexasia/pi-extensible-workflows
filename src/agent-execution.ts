@@ -18,6 +18,7 @@ export interface AgentExecutionOptions {
   model?: string;
   thinking?: ThinkingLevel;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
+  onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => void | Promise<void>;
   tools?: readonly string[];
   agentType?: string;
   role?: string;
@@ -39,7 +40,8 @@ export interface AgentExecutionRoot {
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
 export interface AgentToolCallProgress { id: string; name: string; state: "running" | "completed" | "failed" }
-export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; persist: boolean }
+export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
+export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; activity?: AgentActivity; persist: boolean }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
 export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
 
@@ -152,19 +154,32 @@ export class WorkflowAgentExecutor {
       } as ToolDefinition : undefined;
       let session: NativeSession | undefined;
       const toolCalls = new Map<string, AgentToolCallProgress>();
+      let activity: AgentActivity | undefined;
+      let reasoning = "";
+      let output = "";
+      let lastActivityPersisted = 0;
       let progress = Promise.resolve();
       let unsubscribe: (() => void) | undefined;
       const report = (persist: boolean) => {
         if (!session || !options.onProgress) return;
-        const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], persist };
+        const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
         session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
+        await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile) });
         unsubscribe = session.subscribe?.((event) => {
-          if (event.type === "tool_execution_start") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" });
-          if (event.type === "tool_execution_end") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" });
-          if (["message_update", "message_end", "tool_execution_start", "tool_execution_end"].includes(event.type)) report(event.type === "message_end" || event.type === "tool_execution_end");
+          if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; }
+          if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; }
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_start") reasoning = "";
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") { reasoning += event.assistantMessageEvent.delta; activity = { kind: "reasoning", text: oneLine(reasoning) }; }
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_start") output = "";
+          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") { output += event.assistantMessageEvent.delta; activity = { kind: "text", text: oneLine(output) }; }
+          if (["message_update", "message_end", "tool_execution_start", "tool_execution_end"].includes(event.type)) {
+            const persist = event.type !== "message_update" || Date.now() - lastActivityPersisted >= 500;
+            if (persist) lastActivityPersisted = Date.now();
+            report(persist);
+          }
         });
         report(false);
         if (setSteer) {
@@ -459,6 +474,7 @@ export class FairAgentScheduler {
   }
 }
 
+function oneLine(value: string): string { return value.replace(/\s+/g, " ").trim().slice(-120); }
 function resolvePath(path: string): string { return path.replace(/[\\/]+$/, ""); }
 
 function requiredFile(file: string | undefined): string {

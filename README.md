@@ -61,7 +61,6 @@ Invocation options:
 | `foreground` | boolean | Wait for completion instead of returning the run ID |
 | `concurrency` | integer 1-16 | Per-run active-agent cap |
 | `maxAgents` | positive integer | Logical agent cap, including nested agents |
-| `agentTimeoutMs` | positive integer or `null` | Per-attempt timeout; `null` means unlimited |
 
 A workflow final result and every worker RPC value must be JSON-compatible and at most 10 MB.
 
@@ -275,12 +274,11 @@ Optional strict settings live only at `~/.pi/workflows/settings.json`:
 ```json
 {
   "concurrency": 8,
-  "maxAgents": 1000,
-  "agentTimeoutMs": null
+  "maxAgents": 1000
 }
 ```
 
-Unknown keys or invalid values block new workflow launches, not Pi startup. Invocation options override these defaults. The session-wide active-agent ceiling is always 16.
+Unknown keys or invalid values block new workflow launches, not Pi startup. Invocation options override these defaults. Per-agent `timeoutMs` remains opt-in in `agent(...)`. The session-wide active-agent ceiling is always 16.
 
 ## Error contract
 

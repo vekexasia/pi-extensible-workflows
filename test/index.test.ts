@@ -67,6 +67,12 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   assert.doesNotMatch(rendered, /Tokens:/);
   assert.doesNotMatch(rendered, /✓ ls/);
   assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review \[running\] ⠙ read/);
+  const agent = run.agents[0];
+  assert.ok(agent);
+  const reasoning = { ...run, agents: [{ ...agent, activity: { kind: "reasoning" as const, text: "checking cache" } }] };
+  assert.match(formatWorkflowProgress(reasoning), /reasoning: checking cache/);
+  const text = { ...run, agents: [{ ...agent, activity: { kind: "text" as const, text: "streaming answer" } }] };
+  assert.match(formatWorkflowProgress(text), /> streaming answer/);
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
@@ -94,7 +100,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] };
   workflowExtension(pi as never, home);
   let selectCall = 0;
-  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options[0]; return "Close"; }, confirm: async () => deleteConfirmed } };
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options.find((option) => option.includes("completed")); if (selectCall === 2) return "Transcript paths"; if (selectCall === 3) return "Back"; return "Close"; }, confirm: async () => deleteConfirmed } };
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
@@ -104,12 +110,30 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.match(runList, /Close/);
   const dashActions = selections[1]?.join("\n") ?? "";
   assert.match(dashActions, /Delete|Stop|Approve|Reject/);
+  assert.match(dashActions, /Transcript paths/);
+  assert.ok(selections.some((options) => options.includes("/pi/native-a.jsonl")));
   assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
   await command("delete run-a", ctx as never);
   assert.equal(existsSync(store.directory), true);
   deleteConfirmed = true;
   await command("delete run-a", ctx as never);
   assert.equal(existsSync(store.directory), false);
+});
+
+void test("navigator refresh reloads the selected run", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-refresh-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session", "run", home);
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", phase: "before", agents: [], nativeSessions: [] }, snapshot);
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  const prompts: string[] = [];
+  let call = 0;
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { prompts.push(prompt); call += 1; if (call === 1) return options[0]; if (call === 2) { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase: "after" }); return "Refresh"; } return "Close"; } } };
+  await commands[0]?.handler("", ctx as never);
+  assert.match(prompts[1] ?? "", /phase: before/);
+  assert.match(prompts[2] ?? "", /phase: after/);
 });
 
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
@@ -119,7 +143,7 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   const storeA = new RunStore(cwd, "s", "aaaa-1111-2222-3333", home);
   await storeA.create({ id: "aaaa-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "completed", agents: [{ id: "a:1", name: "scout", path: "a:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: ["read"], attempts: 1, accounting: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01 } }], nativeSessions: [] }, snapshot);
   const storeB = new RunStore(cwd, "s", "bbbb-1111-2222-3333", home);
-  await storeB.create({ id: "bbbb-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "running", phase: "review", agents: [{ id: "b:1", name: "root", path: "b:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }, { id: "b:2", name: "child", path: "b:2", state: "running", parentId: "b:1", model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], attempts: 1, toolCalls: [{ id: "tc1", name: "read", state: "running" }] }], nativeSessions: [] }, snapshot);
+  await storeB.create({ id: "bbbb-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "running", phase: "review", agents: [{ id: "b:1", name: "root", path: "b:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }, { id: "b:2", name: "child", path: "b:2", state: "running", parentId: "b:1", model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "active", sessionFile: "/sessions/active.jsonl", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }], accounting: { input: 10, output: 5, cacheRead: 20, cacheWrite: 2, cost: 0.04 }, toolCalls: [{ id: "tc1", name: "read", state: "running" }], activity: { kind: "reasoning", text: "checking source" } }], nativeSessions: [{ sessionId: "active", sessionFile: "/sessions/active.jsonl" }] }, snapshot);
   const storeC = new RunStore(cwd, "s", "cccc-1111-2222-3333", home);
   await storeC.create({ id: "cccc-1111-2222-3333", workflowName: "deploy", cwd, sessionId: "s", state: "failed", agents: [{ id: "c:1", name: "deployer", path: "c:1", state: "failed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 2, sessionId: "n", sessionFile: "/n", error: { code: "AGENT_FAILED", message: "timeout" }, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
 
@@ -128,7 +152,9 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /root > child/);
   assert.match(dashB, /phase: review/);
   assert.match(dashB, /1\/2 agents/);
-  assert.match(dashB, /⠦ read/);
+  assert.match(dashB, /37 tok \(in 10, out 5, cache read 20, cache write 2\)/);
+  assert.match(dashB, /reasoning: checking source/);
+  assert.match(dashB, /transcript attempt 1: \/sessions\/active\.jsonl/);
 
   const dashC = formatNavigatorDashboard((await storeC.load()).run, [], []);
   assert.match(dashC, /error: AGENT_FAILED: timeout/);
@@ -387,7 +413,7 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   assert.equal(loadSettings(join(dir, "missing.json")), DEFAULT_SETTINGS);
   const path = join(dir, "settings.json");
   writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgents: 20, agentTimeoutMs: 500 }));
-  assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgents: 20, agentTimeoutMs: 500 });
+  assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgents: 20 });
   writeFileSync(path, JSON.stringify({ concurrency: 17 }));
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
   writeFileSync(path, JSON.stringify({ surprise: true }));
@@ -451,7 +477,7 @@ void test("AST meta parsing rejects non-literal constructs and accepts valid met
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
+  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   assert.deepEqual(snapshot.args, { nested: [1] });

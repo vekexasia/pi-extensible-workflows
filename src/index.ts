@@ -8,7 +8,7 @@ import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { parseFrontmatter, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -34,9 +34,9 @@ export type WorkResult<T extends JsonValue = JsonValue> = WorkSuccess<T> | WorkF
 export interface ModelSpec { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description: string; phases?: readonly string[]; extensions?: readonly ExtensionRequirement[] }
-export interface WorkflowSettings { concurrency: number; maxAgents: number; agentTimeoutMs: number | null }
+export interface WorkflowSettings { concurrency: number; maxAgents: number }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[] }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
@@ -117,7 +117,7 @@ export class RunLifecycle {
   async #set(state: RunState): Promise<void> { this.#state = state; await this.changed?.(state); }
 }
 
-export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgents: 1000, agentTimeoutMs: null });
+export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgents: 1000 });
 
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -151,16 +151,14 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
     fail("INVALID_SETTINGS", `Invalid workflow settings: ${(error as Error).message}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", "Workflow settings must be an object");
-  const allowed = new Set(["concurrency", "maxAgents", "agentTimeoutMs"]);
+  const allowed = new Set(["concurrency", "maxAgents", "agentTimeoutMs"]); // agentTimeoutMs is legacy and ignored; per-agent timeoutMs remains opt-in.
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting: ${unknown}`);
   const concurrency = parsed.concurrency === undefined ? DEFAULT_SETTINGS.concurrency : parsed.concurrency;
   const maxAgents = parsed.maxAgents === undefined ? DEFAULT_SETTINGS.maxAgents : parsed.maxAgents;
-  const agentTimeoutMs = parsed.agentTimeoutMs === undefined ? DEFAULT_SETTINGS.agentTimeoutMs : parsed.agentTimeoutMs;
   if (!positiveInteger(concurrency) || concurrency > 16) fail("INVALID_SETTINGS", "concurrency must be an integer from 1 to 16");
   if (!positiveInteger(maxAgents)) fail("INVALID_SETTINGS", "maxAgents must be a positive integer");
-  if (agentTimeoutMs !== null && !positiveInteger(agentTimeoutMs)) fail("INVALID_SETTINGS", "agentTimeoutMs must be null or a positive integer");
-  return Object.freeze({ concurrency, maxAgents, agentTimeoutMs });
+  return Object.freeze({ concurrency, maxAgents });
 }
 
 export function parseRoleMarkdown(content: string, strict = false): AgentDefinition {
@@ -732,12 +730,21 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   return { result, cancel };
 }
 
+export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">): Promise<void> {
+  const loaded = await store.load();
+  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  const accounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const nativeSessions = loaded.run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? loaded.run.nativeSessions : [...loaded.run.nativeSessions, { sessionId: active.sessionId, sessionFile: active.sessionFile }];
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : agent), nativeSessions });
+}
+
 export async function persistAgentAttempts(store: RunStore, id: string, attempts: readonly AgentAttempt[]): Promise<void> {
   const loaded = await store.load();
   if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
   const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
   const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting }));
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, attemptDetails, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+  const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, attemptDetails, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
 }
 
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
@@ -753,9 +760,8 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): stri
     for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat(depth + 1);
-    const lastTool = agent.toolCalls?.at(-1);
-    const toolText = lastTool ? ` ${lastTool.state === "completed" ? "✓" : lastTool.state === "failed" ? "✗" : spinner} ${lastTool.name}` : "";
-    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]${toolText}`);
+    const activity = formatAgentActivity(agent, spinner);
+    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]${activity ? ` ${activity}` : ""}`);
   }
   return lines.join("\n");
 }
@@ -818,14 +824,27 @@ function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): st
   return parts.length > 1 ? parts.join(" > ") : agent.name;
 }
 
+function formatAgentActivity(agent: AgentRecord, spinner: string): string {
+  if (agent.activity?.kind === "reasoning") return `… reasoning: ${agent.activity.text}`;
+  if (agent.activity?.kind === "text") return `> ${agent.activity.text}`;
+  if (agent.activity?.kind === "tool") return `${spinner} ${agent.activity.text}`;
+  const tool = [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running");
+  return tool ? `${spinner} ${tool.name}` : "";
+}
+
+function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): string {
+  const total = accounting.input + accounting.output + accounting.cacheRead + accounting.cacheWrite;
+  return `${String(total)} tok (in ${String(accounting.input)}, out ${String(accounting.output)}, cache read ${String(accounting.cacheRead)}, cache write ${String(accounting.cacheWrite)})`;
+}
+
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
   const settled = new Set(["completed", "failed", "cancelled"]);
   const done = run.agents.filter((a) => settled.has(a.state)).length;
-  const totalTokens = run.agents.reduce((sum, a) => sum + (a.accounting ? a.accounting.input + a.accounting.output : 0), 0);
-  const totalCost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
+  const totalAccounting = run.agents.reduce((sum, a) => ({ input: sum.input + (a.accounting?.input ?? 0), output: sum.output + (a.accounting?.output ?? 0), cacheRead: sum.cacheRead + (a.accounting?.cacheRead ?? 0), cacheWrite: sum.cacheWrite + (a.accounting?.cacheWrite ?? 0), cost: sum.cost + (a.accounting?.cost ?? 0) }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  const hasAccounting = run.agents.some((a) => a.accounting);
   const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
   const header = `${glyph} ${run.workflowName}`;
-  const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, totalTokens > 0 ? `${String(totalTokens)} tok` : "", totalCost > 0 ? `$${totalCost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
+  const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, hasAccounting ? formatAccounting(totalAccounting) : "", totalAccounting.cost > 0 ? `$${totalAccounting.cost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
   const lines = [header, meta];
   if (run.error) lines.push(`Error: ${run.error.code}: ${run.error.message}`);
   lines.push("");
@@ -840,18 +859,16 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = agentBreadcrumb(agent, byId);
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
-    const tokens = agent.accounting ? `${String(agent.accounting.input + agent.accounting.output)} tok` : "";
+    const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
     const parts = [`${icon} ${breadcrumb}`, agent.state, model, tokens].filter(Boolean);
     lines.push(parts.join("  "));
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
       if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
     }
-    if (!settled.has(agent.state)) {
-      for (const call of agent.toolCalls ?? []) {
-        if (call.state === "running" || call.state === "failed") lines.push(`  ${call.state === "failed" ? "✗" : "⠦"} ${call.name}`);
-      }
-    }
+    const activity = !settled.has(agent.state) ? formatAgentActivity(agent, "⠦") : "";
+    if (activity) lines.push(`  ${activity}`);
+    for (const attempt of agent.attemptDetails ?? []) lines.push(`  transcript attempt ${String(attempt.attempt)}: ${attempt.sessionFile}`);
   }
   if (checkpoints.length) { lines.push(""); for (const cp of checkpoints) lines.push(`● checkpoint ${cp.name}: ${cp.prompt}`); }
   if (worktrees.length) { lines.push(""); for (const wt of worktrees) lines.push(`branch ${wt.branch} (${wt.path})`); }
@@ -1012,7 +1029,7 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
   const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => {
     const loaded = await store.load();
     const run = { ...loaded.run, state: next };
@@ -1026,11 +1043,16 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const onProgress = async (progress: AgentProgress) => {
         const loaded = await run.store.load();
         if (!loaded.run.agents.some((agent) => agent.id === id)) return;
-        const runState = { ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls } : agent) };
+        const runState = { ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls, activity: progress.activity } : agent) };
         if (progress.persist) await run.store.saveState(runState);
         run.update?.(workflowToolUpdate(runState));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => {
+        await scheduler.flush();
+        await persistActiveAgentAttempt(run.store, id, attempt);
+        run.update?.(workflowToolUpdate((await run.store.load()).run));
+      };
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1046,7 +1068,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
     const agents = ownership.map((node) => {
       const previous = existing.get(node.id);
-      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}) };
+      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
     });
     const runState = { ...loaded.run, agents };
     await run.store.saveState(runState);
@@ -1123,7 +1145,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: loadAgentDefinitions(ctx.cwd), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle, checkpointResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: loadAgentDefinitions(ctx.cwd), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
@@ -1161,12 +1183,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
       concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
       maxAgents: Type.Optional(Type.Integer({ minimum: 1 })),
-      agentTimeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const defaults = loadSettings();
-      const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents, agentTimeoutMs: params.agentTimeoutMs === undefined ? defaults.agentTimeoutMs : params.agentTimeoutMs });
+      const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents });
       const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
       const rootModelName = `${rootModel.provider}/${rootModel.model}`;
       const modelRegistry = (ctx as unknown as { modelRegistry?: { getAvailable(): Array<{ provider: string; id: string }> } }).modelRegistry;
@@ -1185,7 +1206,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), agentDefinitions, runStore: store, providerPause });
-      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
+      runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
@@ -1286,27 +1307,37 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (runIndex < 0) return;
         const selected = sorted[runIndex];
         if (!selected) return;
-        const { store, loaded } = selected;
-        const checkpoints = await store.awaitingCheckpoints();
-        const dashboard = formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees());
-        const actions = new Map<string, string>();
-        const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
-        if (loaded.run.state === "running") add("Pause", "pause");
-        if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
-        if (!terminalStates.has(loaded.run.state)) add("Stop", "stop");
-        for (const cp of checkpoints) {
-          actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
-          actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
+        const { store } = selected;
+        for (;;) {
+          const loaded = await store.load();
+          const checkpoints = await store.awaitingCheckpoints();
+          const dashboard = formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees());
+          const actions = new Map<string, string>();
+          const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
+          if (loaded.run.state === "running") add("Pause", "pause");
+          if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
+          if (!terminalStates.has(loaded.run.state)) add("Stop", "stop");
+          for (const cp of checkpoints) {
+            actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
+            actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
+          }
+          actions.set("Refresh", "refresh");
+          const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
+          if (transcripts.length) actions.set("Transcript paths", "transcripts");
+          if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
+          const actionChoice = await ctx.ui.select(dashboard, [...actions.keys(), "Back", "Close"]);
+          if (!actionChoice || actionChoice === "Close") return;
+          if (actionChoice === "Back") return;
+          if (actionChoice === "Refresh") continue;
+          if (actionChoice === "Transcript paths") { await ctx.ui.select("Native Pi transcript paths", [...transcripts, "Back"]); continue; }
+          command = actions.get(actionChoice) ?? "";
+          break;
         }
-        if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
-        const actionChoice = await ctx.ui.select(dashboard, [...actions.keys(), "Back", "Close"]);
-        if (!actionChoice || actionChoice === "Close") return;
-        if (actionChoice === "Back") { await ctx.ui.select("Returning to run list. Run /workflow again.", ["OK"]); return; }
-        command = actions.get(actionChoice) ?? "";
       }
       const [action, runId, ...rest] = command.split(/\s+/);
       const run = runId ? runs.get(runId) : undefined;
-      const stored = runId ? stores.find(({ store }) => store.runId === runId) : undefined;
+      const storedEntry = runId ? stores.find(({ store }) => store.runId === runId) : undefined;
+      const stored = storedEntry ? { store: storedEntry.store, loaded: await storedEntry.store.load() } : undefined;
       if ((action === "approve" || action === "reject") && runId && rest.length) {
         const accepted = await answerCheckpoint(runId, rest.join(" "), action === "approve", true);
         ctx.ui.notify(accepted ? `${action === "approve" ? "Approved" : "Rejected"} checkpoint ${rest.join(" ")}.` : "Checkpoint is not awaiting a response.", accepted ? "info" : "warning"); return;
