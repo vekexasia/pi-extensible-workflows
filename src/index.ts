@@ -795,13 +795,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         for (const { store, loaded } of stores) {
           const checkpoints = await store.awaitingCheckpoints();
           details.push(formatNavigatorRun(loaded, checkpoints, await store.worktrees()));
-          const add = (label: string, value: string) => { actions.set(`${loaded.run.workflowName}: ${label}`, `${value} ${store.runId}`); };
+          const add = (label: string, value: string) => { actions.set(`${loaded.run.workflowName} (${store.runId}): ${label}`, `${value} ${store.runId}`); };
           if (loaded.run.state === "running") add("Pause", "pause");
           if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
           if (!["completed", "failed", "stopped"].includes(loaded.run.state)) add("Stop", "stop");
           for (const checkpoint of checkpoints) {
-            actions.set(`${loaded.run.workflowName}: Approve ${checkpoint.name}`, `approve ${store.runId} ${checkpoint.name}`);
-            actions.set(`${loaded.run.workflowName}: Reject ${checkpoint.name}`, `reject ${store.runId} ${checkpoint.name}`);
+            actions.set(`${loaded.run.workflowName} (${store.runId}): Approve ${checkpoint.name}`, `approve ${store.runId} ${checkpoint.name}`);
+            actions.set(`${loaded.run.workflowName} (${store.runId}): Reject ${checkpoint.name}`, `reject ${store.runId} ${checkpoint.name}`);
           }
           if (["completed", "failed", "stopped"].includes(loaded.run.state)) add("Delete", "delete");
         }

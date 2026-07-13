@@ -35,6 +35,9 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create({ id: "run-a", workflowName: "nav", cwd, sessionId: "session-a", state: "completed", phase: "review", agents: [{ id: "run-a:1", name: "reviewer", path: "run-a:1", state: "failed", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read"], attempts: 2, attemptDetails: [{ attempt: 2, sessionId: "native-a", sessionFile: "/pi/native-a.jsonl", error: { code: "AGENT_FAILED", message: "boom" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], nativeSessions: [{ sessionId: "native-a", sessionFile: "/pi/native-a.jsonl" }] }, snapshot);
+  const same = new RunStore(cwd, "session-a", "run-c", home);
+  await same.create({ id: "run-c", workflowName: "nav", cwd, sessionId: "session-a", state: "awaiting_input", agents: [], nativeSessions: [] }, snapshot);
+  await same.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
   const other = new RunStore(cwd, "session-b", "run-b", home);
   await other.create({ id: "run-b", workflowName: "other", cwd, sessionId: "session-b", state: "completed", agents: [], nativeSessions: [] }, snapshot);
   const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "reviewer", branch: "pi-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
@@ -54,7 +57,11 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
-  assert.match(selections[0]?.[0] ?? "", /nav: Delete/);
+  const actions = selections[0]?.join("\n") ?? "";
+  assert.match(actions, /nav \(run-a\): Delete/);
+  assert.match(actions, /nav \(run-c\): Stop/);
+  assert.match(actions, /nav \(run-c\): Approve ship/);
+  assert.match(actions, /nav \(run-c\): Reject ship/);
   assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
   assert.match(prompts[0] ?? "", /Native Pi transcript paths/);
   await command("delete run-a", ctx as never);
