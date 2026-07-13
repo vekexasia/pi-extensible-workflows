@@ -16,6 +16,15 @@ void test("resolves root-bounded definitions and model specs", () => {
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", agentType: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
 });
 
+void test("provider limits pause and retry the same native session", async () => {
+  let prompts = 0;
+  let pauses = 0;
+  const executor = new WorkflowAgentExecutor({ ...root, providerPause: async () => { pauses += 1; } }, async () => ({ sessionId: "same", sessionFile: "/sessions/same.jsonl", messages: [assistant("continued")], prompt: async () => { prompts += 1; if (prompts === 1) throw Object.assign(new Error("limited"), { status: 429 }); }, dispose() {} }));
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc" })).value, "continued");
+  assert.equal(prompts, 2);
+  assert.equal(pauses, 1);
+});
+
 void test("returns final text and captures persisted native session accounting", async () => {
   const prompts: string[] = [];
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "s1", sessionFile: "/sessions/s1.jsonl", messages: [assistant("done")], prompt: async (prompt) => { prompts.push(prompt); }, dispose() {} }));

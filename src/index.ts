@@ -8,7 +8,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt } from "./agent-execution.js";
-import { listRunIds, RunStore } from "./persistence.js";
+import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
@@ -52,6 +52,52 @@ export interface WorkflowMacroJournal { get(path: string): JsonValue | undefined
 
 export class WorkflowError extends Error {
   constructor(public readonly code: WorkflowErrorCode, message: string) { super(message); this.name = "WorkflowError"; }
+}
+
+export class RunLifecycle {
+  #state: RunState;
+  #active = 0;
+  #waiters: Array<() => void> = [];
+
+  constructor(state: RunState = "running", private readonly changed?: (state: RunState) => void | Promise<void>) { this.#state = state; }
+  get state(): RunState { return this.#state; }
+
+  async enter(): Promise<void> {
+    while (this.#state === "pausing" || this.#state === "paused") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
+    if (this.#state !== "running") throw new WorkflowError("CANCELLED", `Run is ${this.#state}`);
+    this.#active += 1;
+  }
+
+  async leave(): Promise<void> {
+    if (this.#active > 0) this.#active -= 1;
+    if (this.#state === "pausing" && this.#active === 0) await this.#set("paused");
+  }
+
+  async pause(): Promise<void> {
+    if (this.#state !== "running") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot pause ${this.#state} run`);
+    await this.#set("pausing");
+    if (this.#active === 0) await this.#set("paused");
+  }
+
+  async resume(): Promise<void> {
+    if (this.#state !== "paused" && this.#state !== "interrupted") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot resume ${this.#state} run`);
+    await this.#set("running");
+    for (const resolve of this.#waiters.splice(0)) resolve();
+  }
+
+  async providerPause(): Promise<void> {
+    await this.leave();
+    if (this.#state === "running") await this.pause();
+    await this.enter();
+  }
+
+  async terminal(state: "completed" | "failed" | "stopped" | "interrupted"): Promise<void> {
+    if (["completed", "failed", "stopped"].includes(this.#state)) throw new WorkflowError("RESUME_INCOMPATIBLE", `${this.#state} runs are terminal`);
+    await this.#set(state);
+    for (const resolve of this.#waiters.splice(0)) resolve();
+  }
+
+  async #set(state: RunState): Promise<void> { this.#state = state; await this.changed?.(state); }
 }
 
 export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgents: 1000, agentTimeoutMs: null });
@@ -462,7 +508,8 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec }>();
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution }>();
+  const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => { const loaded = await store.load(); await store.saveState({ ...loaded.run, state: next }); });
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
@@ -495,7 +542,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const loaded = await store.load();
       if (["completed", "failed", "stopped"].includes(loaded.run.state)) continue;
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model });
+      const lifecycle = lifecycleFor(store, loaded.run.state);
+      const providerPause = () => lifecycle.providerPause();
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model, lifecycle });
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
   });
@@ -523,24 +572,34 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store });
-      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel });
+      const lifecycle = lifecycleFor(store, "running");
+      const providerPause = () => lifecycle.providerPause();
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store, providerPause });
+      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
       const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
+        await lifecycle.enter();
+        try {
         const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
         const label = typeof options.name === "string" ? options.name : "agent";
+        const path = operationPath("agent", label);
+        const replayed = await store.replay(path);
+        if (replayed) return replayed.value;
         const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
         const cwd = isolation ? (await store.worktree(label)).cwd : ctx.cwd;
         const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner: label } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         topLevel.add(spawned.result);
         const cancel = () => { scheduler.cancel(spawned.id); };
         if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
-        const outcome = await spawned.result.finally(() => { topLevel.delete(spawned.result); agentSignal.removeEventListener("abort", cancel); });
-        if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
-        return outcome.value;
-      } }, signal);
-      const finish = execution.result.then(async (value) => { await scheduler.flush(); const loaded = await store.load(); await store.saveState({ ...loaded.run, state: "completed" }); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const loaded = await store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await store.saveState({ ...loaded.run, state: typed.code === "CANCELLED" ? "stopped" : "failed", error: { code: typed.code, message: typed.message } }); throw typed; });
+          const outcome = await spawned.result.finally(() => { topLevel.delete(spawned.result); agentSignal.removeEventListener("abort", cancel); });
+          if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+          await store.complete(path, outcome.value);
+          return outcome.value;
+        } finally { await lifecycle.leave(); }
+      }, phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, signal);
+      (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
+      const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
       if (!params.foreground) { void finish.catch(() => undefined); return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } }; }
       const value = await finish;
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
@@ -550,14 +609,56 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     description: "Inspect and control workflows for this Pi session",
     handler: async (args, ctx) => {
       const [action, runId] = args.trim().split(/\s+/);
-      if (action === "stop" && runId && runs.has(runId)) {
-        await scheduler.cancelRun(runId); await scheduler.flush();
-        const run = runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>;
-        const loaded = await run.store.load(); await run.store.saveState({ ...loaded.run, state: "stopped" });
-        ctx.ui.notify(`Stopped workflow ${runId}.`, "info"); return;
+      const run = runId ? runs.get(runId) : undefined;
+      if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return; }
+      if (action === "resume" && run) {
+        if (run.lifecycle.state === "interrupted") {
+          const loaded = await run.store.load();
+          const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow"));
+          const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
+          if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
+          preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
+          await scheduler.cancelRun(run.store.runId);
+          await run.lifecycle.resume();
+          const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, { agent: async (prompt, options, signal) => {
+            await run.lifecycle.enter();
+            try {
+              const label = typeof options.name === "string" ? options.name : "agent";
+              const path = operationPath("agent", label);
+              const replayed = await run.store.replay(path);
+              if (replayed) return replayed.value;
+              const tools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools;
+              const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
+              const cwd = isolation ? (await run.store.worktree(label)).cwd : run.store.cwd;
+              const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: label } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+              const cancel = () => { scheduler.cancel(spawned.id); };
+              signal.addEventListener("abort", cancel, { once: true });
+              const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
+              if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+              await run.store.complete(path, outcome.value);
+              return outcome.value;
+            } finally { await run.lifecycle.leave(); }
+          }, phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } });
+          run.execution = execution;
+          void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
+        } else await run.lifecycle.resume();
+        ctx.ui.notify(`Resumed workflow ${run.store.runId}.`, "info"); return;
+      }
+      if (action === "stop" && run) {
+        await run.lifecycle.terminal("stopped"); run.execution?.cancel(); await scheduler.cancelRun(run.store.runId); await scheduler.flush();
+        ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return;
       }
       ctx.ui.notify([...runs.keys()].join("\n") || "No workflow runs in this session.", "info");
     },
+  });
+  pi.on("session_shutdown", async () => {
+    await Promise.all([...runs.entries()].map(async ([runId, run]) => {
+      if (["completed", "failed", "stopped"].includes(run.lifecycle.state)) return;
+      await run.lifecycle.terminal("interrupted");
+      run.execution?.cancel();
+      await scheduler.cancelRun(runId);
+    }));
+    await scheduler.flush();
   });
 }
 

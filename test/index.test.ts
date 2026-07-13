@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -27,6 +27,33 @@ void test("registers the workflow tool and singular command", async () => {
   const tool = tools[0];
   assert.ok(tool);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+
+void test("run lifecycle pauses cooperatively, resumes waiters, and keeps terminal states irreversible", async () => {
+  const states: string[] = [];
+  const lifecycle = new RunLifecycle("running", (state) => { states.push(state); });
+  await lifecycle.enter();
+  await lifecycle.pause();
+  assert.equal(lifecycle.state, "pausing");
+  let continued = false;
+  const waiting = lifecycle.enter().then(() => { continued = true; });
+  await lifecycle.leave();
+  assert.equal(lifecycle.state, "paused");
+  assert.equal(continued, false);
+  await lifecycle.resume();
+  await waiting;
+  assert.equal(continued, true);
+  await lifecycle.leave();
+  await lifecycle.terminal("stopped");
+  await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  assert.deepEqual(states, ["pausing", "paused", "running", "stopped"]);
+});
+
+void test("interrupted lifecycle can cold-resume while completed and failed cannot", async () => {
+  const interrupted = new RunLifecycle("interrupted");
+  await interrupted.resume();
+  assert.equal(interrupted.state, "running");
+  for (const state of ["completed", "failed"] as const) await assert.rejects(new RunLifecycle(state).resume(), /Cannot resume/);
 });
 
 void test("strict settings use defaults and reject unknown or unsafe values", () => {
