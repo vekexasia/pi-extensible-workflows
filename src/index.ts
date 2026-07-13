@@ -467,7 +467,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const run = runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
     try {
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -495,7 +495,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const loaded = await store.load();
       if (["completed", "failed", "stopped"].includes(loaded.run.state)) continue;
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))) }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), runStore: store }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model });
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
   });
@@ -523,13 +523,16 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools) });
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store });
       runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
       const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
         const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
-        const spawned = scheduler.spawn(runId, prompt, { label: typeof options.name === "string" ? options.name : "agent", cwd: ctx.cwd, tools: requestedTools, ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const label = typeof options.name === "string" ? options.name : "agent";
+        const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
+        const cwd = isolation ? (await store.worktree(label)).cwd : ctx.cwd;
+        const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner: label } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         topLevel.add(spawned.result);
         const cancel = () => { scheduler.cancel(spawned.id); };
         if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
@@ -564,6 +567,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
-export type { CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun } from "./persistence.js";
+export type { CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";

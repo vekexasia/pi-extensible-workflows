@@ -5,6 +5,7 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
 import { WorkflowError } from "./index.js";
+import type { RunStore } from "./persistence.js";
 
 export interface AgentDefinition { prompt?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
 export interface AgentExecutionOptions {
@@ -13,6 +14,7 @@ export interface AgentExecutionOptions {
   workflowDescription: string;
   phase?: string;
   parent?: string;
+  parentIsolation?: "worktree";
   model?: string;
   thinking?: ThinkingLevel;
   tools?: readonly string[];
@@ -21,16 +23,20 @@ export interface AgentExecutionOptions {
   retries?: number;
   timeoutMs?: number | null;
   retryState?: string;
+  isolation?: "worktree";
+  worktreeOwner?: string;
+  cwd?: string;
 }
 export interface AgentExecutionRoot {
   cwd: string;
   model: ModelSpec;
   tools: ReadonlySet<string>;
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
+  runStore?: RunStore;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
-export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[] }
+export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
 
 export interface NativeSession {
   readonly sessionId: string;
@@ -101,6 +107,27 @@ export class WorkflowAgentExecutor {
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
+    let cwd: string;
+    if (options.parent) {
+      if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Only top-level agents may request worktree isolation");
+      if (!options.cwd) throw new WorkflowError("INVALID_METADATA", "Child agents require their parent cwd");
+      if (options.parentIsolation) {
+        if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree inheritance requires a persisted run");
+        cwd = (await this.root.runStore.validateWorktree(options.worktreeOwner ?? options.parent, options.cwd)).cwd;
+      } else {
+        if (options.cwd !== this.root.cwd) throw new WorkflowError("INVALID_METADATA", "Shared-tree children must inherit the root cwd");
+        cwd = this.root.cwd;
+      }
+    } else {
+      if (options.parentIsolation || (options.cwd && !options.isolation)) throw new WorkflowError("INVALID_METADATA", "Only isolated top-level agents or child agents may provide a cwd");
+      if (!options.isolation) cwd = this.root.cwd;
+      else {
+        if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree isolation requires a persisted run");
+        const worktree = await this.root.runStore.worktree(options.worktreeOwner ?? options.label);
+        if (options.cwd && resolvePath(options.cwd) !== resolvePath(worktree.cwd)) throw new WorkflowError("WORKTREE_FAILED", "Isolated agent cwd does not match its owned worktree");
+        cwd = worktree.cwd;
+      }
+    }
     const resolved = this.resolve(options);
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
@@ -121,7 +148,7 @@ export class WorkflowAgentExecutor {
       } as ToolDefinition : undefined;
       let session: NativeSession | undefined;
       try {
-        session = await this.createSession({ cwd: this.root.cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}) });
+        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}) });
         if (setSteer) {
           if (!session.steer) throw new WorkflowError("INTERNAL_ERROR", "Native Pi session does not support steering");
           setSteer((message) => session?.steer?.(message));
@@ -139,16 +166,18 @@ export class WorkflowAgentExecutor {
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
         const value = options.schema ? schemaResult as JsonValue : text(session.messages);
+        if (options.isolation) await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label);
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: accounting(session.messages) });
         session.dispose();
-        return { value, attempts };
+        return { value, attempts, cwd };
       } catch (error) {
         const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
         if (session) {
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: accounting(session.messages) });
           session.dispose();
         }
-        if (attempt === maxAttempts || typed.code === "CANCELLED") throw Object.assign(typed, { attempts });
+        if (options.isolation && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label).catch(() => undefined);
+        if (attempt === maxAttempts || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
         beforeRetry?.();
       }
     }
@@ -160,6 +189,8 @@ export interface ScheduledAgentOptions {
   label: string;
   cwd: string;
   tools: readonly string[];
+  isolation?: "worktree";
+  worktreeOwner?: string;
   model?: string;
   schema?: JsonSchema;
   retries?: number;
@@ -339,14 +370,14 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "model", "schema", "retries", "timeoutMs"].includes(key));
+    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "schema", "retries", "timeoutMs"].includes(key));
     if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });
     if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const forbidden = options.tools.find((tool) => !parent.options.tools.includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
-    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]) });
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(parent.options.isolation ? { isolation: parent.options.isolation, worktreeOwner: parent.options.worktreeOwner } : {}) });
   }
   /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
 
@@ -402,6 +433,8 @@ export class FairAgentScheduler {
     this.#persistence = this.#persistence.then(() => this.writeOwnership?.(runId, ownership)).then(() => undefined);
   }
 }
+
+function resolvePath(path: string): string { return path.replace(/[\\/]+$/, ""); }
 
 function requiredFile(file: string | undefined): string {
   if (!file) throw new WorkflowError("INTERNAL_ERROR", "Workflow agents require persisted native Pi sessions");
