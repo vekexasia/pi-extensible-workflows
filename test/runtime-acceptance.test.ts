@@ -139,7 +139,7 @@ void test("production worker runs named combinators with railway lifecycle seman
 
   assert.deepEqual(await runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
     return pipeline([{name:'first',value:1},{name:'second',value:2}],{name:'double',run:value=>value*2},{name:'fail-two',run:value=>{if(value===4)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value}},{name:'pipe'});`).result,
-  [{ name: "first", ok: true, value: 2 }, { name: "second", ok: false, failedAt: "pipe/second/fail-two", error: { code: "AGENT_FAILED", message: "no" } }]);
+  [{ name: "first", ok: true, value: 2, __workResult: true }, { name: "second", ok: false, failedAt: "pipe/second/fail-two", error: { code: "AGENT_FAILED", message: "no" }, __workResult: true }]);
 });
 
 void test("terminal failed attempts remain persisted", async () => {
@@ -164,7 +164,7 @@ void test("production workflow exposes registered extension macros and replays t
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const script = `export const meta={name:'extension-e2e',description:'extension e2e',phases:['verify'],extensions:[{name:'issue16Acceptance',version:'^1.0.0'}]}; phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first,replayed];`;
+  const script = `export const meta={name:'extension-e2e',description:'extension e2e',phases:['verify'],extensions:[{name:'issue16Acceptance',version:'^1.0.0'}]}; phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first.value,replayed.value];`;
   const result = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.deepEqual(result.details.value, [{ value: "first" }, { value: "first" }]);
   assert.equal(calls, 1);

@@ -100,7 +100,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
 
 void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
   const accepted: unknown[] = [];
-  assert.equal(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, false);
+  assert.deepEqual(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, { name: "ship", ok: true, value: "rejected", __workResult: true });
   assert.deepEqual(accepted, [{ name: "ship", prompt: "Ship?", context: { sha: "abc" } }]);
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "😀".repeat(257), context: null }), /1024/);
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: "😀".repeat(1025) }), /4096/);
@@ -123,7 +123,7 @@ void test("production checkpoints resolve in foreground navigator and background
   const script = `export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
   let selections = 0;
   const foreground = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, mode: "rpc", hasUI: true, ui: { select: async () => ++selections === 1 ? undefined : "Approve" } }) as { content: Array<{ text: string }> };
-  assert.equal(foreground.content[0]?.text, "true");
+  assert.deepEqual(JSON.parse(foreground.content[0]?.text ?? ""), { name: "ship", ok: true, value: "approved", __workResult: true });
   assert.equal(selections, 2);
   await assert.rejects(workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: false }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   const teardown = new AbortController();
@@ -366,7 +366,7 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   const phases: string[] = [];
   const script = `export const meta={name:'x',description:'x'};
     if (typeof process !== 'undefined' || typeof require !== 'undefined' || typeof console !== 'undefined' || typeof Date !== 'undefined' || typeof setTimeout !== 'undefined' || typeof Math.random !== 'undefined') throw new Error('unsafe global');
-    await phase('build'); if (!await checkpoint({name:'gate'})) throw new Error('rejected'); return await agent('echo', {name:'echo', value: args});`;
+    await phase('build'); const cp = await checkpoint({name:'gate'}); if (cp.value !== 'approved') throw new Error('rejected'); const r = await agent('echo', {name:'echo', value: args}); return r.value;`;
   const run = runWorkflow(script, { n: 2 }, {
     phase(name) { phases.push(name); },
     checkpoint() { return true; },
@@ -394,21 +394,36 @@ void test("named parallel and pipeline preserve order, contain failures, and exp
     ],{name:'batch'});`, null, bridge);
   while (started.length < 3) await new Promise((resolve) => setImmediate(resolve));
   pending.get("fast")?.(2); pending.get("slow")?.(1);
-  assert.deepEqual(await parallelRun.result, [
-    { name: "first/item", ok: true, value: 1 },
-    { name: "second", ok: true, value: 2 },
-    { name: "broken", ok: false, failedAt: "batch/broken", error: { code: "AGENT_FAILED", message: "expected failure" } },
-  ]);
+  const parallelResult = await parallelRun.result;
+  assert.ok(Array.isArray(parallelResult));
+  const [pFirst, pSecond, pBroken] = parallelResult as Array<{ name: string; ok: boolean; value?: JsonValue; failedAt?: string; error?: { code: string; message: string } }>;
+  assert.ok(pFirst && pSecond && pBroken);
+  assert.equal(pFirst.name, "first/item");
+  assert.equal(pFirst.ok, true);
+  assert.equal(pFirst.value, 1);
+  assert.equal(pSecond.name, "second");
+  assert.equal(pSecond.ok, true);
+  assert.equal(pSecond.value, 2);
+  assert.equal(pBroken.name, "broken");
+  assert.equal(pBroken.ok, false);
+  assert.ok(typeof pBroken.failedAt === "string" && /batch\/broken/.test(pBroken.failedAt));
+  assert.equal(pBroken.error?.code, "AGENT_FAILED");
 
   const pipelineRun = runWorkflow(`export const meta={name:'x',description:'x'};
     return pipeline([{name:'one',value:1},{name:'two',value:2}],
       {name:'double',run:value=>value*2},
       {name:'reject odd',run:value=>{if(value===2)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value+1}},
       {name:'pipe/name'});`);
-  assert.deepEqual(await pipelineRun.result, [
-    { name: "one", ok: false, failedAt: "pipe%2Fname/one/reject%20odd", error: { code: "AGENT_FAILED", message: "no" } },
-    { name: "two", ok: true, value: 5 },
-  ]);
+  const pipelineResult = await pipelineRun.result;
+  assert.ok(Array.isArray(pipelineResult));
+  const [ppOne, ppTwo] = pipelineResult as Array<{ name: string; ok: boolean; value?: JsonValue; failedAt?: string; error?: { code: string; message: string } }>;
+  assert.ok(ppOne && ppTwo);
+  assert.equal(ppOne.name, "one");
+  assert.equal(ppOne.ok, false);
+  assert.ok(typeof ppOne.failedAt === "string" && /pipe%2Fname\/one\/reject%20odd/.test(ppOne.failedAt));
+  assert.equal(ppTwo.name, "two");
+  assert.equal(ppTwo.ok, true);
+  assert.equal(ppTwo.value, 5);
 
   const duplicate = runWorkflow(`export const meta={name:'x',description:'x'}; return parallel([{name:'same',run:()=>1},{name:'same',run:()=>2}],{name:'batch'});`);
   await assert.rejects(duplicate.result, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");

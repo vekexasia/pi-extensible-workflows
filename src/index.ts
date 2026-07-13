@@ -432,6 +432,9 @@ export interface WorkflowBridge {
 
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 
+const OUTCOME_ERRORS = new Set<string>(["AGENT_TIMEOUT", "AGENT_FAILED", "RESULT_INVALID"]);
+const WORK_RESULT_BRAND = "__workResult";
+
 const childSource = String.raw`
 "use strict";
 const vm = require("node:vm");
@@ -474,8 +477,9 @@ process.on("message", raw => {
 });
 const heartbeat = setInterval(() => send({ type: "heartbeat" }), 1000);
 send({ type: "heartbeat" });
+const BRAND = "${WORK_RESULT_BRAND}";
 const workError = (code, message) => Object.assign(new Error(message), { code });
-const failure = (name, failedAt, error) => ({ name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message } });
+const isBranded = value => value && typeof value === "object" && value[BRAND] === true;
 const named = (value, kind) => { if (!value || typeof value.name !== "string" || !value.name.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value.name; };
 const unique = (values, kind) => { const names = values.map(value => named(value, kind)); if (new Set(names).size !== names.length) throw workError("DUPLICATE_NAME", "Duplicate " + kind + " name"); return names; };
 const path = (...names) => names.map(encodeURIComponent).join("/");
@@ -491,8 +495,12 @@ const parallel = async (tasks, operation) => {
   return Promise.all(tasks.map(async (task, index) => {
     const name = taskNames[index];
     const failedAt = path(operationName, name);
-    try { return { name, ok: true, value: await task.run() }; }
-    catch (error) { if (error.code === "CANCELLED") throw error; return failure(name, failedAt, error); }
+    try {
+      const result = await task.run();
+      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, result.failedAt), error: result.error, [BRAND]: true };
+      return { name, ok: true, value: isBranded(result) ? result.value : result, [BRAND]: true };
+    }
+    catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
   }));
 };
 const pipeline = async (items, ...parts) => {
@@ -509,10 +517,12 @@ const pipeline = async (items, ...parts) => {
     try {
       for (let stageIndex = 0; stageIndex < parts.length; stageIndex += 1) {
         failedAt = path(operationName, name, stageNames[stageIndex]);
-        value = await parts[stageIndex].run(value);
+        const result = await parts[stageIndex].run(value);
+        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, stageNames[stageIndex], result.failedAt), error: result.error, [BRAND]: true };
+        value = isBranded(result) ? result.value : result;
       }
-      return { name, ok: true, value };
-    } catch (error) { if (error.code === "CANCELLED") throw error; return failure(name, failedAt, error); }
+      return { name, ok: true, value, [BRAND]: true };
+    } catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
   }));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
@@ -577,6 +587,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   }
   function finish() { settled = true; clearTimeout(watchdog); signal?.removeEventListener("abort", cancel); killChild(); }
   function stop(code: WorkflowErrorCode, message: string) { if (settled) return; controller.abort(); finish(); rejectResult(new WorkflowError(code, message)); }
+  function branded(result: Record<string, JsonValue>): JsonValue { return { ...result, [WORK_RESULT_BRAND]: true }; }
   async function handleRpc(id: number, method: string, values: JsonValue[]) {
     try {
       encoded(values);
@@ -584,14 +595,39 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       if (method === "agent") {
         if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
-        value = await bridge.agent(values[0], object(values[1]) ? values[1] : {}, controller.signal);
+        const opts = object(values[1]) ? values[1] : {};
+        const name = typeof opts.name === "string" ? opts.name : "agent";
+        try {
+          const result = await bridge.agent(values[0], opts, controller.signal);
+          value = branded({ name, ok: true, value: result ?? null });
+        } catch (error) {
+          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
+          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
+        }
       } else if (method === "checkpoint") {
         if (!bridge.checkpoint || !object(values[0])) fail("INTERNAL_ERROR", "checkpoint requires an available bridge and object input");
-        value = await bridge.checkpoint(values[0], controller.signal);
-        if (typeof value !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
+        const name = typeof values[0].name === "string" ? values[0].name : "checkpoint";
+        try {
+          const result = await bridge.checkpoint(values[0], controller.signal);
+          if (typeof result !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
+          value = branded({ name, ok: true, value: result ? "approved" : "rejected" });
+        } catch (error) {
+          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
+          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
+        }
       } else if (method === "extension") {
         if (!bridge.extension || typeof values[0] !== "string" || typeof values[1] !== "string" || !object(values[2]) || typeof values[3] !== "string") fail("INTERNAL_ERROR", "extension requires an available bridge, names, object input, and path");
-        value = await bridge.extension(values[0], values[1], values[2], values[3], controller.signal);
+        const name = `${values[0]}.${values[1]}`;
+        try {
+          const result = await bridge.extension(values[0], values[1], values[2], values[3], controller.signal);
+          value = branded({ name, ok: true, value: result ?? null });
+        } catch (error) {
+          const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", (error as Error).message);
+          if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
+          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
+        }
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
         await bridge.phase?.(values[0]);
@@ -731,6 +767,10 @@ function namedHostOperation(value: unknown, kind: string): { name: string; run?:
   return value as { name: string; run?: (value?: JsonValue) => JsonValue | Promise<JsonValue>; value?: JsonValue };
 }
 
+function isBrandedResult(value: unknown): value is Record<string, JsonValue> & { ok: boolean; name: string } {
+  return object(value) && value[WORK_RESULT_BRAND] === true;
+}
+
 async function hostParallel(rawTasks: unknown, rawOperation: unknown): Promise<JsonValue> {
   if (!Array.isArray(rawTasks)) fail("INVALID_METADATA", "parallel tasks must be an array");
   const operation = namedHostOperation(rawOperation, "parallel");
@@ -739,11 +779,13 @@ async function hostParallel(rawTasks: unknown, rawOperation: unknown): Promise<J
   return Promise.all(tasks.map(async ({ name, run }) => {
     try {
       if (!run) fail("INVALID_METADATA", "parallel tasks require run functions");
-      return { name, ok: true, value: await run() };
+      const result: unknown = await run();
+      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+      return { name, ok: true, value: (isBrandedResult(result) ? result.value : result) as JsonValue, [WORK_RESULT_BRAND]: true };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt: operationPath(operation.name, name), error: { code: typed.code, message: typed.message } };
+      return { name, ok: false, failedAt: operationPath(operation.name, name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
     }
   }));
 }
@@ -762,13 +804,15 @@ async function hostPipeline(rawItems: unknown, ...parts: unknown[]): Promise<Jso
       for (const stage of stages) {
         failedAt = operationPath(operation.name, name, stage.name);
         if (!stage.run) fail("INVALID_METADATA", "pipeline stages require run functions");
-        current = await stage.run(current);
+        const result: unknown = await stage.run(current);
+        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, name, stage.name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+        current = (isBrandedResult(result) ? result.value : result) as JsonValue;
       }
-      return { name, ok: true, value: current };
+      return { name, ok: true, value: current, [WORK_RESULT_BRAND]: true };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt, error: { code: typed.code, message: typed.message } };
+      return { name, ok: false, failedAt, error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
     }
   }));
 }
@@ -921,17 +965,18 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
-      "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input). Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+      "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case, unique). Names drive journaling, replay after recovery, and live status; duplicates are rejected in preflight.",
       "For workflow, agent options are { name, model, tools, schema, retries, timeoutMs, isolation: 'worktree' }. Omitted model and tools inherit the launch session and cannot escalate beyond it.",
       "For workflow, parallel(tasks, operation) takes named tasks plus a named operation: await parallel([{ name: 'lint', run: () => agent('...', { name: 'lint-agent' }) }], { name: 'verification' }). Results preserve input order.",
       "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
+      "For workflow, agent() never throws; it returns { name, ok: true, value } or { name, ok: false, failedAt, error: { code, message } }. Branch on ok instead of try/catch. checkpoint() returns { name, ok: true, value: 'approved'|'rejected' }. In combinators, a failed agent fails its branch automatically.",
       "For workflow, parallel() and pipeline() branch results are { name, ok: true, value } or { name, ok: false, failedAt, error }; branch failures do not cancel siblings. Check ok before synthesizing conclusions.",
       "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-compatible value with ok/verdict plus the important outputs.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via options.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
       "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
-      "For workflow, use checkpoint({ name, prompt, context }) for human approval gates; it returns true or false and pauses the run until answered via /workflow or workflow_respond.",
+      "For workflow, use checkpoint({ name, prompt, context }) for human approval gates; it returns { name, ok: true, value: 'approved' | 'rejected' } and pauses the run until answered via /workflow or workflow_respond.",
       "For workflow, runs are backgrounded by default and return a runId immediately; completion arrives as a follow-up message, so do not poll. Set foreground: true only when the result is needed inline.",
     ],
     parameters: Type.Object({
