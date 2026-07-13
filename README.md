@@ -1,7 +1,175 @@
 # pi-workflows
-Deterministic multi-agent workflow orchestration for Pi
 
-Pi extensions can register workflow DSL macros during extension load:
+Deterministic, resumable multi-agent workflow orchestration for Pi.
+
+Requires Node.js 22.19 or newer. Verified against Pi 0.80.6. This is a trusted Pi extension: installing it grants it the same filesystem and process access as Pi.
+
+## Install
+
+From the private Git repository:
+
+```sh
+pi install git:git@github.com:vekexasia/pi-workflows.git
+```
+
+From a local checkout:
+
+```sh
+npm ci
+npm run check
+pi install /absolute/path/to/pi-workflows
+```
+
+For a one-session trial without changing Pi settings:
+
+```sh
+pi --no-extensions --extension /absolute/path/to/pi-workflows/src/index.ts
+```
+
+The package registers two tools, `workflow` and the narrow checkpoint response tool `workflow_respond`, plus one singular `/workflow` command.
+
+## Run a workflow
+
+Call the `workflow` tool with immutable JavaScript source:
+
+```json
+{
+  "script": "export const meta = { name: 'release-check', description: 'Check a release', phases: ['inspect'] }; phase('inspect'); const result = await agent('Inspect the package', { name: 'package-inspection', tools: ['read'] }); return { result };",
+  "args": { "target": "dist" }
+}
+```
+
+Runs are backgrounded by default. The initial result contains a run ID; completion or failure arrives as one root-conversation follow-up. Set `foreground: true` to wait and return the final JSON value inline.
+
+Invocation options:
+
+| Option | Type | Meaning |
+| --- | --- | --- |
+| `script` | string | Required immutable workflow source |
+| `args` | JSON value | Available to the script as `args`; defaults to `null` |
+| `foreground` | boolean | Wait for completion instead of returning the run ID |
+| `concurrency` | integer 1-16 | Per-run active-agent cap |
+| `maxAgents` | positive integer | Logical agent cap, including nested agents |
+| `agentTimeoutMs` | positive integer or `null` | Per-attempt timeout; `null` means unlimited |
+
+A workflow final result and every worker RPC value must be JSON-compatible and at most 10 MB.
+
+## Workflow source contract
+
+The first statement must be a metadata export:
+
+```js
+export const meta = {
+  name: "release-check",
+  description: "Check a release",
+  phases: ["inspect", "verify"],
+  extensions: [{ name: "git", version: "^1.0.0" }],
+};
+```
+
+`name` and `description` are required non-empty strings. `phases` is optional, unique, and exhaustive: `phase(name)` rejects undeclared phases. `extensions` declares required registered DSL extension versions.
+
+Preflight is synchronous and runs before a run directory is created. It rejects syntax errors, malformed metadata or schemas, missing stable names, duplicate names, undeclared phases, unavailable models/tools/agent types, and missing or incompatible DSL extensions.
+
+The worker exposes only deterministic data operations plus:
+
+- `args`
+- `agent(prompt, options)`
+- `parallel(tasks, operation)`
+- `pipeline(items, ...stages, operation)`
+- `phase(name)`
+- `log(message)`
+- `checkpoint({ name, prompt, context })`
+- `extensions.<namespace>.<method>(input)`
+
+Clocks, random numbers, timers, environment/process access, imports, `require`, dynamic code generation, filesystem, and network globals are unavailable. Workflow source runs in a dedicated worker thread. Cancellation is immediate; a missing heartbeat for five seconds fails with `WORKER_UNRESPONSIVE`.
+
+## Agents
+
+```js
+const text = await agent("Review the implementation", {
+  name: "review",
+  model: "openai-codex/gpt-5.6-sol:high",
+  tools: ["read", "grep", "find", "ls"],
+  retries: 1,
+  timeoutMs: 120000,
+});
+```
+
+`name` is required and stable. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
+
+Without `schema`, an agent returns its final text. With a plain JSON Schema:
+
+```js
+const result = await agent("Count failures", {
+  name: "count-failures",
+  schema: {
+    type: "object",
+    properties: { count: { type: "number" } },
+    required: ["count"],
+    additionalProperties: false,
+  },
+});
+```
+
+The native agent receives the stable `workflow_result` tool from session creation. Result acceptance starts only after normal task completion; one repair prompt is allowed. Prose is never parsed as structured output.
+
+If a top-level agent includes `agent` in its effective tools, it can create recursively nested children. The child-facing tools are `agent`, `get_subagent_result`, and `steer_subagent`. Children inherit the parent cwd/worktree and cannot escalate tools. Parents release scheduler capacity while waiting; uncollected descendants are cancelled when the parent ends.
+
+## Parallel and pipeline railways
+
+Every operation, task, item, and stage has an explicit stable name.
+
+```js
+const checked = await parallel(
+  [
+    { name: "lint", run: () => agent("Run lint", { name: "lint-agent" }) },
+    { name: "tests", run: () => agent("Run tests", { name: "test-agent" }) },
+  ],
+  { name: "verification" },
+);
+
+const built = await pipeline(
+  [
+    { name: "api", value: "src/api.ts" },
+    { name: "ui", value: "src/ui.ts" },
+  ],
+  { name: "normalize", run: (path) => ({ path }) },
+  { name: "summarize", run: (entry) => ({ ...entry, checked: true }) },
+  { name: "component-pipeline" },
+);
+```
+
+Results preserve input order:
+
+```js
+{ name: "lint", ok: true, value: "..." }
+{ name: "tests", ok: false, failedAt: "verification/tests", error: { code: "AGENT_FAILED", message: "..." } }
+```
+
+Ordinary branch failures are contained and do not cancel siblings. Run cancellation aborts the whole combinator and cannot be converted into a branch failure.
+
+## Checkpoints
+
+```js
+const approved = await checkpoint({
+  name: "ship",
+  prompt: "Ship this build?",
+  context: { commit: args.commit },
+});
+```
+
+Checkpoints return only `true` or `false`. Prompt size is limited to 1 KB UTF-8 and serialized context to 4 KB. The run enters `awaiting_input`; answer it with Approve/Reject in `/workflow` or:
+
+```json
+{ "runId": "...", "name": "ship", "approved": true }
+```
+
+through `workflow_respond`. The first valid response wins. Responses and completed checkpoints are journaled and replay after cold recovery. Foreground checkpoints require an interactive or RPC UI.
+
+## DSL extensions
+
+Trusted Pi extensions can register validated orchestration macros during extension load:
 
 ```ts
 import { registerWorkflowDslExtension } from "pi-workflows";
@@ -15,13 +183,122 @@ registerWorkflowDslExtension({
     status: {
       description: "Read repository status",
       input: { type: "object", properties: {}, additionalProperties: false },
-      output: { type: "object", properties: { clean: { type: "boolean" } }, required: ["clean"] },
+      output: {
+        type: "object",
+        properties: { clean: { type: "boolean" } },
+        required: ["clean"],
+        additionalProperties: false,
+      },
       async run(_input, { agent }) {
-        return agent("Inspect git status", { name: "git-status" });
+        const text = await agent("Inspect git status", { name: "git-status" });
+        return { clean: String(text).trim() === "clean" };
       },
     },
   },
 });
 ```
 
-The method is available to workflows as `extensions.git.status(...)`. Calls validate input and output and replay as a single journaled macro.
+A workflow declaring `{ name: "git", version: "^1.0.0" }` can call `extensions.git.status({})`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, and output schema. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. Duplicate namespaces fail extension load.
+
+## Lifecycle and recovery
+
+Run states are `queued`, `running`, `pausing`, `paused`, `awaiting_input`, `completed`, `failed`, `stopped`, and `interrupted`. Agent states are `queued`, `running`, `waiting_for_child`, `paused`, `retrying`, `completed`, `failed`, and `cancelled`.
+
+- Manual pause is cooperative: active native operations finish before `paused`.
+- Provider limits pause and continue the same native Pi session after explicit resume.
+- Stop is immediate, cascading, irreversible, and waits for owned agents to terminate.
+- Pi shutdown marks active work `interrupted`; no daemon remains and nothing auto-resumes.
+- Reopening the original Pi session can explicitly cold-resume an interrupted run.
+- Cold resume revalidates snapshotted capabilities/extensions, replays completed structural operations, and reruns interrupted parents.
+- Completed, failed, and stopped runs are terminal.
+
+## `/workflow`
+
+`/workflow` lists only runs launched from the exact resolved cwd and current Pi session ID. The navigator shows run state, phase, ownership tree, retries, models, token/cost accounting, errors, worktree/branch locations, checkpoints, and native Pi transcript paths.
+
+Available actions depend on state: Pause, Resume, Stop, Approve, Reject, and Delete. Delete is shown only for terminal runs and requires confirmation. It removes verified workflow run metadata, journals, results, worktrees, and branches. Native Pi transcript files remain in Pi session storage.
+
+Direct command forms are also supported:
+
+```text
+/workflow pause <run-id>
+/workflow resume <run-id>
+/workflow stop <run-id>
+/workflow approve <run-id> <checkpoint>
+/workflow reject <run-id> <checkpoint>
+/workflow delete <run-id>
+```
+
+## Persistence and worktrees
+
+Runs are stored under:
+
+```text
+~/.pi/workflows/projects/<cwd-slug>-<cwd-hash>/sessions/<session-id>/runs/<run-id>/
+```
+
+Identity checks use the exact resolved launch cwd and Pi session ID. Immutable snapshots include source, args, settings, models, tools, schemas, and extension versions. Native transcripts remain in Pi session storage and their paths are referenced by the run.
+
+Top-level agents may request `isolation: "worktree"`:
+
+```js
+await agent("Implement the fix", { name: "implementation", isolation: "worktree" });
+```
+
+The runtime creates a deterministic owned branch/worktree, preserves the launch cwd's relative subdirectory, and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the worktree. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
+
+## Delivery
+
+Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, duration, cost, and agent-count telemetry stays in `/workflow`.
+
+## Global settings
+
+Optional strict settings live only at `~/.pi/workflows/settings.json`:
+
+```json
+{
+  "concurrency": 8,
+  "maxAgents": 1000,
+  "agentTimeoutMs": null
+}
+```
+
+Unknown keys or invalid values block new workflow launches, not Pi startup. Invocation options override these defaults. The session-wide active-agent ceiling is always 16.
+
+## Error contract
+
+Failures use `WorkflowError` with a stable `code` and message. Codes are:
+
+```text
+INVALID_SETTINGS INVALID_SYNTAX INVALID_METADATA DUPLICATE_NAME UNKNOWN_PHASE
+INVALID_SCHEMA MISSING_EXTENSION INCOMPATIBLE_EXTENSION UNKNOWN_MODEL UNKNOWN_TOOL
+UNKNOWN_AGENT_TYPE RUN_LIMIT_EXCEEDED RPC_LIMIT_EXCEEDED AGENT_TIMEOUT AGENT_FAILED
+RESULT_INVALID CANCELLED WORKER_UNRESPONSIVE WORKTREE_FAILED RESUME_INCOMPATIBLE
+INTERNAL_ERROR
+```
+
+Direct `agent()` and extension calls return bare values or throw typed failures. Parallel and pipeline convert ordinary branch failures to railway results.
+
+## Deliberate non-goals
+
+- Transcript rendering or a built-in transcript viewer
+- Nested workflow calls, saved workflows, restart, or save-as-command
+- Shared mutable stores between agents
+- Token/phase budgets, rate sampling, or automatic spend enforcement
+- Built-in quality helpers or generic retry/gate abstractions
+- Automatic Git merges or worktree cleanup before confirmed deletion
+- Tracking or terminating OS processes launched by agents
+- Project/folder settings or cross-session/parent-folder run discovery
+- Always-visible task panels or a settings editor
+
+## Development verification
+
+```sh
+npm ci
+npm run check       # lint, TypeScript build, complete test suite
+npm run acceptance  # production-seam acceptance suite
+npm pack --dry-run --json
+git diff --check
+```
+
+The acceptance suite covers worker isolation, structural replay, exact cwd/session isolation, nested ownership and permit handoff, retries and schema finalization, railway combinators, lifecycle recovery and checkpoints, deterministic worktrees and deletion, registered extension macros, strict preflight/settings, native Pi session integration, and minimal delivery.

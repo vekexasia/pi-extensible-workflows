@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
 
@@ -151,4 +151,24 @@ void test("terminal failed attempts remain persisted", async () => {
   const persisted = (await store.load()).run;
   assert.deepEqual(persisted.agents.map(({ attempts, accounting }) => ({ attempts, accounting })), [{ attempts: 1, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
   assert.deepEqual(persisted.nativeSessions, [{ sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" }]);
+});
+
+void test("production workflow exposes registered extension macros and replays them structurally", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-extension-acceptance-"));
+  let calls = 0;
+  registerWorkflowDslExtension({
+    name: "issue16Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance macro",
+    methods: { echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { calls += 1; return { value: input.value as string }; } } },
+  });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId: string; value: unknown } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const script = `export const meta={name:'extension-e2e',description:'extension e2e',phases:['verify'],extensions:[{name:'issue16Acceptance',version:'^1.0.0'}]}; phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first,replayed];`;
+  const result = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(result.details.value, [{ value: "first" }, { value: "first" }]);
+  assert.equal(calls, 1);
+  const store = new RunStore(home, "session", result.details.runId, home);
+  assert.equal((await store.load()).run.phase, "verify");
+  assert.deepEqual(await store.replay("extension/issue16Acceptance/echo"), { path: "extension/issue16Acceptance/echo", value: { value: "first" } });
 });

@@ -5,7 +5,7 @@
   "type": "module",
   "keywords": ["pi-package"],
   "exports": "./dist/src/index.js",
-  "files": ["dist", "src"],
+  "files": ["dist/src", "src"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
@@ -18,7 +18,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.80.6",

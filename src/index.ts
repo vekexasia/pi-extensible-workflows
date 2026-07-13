@@ -396,6 +396,8 @@ export const HEARTBEAT_TIMEOUT_MS = 5000;
 export interface WorkflowBridge {
   agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<JsonValue>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
+  extension?: (extension: string, method: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal) => Promise<JsonValue>;
+  extensions?: Readonly<Record<string, readonly string[]>>;
   phase?: (name: string) => void | Promise<void>;
   log?: (message: string) => void | Promise<void>;
 }
@@ -409,6 +411,7 @@ const LIMIT = workerData.limit;
 let nextId = 0;
 let cancelled = false;
 const pending = new Map();
+const inflight = new Set();
 function send(value) {
   const json = JSON.stringify(value);
   if (json === undefined || Buffer.byteLength(json) > LIMIT) throw Object.assign(new Error("RPC value exceeds the 10 MB JSON boundary"), { code: "RPC_LIMIT_EXCEEDED" });
@@ -418,7 +421,10 @@ function rpc(method, args) {
   if (cancelled) throw Object.assign(new Error("Workflow cancelled"), { code: "CANCELLED" });
   const id = ++nextId;
   send({ type: "rpc", id, method, args });
-  return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  const promise = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  inflight.add(promise);
+  void promise.then(() => inflight.delete(promise), () => inflight.delete(promise));
+  return promise;
 }
 parentPort.on("message", raw => {
   let message;
@@ -445,6 +451,7 @@ const agent = (prompt, options = {}) => rpc("agent", [prompt, options]);
 const checkpoint = input => rpc("checkpoint", [input]);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
+const extensions = Object.freeze(Object.fromEntries(Object.entries(workerData.extensions).map(([extension, methods]) => [extension, Object.freeze(Object.fromEntries(methods.map(method => [method, input => rpc("extension", [extension, method, input, path("extension", extension, method)])])))])));
 const parallel = async (tasks, operation) => {
   const operationName = named(operation, "parallel");
   if (!Array.isArray(tasks)) throw workError("INVALID_METADATA", "parallel tasks must be an array");
@@ -477,12 +484,12 @@ const pipeline = async (items, ...parts) => {
   }));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, checkpoint, parallel, pipeline, phase, log, args: workerData.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, checkpoint, parallel, pipeline, phase, log, extensions, args: workerData.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = workerData.script.replace(/^\s*export\s+const\s+meta/, "const meta");
 Promise.resolve().then(() => new vm.Script("(async()=>{" + body + "\n})()", { filename: "workflow.js" }).runInContext(context))
-  .then(value => send({ type: "result", value: value === undefined ? null : value }))
+  .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: { code: error.code || "INTERNAL_ERROR", message: error.message } }))
   .finally(() => clearInterval(heartbeat));
 `;
@@ -496,7 +503,7 @@ function encoded(value: unknown): string {
 
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
-  const worker = new Worker(workerSource, { eval: true, execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")), workerData: { script, args: structuredClone(args), limit: RPC_LIMIT_BYTES } });
+  const worker = new Worker(workerSource, { eval: true, execArgv: process.execArgv.filter((argument) => !argument.startsWith("--input-type")), workerData: { script, args: structuredClone(args), extensions: bridge.extensions ?? {}, limit: RPC_LIMIT_BYTES } });
   const controller = new AbortController();
   let settled = false;
   let rejectResult: (error: WorkflowError) => void = () => undefined;
@@ -531,6 +538,9 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         if (!bridge.checkpoint || !object(values[0])) fail("INTERNAL_ERROR", "checkpoint requires an available bridge and object input");
         value = await bridge.checkpoint(values[0], controller.signal);
         if (typeof value !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
+      } else if (method === "extension") {
+        if (!bridge.extension || typeof values[0] !== "string" || typeof values[1] !== "string" || !object(values[2]) || typeof values[3] !== "string") fail("INTERNAL_ERROR", "extension requires an available bridge, names, object input, and path");
+        value = await bridge.extension(values[0], values[1], values[2], values[3], controller.signal);
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
         await bridge.phase?.(values[0]);
@@ -616,6 +626,81 @@ function utf8Prefix(value: string, maxBytes: number): string {
 
 function deliver(pi: ExtensionAPI, content: string): void {
   pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
+}
+
+function namedHostOperation(value: unknown, kind: string): { name: string; run?: (value?: JsonValue) => JsonValue | Promise<JsonValue>; value?: JsonValue } {
+  if (!object(value) || typeof value.name !== "string" || value.name.trim() === "") fail("INVALID_METADATA", `${kind} requires a stable explicit name`);
+  return value as { name: string; run?: (value?: JsonValue) => JsonValue | Promise<JsonValue>; value?: JsonValue };
+}
+
+async function hostParallel(rawTasks: unknown, rawOperation: unknown): Promise<JsonValue> {
+  if (!Array.isArray(rawTasks)) fail("INVALID_METADATA", "parallel tasks must be an array");
+  const operation = namedHostOperation(rawOperation, "parallel");
+  const tasks = rawTasks.map((task) => namedHostOperation(task, "parallel task"));
+  if (new Set(tasks.map(({ name }) => name)).size !== tasks.length) fail("DUPLICATE_NAME", "Duplicate parallel task name");
+  return Promise.all(tasks.map(async ({ name, run }) => {
+    try {
+      if (!run) fail("INVALID_METADATA", "parallel tasks require run functions");
+      return { name, ok: true, value: await run() };
+    } catch (error) {
+      const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+      if (typed.code === "CANCELLED") throw typed;
+      return { name, ok: false, failedAt: operationPath(operation.name, name), error: { code: typed.code, message: typed.message } };
+    }
+  }));
+}
+
+async function hostPipeline(rawItems: unknown, ...parts: unknown[]): Promise<JsonValue> {
+  if (!Array.isArray(rawItems)) fail("INVALID_METADATA", "pipeline items must be an array");
+  const operation = namedHostOperation(parts.pop(), "pipeline");
+  const items = rawItems.map((item) => namedHostOperation(item, "pipeline item"));
+  const stages = parts.map((stage) => namedHostOperation(stage, "pipeline stage"));
+  if (!stages.length) fail("INVALID_METADATA", "pipeline requires at least one named stage");
+  if (new Set(items.map(({ name }) => name)).size !== items.length || new Set(stages.map(({ name }) => name)).size !== stages.length) fail("DUPLICATE_NAME", "Duplicate pipeline item or stage name");
+  return Promise.all(items.map(async ({ name, value }) => {
+    let current = value ?? null;
+    let failedAt = operationPath(operation.name, name);
+    try {
+      for (const stage of stages) {
+        failedAt = operationPath(operation.name, name, stage.name);
+        if (!stage.run) fail("INVALID_METADATA", "pipeline stages require run functions");
+        current = await stage.run(current);
+      }
+      return { name, ok: true, value: current };
+    } catch (error) {
+      const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
+      if (typed.code === "CANCELLED") throw typed;
+      return { name, ok: false, failedAt, error: { code: typed.code, message: typed.message } };
+    }
+  }));
+}
+
+function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge {
+  const namespaces = workflowDslRegistry.namespaces();
+  return { ...bridge, extensions: Object.fromEntries(Object.entries(namespaces).map(([name, methods]) => [name, Object.keys(methods)])), extension: async (extension, method, input, path, signal) => {
+    const replayed = await store.replay(path);
+    let stored: JsonValue | undefined;
+    const sideEffects: Promise<void>[] = [];
+    const context: WorkflowOrchestrationContext = Object.freeze({
+      agent: async (...args: readonly unknown[]) => {
+        if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
+        const options = object(args[1]) && jsonValue(args[1]) ? args[1] as Readonly<Record<string, JsonValue>> : {};
+        return bridge.agent(args[0], options, signal);
+      },
+      parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
+      pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], ...args.slice(1)),
+      checkpoint: async (...args: readonly unknown[]) => {
+        if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
+        return bridge.checkpoint(args[0], signal);
+      },
+      phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
+      log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
+    });
+    const result = await workflowDslRegistry.invoke(extension, method, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } });
+    await Promise.all(sideEffects);
+    if (!replayed) await store.complete(path, stored ?? result);
+    return result;
+  } };
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
@@ -730,11 +815,15 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const defaults = loadSettings();
       const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents, agentTimeoutMs: params.agentTimeoutMs === undefined ? defaults.agentTimeoutMs : params.agentTimeoutMs });
       const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
+      const rootModelName = `${rootModel.provider}/${rootModel.model}`;
+      const modelRegistry = (ctx as unknown as { modelRegistry?: { getAvailable(): Array<{ provider: string; id: string }> } }).modelRegistry;
+      const availableModels = new Set((modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
+      availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
-      const checked = preflight(params.script, { models: new Set([`${rootModel.provider}/${rootModel.model}`]), tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
+      const checked = preflight(params.script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
-      const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
       const lifecycle = lifecycleFor(store, "running");
       const background = !params.foreground;
@@ -743,7 +832,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map() });
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
-      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
+      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal) => {
         await lifecycle.enter();
         try {
         const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
@@ -762,7 +851,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { await lifecycle.leave(); }
-      }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, signal);
+      }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
       if (background) {
@@ -831,7 +920,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
           await scheduler.cancelRun(run.store.runId);
           await run.lifecycle.resume();
-          const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, { agent: async (prompt, options, signal) => {
+          const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal) => {
             await run.lifecycle.enter();
             try {
               const label = typeof options.name === "string" ? options.name : "agent";
@@ -849,7 +938,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
               await run.store.complete(path, outcome.value);
               return outcome.value;
             } finally { await run.lifecycle.leave(); }
-          }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } });
+          }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
           run.execution = execution;
           void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
         } else await run.lifecycle.resume();
