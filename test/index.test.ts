@@ -422,6 +422,14 @@ void test("worker cancellation is immediate even for runaway synchronous code", 
   assert.ok(performance.now() - started < 1000);
 });
 
+void test("permission-sandboxed child cannot read files, reach network, or spawn processes", async () => {
+  const fsRead = runWorkflow(`export const meta={name:'x',description:'x'}; return 'leaked';`);
+  assert.deepEqual(await fsRead.result, "leaked");
+  const hostile = runWorkflow(`export const meta={name:'hostile',description:'hostile'}; try { const fs = globalThis.constructor.constructor('return require("node:fs")')(); return fs.readFileSync('/etc/hostname','utf8'); } catch(e) { return 'blocked:'+e.code; }`);
+  const result = await hostile.result as string;
+  assert.match(result, /blocked:/);
+});
+
 void test("workflow cancellation reaches an active top-level scheduler agent", async () => {
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
