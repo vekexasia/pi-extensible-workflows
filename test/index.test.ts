@@ -14,13 +14,7 @@ phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: [
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
   const preview = formatWorkflowPreview({ script: valid });
   assert.match(preview, /^workflow review\nReview code/m);
-  assert.match(preview, /Phases: check/);
-  assert.match(preview, /Steps: 1 agent/);
-  assert.match(preview, /Agents: reviewer/);
-  assert.match(preview, /Models: openai\/gpt/);
-  assert.match(preview, /Roles: reviewer/);
-  assert.match(preview, /Tools: read/);
-  assert.match(preview, /Extensions: git@\^1\.0\.0/);
+  assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
   assert.equal(formatWorkflowPreview({ workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
   assert.equal(formatWorkflowPreview({ script: "", workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
   assert.equal(formatWorkflowPreview({ script: "not javascript" }), "workflow (invalid script)");
@@ -442,8 +436,10 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   const dir = mkdtempSync(join(tmpdir(), "pi-workflows-"));
   assert.equal(loadSettings(join(dir, "missing.json")), DEFAULT_SETTINGS);
   const path = join(dir, "settings.json");
-  writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgents: 20, agentTimeoutMs: 500 }));
+  writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgents: 20 }));
   assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgents: 20 });
+  writeFileSync(path, JSON.stringify({ agentTimeoutMs: 500 }));
+  assert.throws(() => loadSettings(path), /Unknown workflow setting/);
   writeFileSync(path, JSON.stringify({ concurrency: 17 }));
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
   writeFileSync(path, JSON.stringify({ surprise: true }));

@@ -1,6 +1,6 @@
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import { Script } from "node:vm";
@@ -14,6 +14,7 @@ import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./pers
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
+const SETTLED_AGENT_STATES: ReadonlySet<AgentState> = new Set(["completed", "failed", "cancelled"]);
 export const ERROR_CODES = [
   "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "UNKNOWN_PHASE", "INVALID_SCHEMA",
   "MISSING_EXTENSION", "INCOMPATIBLE_EXTENSION", "UNKNOWN_MODEL", "UNKNOWN_TOOL", "UNKNOWN_AGENT_TYPE",
@@ -151,7 +152,7 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
     fail("INVALID_SETTINGS", `Invalid workflow settings: ${(error as Error).message}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", "Workflow settings must be an object");
-  const allowed = new Set(["concurrency", "maxAgents", "agentTimeoutMs"]); // agentTimeoutMs is legacy and ignored; per-agent timeoutMs remains opt-in.
+  const allowed = new Set(["concurrency", "maxAgents"]);
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting: ${unknown}`);
   const concurrency = parsed.concurrency === undefined ? DEFAULT_SETTINGS.concurrency : parsed.concurrency;
@@ -433,22 +434,7 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${typeof args.workflow === "string" ? args.workflow : "workflow"}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
   try {
     const metadata = parseMetadata(args.script);
-    const agentCalls = callsFor(args.script, "agent");
-    const agents = agentCalls.map((body) => stringsFor(body, "name")[0] ?? "unnamed");
-    const models = [...new Set(agentCalls.flatMap((body) => stringsFor(body, "model")))];
-    const roles = [...new Set(agentCalls.flatMap((body) => [...stringsFor(body, "role"), ...stringsFor(body, "agentType")]))];
-    const steps = [[agentCalls.length, "agent"], [callsFor(args.script, "parallel").length, "parallel"], [callsFor(args.script, "pipeline").length, "pipeline"], [callsFor(args.script, "checkpoint").length, "checkpoint"]]
-      .filter(([count]) => Number(count) > 0).map(([count, name]) => `${String(count)} ${String(name)}${count === 1 ? "" : "s"}`);
-    const tools = [...new Set([...args.script.matchAll(/\btools\s*:\s*\[([^\]]*)\]/g)].flatMap((match) => [...((match[1] ?? "").matchAll(/(["'])((?:\\.|(?!\1).)*)\1/g))].map((item) => item[2] ?? "")))];
-    const lines = [`workflow ${metadata.name}`, metadata.description];
-    if (metadata.phases?.length) lines.push(`Phases: ${metadata.phases.join(" → ")}`);
-    if (steps.length) lines.push(`Steps: ${steps.join(" · ")}`);
-    if (agents.length) lines.push(`Agents: ${agents.join(", ")}`);
-    if (models.length) lines.push(`Models: ${models.join(", ")}`);
-    if (roles.length) lines.push(`Roles: ${roles.join(", ")}`);
-    if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
-    if (metadata.extensions?.length) lines.push(`Extensions: ${metadata.extensions.map(({ name, version }) => `${name}@${version}`).join(", ")}`);
-    return lines.join("\n");
+    return [`workflow ${metadata.name}`, metadata.description].filter(Boolean).join("\n");
   } catch { return "workflow (invalid script)"; }
 }
 
@@ -682,7 +668,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       setTimeout(() => { if (!child.killed) child.kill("SIGKILL"); }, 1000).unref();
     }
   }
-  function finish() { settled = true; clearTimeout(watchdog); signal?.removeEventListener("abort", cancel); killChild(); }
+  function finish() { settled = true; clearTimeout(watchdog); signal?.removeEventListener("abort", cancel); killChild(); rmSync(childDir, { recursive: true, force: true }); }
   function stop(code: WorkflowErrorCode, message: string) { if (settled) return; controller.abort(); finish(); rejectResult(new WorkflowError(code, message)); }
   function branded(result: Record<string, JsonValue>): JsonValue { return { ...result, [WORK_RESULT_BRAND]: true }; }
   async function handleRpc(id: number, method: string, values: JsonValue[]) {
@@ -773,8 +759,7 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
 
 export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): string {
-  const settled = new Set(["completed", "failed", "cancelled"]);
-  const done = run.agents.filter((agent) => settled.has(agent.state)).length;
+  const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
   if (run.phase) lines.push(`  Phase: ${run.phase}`);
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
@@ -823,9 +808,8 @@ function navigatorAttentionSort<T extends { loaded: { run: PersistedRun } }>(ent
 function navigatorRunLabels(entries: readonly { store: RunStore; loaded: { run: PersistedRun } }[]): string[] {
   const nameCount = new Map<string, number>();
   for (const { loaded: { run } } of entries) nameCount.set(run.workflowName, (nameCount.get(run.workflowName) ?? 0) + 1);
-  const settled = new Set(["completed", "failed", "cancelled"]);
   return entries.map(({ store, loaded: { run } }) => {
-    const done = run.agents.filter((a) => settled.has(a.state)).length;
+    const done = run.agents.filter((a) => SETTLED_AGENT_STATES.has(a.state)).length;
     const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
     const suffix = (nameCount.get(run.workflowName) ?? 0) > 1 ? ` ${store.runId.slice(0, 8)}` : "";
     const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
@@ -861,8 +845,7 @@ function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): s
 }
 
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
-  const settled = new Set(["completed", "failed", "cancelled"]);
-  const done = run.agents.filter((a) => settled.has(a.state)).length;
+  const done = run.agents.filter((a) => SETTLED_AGENT_STATES.has(a.state)).length;
   const totalAccounting = run.agents.reduce((sum, a) => ({ input: sum.input + (a.accounting?.input ?? 0), output: sum.output + (a.accounting?.output ?? 0), cacheRead: sum.cacheRead + (a.accounting?.cacheRead ?? 0), cacheWrite: sum.cacheWrite + (a.accounting?.cacheWrite ?? 0), cost: sum.cost + (a.accounting?.cost ?? 0) }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
   const hasAccounting = run.agents.some((a) => a.accounting);
   const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
@@ -889,7 +872,7 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
       if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
     }
-    const activity = !settled.has(agent.state) ? formatAgentActivity(agent, "⠦") : "";
+    const activity = !SETTLED_AGENT_STATES.has(agent.state) ? formatAgentActivity(agent, "⠦") : "";
     if (activity) lines.push(`  ${activity}`);
     for (const attempt of agent.attemptDetails ?? []) lines.push(`  transcript attempt ${String(attempt.attempt)}: ${attempt.sessionFile}`);
   }
@@ -1434,12 +1417,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
 }
 
 function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
-  const slash = value.indexOf("/");
-  if (slash <= 0) return fallback;
-  const colon = value.lastIndexOf(":");
-  const hasThinking = colon > slash;
-  const thinking = hasThinking ? value.slice(colon + 1) as ModelSpec["thinking"] : fallback.thinking;
-  return { provider: value.slice(0, slash), model: value.slice(slash + 1, hasThinking ? colon : undefined), ...(thinking ? { thinking } : {}) };
+  try {
+    const parsed = parseModelReference(value);
+    return { ...parsed, ...(parsed.thinking || !fallback.thinking ? {} : { thinking: fallback.thinking }) };
+  } catch {
+    return fallback;
+  }
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
