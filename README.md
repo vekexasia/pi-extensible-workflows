@@ -249,7 +249,7 @@ The runtime creates a deterministic owned branch/worktree, preserves the launch 
 
 ## Delivery
 
-Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, duration, cost, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with the current phase, ownership tree, agent states, model/thinking level, token accounting, and tool calls.
+Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, duration, cost, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, ownership tree, agent states, model/thinking level, token accounting, and tool calls.
 
 ## Global settings
 

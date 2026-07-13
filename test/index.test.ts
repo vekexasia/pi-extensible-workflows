@@ -53,6 +53,7 @@ void test("workflow progress surfaces model, thinking, tokens, and tool calls", 
   assert.match(rendered, /Model: openai-codex\/gpt-5\.6-sol:high/);
   assert.match(rendered, /Tokens: 150 \(in 120, out 30, cache 40\)/);
   assert.match(rendered, /◇ read/);
+  assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review[\s\S]*⠙ read/);
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {

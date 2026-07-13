@@ -583,21 +583,21 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
 
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
 
-export function formatWorkflowProgress(run: PersistedRun): string {
+export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): string {
   const settled = new Set(["completed", "failed", "cancelled"]);
   const done = run.agents.filter((agent) => settled.has(agent.state)).length;
-  const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
+  const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
   if (run.phase) lines.push(`  Phase: ${run.phase}`);
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
   for (const [index, agent] of run.agents.entries()) {
     let depth = 0;
     for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
-    const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "◇" : "○";
+    const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat(depth + 1);
     lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]`);
     lines.push(`${indent}  Model: ${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`);
     if (agent.accounting) lines.push(`${indent}  Tokens: ${String(agent.accounting.input + agent.accounting.output)} (in ${String(agent.accounting.input)}, out ${String(agent.accounting.output)}, cache ${String(agent.accounting.cacheRead + agent.accounting.cacheWrite)})`);
-    for (const call of agent.toolCalls ?? []) lines.push(`${indent}  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : "◇"} ${call.name}`);
+    for (const call of agent.toolCalls ?? []) lines.push(`${indent}  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : spinner} ${call.name}`);
   }
   return lines.join("\n");
 }
@@ -606,10 +606,22 @@ function workflowToolUpdate(run: PersistedRun): WorkflowToolUpdate {
   return { content: [{ type: "text", text: formatWorkflowProgress(run) }], details: { runId: run.id, run } };
 }
 
+const workflowSpinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 function textBlock(text: string) {
   return {
     render(width: number) {
       return text.split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`);
+    },
+    invalidate() {},
+  };
+}
+
+function workflowProgressBlock(run: PersistedRun) {
+  return {
+    render(width: number) {
+      const frame = workflowSpinner[Math.floor(Date.now() / 80) % workflowSpinner.length] ?? "◇";
+      return formatWorkflowProgress(run, frame).split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`);
     },
     invalidate() {},
   };
@@ -858,6 +870,26 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     name: "workflow",
     label: "Workflow",
     description: "Run a deterministic JavaScript workflow",
+    promptSnippet:
+      "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Runs in the background by default; completion arrives as a follow-up message.",
+    promptGuidelines: [
+      "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
+      "For workflow, always pass one raw JavaScript string in the required script parameter; do not include Markdown fences or prose around the script.",
+      "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
+      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
+      "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input). Every workflow must call agent() at least once; do not use workflow only to declare phases or return a static object.",
+      "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
+      "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case, unique). Names drive journaling, replay after recovery, and live status; duplicates are rejected in preflight.",
+      "For workflow, agent options are { name, model, tools, schema, retries, timeoutMs, isolation: 'worktree' }. Omitted model and tools inherit the launch session and cannot escalate beyond it.",
+      "For workflow, parallel(tasks, operation) takes named tasks plus a named operation: await parallel([{ name: 'lint', run: () => agent('...', { name: 'lint-agent' }) }], { name: 'verification' }). Results preserve input order.",
+      "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
+      "For workflow, parallel() and pipeline() branch results are { name, ok: true, value } or { name, ok: false, failedAt, error }; branch failures do not cancel siblings. Check ok before synthesizing conclusions.",
+      "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-compatible value with ok/verdict plus the important outputs.",
+      "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via options.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
+      "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
+      "For workflow, use checkpoint({ name, prompt, context }) for human approval gates; it returns true or false and pauses the run until answered via /workflow or workflow_respond.",
+      "For workflow, runs are backgrounded by default and return a runId immediately; completion arrives as a follow-up message, so do not poll. Set foreground: true only when the result is needed inline.",
+    ],
     parameters: Type.Object({
       script: Type.String({ description: "Immutable JavaScript workflow source" }),
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
@@ -936,9 +968,17 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       try { name = parseMetadata(args.script).name; } catch { name = "workflow"; }
       return textBlock(`workflow ${name}`);
     },
-    renderResult(result, { isPartial }) {
+    renderResult(result, { isPartial }, _theme, context) {
       const details = result.details as { run?: PersistedRun; value?: JsonValue } | undefined;
-      if (details?.run) return textBlock(formatWorkflowProgress(details.run));
+      const state = context.state as { workflowSpinner?: ReturnType<typeof setInterval> };
+      if (details?.run && isPartial && details.run.state === "running" && !state.workflowSpinner) {
+        state.workflowSpinner = setInterval(context.invalidate, 80);
+        state.workflowSpinner.unref();
+      } else if ((!isPartial || details?.run?.state !== "running") && state.workflowSpinner) {
+        clearInterval(state.workflowSpinner);
+        delete state.workflowSpinner;
+      }
+      if (details?.run) return workflowProgressBlock(details.run);
       const content = result.content[0];
       return textBlock(isPartial ? "Workflow starting..." : content?.type === "text" ? content.text : "Workflow finished");
     },
