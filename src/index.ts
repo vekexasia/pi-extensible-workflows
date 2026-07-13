@@ -581,6 +581,36 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
   await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, attemptDetails, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
 }
 
+type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
+
+export function formatWorkflowProgress(run: PersistedRun): string {
+  const settled = new Set(["completed", "failed", "cancelled"]);
+  const done = run.agents.filter((agent) => settled.has(agent.state)).length;
+  const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
+  if (run.phase) lines.push(`  Phase: ${run.phase}`);
+  const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
+  for (const [index, agent] of run.agents.entries()) {
+    let depth = 0;
+    for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
+    const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "◇" : "○";
+    lines.push(`${"  ".repeat(depth + 1)}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]`);
+  }
+  return lines.join("\n");
+}
+
+function workflowToolUpdate(run: PersistedRun): WorkflowToolUpdate {
+  return { content: [{ type: "text", text: formatWorkflowProgress(run) }], details: { runId: run.id, run } };
+}
+
+function textBlock(text: string) {
+  return {
+    render(width: number) {
+      return text.split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`);
+    },
+    invalidate() {},
+  };
+}
+
 export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
   const { run, snapshot } = loaded;
   const lines = [
@@ -711,8 +741,13 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void> }>();
-  const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => { const loaded = await store.load(); await store.saveState({ ...loaded.run, state: next }); });
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => {
+    const loaded = await store.load();
+    const run = { ...loaded.run, state: next };
+    await store.saveState(run);
+    runs.get(store.runId)?.update?.(workflowToolUpdate(run));
+  });
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
@@ -735,7 +770,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const previous = existing.get(node.id);
       return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}) };
     });
-    await run.store.saveState({ ...loaded.run, agents });
+    const runState = { ...loaded.run, agents };
+    await run.store.saveState(runState);
+    run.update?.(workflowToolUpdate(runState));
   });
   const answerCheckpoint = async (runId: string, name: string, approved: boolean) => {
     const run = runs.get(runId);
@@ -817,7 +854,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       maxAgents: Type.Optional(Type.Integer({ minimum: 1 })),
       agentTimeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
     }),
-    async execute(_id, params, signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, onUpdate, ctx) {
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const defaults = loadSettings();
       const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents, agentTimeoutMs: params.agentTimeoutMs === undefined ? defaults.agentTimeoutMs : params.agentTimeoutMs });
@@ -836,7 +873,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), runStore: store, providerPause });
-      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map() });
+      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
+      if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
       const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal) => {
@@ -858,7 +896,15 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { await lifecycle.leave(); }
-      }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await lifecycle.enter(); try { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase }); } finally { await lifecycle.leave(); } }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
+      }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => {
+        await lifecycle.enter();
+        try {
+          const loaded = await store.load();
+          const run = { ...loaded.run, phase };
+          await store.saveState(run);
+          runs.get(runId)?.update?.(workflowToolUpdate(run));
+        } finally { await lifecycle.leave(); }
+      }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
       if (background) {
@@ -866,10 +912,23 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           const resultPath = await store.saveResult(value);
           deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
         }, (error: unknown) => { deliver(pi, `Workflow ${checked.metadata.name} failed: ${error instanceof Error ? error.message : String(error)}`); });
-        return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } };
+        const run = (await store.load()).run;
+        return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, run } };
       }
       const value = await finish;
-      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
+      const run = (await store.load()).run;
+      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value, run } };
+    },
+    renderCall(args) {
+      let name: string;
+      try { name = parseMetadata(args.script).name; } catch { name = "workflow"; }
+      return textBlock(`workflow ${name}`);
+    },
+    renderResult(result, { isPartial }) {
+      const details = result.details as { run?: PersistedRun; value?: JsonValue } | undefined;
+      if (details?.run) return textBlock(formatWorkflowProgress(details.run));
+      const content = result.content[0];
+      return textBlock(isPartial ? "Workflow starting..." : content?.type === "text" ? content.text : "Workflow finished");
     },
   });
   pi.registerCommand("workflow", {

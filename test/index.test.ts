@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorRun, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorRun, formatWorkflowProgress, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -27,6 +27,23 @@ void test("registers the workflow tool and singular command", async () => {
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+
+void test("streams foreground workflow progress into its tool card", async () => {
+  type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string } } };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-progress-"));
+  workflowExtension({
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
+    registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {},
+  } as never, home);
+  const tool = tools.find(({ name }) => name === "workflow");
+  assert.ok(tool);
+  const updates: Update[] = [];
+  const result = await tool.execute("id", { script: `export const meta={name:'progress',description:'progress',phases:['work']}; phase('work'); return true;`, foreground: true }, new AbortController().signal, (update: Update) => { updates.push(update); }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
+  assert.ok(updates.some(({ details }) => details.run.phase === "work"));
+  assert.equal(updates.at(-1)?.details.run.state, "completed");
+  assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
