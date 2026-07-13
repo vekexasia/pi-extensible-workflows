@@ -548,8 +548,15 @@ function completionDelivery(name: string, value: JsonValue, resultPath: string, 
   if (Buffer.byteLength(message) <= DELIVERY_LIMIT_BYTES) return message;
   const suffix = `... Full result: ${resultPath}${locations}`;
   const suffixBytes = Buffer.byteLength(suffix);
-  if (suffixBytes >= DELIVERY_LIMIT_BYTES) return Buffer.from(suffix).subarray(0, DELIVERY_LIMIT_BYTES).toString("utf8");
-  return Buffer.from(message).subarray(0, DELIVERY_LIMIT_BYTES - suffixBytes).toString("utf8") + suffix;
+  if (suffixBytes >= DELIVERY_LIMIT_BYTES) return utf8Prefix(suffix, DELIVERY_LIMIT_BYTES);
+  return utf8Prefix(message, DELIVERY_LIMIT_BYTES - suffixBytes) + suffix;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const bytes = Buffer.from(value);
+  let end = Math.min(bytes.length, maxBytes);
+  while (end < bytes.length && end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
 }
 
 function deliver(pi: ExtensionAPI, content: string): void {

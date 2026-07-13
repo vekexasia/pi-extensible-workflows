@@ -44,11 +44,12 @@ void test("background delivery is minimal and capped while foreground stays inli
   const execute = tools[0]?.execute;
   assert.ok(execute);
   const ctx = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  const background = await execute("id", { script: `export const meta={name:"large",description:"large"}; return "x".repeat(5000);` }, new AbortController().signal, undefined, ctx);
+  const background = await execute("id", { script: `export const meta={name:"large",description:"large"}; return "😀".repeat(5000);` }, new AbortController().signal, undefined, ctx);
   assert.match(background.content[0]?.text ?? "", /"state":"running"/);
   await delivered;
   assert.equal(messages.length, 1);
-  assert.equal(Buffer.byteLength(messages[0]?.message.content ?? ""), 4096);
+  assert.ok(Buffer.byteLength(messages[0]?.message.content ?? "") <= 4096);
+  assert.doesNotMatch(messages[0]?.message.content ?? "", /�/);
   assert.match(messages[0]?.message.content ?? "", /^Workflow large completed:/);
   assert.match(messages[0]?.message.content ?? "", /Full result: .*result\.json/);
   assert.deepEqual(messages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
