@@ -707,6 +707,30 @@ function workflowProgressBlock(run: PersistedRun) {
   };
 }
 
+function formatDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
+  const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : "◆";
+  const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
+  const lines = [`${glyph} ${run.workflowName}`, `${run.state}${run.phase ? ` · phase: ${run.phase}` : ""}${cost > 0 ? ` · $${cost.toFixed(2)}` : ""}`];
+  if (run.error) lines.push(`Error: ${run.error.code}: ${run.error.message}`);
+  lines.push("");
+  const settled = new Set(["completed", "failed", "cancelled"]);
+  for (const agent of run.agents) {
+    const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
+    const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const tokens = agent.accounting ? `${String(agent.accounting.input + agent.accounting.output)} tok` : "";
+    const retries = agent.attempts > 1 ? ` ${String(agent.attempts - 1)} retries` : "";
+    lines.push(`${icon} ${agent.name}  ${model}  ${tokens}${retries}`);
+    if (agent.state === "failed" && agent.attemptDetails?.length) {
+      const last = agent.attemptDetails[agent.attemptDetails.length - 1];
+      if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
+    }
+    if (!settled.has(agent.state)) for (const call of agent.toolCalls ?? []) lines.push(`  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : "⠦"} ${call.name}`);
+  }
+  if (checkpoints.length) { lines.push(""); for (const cp of checkpoints) lines.push(`● checkpoint ${cp.name}: ${cp.prompt}`); }
+  if (worktrees.length) { lines.push(""); for (const wt of worktrees) lines.push(`branch ${wt.branch} (${wt.path})`); }
+  return lines.join("\n");
+}
+
 export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
   const { run, snapshot } = loaded;
   const lines = [
@@ -1086,24 +1110,37 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           const details = await Promise.all(stores.map(async ({ store, loaded }) => formatNavigatorRun(loaded, await store.awaitingCheckpoints(), await store.worktrees())));
           ctx.ui.notify(details.join("\n\n"), "info"); return;
         }
-        const details: string[] = [];
+        const settled = new Set(["completed", "failed", "cancelled"]);
+        const rows = stores.map(({ loaded: { run } }) => {
+          const done = run.agents.filter((a) => settled.has(a.state)).length;
+          const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
+          const cost = run.agents.reduce((sum, a) => sum + (a.accounting?.cost ?? 0), 0);
+          const costStr = cost > 0 ? ` $${cost.toFixed(2)}` : "";
+          return `${glyph} ${run.workflowName}  ${run.state}  ${run.phase ?? ""}  ${String(done)}/${String(run.agents.length)} agents${costStr}`;
+        });
+        const runChoice = await ctx.ui.select("Workflows\n", [...rows, "Close"]);
+        if (!runChoice || runChoice === "Close") return;
+        const runIndex = rows.indexOf(runChoice);
+        if (runIndex < 0) return;
+        const selected = stores[runIndex];
+        if (!selected) return;
+        const { store, loaded } = selected;
+        const checkpoints = await store.awaitingCheckpoints();
+        const dashboard = formatDashboard(loaded.run, checkpoints, await store.worktrees());
         const actions = new Map<string, string>();
-        for (const { store, loaded } of stores) {
-          const checkpoints = await store.awaitingCheckpoints();
-          details.push(formatNavigatorRun(loaded, checkpoints, await store.worktrees()));
-          const add = (label: string, value: string) => { actions.set(`${loaded.run.workflowName} (${store.runId}): ${label}`, `${value} ${store.runId}`); };
-          if (loaded.run.state === "running") add("Pause", "pause");
-          if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
-          if (!["completed", "failed", "stopped"].includes(loaded.run.state)) add("Stop", "stop");
-          for (const checkpoint of checkpoints) {
-            actions.set(`${loaded.run.workflowName} (${store.runId}): Approve ${checkpoint.name}`, `approve ${store.runId} ${checkpoint.name}`);
-            actions.set(`${loaded.run.workflowName} (${store.runId}): Reject ${checkpoint.name}`, `reject ${store.runId} ${checkpoint.name}`);
-          }
-          if (["completed", "failed", "stopped"].includes(loaded.run.state)) add("Delete", "delete");
+        const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
+        if (loaded.run.state === "running") add("Pause", "pause");
+        if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
+        if (!["completed", "failed", "stopped"].includes(loaded.run.state)) add("Stop", "stop");
+        for (const cp of checkpoints) {
+          actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
+          actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
         }
-        const choice = await ctx.ui.select(`Workflow runs for this cwd and Pi session\n\n${details.join("\n\n")}`, [...actions.keys(), "Close"]);
-        if (!choice || choice === "Close") return;
-        command = actions.get(choice) ?? "";
+        if (["completed", "failed", "stopped"].includes(loaded.run.state)) add("Delete", "delete");
+        const actionChoice = await ctx.ui.select(dashboard, [...actions.keys(), "Back", "Close"]);
+        if (!actionChoice || actionChoice === "Close") return;
+        if (actionChoice === "Back") { await ctx.ui.select("Returning to run list. Run /workflow again.", ["OK"]); return; }
+        command = actions.get(actionChoice) ?? "";
       }
       const [action, runId, ...rest] = command.split(/\s+/);
       const run = runId ? runs.get(runId) : undefined;
