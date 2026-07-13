@@ -41,7 +41,7 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   writeFileSync(join(paths.cwd, ".pi", "agents", "placeholder.md"), "Use {{tools}} here");
   writeFileSync(join(paths.cwd, ".pi", "agents", "empty-frontmatter.md"), "---\n---\nBody");
 
-  const report = await doctor({ ...paths, discoverPi: async () => pi({ extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) });
+  const report = await doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) });
   const codes = report.diagnostics.map(({ code }) => code);
   assert.ok(codes.includes("ROLE_TOOL_INACTIVE"));
   assert.ok(codes.includes("ROLE_FRONTMATTER"));

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -11,8 +11,23 @@ const capabilities = {
 const valid = `export const meta = { name: "review", description: "Review code", phases: ["check"], extensions: [{name:"git",version:"^1.0.0"}] };
 phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], agentType: "reviewer" });`;
 
+void test("workflow call preview summarizes inline and registered workflows safely", () => {
+  const preview = formatWorkflowPreview({ script: valid });
+  assert.match(preview, /^workflow review\nReview code/m);
+  assert.match(preview, /Phases: check/);
+  assert.match(preview, /Steps: 1 agent/);
+  assert.match(preview, /Agents: reviewer/);
+  assert.match(preview, /Models: openai\/gpt/);
+  assert.match(preview, /Roles: reviewer/);
+  assert.match(preview, /Tools: read/);
+  assert.match(preview, /Extensions: git@\^1\.0\.0/);
+  assert.equal(formatWorkflowPreview({ workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
+  assert.equal(formatWorkflowPreview({ script: "", workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
+  assert.equal(formatWorkflowPreview({ script: "not javascript" }), "workflow (invalid script)");
+});
+
 void test("registers the workflow tool and singular command", async () => {
-  const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
+  const tools: Array<{ name: string; promptGuidelines?: string[]; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
   const commands: Array<{ name: string; options: { handler: (args: string, ctx: unknown) => Promise<void> } }> = [];
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
@@ -26,7 +41,22 @@ void test("registers the workflow tool and singular command", async () => {
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
+  const guidelines = tool.promptGuidelines?.join("\n") ?? "";
+  assert.match(guidelines, /call phase\(name\) before each major stage/);
+  assert.match(guidelines, /only combine the supplied reports/);
+  assert.match(guidelines, /timeoutMs is opt-in per agent/);
+  assert.match(guidelines, /retries are opt-in only/);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+
+void test("/workflow doctor formats the shared doctor report with active session tools", async () => {
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"], on() {} } as never);
+  let output = "";
+  await commands[0]?.handler("doctor", { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-slash-doctor-")), ui: { notify(text: string) { output = text; } } } as never);
+  assert.match(output, /^# pi-workflows doctor/m);
+  assert.match(output, /## Active tools\n- `read`/);
+  assert.doesNotMatch(output, /- `workflow`/);
 });
 
 void test("registered extension workflows can run by name", async () => {

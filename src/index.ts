@@ -429,6 +429,29 @@ function namedArray(argument: string): boolean {
   return value.startsWith("[") && value.endsWith("]") && splitTopLevel(value.slice(1, -1)).every(named);
 }
 
+export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown }): string {
+  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${typeof args.workflow === "string" ? args.workflow : "workflow"}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
+  try {
+    const metadata = parseMetadata(args.script);
+    const agentCalls = callsFor(args.script, "agent");
+    const agents = agentCalls.map((body) => stringsFor(body, "name")[0] ?? "unnamed");
+    const models = [...new Set(agentCalls.flatMap((body) => stringsFor(body, "model")))];
+    const roles = [...new Set(agentCalls.flatMap((body) => [...stringsFor(body, "role"), ...stringsFor(body, "agentType")]))];
+    const steps = [[agentCalls.length, "agent"], [callsFor(args.script, "parallel").length, "parallel"], [callsFor(args.script, "pipeline").length, "pipeline"], [callsFor(args.script, "checkpoint").length, "checkpoint"]]
+      .filter(([count]) => Number(count) > 0).map(([count, name]) => `${String(count)} ${String(name)}${count === 1 ? "" : "s"}`);
+    const tools = [...new Set([...args.script.matchAll(/\btools\s*:\s*\[([^\]]*)\]/g)].flatMap((match) => [...((match[1] ?? "").matchAll(/(["'])((?:\\.|(?!\1).)*)\1/g))].map((item) => item[2] ?? "")))];
+    const lines = [`workflow ${metadata.name}`, metadata.description];
+    if (metadata.phases?.length) lines.push(`Phases: ${metadata.phases.join(" → ")}`);
+    if (steps.length) lines.push(`Steps: ${steps.join(" · ")}`);
+    if (agents.length) lines.push(`Agents: ${agents.join(", ")}`);
+    if (models.length) lines.push(`Models: ${models.join(", ")}`);
+    if (roles.length) lines.push(`Roles: ${roles.join(", ")}`);
+    if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
+    if (metadata.extensions?.length) lines.push(`Extensions: ${metadata.extensions.map(({ name, version }) => `${name}@${version}`).join(", ")}`);
+    return lines.join("\n");
+  } catch { return "workflow (invalid script)"; }
+}
+
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
   if (typeof script !== "string" || script.trim() === "") fail("INVALID_SYNTAX", "Workflow script must be non-empty");
   try { new Script(`(async()=>{${script.replace(/^\s*export\s+const\s+meta/, "const meta")}\n})`); }
@@ -1161,6 +1184,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
       "For workflow, pass either one raw JavaScript string in script or a registered reusable workflow name in workflow; do not include Markdown fences or prose around script.",
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
+      "For workflow, call phase(name) before each major stage such as scouting, synthesis, implementation, and verification so /workflow shows useful progress; skip phases only for tiny single-agent workflows.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
       "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
@@ -1170,7 +1194,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
       "For workflow, agent() never throws; it returns { name, ok: true, value } or { name, ok: false, failedAt, error: { code, message } }. Branch on ok instead of try/catch. checkpoint() returns { name, ok: true, value: 'approved'|'rejected' }. In combinators, a failed agent fails its branch automatically.",
       "For workflow, parallel() and pipeline() branch results are { name, ok: true, value } or { name, ok: false, failedAt, error }; branch failures do not cancel siblings. Check ok before synthesizing conclusions.",
-      "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-compatible value with ok/verdict plus the important outputs.",
+      "For workflow, keep synthesis agents bounded: tell them to only combine the supplied reports, not perform new investigation; pass compact summaries when possible and require a compact schema for implementation maps.",
+      "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-compatible value with ok/verdict plus the important outputs, or a clear top-level { ok: false, failedAt, error } when a required child fails.",
+      "For workflow, timeoutMs is opt-in per agent: omit it unless the user requests a time budget or the step is intentionally bounded. Never add a workflow-level or default timeout.",
+      "For workflow, retries are opt-in only for idempotent/read-only work, or when the prompt explains how to avoid duplicate side effects.",
       "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via options.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
       "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
       "For workflow, use checkpoint({ name, prompt, context }) for human approval gates; it returns { name, ok: true, value: 'approved' | 'rejected' } and pauses the run until answered via /workflow or workflow_respond.",
@@ -1256,9 +1283,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value, run } };
     },
     renderCall(args) {
-      let name: string;
-      try { name = typeof args.script === "string" ? parseMetadata(args.script).name : typeof args.workflow === "string" ? args.workflow : "workflow"; } catch { name = "workflow"; }
-      return textBlock(`workflow ${name}`);
+      return textBlock(formatWorkflowPreview(args));
     },
     renderResult(result, { isPartial }, _theme, context) {
       const details = result.details as { run?: PersistedRun; value?: JsonValue } | undefined;
@@ -1279,6 +1304,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     description: "Inspect and control workflows for this Pi session",
     handler: async (args, ctx) => {
       let command = args.trim();
+      if (command === "doctor") {
+        const { doctor, doctorExitCode, formatDoctorReport } = await import("./doctor.js");
+        const report = await doctor({ cwd: ctx.cwd, activeTools: pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond") });
+        ctx.ui.notify(formatDoctorReport(report), doctorExitCode(report) ? "warning" : "info");
+        return;
+      }
       const stores = await Promise.all((await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)).map(async (runId) => {
         const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
         return { store, loaded: await store.load() };
@@ -1388,7 +1419,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         await run.lifecycle.terminal("stopped"); run.execution?.cancel(); await scheduler.cancelRun(run.store.runId); await scheduler.flush();
         ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return;
       }
-      ctx.ui.notify("Usage: /workflow, or /workflow pause|resume|stop|approve|reject|delete <run-id> [checkpoint]", "warning");
+      ctx.ui.notify("Usage: /workflow [doctor], or /workflow pause|resume|stop|approve|reject|delete <run-id> [checkpoint]", "warning");
     },
   });
   pi.on("session_shutdown", async () => {

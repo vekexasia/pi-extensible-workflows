@@ -36,6 +36,8 @@ Run the read-only, non-interactive health check after opening and trusting the p
 npx pi-workflows doctor
 ```
 
+From an active Pi session, `/workflow doctor` runs the same checks using that session's active tools.
+
 Doctor validates Pi trust/resources, active tools, global and project roles, settings, extension load failures, and registered reusable workflows. It is verbose by default and exits nonzero only for errors. It never installs packages or changes trust; configured extensions still execute as trusted Pi code while being inspected.
 
 ## Run a workflow
@@ -102,12 +104,10 @@ const text = await agent("Review the implementation", {
   model: "openai-codex/gpt-5.6-sol:high",
   role: "reviewer",
   tools: ["read", "grep", "find", "ls"],
-  retries: 1,
-  timeoutMs: 120000,
 });
 ```
 
-`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. Each retry gets a fresh persisted Pi session but keeps filesystem changes; retries count as one logical agent.
+`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
 
 Without `schema`, an agent returns its final text. With a plain JSON Schema:
 
@@ -238,6 +238,7 @@ Available actions depend on state: Pause, Resume, Stop, Approve, Reject, and Del
 Direct command forms are also supported:
 
 ```text
+/workflow doctor
 /workflow pause <run-id>
 /workflow resume <run-id>
 /workflow stop <run-id>

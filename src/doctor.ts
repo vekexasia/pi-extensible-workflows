@@ -53,6 +53,7 @@ export interface DoctorOptions {
   agentDir?: string;
   settingsPath?: string;
   discoverPi?: (cwd: string, agentDir: string) => Promise<DoctorPiState>;
+  activeTools?: readonly string[];
 }
 
 const THINKING_HINT = "Use off, minimal, low, medium, high, xhigh, or max.";
@@ -186,6 +187,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     diagnostics.push(diagnostic("error", "PI_DISCOVERY", `Pi headless discovery failed: ${(error as Error).message}`, undefined, "Open and trust the project in Pi, fix extension errors, then rerun doctor."));
     pi = { trust: { required: false, trusted: false, source: "discovery failed" }, activeTools: [], knownModels: [], availableModels: [], extensionErrors: [], workflows: {}, extensionVersions: {} };
   }
+  if (options.activeTools) pi = { ...pi, activeTools: options.activeTools };
   if (pi.trust.required && !pi.trust.trusted) diagnostics.push(diagnostic("warning", "PROJECT_UNTRUSTED", "Pi project resources are inactive because the project is not trusted", cwd, "Open this project in Pi, choose Trust, then rerun doctor."));
   for (const error of pi.extensionErrors) diagnostics.push(diagnostic("error", "EXTENSION_LOAD", error.message, error.path, "Fix or disable the failing Pi extension."));
 
