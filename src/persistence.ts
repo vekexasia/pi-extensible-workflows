@@ -235,11 +235,14 @@ export class RunStore {
     }
   }
 
-  async changedWorktrees(): Promise<readonly WorktreeReference[]> {
+  async worktrees(): Promise<readonly WorktreeReference[]> {
     const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+    return Promise.all(records.map((record) => this.validateWorktree(record.owner)));
+  }
+
+  async changedWorktrees(): Promise<readonly WorktreeReference[]> {
     const changed: WorktreeReference[] = [];
-    for (const record of records) {
-      const valid = await this.validateWorktree(record.owner);
+    for (const valid of await this.worktrees()) {
       try { await git(valid.path, ["diff", "--quiet", valid.base, "HEAD"]); }
       catch { changed.push(valid); }
     }

@@ -9,6 +9,7 @@ import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
+import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
@@ -33,7 +34,8 @@ export interface ModelSpec { provider: string; model: string; thinking?: "off" |
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description: string; phases?: readonly string[]; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgents: number; agentTimeoutMs: number | null }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
@@ -558,7 +560,39 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
   const loaded = await store.load();
   if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
   const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+  const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting }));
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, attemptDetails, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+}
+
+export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
+  const { run, snapshot } = loaded;
+  const lines = [
+    `Workflow: ${run.workflowName}`,
+    `Run: ${run.id}`,
+    `Status: ${run.state}`,
+    `Phase: ${run.phase ?? "(none)"}`,
+    `Launch cwd: ${run.cwd}`,
+    `Launch models: ${snapshot.models.join(", ") || "(none)"}`,
+  ];
+  if (run.error) lines.push(`Run error: ${run.error.code}: ${run.error.message}`);
+  lines.push("Agents / ownership:");
+  if (!run.agents.length) lines.push("  (none)");
+  for (const agent of run.agents) {
+    const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
+    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
+    for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
+  }
+  lines.push("Checkpoints:");
+  if (!checkpoints.length) lines.push("  (none)");
+  for (const checkpoint of checkpoints) lines.push(`  ${checkpoint.name}: ${checkpoint.prompt} context=${JSON.stringify(checkpoint.context)}`);
+  lines.push("Worktrees / branches:");
+  if (!worktrees.length) lines.push("  (none)");
+  for (const worktree of worktrees) lines.push(`  ${worktree.owner}: branch=${worktree.branch} path=${worktree.path} cwd=${worktree.cwd}`);
+  lines.push("Native Pi transcript paths:");
+  if (!run.nativeSessions.length) lines.push("  (none)");
+  for (const session of run.nativeSessions) lines.push(`  ${session.sessionId}: ${session.sessionFile}`);
+  return lines.join("\n");
 }
 
 const DELIVERY_LIMIT_BYTES = 4 * 1024;
@@ -607,7 +641,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
     const agents = ownership.map((node) => {
       const previous = existing.get(node.id);
-      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.accounting ? { accounting: previous.accounting } : {}) };
+      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}) };
     });
     await run.store.saveState({ ...loaded.run, agents });
   });
@@ -745,8 +779,48 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   pi.registerCommand("workflow", {
     description: "Inspect and control workflows for this Pi session",
     handler: async (args, ctx) => {
-      const [action, runId] = args.trim().split(/\s+/);
+      let command = args.trim();
+      const stores = await Promise.all((await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)).map(async (runId) => {
+        const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
+        return { store, loaded: await store.load() };
+      }));
+      if (!command) {
+        if (!stores.length) { ctx.ui.notify("No workflow runs in this session.", "info"); return; }
+        if (!ctx.hasUI) {
+          const details = await Promise.all(stores.map(async ({ store, loaded }) => formatNavigatorRun(loaded, await store.awaitingCheckpoints(), await store.worktrees())));
+          ctx.ui.notify(details.join("\n\n"), "info"); return;
+        }
+        const details: string[] = [];
+        const actions = new Map<string, string>();
+        for (const { store, loaded } of stores) {
+          const checkpoints = await store.awaitingCheckpoints();
+          details.push(formatNavigatorRun(loaded, checkpoints, await store.worktrees()));
+          const add = (label: string, value: string) => { actions.set(`${loaded.run.workflowName}: ${label}`, `${value} ${store.runId}`); };
+          if (loaded.run.state === "running") add("Pause", "pause");
+          if (["paused", "interrupted"].includes(loaded.run.state)) add("Resume", "resume");
+          if (!["completed", "failed", "stopped"].includes(loaded.run.state)) add("Stop", "stop");
+          for (const checkpoint of checkpoints) {
+            actions.set(`${loaded.run.workflowName}: Approve ${checkpoint.name}`, `approve ${store.runId} ${checkpoint.name}`);
+            actions.set(`${loaded.run.workflowName}: Reject ${checkpoint.name}`, `reject ${store.runId} ${checkpoint.name}`);
+          }
+          if (["completed", "failed", "stopped"].includes(loaded.run.state)) add("Delete", "delete");
+        }
+        const choice = await ctx.ui.select(`Workflow runs for this cwd and Pi session\n\n${details.join("\n\n")}`, [...actions.keys(), "Close"]);
+        if (!choice || choice === "Close") return;
+        command = actions.get(choice) ?? "";
+      }
+      const [action, runId, ...rest] = command.split(/\s+/);
       const run = runId ? runs.get(runId) : undefined;
+      const stored = runId ? stores.find(({ store }) => store.runId === runId) : undefined;
+      if ((action === "approve" || action === "reject") && runId && rest.length) {
+        const accepted = await answerCheckpoint(runId, rest.join(" "), action === "approve");
+        ctx.ui.notify(accepted ? `${action === "approve" ? "Approved" : "Rejected"} checkpoint ${rest.join(" ")}.` : "Checkpoint is not awaiting a response.", accepted ? "info" : "warning"); return;
+      }
+      if (action === "delete" && stored) {
+        if (!["completed", "failed", "stopped"].includes(stored.loaded.run.state)) { ctx.ui.notify("Stop the workflow before deleting it.", "warning"); return; }
+        if (!await ctx.ui.confirm("Delete workflow?", `Delete ${stored.loaded.run.workflowName} (${stored.store.runId}) and all owned artifacts? This cannot be undone.`)) return;
+        await stored.store.delete(true); runs.delete(stored.store.runId); ctx.ui.notify(`Deleted workflow ${stored.store.runId}.`, "info"); return;
+      }
       if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return; }
       if (action === "resume" && run) {
         if (run.lifecycle.state === "interrupted") {
@@ -776,6 +850,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
               return outcome.value;
             } finally { await run.lifecycle.leave(); }
           }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } });
+          run.execution = execution;
           void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
         } else await run.lifecycle.resume();
         ctx.ui.notify(`Resumed workflow ${run.store.runId}.`, "info"); return;
@@ -784,7 +859,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         await run.lifecycle.terminal("stopped"); run.execution?.cancel(); await scheduler.cancelRun(run.store.runId); await scheduler.flush();
         ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return;
       }
-      ctx.ui.notify([...runs.keys()].join("\n") || "No workflow runs in this session.", "info");
+      ctx.ui.notify("Usage: /workflow, or /workflow pause|resume|stop|approve|reject|delete <run-id> [checkpoint]", "warning");
     },
   });
   pi.on("session_shutdown", async () => {

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorRun, loadSettings, preflight, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -27,6 +27,41 @@ void test("registers the workflow tool and singular command", async () => {
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+
+void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-"));
+  const cwd = join(home, "project");
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "nav", cwd, sessionId: "session-a", state: "completed", phase: "review", agents: [{ id: "run-a:1", name: "reviewer", path: "run-a:1", state: "failed", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read"], attempts: 2, attemptDetails: [{ attempt: 2, sessionId: "native-a", sessionFile: "/pi/native-a.jsonl", error: { code: "AGENT_FAILED", message: "boom" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], nativeSessions: [{ sessionId: "native-a", sessionFile: "/pi/native-a.jsonl" }] }, snapshot);
+  const other = new RunStore(cwd, "session-b", "run-b", home);
+  await other.create({ id: "run-b", workflowName: "other", cwd, sessionId: "session-b", state: "completed", agents: [], nativeSessions: [] }, snapshot);
+  const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "reviewer", branch: "pi-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
+  assert.match(rendered, /Phase: review/);
+  assert.match(rendered, /parent=root model=openai\/gpt:medium attempts=2 retries=1/);
+  assert.match(rendered, /error=AGENT_FAILED: boom/);
+  assert.match(rendered, /branch=pi-workflows\/run-a\/tree path=\/worktree/);
+  assert.match(rendered, /native-a: \/pi\/native-a\.jsonl/);
+
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  const prompts: string[] = [];
+  const selections: string[][] = [];
+  let deleteConfirmed = false;
+  const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] };
+  workflowExtension(pi as never, home);
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); return "Close"; }, confirm: async () => deleteConfirmed } };
+  const command = commands[0]?.handler;
+  assert.ok(command);
+  await command("", ctx as never);
+  assert.match(selections[0]?.[0] ?? "", /nav: Delete/);
+  assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
+  assert.match(prompts[0] ?? "", /Native Pi transcript paths/);
+  await command("delete run-a", ctx as never);
+  assert.equal(existsSync(store.directory), true);
+  deleteConfirmed = true;
+  await command("delete run-a", ctx as never);
+  assert.equal(existsSync(store.directory), false);
 });
 
 void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
