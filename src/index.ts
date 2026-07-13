@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { Script } from "node:vm";
+import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -156,33 +157,53 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
   return Object.freeze({ concurrency, maxAgents, agentTimeoutMs });
 }
 
-function extractObject(source: string, start: number): string {
-  let depth = 0;
-  let quote = "";
-  let escaped = false;
-  for (let i = start; i < source.length; i += 1) {
-    const char = source[i] ?? "";
-    if (quote) {
-      if (escaped) escaped = false;
-      else if (char === "\\") escaped = true;
-      else if (char === quote) quote = "";
-      continue;
+const AST_DEPTH_LIMIT = 8;
+
+function astToValue(node: acorn.AnyNode, depth = 0): unknown {
+  if (depth > AST_DEPTH_LIMIT) fail("INVALID_METADATA", "Workflow metadata nesting exceeds depth limit");
+  switch (node.type) {
+    case "Literal":
+      if (typeof node.value === "string" || typeof node.value === "number" || typeof node.value === "boolean" || node.value === null) return node.value;
+      fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
+      break;
+    case "UnaryExpression":
+      if (node.operator === "-" && node.argument.type === "Literal" && typeof node.argument.value === "number") return -node.argument.value;
+      fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
+      break;
+    case "ArrayExpression": return node.elements.map((el) => { if (!el || el.type === "SpreadElement") fail("INVALID_METADATA", "Workflow metadata arrays must not use spread"); return astToValue(el, depth + 1); });
+    case "ObjectExpression": {
+      const obj: Record<string, unknown> = {};
+      for (const prop of node.properties) {
+        if (prop.type === "SpreadElement") fail("INVALID_METADATA", "Workflow metadata must not use spread");
+        if (prop.computed) fail("INVALID_METADATA", "Workflow metadata must not use computed keys");
+        if (prop.method) fail("INVALID_METADATA", "Workflow metadata must not contain methods");
+        if (prop.kind !== "init") fail("INVALID_METADATA", "Workflow metadata must not contain getters or setters");
+        const key = prop.key.type === "Identifier" ? prop.key.name : prop.key.type === "Literal" ? String(prop.key.value) : undefined;
+        if (key === undefined) fail("INVALID_METADATA", "Workflow metadata keys must be identifiers or string literals");
+        obj[key] = astToValue(prop.value, depth + 1);
+      }
+      return obj;
     }
-    if (char === "\"" || char === "'" || char === "`") { quote = char; continue; }
-    if (char === "{") depth += 1;
-    if (char === "}" && --depth === 0) return source.slice(start, i + 1);
+    case "TemplateLiteral": fail("INVALID_METADATA", "Workflow metadata must not use template literals");
+      break;
+    default: fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
   }
-  fail("INVALID_METADATA", "Workflow metadata object is incomplete");
 }
 
 function parseMetadata(source: string): WorkflowMetadata {
   const match = /^\s*export\s+const\s+meta\s*=\s*/.exec(source);
   if (!match) fail("INVALID_METADATA", "First statement must export const meta");
-  const start = match[0].length;
-  if (source[start] !== "{") fail("INVALID_METADATA", "Workflow metadata must be an object literal");
-  let value: unknown;
-  try { value = new Script(`(${extractObject(source, start)})`).runInNewContext({}, { timeout: 50 }) as unknown; }
+  let program: acorn.Program;
+  try { program = acorn.parse(source, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true }); }
   catch (error) { fail("INVALID_METADATA", `Invalid workflow metadata: ${(error as Error).message}`); }
+  const first = program.body[0];
+  if (!first || first.type !== "ExportNamedDeclaration" || !first.declaration || first.declaration.type !== "VariableDeclaration" || first.declaration.kind !== "const") fail("INVALID_METADATA", "First statement must export const meta");
+  const declarator = first.declaration.declarations[0];
+  if (!declarator || declarator.id.type !== "Identifier" || declarator.id.name !== "meta" || !declarator.init) fail("INVALID_METADATA", "First statement must export const meta");
+  if (declarator.init.type !== "ObjectExpression") fail("INVALID_METADATA", "Workflow metadata must be an object literal");
+  let value: unknown;
+  try { value = astToValue(declarator.init); }
+  catch (error) { if (error instanceof WorkflowError) throw error; fail("INVALID_METADATA", `Invalid workflow metadata: ${(error as Error).message}`); }
   if (!object(value) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.description !== "string" || value.description.trim() === "") fail("INVALID_METADATA", "Workflow metadata requires non-empty name and description");
   const allowed = new Set(["name", "description", "phases", "extensions"]);
   const unknown = Object.keys(value).find((key) => !allowed.has(key));

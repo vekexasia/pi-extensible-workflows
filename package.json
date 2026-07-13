@@ -3,9 +3,14 @@
   "version": "0.1.0",
   "description": "Deterministic multi-agent workflow orchestration for Pi",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "exports": "./dist/src/index.js",
-  "files": ["dist/src", "src"],
+  "files": [
+    "dist/src",
+    "src"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
@@ -14,7 +19,9 @@
     "check": "npm run lint && npm test"
   },
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -33,5 +40,8 @@
   "engines": {
     "node": ">=22.19.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "acorn": "^8.17.0"
+  }
 }

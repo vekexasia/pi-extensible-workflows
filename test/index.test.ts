@@ -337,6 +337,22 @@ void test("preflight rejects non-JSON schemas, incompatible extension versions, 
   preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'}); pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities);
 });
 
+void test("AST meta parsing rejects non-literal constructs and accepts valid meta", () => {
+  const valid = (s: string) => { preflight(s, capabilities); };
+  const invalid = (s: string) => { assert.throws(() => preflight(s, capabilities), (e: unknown) => e instanceof WorkflowError && e.code === "INVALID_METADATA"); };
+  valid(`export const meta = { name: 'ok', description: 'ok' };`);
+  valid(`export const meta = { name: 'ok', description: 'ok', phases: ['a', 'b'] };`);
+  valid(`export const meta = { name: 'ok', description: 'ok' }; return 1;`);
+  invalid(`export const meta = { name: 'ok', description: 'ok', [Symbol()]: 1 };`);
+  invalid(`export const meta = { name: 'ok', description: 'ok', ...defaults };`);
+  invalid(`export const meta = { name: \`template\`, description: 'ok' };`);
+  invalid(`export const meta = { name: getName(), description: 'ok' };`);
+  invalid(`export const meta = { name: 'ok', description: 'ok', get phases() { return []; } };`);
+  invalid(`export const meta = { name: 'ok', description: 'ok', run() {} };`);
+  const deep = 'export const meta = { name: "ok", description: "ok", phases: ' + '['.repeat(10) + '1' + ']'.repeat(10) + ' };';
+  invalid(deep);
+});
+
 void test("launch snapshots are detached and deeply immutable", () => {
   const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
