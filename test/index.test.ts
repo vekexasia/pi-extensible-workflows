@@ -29,6 +29,34 @@ void test("registers the workflow tool and singular command", async () => {
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
+void test("background delivery is minimal and capped while foreground stays inline", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-delivery-"));
+  const tools: Array<{ execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const messages: Array<{ message: { content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
+  let markDelivered!: () => void;
+  const delivered = new Promise<void>((resolve) => { markDelivered = resolve; });
+  const pi = {
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"],
+    sendMessage(message: { content: string }, options: { deliverAs: string; triggerTurn: boolean }) { messages.push({ message, options }); markDelivered(); }
+  };
+  workflowExtension(pi as never, home);
+  const execute = tools[0]?.execute;
+  assert.ok(execute);
+  const ctx = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const background = await execute("id", { script: `export const meta={name:"large",description:"large"}; return "x".repeat(5000);` }, new AbortController().signal, undefined, ctx);
+  assert.match(background.content[0]?.text ?? "", /"state":"running"/);
+  await delivered;
+  assert.equal(messages.length, 1);
+  assert.equal(Buffer.byteLength(messages[0]?.message.content ?? ""), 4096);
+  assert.match(messages[0]?.message.content ?? "", /^Workflow large completed:/);
+  assert.match(messages[0]?.message.content ?? "", /Full result: .*result\.json/);
+  assert.deepEqual(messages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+  const foreground = await execute("id", { script: `export const meta={name:"inline",description:"inline"}; return {ok:true};`, foreground: true }, new AbortController().signal, undefined, ctx);
+  assert.equal(foreground.content[0]?.text, `{"ok":true}`);
+  assert.equal(messages.length, 1);
+});
+
 void test("run lifecycle pauses cooperatively, resumes waiters, and keeps terminal states irreversible", async () => {
   const states: string[] = [];
   const lifecycle = new RunLifecycle("running", (state) => { states.push(state); });

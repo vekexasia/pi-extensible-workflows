@@ -13,7 +13,7 @@ export interface PersistedRun extends RunRecord { nativeSessions: readonly Nativ
 export interface CompletedOperation { path: string; value: JsonValue }
 export type PersistedOwnershipNode = OwnershipRecord
 type Journal = { completed: Record<string, CompletedOperation> };
-export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string }
+export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
 
 const execute = promisify(execFile);
 const gitIdentity = {
@@ -117,7 +117,7 @@ export class RunStore {
     const expected = this.expectedWorktree(owner);
     const relativePath = typeof candidate.path === "string" ? relative(this.directory, candidate.path) : "..";
     const relativeCwd = typeof candidate.path === "string" && typeof candidate.cwd === "string" ? relative(candidate.path, candidate.cwd) : "..";
-    if (candidate.owner !== owner || typeof candidate.path !== "string" || typeof candidate.branch !== "string" || typeof candidate.cwd !== "string" || resolve(candidate.path) !== expected.path || candidate.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
+    if (candidate.owner !== owner || typeof candidate.path !== "string" || typeof candidate.branch !== "string" || typeof candidate.cwd !== "string" || typeof candidate.base !== "string" || resolve(candidate.path) !== expected.path || candidate.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
     return candidate as WorktreeReference;
   }
 
@@ -156,7 +156,7 @@ export class RunStore {
         await git(root, ["add", "-A"], { GIT_INDEX_FILE: index });
         const tree = (await git(root, ["write-tree"], { GIT_INDEX_FILE: index })).trim();
         const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
-        const record = { owner, path, branch, cwd: join(path, launchRelative) };
+        const record = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
         await atomicJson(recordsPath, [...records, record]);
         await git(root, ["branch", branch, commit]);
         branchCreated = true;
@@ -197,6 +197,23 @@ export class RunStore {
     } catch (error) {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async changedWorktrees(): Promise<readonly WorktreeReference[]> {
+    const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+    const changed: WorktreeReference[] = [];
+    for (const record of records) {
+      const valid = await this.validateWorktree(record.owner);
+      try { await git(valid.path, ["diff", "--quiet", valid.base, "HEAD"]); }
+      catch { changed.push(valid); }
+    }
+    return changed;
+  }
+
+  async saveResult(value: JsonValue): Promise<string> {
+    const path = join(this.directory, "result.json");
+    await atomicJson(path, value);
+    return path;
   }
 
   async delete(confirmed: boolean): Promise<void> {
