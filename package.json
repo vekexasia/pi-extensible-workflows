@@ -10,6 +10,7 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "test": "npm run build && node --test 'dist/test/*.test.js'",
+    "acceptance": "npm run build && node --test dist/test/runtime-acceptance.test.js",
     "check": "npm run lint && npm test"
   },
   "pi": {

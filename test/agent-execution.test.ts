@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
+import { Type } from "@earendil-works/pi-ai";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
 import { WorkflowError } from "../src/index.js";
 
 const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(["read", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", tools: ["read"] } } };
@@ -56,4 +57,175 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
 void test("per-attempt timeout is typed and terminal", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "slow", sessionFile: "/sessions/slow.jsonl", messages: [], prompt: () => new Promise(() => {}), dispose() {} }));
   await assert.rejects(executor.execute("slow", { label: "slow", workflowName: "flow", workflowDescription: "desc", timeoutMs: 10 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && Array.isArray((error as WorkflowError & { attempts: unknown[] }).attempts));
+});
+
+void test("production native Pi session installs nested scheduler tools", async () => {
+  const nestedTool = { name: "agent", label: "Child Agent", description: "Start child", parameters: Type.Object({}), async execute() { return { content: [{ type: "text" as const, text: "ok" }], details: {} }; } };
+  const session = await createNativeAgentSession({ cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], customTools: [nestedTool], sessionLabel: "scheduler-production-seam" });
+  assert.ok(session.agent?.state.tools.some(({ name }) => name === "agent"));
+  session.dispose();
+});
+
+void test("executor registers the production native steering handler", async () => {
+  const steered: string[] = [];
+  let registered: ((message: string) => void | Promise<void>) | undefined;
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "steer", sessionFile: "/sessions/steer.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => undefined, steer: async (message) => { steered.push(message); }, dispose() {} }));
+  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc" }, undefined, [], (handler) => { registered = handler; });
+  assert.ok(registered);
+  await registered("redirect");
+  assert.deepEqual(steered, ["redirect"]);
+});
+
+void test("fair scheduler enforces session/run ceilings and round-robins runs", async () => {
+  const order: string[] = [];
+  const releases: Array<() => void> = [];
+  const scheduler = new FairAgentScheduler(async ({ prompt }) => { order.push(prompt); await new Promise<void>((resolve) => releases.push(resolve)); return prompt; }, 1);
+  scheduler.addRun("a", 1);
+  scheduler.addRun("b", 1);
+  const a1 = scheduler.spawn("a", "a1", { label: "a1", cwd: "/repo", tools: ["read"] });
+  const a2 = scheduler.spawn("a", "a2", { label: "a2", cwd: "/repo", tools: ["read"] });
+  const b1 = scheduler.spawn("b", "b1", { label: "b1", cwd: "/repo", tools: ["read"] });
+  await Promise.resolve();
+  assert.deepEqual(order, ["a1"]);
+  releases.shift()?.(); await a1.result; await Promise.resolve();
+  assert.deepEqual(order, ["a1", "b1"]);
+  releases.shift()?.(); await b1.result; await Promise.resolve();
+  assert.deepEqual(order, ["a1", "b1", "a2"]);
+  releases.shift()?.(); await a2.result;
+});
+
+void test("cancelling a queued agent releases its eventual permit so later work starts", async () => {
+  const started: string[] = [];
+  let release!: () => void;
+  const scheduler = new FairAgentScheduler(async ({ prompt }) => { started.push(prompt); if (prompt === "r1") await new Promise<void>((resolve) => { release = resolve; }); return prompt; }, 1);
+  scheduler.addRun("r", 1);
+  const r1 = scheduler.spawn("r", "r1", { label: "r1", cwd: "/repo", tools: [] });
+  const r2 = scheduler.spawn("r", "r2", { label: "r2", cwd: "/repo", tools: [] });
+  const r3 = scheduler.spawn("r", "r3", { label: "r3", cwd: "/repo", tools: [] });
+  scheduler.cancel(r2.id);
+  release();
+  await r1.result;
+  assert.equal((await r2.result).ok, false);
+  assert.equal((await r3.result).ok, true);
+  assert.deepEqual(started, ["r1", "r3"]);
+});
+
+void test("writes each ownership-tree transition to persistence", async () => {
+  const writes: Array<readonly unknown[]> = [];
+  const scheduler = new FairAgentScheduler(async () => "done", 1, (_run, ownership) => { writes.push(structuredClone(ownership)); });
+  scheduler.addRun("r", 1);
+  const child = scheduler.spawn("r", "work", { label: "worker", cwd: "/repo", tools: [] });
+  await child.result;
+  await scheduler.flush();
+  assert.equal(writes.at(-1)?.[0] && (writes.at(-1)?.[0] as { state: string }).state, "completed");
+  assert.equal((writes.at(-1)?.[0] as { label: string }).label, "worker");
+});
+
+void test("nested ownership releases permits, contains child failure, and blocks escalation", async () => {
+  let scheduler: FairAgentScheduler;
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options }) => {
+    if (prompt === "parent") {
+      assert.throws(() => scheduler.spawn("run", "bad", { label: "bad", cwd: options.cwd, tools: ["bash"] }, id), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: options.tools }, id);
+      return scheduler.result(id, child.id);
+    }
+    throw new WorkflowError("AGENT_FAILED", "child failed");
+  }, 1);
+  scheduler.addRun("run", 1, 2);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["read"] });
+  const result = await parent.result;
+  assert.equal(result.ok, true);
+  assert.deepEqual((result as { ok: true; value: unknown }).value, { id: "run:2", ok: false, error: { code: "AGENT_FAILED", message: "child failed" } });
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["completed", "failed"]);
+  assert.throws(() => scheduler.spawn("run", "extra", { label: "extra", cwd: "/repo", tools: ["read"] }), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_LIMIT_EXCEEDED");
+});
+
+void test("cancelling a parent waiting for a child releases its reacquired permit", async () => {
+  let scheduler: FairAgentScheduler;
+  let childStarted!: () => void;
+  const started = new Promise<void>((resolve) => { childStarted = resolve; });
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options, signal }) => {
+    if (prompt === "parent") {
+      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: [] }, id);
+      return scheduler.result(id, child.id);
+    }
+    if (prompt === "child") {
+      childStarted();
+      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+      throw new WorkflowError("CANCELLED", "cancelled");
+    }
+    return "later completed";
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  await started;
+  scheduler.cancel(parent.id);
+  assert.equal((await parent.result).ok, false);
+  const later = scheduler.spawn("run", "later", { label: "later", cwd: "/repo", tools: [] });
+  assert.deepEqual(await later.result, { id: later.id, ok: true, value: "later completed" });
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled", "completed"]);
+});
+
+void test("persisted ownership restores cancellation and scoped runtime state", async () => {
+  const options = { label: "parent", cwd: "/repo", tools: ["agent"] };
+  const persisted = [{ id: "run:1", label: "parent", state: "running" as const, options }, { id: "run:2", parentId: "run:1", label: "child", state: "waiting_for_child" as const, options: { ...options, label: "child" } }];
+  const scheduler = new FairAgentScheduler(async () => "unused", 1);
+  scheduler.restoreRun("run", 1, 10, persisted);
+  assert.deepEqual(scheduler.toolsFor("run:1").map(({ name }) => name), ["agent", "get_subagent_result", "steer_subagent"]);
+  scheduler.cancel("run:1");
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled"]);
+});
+
+void test("scoped tools honor the root capability boundary and cancel orphan descendants", async () => {
+  let scheduler: FairAgentScheduler;
+  let orphanId = "";
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, signal, setSteer, options }) => {
+    if (prompt === "parent") {
+      const orphan = scheduler.spawn("run", "orphan", { label: "orphan", cwd: options.cwd, tools: options.tools }, id);
+      orphanId = orphan.id;
+      return "done";
+    }
+    setSteer(() => {});
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 2);
+  scheduler.addRun("run", 2);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent"] });
+  await parent.result;
+  await Promise.resolve();
+  assert.equal(scheduler.snapshot().find(({ id }) => id === orphanId)?.state, "cancelled");
+  const denied = scheduler.spawn("run", "denied", { label: "denied", cwd: "/repo", tools: ["read"] });
+  assert.deepEqual(scheduler.toolsFor(denied.id), []);
+  scheduler.cancel(denied.id);
+  await denied.result;
+  const outsider = scheduler.spawn("run", "outsider", { label: "outsider", cwd: "/repo", tools: ["agent"] });
+  const scopedTools = scheduler.toolsFor(outsider.id);
+  assert.deepEqual(scopedTools.map(({ name }) => name), ["agent", "get_subagent_result", "steer_subagent"]);
+  const resultTool = scopedTools[1];
+  assert.ok(resultTool);
+  await assert.rejects(resultTool.execute("x", { id: orphanId }, undefined, undefined, {} as never), /direct children/);
+  scheduler.cancel(outsider.id);
+  await outsider.result;
+});
+
+void test("explicit null timeout remains unlimited", async () => {
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "unlimited", sessionFile: "/sessions/unlimited.jsonl", messages: [assistant("done")], prompt: async () => { await new Promise((resolve) => setTimeout(resolve, 20)); }, dispose() {} }));
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", timeoutMs: null })).value, "done");
+});
+
+void test("cancelRun waits for active agents to terminate", async () => {
+  let terminated = false;
+  const scheduler = new FairAgentScheduler(async ({ signal }) => {
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { setTimeout(() => { terminated = true; resolve(); }, 20); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 1);
+  scheduler.addRun("run", 1);
+  const agent = scheduler.spawn("run", "active", { label: "active", cwd: "/repo", tools: [] });
+  await Promise.resolve();
+  await scheduler.cancelRun("run");
+  assert.equal(terminated, true);
+  assert.equal((await agent.result).ok, false);
 });

@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
+import type { OwnershipRecord } from "./agent-execution.js";
 import { createLaunchSnapshot, WorkflowError } from "./index.js";
 
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
+export type PersistedOwnershipNode = OwnershipRecord
 type Journal = { completed: Record<string, CompletedOperation> };
 
 function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
@@ -20,6 +22,11 @@ export function projectStorageKey(cwd: string): string {
 
 export function runsDirectory(cwd: string, sessionId: string, home = homedir()): string {
   return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions", safePart(sessionId), "runs");
+}
+
+export async function listRunIds(cwd: string, sessionId: string, home = homedir()): Promise<string[]> {
+  try { return (await readdir(runsDirectory(cwd, sessionId, home), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map(({ name }) => name); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
 export function structuralPath(...names: string[]): string {
@@ -50,6 +57,7 @@ export class RunStore {
     await mkdir(this.directory, { mode: 0o700 });
     await atomicJson(join(this.directory, "snapshot.json"), snapshot);
     await atomicJson(join(this.directory, "journal.json"), { completed: {} });
+    await atomicJson(join(this.directory, "ownership.json"), []);
     await atomicJson(join(this.directory, "state.json"), run);
   }
 
@@ -62,6 +70,14 @@ export class RunStore {
   async saveState(run: PersistedRun): Promise<void> {
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("INTERNAL_ERROR", "Run identity does not match its session-scoped store");
     await atomicJson(join(this.directory, "state.json"), run);
+  }
+
+  async saveOwnership(nodes: readonly PersistedOwnershipNode[]): Promise<void> {
+    await atomicJson(join(this.directory, "ownership.json"), nodes);
+  }
+
+  async loadOwnership(): Promise<readonly PersistedOwnershipNode[]> {
+    return json<readonly PersistedOwnershipNode[]>(join(this.directory, "ownership.json"));
   }
 
   async complete(path: string, value: JsonValue): Promise<void> {

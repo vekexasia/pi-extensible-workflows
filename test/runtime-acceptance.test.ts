@@ -1,0 +1,87 @@
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { Type } from "@earendil-works/pi-ai";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistAgentAttempts, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
+import { createNativeAgentSession } from "../src/agent-execution.js";
+import { RunStore } from "../src/persistence.js";
+
+void test("production session_start cold-restores ownership and /workflow stop cascades", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-acceptance-"));
+  const cwd = join(home, "project");
+  const sessionId = "session-a";
+  const runId = "run-a";
+  const store = new RunStore(cwd, sessionId, runId, home);
+  const settings = { concurrency: 1, maxAgents: 2, agentTimeoutMs: 25 };
+  await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], extensions: {}, schemas: [] }));
+  const options = { label: "parent", cwd, tools: ["agent"] };
+  await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { ...options, label: "child" } }]);
+
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const notices: string[] = [];
+  const ctx = { cwd, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, sessionManager: { getSessionId: () => sessionId }, ui: { notify: (message: string) => { notices.push(message); } } };
+  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["agent", "workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  await command(`stop ${runId}`, ctx);
+  assert.equal((await store.load()).run.state, "stopped");
+  assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled", "cancelled"]);
+  assert.deepEqual((await store.load()).run.agents.map(({ state }) => state), ["cancelled", "cancelled"]);
+  assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
+});
+
+void test("production Pi seam installs child tools and registers native steering", async () => {
+  const childTool = { name: "agent", label: "Child", description: "child", parameters: Type.Object({}), async execute() { return { content: [{ type: "text" as const, text: "ok" }], details: {} }; } };
+  const session = await createNativeAgentSession({ cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], customTools: [childTool], sessionLabel: "issue-9-acceptance" });
+  assert.ok(session.agent?.state.tools.some(({ name }) => name === "agent"));
+  session.dispose();
+  let steer: ((message: string) => void | Promise<void>) | undefined;
+  const received: string[] = [];
+  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => ({ sessionId: "s", sessionFile: "/s", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }], prompt: async () => {}, steer: async (message) => { received.push(message); }, dispose() {} }));
+  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "flow" }, undefined, [], (handler) => { steer = handler; });
+  assert.ok(steer); await steer("redirect"); assert.deepEqual(received, ["redirect"]);
+});
+
+void test("concurrency-1 cancellation and nested containment retain accounting and retry isolation", async () => {
+  const started: string[] = [];
+  let release!: () => void;
+  let scheduler: FairAgentScheduler;
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options }) => {
+    started.push(prompt);
+    if (prompt === "r1") await new Promise<void>((resolve) => { release = resolve; });
+    if (prompt === "parent") { const child = scheduler.spawn("nested", "child", { label: "child", cwd: options.cwd, tools: [] }, id); return scheduler.result(id, child.id); }
+    if (prompt === "child") throw new WorkflowError("AGENT_FAILED", "child failed");
+    return prompt;
+  }, 1);
+  scheduler.addRun("run", 1);
+  const r1 = scheduler.spawn("run", "r1", { label: "r1", cwd: "/repo", tools: [] });
+  const r2 = scheduler.spawn("run", "r2", { label: "r2", cwd: "/repo", tools: [] });
+  const r3 = scheduler.spawn("run", "r3", { label: "r3", cwd: "/repo", tools: [] });
+  scheduler.cancel(r2.id); release(); await Promise.all([r1.result, r2.result, r3.result]);
+  assert.deepEqual(started, ["r1", "r3"]);
+  scheduler.addRun("nested", 1, 2);
+  const parent = scheduler.spawn("nested", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  assert.equal((await parent.result).ok, true);
+  assert.deepEqual(scheduler.snapshot().slice(-2).map(({ state }) => state), ["completed", "failed"]);
+
+  let attempt = 0;
+  let cleaned = 0;
+  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => { const current = ++attempt; return { sessionId: `s${String(current)}`, sessionFile: `/s${String(current)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } } }], prompt: async () => { if (current === 1) throw new Error("retry"); }, dispose() {} }; });
+  const retried = await executor.execute("retry", { label: "retry", workflowName: "flow", workflowDescription: "flow", retries: 1, timeoutMs: 100 }, undefined, [], undefined, () => { cleaned += 1; });
+  assert.equal(cleaned, 1); assert.equal(retried.attempts.length, 2); assert.deepEqual(retried.attempts.map(({ accounting }) => accounting.cost), [0.5, 0.5]);
+});
+
+void test("terminal failed attempts remain persisted", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-attempts-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed", description: "failed" }, settings: { concurrency: 1, maxAgents: 1, agentTimeoutMs: null }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await persistAgentAttempts(store, "run-a:1", [{ attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl", error: { code: "AGENT_FAILED", message: "failed" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
+  const persisted = (await store.load()).run;
+  assert.deepEqual(persisted.agents.map(({ attempts, accounting }) => ({ attempts, accounting })), [{ attempts: 1, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }]);
+  assert.deepEqual(persisted.nativeSessions, [{ sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" }]);
+});

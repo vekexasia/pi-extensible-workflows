@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,8 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt } from "./agent-execution.js";
+import { listRunIds, RunStore } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
@@ -30,7 +33,7 @@ export interface ModelSpec { provider: string; model: string; thinking?: "off" |
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description: string; phases?: readonly string[]; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgents: number; agentTimeoutMs: number | null }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
@@ -451,7 +454,52 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   return { result, cancel };
 }
 
-export default function workflowExtension(pi: ExtensionAPI) {
+export async function persistAgentAttempts(store: RunStore, id: string, attempts: readonly AgentAttempt[]): Promise<void> {
+  const loaded = await store.load();
+  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+}
+
+export default function workflowExtension(pi: ExtensionAPI, home?: string) {
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec }>();
+  const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
+    const run = runs.get(runId);
+    if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
+    try {
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      await persistAgentAttempts(run.store, id, result.attempts);
+      return result.value;
+    } catch (error) {
+      const attempts = (error as WorkflowError & { attempts?: readonly AgentAttempt[] }).attempts;
+      if (attempts?.length) await persistAgentAttempts(run.store, id, attempts);
+      throw error;
+    }
+  }, 16, async (runId, ownership) => {
+    const run = runs.get(runId);
+    if (!run) return;
+    await run.store.saveOwnership(ownership);
+    const loaded = await run.store.load();
+    const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
+    const agents = ownership.map((node) => {
+      const previous = existing.get(node.id);
+      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.accounting ? { accounting: previous.accounting } : {}) };
+    });
+    await run.store.saveState({ ...loaded.run, agents });
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    for (const runId of await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)) {
+      if (runs.has(runId)) continue;
+      const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
+      const loaded = await store.load();
+      if (["completed", "failed", "stopped"].includes(loaded.run.state)) continue;
+      const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))) }), store, metadata: loaded.snapshot.metadata, timeoutMs: loaded.snapshot.settings.agentTimeoutMs, model });
+      scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
+    }
+  });
+
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
@@ -460,16 +508,62 @@ export default function workflowExtension(pi: ExtensionAPI) {
       script: Type.String({ description: "Immutable JavaScript workflow source" }),
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
+      concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
+      maxAgents: Type.Optional(Type.Integer({ minimum: 1 })),
+      agentTimeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])),
     }),
-    async execute() { throw new Error("Workflow execution is not implemented yet"); },
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
+      const defaults = loadSettings();
+      const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents, agentTimeoutMs: params.agentTimeoutMs === undefined ? defaults.agentTimeoutMs : params.agentTimeoutMs });
+      const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
+      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow");
+      const checked = preflight(params.script, { models: new Set([`${rootModel.provider}/${rootModel.model}`]), tools: new Set(rootTools), agentTypes: new Set(), extensions: workflowDslRegistry.versions() });
+      const runId = randomUUID();
+      const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
+      const snapshot = createLaunchSnapshot({ script: params.script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [`${rootModel.provider}/${rootModel.model}`], tools: rootTools, agentTypes: [], extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools) });
+      runs.set(runId, { executor, store, metadata: checked.metadata, timeoutMs: settings.agentTimeoutMs, model: rootModel });
+      scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
+      const topLevel = new Set<Promise<unknown>>();
+      const execution = runWorkflow(params.script, (params.args ?? null) as JsonValue, { agent: async (prompt, options, agentSignal) => {
+        const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
+        const spawned = scheduler.spawn(runId, prompt, { label: typeof options.name === "string" ? options.name : "agent", cwd: ctx.cwd, tools: requestedTools, ...(typeof options.model === "string" ? { model: options.model } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        topLevel.add(spawned.result);
+        const cancel = () => { scheduler.cancel(spawned.id); };
+        if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
+        const outcome = await spawned.result.finally(() => { topLevel.delete(spawned.result); agentSignal.removeEventListener("abort", cancel); });
+        if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+        return outcome.value;
+      } }, signal);
+      const finish = execution.result.then(async (value) => { await scheduler.flush(); const loaded = await store.load(); await store.saveState({ ...loaded.run, state: "completed" }); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const loaded = await store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await store.saveState({ ...loaded.run, state: typed.code === "CANCELLED" ? "stopped" : "failed", error: { code: typed.code, message: typed.message } }); throw typed; });
+      if (!params.foreground) { void finish.catch(() => undefined); return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId } }; }
+      const value = await finish;
+      return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: { runId, value } };
+    },
   });
   pi.registerCommand("workflow", {
     description: "Inspect and control workflows for this Pi session",
-    handler: async (_args, ctx) => { ctx.ui.notify("No workflow runs in this session.", "info"); },
+    handler: async (args, ctx) => {
+      const [action, runId] = args.trim().split(/\s+/);
+      if (action === "stop" && runId && runs.has(runId)) {
+        await scheduler.cancelRun(runId); await scheduler.flush();
+        const run = runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>;
+        const loaded = await run.store.load(); await run.store.saveState({ ...loaded.run, state: "stopped" });
+        ctx.ui.notify(`Stopped workflow ${runId}.`, "info"); return;
+      }
+      ctx.ui.notify([...runs.keys()].join("\n") || "No workflow runs in this session.", "info");
+    },
   });
 }
 
+function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
+  const slash = value.indexOf("/");
+  return slash > 0 ? { provider: value.slice(0, slash), model: value.slice(slash + 1), ...(fallback.thinking ? { thinking: fallback.thinking } : {}) } : fallback;
+}
+
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
-export type { CompletedOperation, NativeSessionReference, PersistedRun } from "./persistence.js";
-export { WorkflowAgentExecutor } from "./agent-execution.js";
+export type { CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun } from "./persistence.js";
+export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";

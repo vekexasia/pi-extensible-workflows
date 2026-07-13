@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, loadSettings, preflight, RPC_LIMIT_BYTES, runWorkflow, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -12,18 +12,21 @@ const valid = `export const meta = { name: "review", description: "Review code",
 phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], agentType: "reviewer" });`;
 
 void test("registers the workflow tool and singular command", async () => {
-  const tools: Array<{ name: string; execute: () => Promise<unknown> }> = [];
+  const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
   const commands: Array<{ name: string; options: { handler: (args: string, ctx: unknown) => Promise<void> } }> = [];
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
     registerCommand(name: string, options: (typeof commands)[number]["options"]) { commands.push({ name, options }); },
+    getThinkingLevel() { return "medium"; },
+    getActiveTools() { return ["read", "workflow"]; },
+    on() {},
   };
   workflowExtension(pi as never);
   assert.deepEqual(tools.map(({ name }) => name), ["workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools[0];
   assert.ok(tool);
-  await assert.rejects(tool.execute(), /not implemented/);
+  await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
 void test("strict settings use defaults and reject unknown or unsafe values", () => {
@@ -105,6 +108,32 @@ void test("worker cancellation is immediate even for runaway synchronous code", 
   run.cancel();
   await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   assert.ok(performance.now() - started < 1000);
+});
+
+void test("workflow cancellation reaches an active top-level scheduler agent", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const scheduler = new FairAgentScheduler(async ({ signal }) => {
+    markStarted();
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 1);
+  scheduler.addRun("run", 1);
+  const run = runWorkflow(`export const meta={name:'x',description:'x'}; return await agent('wait',{name:'wait'});`, null, {
+    agent: async (_prompt, _options, signal) => {
+      const spawned = scheduler.spawn("run", "wait", { label: "wait", cwd: "/repo", tools: [] });
+      const cancel = () => { scheduler.cancel(spawned.id); };
+      signal.addEventListener("abort", cancel, { once: true });
+      const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
+      if (!outcome.ok) throw new WorkflowError("CANCELLED", outcome.error.message);
+      return outcome.value;
+    },
+  });
+  await started;
+  run.cancel();
+  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  await scheduler.flush();
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled"]);
 });
 
 void test("worker watchdog terminates a synchronous heartbeat stall after five seconds", { timeout: 7000 }, async () => {
