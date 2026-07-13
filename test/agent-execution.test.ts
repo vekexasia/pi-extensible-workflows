@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress } from "../src/agent-execution.js";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { WorkflowError } from "../src/index.js";
 import type { RunStore } from "../src/persistence.js";
 
@@ -33,6 +34,26 @@ void test("returns final text and captures persisted native session accounting",
   assert.equal(prompts.length, 1);
   assert.match(prompts[0] ?? "", /Workflow: flow - desc[\s\S]*Phase: build[\s\S]*Parent: root[\s\S]*Task:\nDo work/);
   assert.deepEqual(result.attempts[0], { attempt: 1, sessionId: "s1", sessionFile: "/sessions/s1.jsonl", result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 } });
+});
+
+void test("streams live token and tool-call progress", async () => {
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const messages = [assistant("")];
+  const updates: AgentProgress[] = [];
+  const executor = new WorkflowAgentExecutor(root, async () => ({
+    sessionId: "progress", sessionFile: "/sessions/progress.jsonl", messages,
+    subscribe(next) { listener = next; return () => { listener = undefined; }; },
+    async prompt() {
+      listener?.({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
+      messages[0] = assistant("done");
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: {} } as AgentSessionEvent);
+      listener?.({ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false });
+    },
+    dispose() {},
+  }));
+  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onProgress: (update) => { updates.push(update); } });
+  assert.ok(updates.some(({ toolCalls }) => toolCalls.some(({ name, state }) => name === "read" && state === "running")));
+  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], persist: true });
 });
 
 void test("keeps workflow_result present, delays acceptance, and allows one repair", async () => {

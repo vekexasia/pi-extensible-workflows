@@ -7,7 +7,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -35,7 +35,7 @@ export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description: string; phases?: readonly string[]; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgents: number; agentTimeoutMs: number | null }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[] }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
@@ -593,7 +593,11 @@ export function formatWorkflowProgress(run: PersistedRun): string {
     let depth = 0;
     for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "◇" : "○";
-    lines.push(`${"  ".repeat(depth + 1)}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]`);
+    const indent = "  ".repeat(depth + 1);
+    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]`);
+    lines.push(`${indent}  Model: ${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`);
+    if (agent.accounting) lines.push(`${indent}  Tokens: ${String(agent.accounting.input + agent.accounting.output)} (in ${String(agent.accounting.input)}, out ${String(agent.accounting.output)}, cache ${String(agent.accounting.cacheRead + agent.accounting.cacheWrite)})`);
+    for (const call of agent.toolCalls ?? []) lines.push(`${indent}  ${call.state === "completed" ? "✓" : call.state === "failed" ? "✗" : "◇"} ${call.name}`);
   }
   return lines.join("\n");
 }
@@ -629,6 +633,7 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
     lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
     for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
+    for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
   }
   lines.push("Checkpoints:");
   if (!checkpoints.length) lines.push("  (none)");
@@ -752,7 +757,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const run = runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
     try {
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const onProgress = async (progress: AgentProgress) => {
+        const loaded = await run.store.load();
+        if (!loaded.run.agents.some((agent) => agent.id === id)) return;
+        const runState = { ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls } : agent) };
+        if (progress.persist) await run.store.saveState(runState);
+        run.update?.(workflowToolUpdate(runState));
+      };
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -768,7 +780,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
     const agents = ownership.map((node) => {
       const previous = existing.get(node.id);
-      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}) };
+      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}) };
     });
     const runState = { ...loaded.run, agents };
     await run.store.saveState(runState);
@@ -1030,10 +1042,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
 
 function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
   const slash = value.indexOf("/");
-  return slash > 0 ? { provider: value.slice(0, slash), model: value.slice(slash + 1), ...(fallback.thinking ? { thinking: fallback.thinking } : {}) } : fallback;
+  if (slash <= 0) return fallback;
+  const colon = value.lastIndexOf(":");
+  const hasThinking = colon > slash;
+  const thinking = hasThinking ? value.slice(colon + 1) as ModelSpec["thinking"] : fallback.thinking;
+  return { provider: value.slice(0, slash), model: value.slice(slash + 1, hasThinking ? colon : undefined), ...(thinking ? { thinking } : {}) };
 }
 
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot } from "./agent-execution.js";
+export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress } from "./agent-execution.js";

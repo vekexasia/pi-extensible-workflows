@@ -1,6 +1,6 @@
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { AuthStorage, createAgentSession, ModelRegistry, SessionManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { AuthStorage, createAgentSession, ModelRegistry, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
@@ -17,6 +17,7 @@ export interface AgentExecutionOptions {
   parentIsolation?: "worktree";
   model?: string;
   thinking?: ThinkingLevel;
+  onProgress?: (progress: AgentProgress) => void | Promise<void>;
   tools?: readonly string[];
   agentType?: string;
   schema?: JsonSchema;
@@ -36,6 +37,8 @@ export interface AgentExecutionRoot {
   providerPause?: () => Promise<void>;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+export interface AgentToolCallProgress { id: string; name: string; state: "running" | "completed" | "failed" }
+export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; persist: boolean }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
 export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
 
@@ -44,6 +47,7 @@ export interface NativeSession {
   readonly sessionFile: string | undefined;
   readonly messages: readonly AgentMessage[];
   readonly agent?: { state: { tools: readonly { name: string }[] } };
+  subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string): Promise<void>;
   steer?(text: string): Promise<void>;
   abort?(): Promise<void>;
@@ -148,8 +152,22 @@ export class WorkflowAgentExecutor {
         },
       } as ToolDefinition : undefined;
       let session: NativeSession | undefined;
+      const toolCalls = new Map<string, AgentToolCallProgress>();
+      let progress = Promise.resolve();
+      let unsubscribe: (() => void) | undefined;
+      const report = (persist: boolean) => {
+        if (!session || !options.onProgress) return;
+        const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], persist };
+        progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
+      };
       try {
         session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}) });
+        unsubscribe = session.subscribe?.((event) => {
+          if (event.type === "tool_execution_start") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" });
+          if (event.type === "tool_execution_end") toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" });
+          if (["message_update", "message_end", "tool_execution_start", "tool_execution_end"].includes(event.type)) report(event.type === "message_end" || event.type === "tool_execution_end");
+        });
+        report(false);
         if (setSteer) {
           if (!session.steer) throw new WorkflowError("INTERNAL_ERROR", "Native Pi session does not support steering");
           setSteer((message) => session?.steer?.(message));
@@ -168,12 +186,18 @@ export class WorkflowAgentExecutor {
         }
         const value = options.schema ? schemaResult as JsonValue : text(session.messages);
         if (options.isolation) await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label);
+        report(true);
+        await progress;
+        unsubscribe?.();
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: accounting(session.messages) });
         session.dispose();
         return { value, attempts, cwd };
       } catch (error) {
         const typed = error instanceof WorkflowError ? error : new WorkflowError("AGENT_FAILED", error instanceof Error ? error.message : String(error));
         if (session) {
+          report(true);
+          await progress;
+          unsubscribe?.();
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: accounting(session.messages) });
           session.dispose();
         }

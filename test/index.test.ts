@@ -46,6 +46,15 @@ void test("streams foreground workflow progress into its tool card", async () =>
   assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
 });
 
+void test("workflow progress surfaces model, thinking, tokens, and tool calls", () => {
+  const run = { id: "run", workflowName: "live", cwd: "/repo", sessionId: "session", state: "running", phase: "work", agents: [{ id: "run:1", name: "review", path: "run:1", state: "running", model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" }, tools: ["read"], attempts: 1, accounting: { input: 120, output: 30, cacheRead: 40, cacheWrite: 0, cost: 0.01 }, toolCalls: [{ id: "call", name: "read", state: "running" }] }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const rendered = formatWorkflowProgress(run);
+  assert.match(rendered, /#1 ◇ review \[running\]/);
+  assert.match(rendered, /Model: openai-codex\/gpt-5\.6-sol:high/);
+  assert.match(rendered, /Tokens: 150 \(in 120, out 30, cache 40\)/);
+  assert.match(rendered, /◇ read/);
+});
+
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-"));
   const cwd = join(home, "project");
