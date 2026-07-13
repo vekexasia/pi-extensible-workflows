@@ -282,9 +282,11 @@ export class FairAgentScheduler {
     for (const childId of this.#node(id).children) { const child = this.#nodes.get(childId); if (child) this.#cancelTree(child); }
   }
 
-  cancelRun(runId: string): void {
+  async cancelRun(runId: string): Promise<void> {
     if (!this.#runs.has(runId)) throw new WorkflowError("INTERNAL_ERROR", `Unknown scheduler run: ${runId}`);
-    for (const node of this.#nodes.values()) if (node.runId === runId && !node.parentId) this.#cancelTree(node);
+    const nodes = [...this.#nodes.values()].filter((node) => node.runId === runId);
+    for (const node of nodes) if (!node.parentId) this.#cancelTree(node);
+    await Promise.all(nodes.map(({ promise }) => promise));
   }
 
   /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */

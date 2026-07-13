@@ -210,3 +210,22 @@ void test("scoped tools honor the root capability boundary and cancel orphan des
   scheduler.cancel(outsider.id);
   await outsider.result;
 });
+
+void test("explicit null timeout remains unlimited", async () => {
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "unlimited", sessionFile: "/sessions/unlimited.jsonl", messages: [assistant("done")], prompt: async () => { await new Promise((resolve) => setTimeout(resolve, 20)); }, dispose() {} }));
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", timeoutMs: null })).value, "done");
+});
+
+void test("cancelRun waits for active agents to terminate", async () => {
+  let terminated = false;
+  const scheduler = new FairAgentScheduler(async ({ signal }) => {
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { setTimeout(() => { terminated = true; resolve(); }, 20); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 1);
+  scheduler.addRun("run", 1);
+  const agent = scheduler.spawn("run", "active", { label: "active", cwd: "/repo", tools: [] });
+  await Promise.resolve();
+  await scheduler.cancelRun("run");
+  assert.equal(terminated, true);
+  assert.equal((await agent.result).ok, false);
+});

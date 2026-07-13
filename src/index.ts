@@ -7,7 +7,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentAttempt } from "./agent-execution.js";
 import { listRunIds, RunStore } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
@@ -454,18 +454,27 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   return { result, cancel };
 }
 
+export async function persistAgentAttempts(store: RunStore, id: string, attempts: readonly AgentAttempt[]): Promise<void> {
+  const loaded = await store.load();
+  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+}
+
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; timeoutMs: number | null; model: ModelSpec }>();
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
-    const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs ?? run.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
-    const loaded = await run.store.load();
-    const previous = loaded.run.agents.find((agent) => agent.id === id);
-    const total = result.attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-    await run.store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: result.attempts.length, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions, ...result.attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
-    if (!previous) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
-    return result.value;
+    try {
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, ...(parentId ? { parent: parentId } : {}), ...(options.model ? { model: options.model } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), timeoutMs: options.timeoutMs === undefined ? run.timeoutMs : options.timeoutMs }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      await persistAgentAttempts(run.store, id, result.attempts);
+      return result.value;
+    } catch (error) {
+      const attempts = (error as WorkflowError & { attempts?: readonly AgentAttempt[] }).attempts;
+      if (attempts?.length) await persistAgentAttempts(run.store, id, attempts);
+      throw error;
+    }
   }, 16, async (runId, ownership) => {
     const run = runs.get(runId);
     if (!run) return;
@@ -539,7 +548,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     handler: async (args, ctx) => {
       const [action, runId] = args.trim().split(/\s+/);
       if (action === "stop" && runId && runs.has(runId)) {
-        scheduler.cancelRun(runId); await scheduler.flush();
+        await scheduler.cancelRun(runId); await scheduler.flush();
         const run = runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>;
         const loaded = await run.store.load(); await run.store.saveState({ ...loaded.run, state: "stopped" });
         ctx.ui.notify(`Stopped workflow ${runId}.`, "info"); return;
