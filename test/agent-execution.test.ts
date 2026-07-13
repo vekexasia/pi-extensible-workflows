@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
+import { Type } from "@earendil-works/pi-ai";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot } from "../src/agent-execution.js";
 import { WorkflowError } from "../src/index.js";
 
 const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(["read", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", tools: ["read"] } } };
@@ -56,6 +57,23 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
 void test("per-attempt timeout is typed and terminal", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "slow", sessionFile: "/sessions/slow.jsonl", messages: [], prompt: () => new Promise(() => {}), dispose() {} }));
   await assert.rejects(executor.execute("slow", { label: "slow", workflowName: "flow", workflowDescription: "desc", timeoutMs: 10 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && Array.isArray((error as WorkflowError & { attempts: unknown[] }).attempts));
+});
+
+void test("production native Pi session installs nested scheduler tools", async () => {
+  const nestedTool = { name: "agent", label: "Child Agent", description: "Start child", parameters: Type.Object({}), async execute() { return { content: [{ type: "text" as const, text: "ok" }], details: {} }; } };
+  const session = await createNativeAgentSession({ cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], customTools: [nestedTool], sessionLabel: "scheduler-production-seam" });
+  assert.ok(session.agent?.state.tools.some(({ name }) => name === "agent"));
+  session.dispose();
+});
+
+void test("executor registers the production native steering handler", async () => {
+  const steered: string[] = [];
+  let registered: ((message: string) => void | Promise<void>) | undefined;
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "steer", sessionFile: "/sessions/steer.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => undefined, steer: async (message) => { steered.push(message); }, dispose() {} }));
+  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc" }, undefined, [], (handler) => { registered = handler; });
+  assert.ok(registered);
+  await registered("redirect");
+  assert.deepEqual(steered, ["redirect"]);
 });
 
 void test("fair scheduler enforces session/run ceilings and round-robins runs", async () => {
@@ -150,10 +168,20 @@ void test("cancelling a parent waiting for a child releases its reacquired permi
   assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled", "completed"]);
 });
 
+void test("persisted ownership restores cancellation and scoped runtime state", async () => {
+  const options = { label: "parent", cwd: "/repo", tools: ["agent"] };
+  const persisted = [{ id: "run:1", label: "parent", state: "running" as const, options }, { id: "run:2", parentId: "run:1", label: "child", state: "waiting_for_child" as const, options: { ...options, label: "child" } }];
+  const scheduler = new FairAgentScheduler(async () => "unused", 1);
+  scheduler.restoreRun("run", 1, 10, persisted);
+  assert.deepEqual(scheduler.toolsFor("run:1").map(({ name }) => name), ["agent", "get_subagent_result", "steer_subagent"]);
+  scheduler.cancel("run:1");
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled"]);
+});
+
 void test("scoped tools honor the root capability boundary and cancel orphan descendants", async () => {
   let scheduler: FairAgentScheduler;
   let orphanId = "";
-  // eslint-disable-next-line prefer-const, @typescript-eslint/unbound-method
+  // eslint-disable-next-line prefer-const
   scheduler = new FairAgentScheduler(async ({ id, prompt, signal, setSteer, options }) => {
     if (prompt === "parent") {
       const orphan = scheduler.spawn("run", "orphan", { label: "orphan", cwd: options.cwd, tools: options.tools }, id);

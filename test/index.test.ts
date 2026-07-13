@@ -19,6 +19,7 @@ void test("registers the workflow tool and singular command", async () => {
     registerCommand(name: string, options: (typeof commands)[number]["options"]) { commands.push({ name, options }); },
     getThinkingLevel() { return "medium"; },
     getActiveTools() { return ["read", "workflow"]; },
+    on() {},
   };
   workflowExtension(pi as never);
   assert.deepEqual(tools.map(({ name }) => name), ["workflow"]);

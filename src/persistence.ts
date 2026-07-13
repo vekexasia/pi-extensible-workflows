@@ -1,14 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
+import type { OwnershipRecord } from "./agent-execution.js";
 import { createLaunchSnapshot, WorkflowError } from "./index.js";
 
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
-export interface PersistedOwnershipNode { id: string; parentId?: string; label: string; state: string }
+export type PersistedOwnershipNode = OwnershipRecord
 type Journal = { completed: Record<string, CompletedOperation> };
 
 function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
@@ -21,6 +22,11 @@ export function projectStorageKey(cwd: string): string {
 
 export function runsDirectory(cwd: string, sessionId: string, home = homedir()): string {
   return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions", safePart(sessionId), "runs");
+}
+
+export async function listRunIds(cwd: string, sessionId: string, home = homedir()): Promise<string[]> {
+  try { return (await readdir(runsDirectory(cwd, sessionId, home), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map(({ name }) => name); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
 export function structuralPath(...names: string[]): string {
