@@ -120,6 +120,13 @@ export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ conc
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function positiveInteger(value: unknown): value is number { return Number.isInteger(value) && (value as number) > 0; }
+function modelCapability(value: string): string {
+  const slash = value.indexOf("/");
+  const colon = value.lastIndexOf(":");
+  if (colon <= slash) return value;
+  if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.slice(colon + 1))) fail("UNKNOWN_MODEL", `Invalid thinking level: ${value.slice(colon + 1)}`);
+  return value.slice(0, colon);
+}
 
 export interface CheckpointInput { name: string; prompt: string; context: JsonValue }
 export function validateCheckpoint(value: unknown): CheckpointInput {
@@ -361,7 +368,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const names = namedCalls.flatMap(({ body }) => stringsFor(body, "name").concat(stringsFor(body, "label")));
   const duplicate = names.find((name, index) => names.indexOf(name) !== index);
   if (duplicate) fail("DUPLICATE_NAME", `Duplicate stable name: ${duplicate}`);
-  const models = stringsFor(script, "model");
+  const models = stringsFor(script, "model").map(modelCapability);
   const tools = [...script.matchAll(/\btools\s*:\s*\[([^\]]*)\]/g)].flatMap((match) => [...((match[1] ?? "").matchAll(/(["'])((?:\\.|(?!\1).)*)\1/g))].map((item) => item[2] ?? ""));
   const agentTypes = stringsFor(script, "agentType");
   const missingModel = models.find((model) => !capabilities.models.has(model));

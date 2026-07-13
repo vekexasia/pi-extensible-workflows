@@ -274,6 +274,7 @@ void test("preflight accepts the complete static contract", () => {
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }]);
   assert.equal(result.metadata.name, "review");
   assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+  assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities).referenced.models, ["openai/gpt"]);
   assert.ok(Object.isFrozen(result.metadata));
 });
 
@@ -287,6 +288,7 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`export const meta={name:'x',description:'x',phases:['a','a']};`, "DUPLICATE_NAME"],
     [`export const meta={name:'x',description:'x',phases:['a']}; phase('b')`, "UNKNOWN_PHASE"],
     [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',model:'missing'})`, "UNKNOWN_MODEL"],
+    [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
     [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
     [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',agentType:'writer'})`, "UNKNOWN_AGENT_TYPE"],
     [`export const meta={name:'x',description:'x',extensions:[{name:'nope',version:'1.0.0'}]};`, "MISSING_EXTENSION"],
