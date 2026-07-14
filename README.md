@@ -87,6 +87,7 @@ The worker exposes only deterministic data operations plus:
 
 - `args`
 - `agent(prompt, options)`
+- `prompt(template, values)`
 - `parallel(tasks, operation)`
 - `pipeline(items, ...stages, operation)`
 - `phase(name)`
@@ -95,6 +96,28 @@ The worker exposes only deterministic data operations plus:
 - `extensions.<namespace>.<method>(input)`
 
 Clocks, random numbers, timers, environment/process access, imports, `require`, dynamic code generation, filesystem, and network globals are unavailable. Workflow source runs in a permissioned child process with a VM sandbox. Cancellation is immediate; a missing heartbeat for five seconds fails with `WORKER_UNRESPONSIVE`.
+
+## Safe prompt interpolation
+
+Use the sandbox-only `prompt(template, values)` global to synthesize prompts from agent results:
+
+```js
+const report = await agent("Inspect role mechanics", {
+  name: "role-mechanics",
+  schema: reportSchema,
+});
+
+const synthesis = await agent(
+  prompt("Combine these reports.\n\nREPORT:\n{report}", { report }),
+  { name: "synthesis" },
+);
+```
+
+Placeholders use `{identifier}` syntax, may repeat, and require an exact matching set of value keys. `{{` and `}}` render literal braces; other braces remain literal. Strings interpolate verbatim; numbers, booleans, `null`, arrays, and plain objects render as formatted JSON.
+
+Missing or unused values fail. Values are checked recursively and reject Promises and thenables, functions, `undefined`, symbols, cycles, non-finite numbers, and non-plain objects with the failing key path. Await every `agent()` call before passing its result to `prompt()` or `JSON.stringify()`; unawaited agent Promises refuse serialization. `prompt()` never awaits values automatically.
+
+Rendered prompts use the existing 10 MB worker RPC boundary; there is no separate prompt limit. The helper adds no filesystem, network, process, timer, import, or dynamic-code access.
 
 ## Agents
 

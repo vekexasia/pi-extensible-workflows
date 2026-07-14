@@ -38,6 +38,8 @@ void test("registers the workflow tool and singular command", async () => {
   const guidelines = tool.promptGuidelines?.join("\n") ?? "";
   assert.match(guidelines, /call phase\(name\) before each major stage/);
   assert.match(guidelines, /only combine the supplied reports/);
+  assert.match(guidelines, /prompt\(template, values\)/);
+  assert.match(guidelines, /unawaited agent\(\) Promise; await it first/);
   assert.match(guidelines, /timeoutMs is opt-in per agent/);
   assert.match(guidelines, /retries are opt-in only/);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
@@ -538,6 +540,113 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   assert.deepEqual(phases, ["build"]);
 });
 
+void test("prompt interpolates exact values with JSON formatting and escaped braces", async () => {
+  const run = runWorkflow(`export const meta={name:'prompt',description:'prompt'};
+    return prompt('raw={raw}; again={raw}; number={number}; bool={bool}; nil={nil}; array={array}; object={object}; escaped={{raw}} }}', {
+      raw: 'verbatim', number: 3, bool: false, nil: null, array: [1, {ok:true}], object: {nested:['x']}
+    });`);
+  assert.equal(await run.result, `raw=verbatim; again=verbatim; number=3; bool=false; nil=null; array=[
+  1,
+  {
+    "ok": true
+  }
+]; object={
+  "nested": [
+    "x"
+  ]
+}; escaped={raw} }`);
+});
+
+void test("prompt validates array expando values without changing JSON array rendering", async () => {
+  const run = runWorkflow(`export const meta={name:'array-expandos',description:'array expandos'};
+    const safe=[1,{ok:true}]; safe.note='ignored';
+    const withFunction=[]; withFunction.extra=()=>1;
+    const withCycle=[]; withCycle.extra=withCycle;
+    const message=value=>{try{prompt('{value}',{value});return 'no error'}catch(error){return error.message}};
+    return {rendered:prompt('{value}',{value:safe}),functionError:message(withFunction),cycleError:message(withCycle)};`);
+  const result = await run.result as { rendered: string; functionError: string; cycleError: string };
+  assert.equal(result.rendered, `[
+  1,
+  {
+    "ok": true
+  }
+]`);
+  assert.match(result.functionError, /value\.extra.*function/i);
+  assert.match(result.cycleError, /value\.extra.*cycle/i);
+});
+
+void test("prompt rejects missing, unused, and recursively unsafe values with key-aware errors", async () => {
+  const run = runWorkflow(`export const meta={name:'invalid-prompt',description:'invalid prompt'};
+    const cycle={}; cycle.self=cycle;
+    const accessor={}; Object.defineProperty(accessor,'nested',{enumerable:true,get(){return 1}});
+    const customPrototype=Object.create({constructor:Object}); customPrototype.nested=1;
+    const invalidConstructorPrototype=Object.create(Object.create(null,{constructor:{value:42}}));
+    const cases=[
+      ['missing',()=>prompt('{value}',{})],
+      ['unused',()=>prompt('plain',{value:1})],
+      ['template',()=>prompt(42,{})],
+      ['values',()=>prompt('plain',[])],
+      ['promise',()=>prompt('{value}',{value:Promise.resolve(1)})],
+      ['nested promise',()=>prompt('{value}',{value:{nested:Promise.resolve(1)}})],
+      ['thenable',()=>prompt('{value}',{value:{nested:{then(){}}}})],
+      ['function',()=>prompt('{value}',{value:()=>1})],
+      ['undefined',()=>prompt('{value}',{value:undefined})],
+      ['symbol',()=>prompt('{value}',{value:Symbol('x')})],
+      ['bigint',()=>prompt('{value}',{value:1n})],
+      ['cycle',()=>prompt('{value}',{value:cycle})],
+      ['infinite',()=>prompt('{value}',{value:Infinity})],
+      ['instance',()=>prompt('{value}',{value:new (class Example {})()})],
+      ['accessor',()=>prompt('{value}',{value:accessor})],
+      ['custom prototype',()=>prompt('{value}',{value:customPrototype})],
+      ['invalid prototype constructor',()=>prompt('{value}',{value:invalidConstructorPrototype})],
+    ];
+    return Object.fromEntries(cases.map(([name,run])=>{try{run();return [name,'no error']}catch(error){return [name,error.message]}}));`);
+  const errors = await run.result as Record<string, string>;
+  assert.match(errors.missing ?? "", /Missing prompt value "value"/);
+  assert.match(errors.unused ?? "", /Unused prompt value "value"/);
+  assert.match(errors.template ?? "", /template must be a string/);
+  assert.match(errors.values ?? "", /values must be a plain object/);
+  assert.match(errors.promise ?? "", /value.*Promise.*await/i);
+  assert.match(errors["nested promise"] ?? "", /value\.nested.*Promise.*await/i);
+  assert.match(errors.thenable ?? "", /value\.nested.*thenable.*await/i);
+  assert.match(errors.function ?? "", /value.*function/i);
+  assert.match(errors.undefined ?? "", /value.*undefined/i);
+  assert.match(errors.symbol ?? "", /value.*symbol/i);
+  assert.match(errors.bigint ?? "", /value.*bigint/i);
+  assert.match(errors.cycle ?? "", /value\.self.*cycle/i);
+  assert.match(errors.infinite ?? "", /value.*finite/i);
+  assert.match(errors.instance ?? "", /value.*plain object/i);
+  assert.match(errors.accessor ?? "", /value\.nested.*getters or setters/i);
+  assert.match(errors["custom prototype"] ?? "", /value.*plain object/i);
+  assert.match(errors["invalid prototype constructor"] ?? "", /value.*plain object/i);
+});
+
+void test("agent Promises reject serialization and string coercion but retain await and concurrency", async () => {
+  const started: string[] = [];
+  const run = runWorkflow(`export const meta={name:'agent-promises',description:'agent promises'};
+    const first=agent('first',{name:'first'}); const second=agent('second',{name:'second'});
+    let serialized; try{JSON.stringify(first)}catch(error){serialized=error.message}
+    let interpolated; try{prompt('{report}',{report:first})}catch(error){interpolated=error.message}
+    let stringified; try{first.toString()}catch(error){stringified=error.message}
+    let coerced; try{'prefix '+first}catch(error){coerced=error.message}
+    let agentInput; try{agent('prefix '+first,{name:'third'})}catch(error){agentInput=error.message}
+    let logInput; try{log('prefix '+first)}catch(error){logInput=error.message}
+    let promptTemplate; try{prompt('prefix '+first,{})}catch(error){promptTemplate=error.message}
+    const values=await Promise.all([first,second]);
+    return {serialized,interpolated,stringified,coerced,agentInput,logInput,promptTemplate,awaited:JSON.stringify(values)};`, null, {
+    async agent(text) { started.push(text); return text; },
+  });
+  const result = await run.result as { serialized: string; interpolated: string; stringified: string; coerced: string; agentInput: string; logInput: string; promptTemplate: string; awaited: string };
+  assert.match(result.serialized, /agent result.*Promise.*await.*serialization/i);
+  assert.match(result.interpolated, /report.*Promise.*await.*prompt/i);
+  for (const error of [result.stringified, result.coerced, result.agentInput, result.logInput, result.promptTemplate]) assert.match(error, /agent result.*Promise.*await.*interpolation/i);
+  assert.deepEqual(started, ["first", "second"]);
+  assert.deepEqual(JSON.parse(result.awaited), [
+    { name: "first", ok: true, value: "first", __workResult: true },
+    { name: "second", ok: true, value: "second", __workResult: true },
+  ]);
+});
+
 void test("named parallel and pipeline preserve order, contain failures, and expose stable paths", async () => {
   const pending = new Map<string, (value: JsonValue) => void>();
   const started: string[] = [];
@@ -649,6 +758,10 @@ void test("worker enforces 10 MB boundaries on individual and final JSON values"
   assert.throws(() => runWorkflow(`export const meta={name:'x',description:'x'};`, oversized), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; return 'x'.repeat(${String(RPC_LIMIT_BYTES)});`);
   await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  let called = false;
+  const rendered = runWorkflow(`export const meta={name:'x',description:'x'}; return agent(prompt('{text}',{text:'x'.repeat(${String(RPC_LIMIT_BYTES)})}),{name:'large'});`, null, { agent: async () => { called = true; return null; } });
+  await assert.rejects(rendered.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  assert.equal(called, false);
 });
 
 void test("registers namespaced DSL extensions and replays each call as one validated macro", async () => {

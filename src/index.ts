@@ -558,7 +558,60 @@ const named = (value, kind) => { if (!value || typeof value.name !== "string" ||
 const names = (values, kind) => values.map(value => named(value, kind));
 const occurrenceLabels = values => { const seen = new Map(); return values.map(value => { const count = (seen.get(value) || 0) + 1; seen.set(value, count); return count === 1 ? value : value + "#" + count; }); };
 const path = (...names) => names.map(encodeURIComponent).join("/");
-const agent = (prompt, options = {}) => rpc("agent", [prompt, options]);
+const agent = (prompt, options = {}) => {
+  const result = rpc("agent", [prompt, options]);
+  Object.defineProperties(result, {
+    toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
+    toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
+    [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
+  });
+  return result;
+};
+const promptPath = (at, key) => /^[A-Za-z_$][\w$]*$/.test(key) ? at + "." + key : at + "[" + JSON.stringify(key) + "]";
+const plainPromptObject = value => {
+  const proto = Object.getPrototypeOf(value);
+  return proto === null || Object.getPrototypeOf(proto) === null && Object.prototype.hasOwnProperty.call(proto, "constructor") && typeof proto.constructor === "function" && Function.prototype.toString.call(proto.constructor) === Function.prototype.toString.call(Object);
+};
+const promptValue = (value, at, seen) => {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") { if (!Number.isFinite(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" must be a finite number"); return; }
+  if (typeof value !== "object") throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" cannot be " + typeof value);
+  if (typeof value.then === "function") throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" is a Promise or thenable; await it before calling prompt()");
+  if (!Array.isArray(value) && !plainPromptObject(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" must be a plain object");
+  if (seen.has(value)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" contains a cycle");
+  const keys = Reflect.ownKeys(value);
+  const symbol = keys.find(key => typeof key === "symbol");
+  if (symbol) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" contains a symbol key");
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) promptProperty(value, String(index), at + "[" + index + "]", seen);
+    for (const key of keys) {
+      const index = Number(key);
+      if (key !== "length" && !(Number.isInteger(index) && index >= 0 && index < value.length && String(index) === key)) promptProperty(value, key, promptPath(at, key), seen);
+    }
+  } else for (const key of keys) promptProperty(value, key, promptPath(at, key), seen);
+  seen.delete(value);
+};
+const promptProperty = (value, key, at, seen) => {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor && (descriptor.get || descriptor.set)) throw workError("INVALID_METADATA", "Prompt value \"" + at + "\" cannot use getters or setters");
+  promptValue(descriptor && descriptor.value, at, seen);
+};
+const prompt = (template, values) => {
+  if (typeof template !== "string") throw workError("INVALID_METADATA", "prompt() template must be a string");
+  if (!values || typeof values !== "object" || Array.isArray(values) || !plainPromptObject(values)) throw workError("INVALID_METADATA", "prompt() values must be a plain object");
+  const placeholders = [...template.matchAll(/{{|}}|{([A-Za-z_$][\w$]*)}/g)].flatMap(match => match[1] === undefined ? [] : [match[1]]);
+  const used = new Set(placeholders);
+  const keys = Reflect.ownKeys(values);
+  const symbol = keys.find(key => typeof key === "symbol");
+  if (symbol) throw workError("INVALID_METADATA", "prompt() values must use string keys");
+  const missing = placeholders.find(key => !Object.prototype.hasOwnProperty.call(values, key));
+  if (missing) throw workError("INVALID_METADATA", "Missing prompt value \"" + missing + "\"");
+  const unused = keys.find(key => !used.has(key));
+  if (unused !== undefined) throw workError("INVALID_METADATA", "Unused prompt value \"" + unused + "\"");
+  for (const key of keys) promptProperty(values, key, key, new Set());
+  return template.replace(/{{|}}|{([A-Za-z_$][\w$]*)}/g, (match, key) => match === "{{" ? "{" : match === "}}" ? "}" : typeof values[key] === "string" ? values[key] : JSON.stringify(values[key], null, 2));
+};
 const checkpoint = input => rpc("checkpoint", [input]);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
@@ -604,7 +657,7 @@ const pipeline = async (items, ...parts) => {
   }));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, checkpoint, parallel, pipeline, phase, log, extensions, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, prompt, checkpoint, parallel, pipeline, phase, log, extensions, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = config.script.replace(/^\s*export\s+const\s+meta/, "const meta");
@@ -1168,7 +1221,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
       "For workflow, call phase(name) before each major stage such as scouting, synthesis, implementation, and verification so /workflow shows useful progress; skip phases only for tiny single-agent workflows.",
       "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
-      "For workflow, available globals are args, agent(prompt, options), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
+      "For workflow, available globals are args, agent(prompt, options), prompt(template, values), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
+      "For workflow synthesis, use prompt('REPORT: {report}', { report }) after awaiting agent results. Strings interpolate verbatim; other JSON-compatible values use formatted JSON; {{ and }} escape braces. Never serialize or interpolate an unawaited agent() Promise; await it first.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case recommended). Names drive journaling, replay after recovery, and live status; duplicate names are disambiguated by occurrence order.",
       "For workflow, agent options are { name, model, role, agentType, tools, schema, retries, timeoutMs, isolation: 'worktree' }. role/agentType reference .pi/agents/<name>.md or global ~/.pi/agent/agents/<name>.md role prompts.",
