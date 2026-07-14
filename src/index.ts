@@ -1194,6 +1194,39 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     },
   });
 
+  const coldResumeRun = async (run: NonNullable<ReturnType<typeof runs.get>>, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => {
+    const loaded = await run.store.load();
+    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond"));
+    const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
+    if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
+    preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
+    await scheduler.cancelRun(run.store.runId);
+    await run.lifecycle.resume();
+    const agentCounters = new Map<string, number>();
+    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal) => {
+      await run.lifecycle.enter();
+      try {
+        const label = typeof options.name === "string" ? options.name : "agent";
+        const structuralLabel = nextStructuralLabel(agentCounters, label);
+        const path = operationPath("agent", structuralLabel);
+        const replayed = await run.store.replay(path);
+        if (replayed) return replayed.value;
+        const tools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools;
+        const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
+        const cwd = isolation ? (await run.store.worktree(structuralLabel)).cwd : run.store.cwd;
+        const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const cancel = () => { scheduler.cancel(spawned.id); };
+        signal.addEventListener("abort", cancel, { once: true });
+        const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
+        if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+        await run.store.complete(path, outcome.value);
+        return outcome.value;
+      } finally { await run.lifecycle.leave(); }
+    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
+    run.execution = execution;
+    void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
+  };
   pi.on("session_start", async (_event, ctx) => {
     for (const runId of await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)) {
       if (runs.has(runId)) continue;
@@ -1206,6 +1239,21 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: loadAgentDefinitions(ctx.cwd), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
+    }
+    if (ctx.hasUI) {
+      const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
+      if (interrupted.length > 0) {
+        const labels = interrupted.map((r) => `Resume: ${r.metadata.name} (${r.store.runId.slice(0, 8)})`);
+        const options = [...labels, ...(interrupted.length > 1 ? ["Resume all"] : []), "Skip"];
+        const choice = await ctx.ui.select(`${interrupted.length} interrupted workflow${interrupted.length > 1 ? "s" : ""} found`, options);
+        if (choice && choice !== "Skip") {
+          const toResume = choice === "Resume all" ? interrupted : interrupted.filter((_, i) => labels[i] === choice);
+          for (const run of toResume) {
+            try { await coldResumeRun(run, true, ctx.ui); ctx.ui.notify(`Resumed workflow ${run.metadata.name}.`, "info"); }
+            catch (err) { ctx.ui.notify(`Cannot resume ${run.metadata.name}: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
+          }
+        }
+      }
     }
   });
 
@@ -1455,37 +1503,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return; }
       if (action === "resume" && run) {
         if (run.lifecycle.state === "interrupted") {
-          const loaded = await run.store.load();
-          const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond"));
-          const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
-          if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
-          preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
-          await scheduler.cancelRun(run.store.runId);
-          await run.lifecycle.resume();
-          const agentCounters = new Map<string, number>();
-          const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal) => {
-            await run.lifecycle.enter();
-            try {
-              const label = typeof options.name === "string" ? options.name : "agent";
-              const structuralLabel = nextStructuralLabel(agentCounters, label);
-              const path = operationPath("agent", structuralLabel);
-              const replayed = await run.store.replay(path);
-              if (replayed) return replayed.value;
-              const tools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools;
-              const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
-              const cwd = isolation ? (await run.store.worktree(structuralLabel)).cwd : run.store.cwd;
-              const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
-              const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
-              const cancel = () => { scheduler.cancel(spawned.id); };
-              signal.addEventListener("abort", cancel, { once: true });
-              const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
-              if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
-              await run.store.complete(path, outcome.value);
-              return outcome.value;
-            } finally { await run.lifecycle.leave(); }
-          }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
-          run.execution = execution;
-          void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
+          await coldResumeRun(run, ctx.hasUI, ctx.ui);
         } else await run.lifecycle.resume();
         ctx.ui.notify(`Resumed workflow ${run.store.runId}.`, "info"); return;
       }
