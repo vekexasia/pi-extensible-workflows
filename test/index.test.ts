@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -43,6 +43,39 @@ void test("registers the workflow tool and singular command", async () => {
   assert.match(guidelines, /timeoutMs is opt-in per agent/);
   assert.match(guidelines, /retries are opt-in only/);
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+
+void test("advertises only described effective roles in the system prompt while workflow is active", () => {
+  type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string }) => { systemPrompt?: string } | undefined;
+  let handler: StartHandler | undefined;
+  const activeTools = ["workflow"];
+  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-role-guidance-"));
+  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
+  workflowExtension({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: StartHandler) { if (name === "before_agent_start") handler = candidate; } } as never);
+  assert.ok(handler);
+  const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
+  const guidance = result?.systemPrompt ?? "";
+  assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
+  assert.match(guidance, /reviewer: Reviews correctness/);
+  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool/);
+});
+
+void test("background workflows emit compatible lifecycle events", async () => {
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  const events: Array<{ channel: string; data: Record<string, unknown> }> = [];
+  let completed!: () => void;
+  const done = new Promise<void>((resolve) => { completed = resolve; });
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-events-"));
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data: data as Record<string, unknown> }); if (channel === WORKFLOW_ASYNC_COMPLETE_EVENT) completed(); } } } as never, home);
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
+  assert.ok(execute);
+  const result = await execute("id", { script: `export const meta={name:'events',description:'events'}; return true;` }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  await done;
+  const runId = (JSON.parse(result.content[0]?.text ?? "{}") as { runId?: string }).runId;
+  assert.ok(runId);
+  assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT]);
 });
 
 void test("/workflow doctor formats the shared doctor report with active session tools", async () => {
@@ -137,6 +170,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const dashActions = selections[1]?.join("\n") ?? "";
   assert.match(dashActions, /Delete|Stop|Approve|Reject/);
   assert.match(dashActions, /Transcript paths/);
+  assert.doesNotMatch(dashActions, /View script/);
   assert.ok(selections.some((options) => options.includes("/pi/native-a.jsonl")));
   assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
   await command("delete run-a", ctx as never);
@@ -174,6 +208,48 @@ void test("navigator dashboard auto-refreshes the selected run", async () => {
   };
   await commands[0]?.handler("", ctx as never);
 });
+void test("navigator opens the complete workflow script in a scrollable TUI pane", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-script-viewer-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session", "run", home);
+  const script = ["// SCRIPT_START", ...Array.from({ length: 20 }, (_, index) => `const line${String(index)} = ${String(index)};`), "// SCRIPT_END"].join("\n");
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "running", phase: "view", agents: [], nativeSessions: [] }, snapshot);
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  let selectCalls = 0;
+  let customCalls = 0;
+  const ctx = {
+    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
+    ui: {
+      notify() {}, confirm: async () => false, select: async (_prompt: string, options: string[]) => { selectCalls += 1; return selectCalls === 1 ? options[0] : "Close"; },
+      custom: async (factory: (tui: { terminal: { rows: number }; requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
+        customCalls += 1;
+        let result: string | undefined;
+        const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
+        if (customCalls === 1) {
+          const dashboard = component.render(80).join("\n");
+          assert.match(dashboard, /View script/);
+          component.handleInput?.("tui.select.down");
+          component.handleInput?.("tui.select.down");
+          component.handleInput?.("tui.select.confirm");
+        } else if (customCalls === 2) {
+          assert.match(component.render(80).join("\n"), /SCRIPT_START/);
+          for (let index = 0; index < 10; index += 1) component.handleInput?.("tui.select.pageDown");
+          assert.match(component.render(80).join("\n"), /SCRIPT_END/);
+          component.handleInput?.("tui.select.cancel");
+        } else {
+          component.handleInput?.("tui.select.cancel");
+        }
+        component.dispose?.();
+        return result;
+      },
+    },
+  };
+  await commands[0]?.handler("", ctx as never);
+  assert.equal(customCalls, 3);
+});
+
 
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-v2-"));
@@ -424,13 +500,16 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
 void test("loads markdown agent roles with frontmatter from global and project directories", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-roles-"));
   const cwd = join(home, "project");
-  mkdirSync(join(home, "agents"), { recursive: true });
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
-  writeFileSync(join(home, "agents", "global.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
-  writeFileSync(join(cwd, ".pi", "agents", "reviewer.md"), "Review role");
+  mkdirSync(join(home, "piworkflows", "roles"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
+  writeFileSync(join(home, "piworkflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
+  writeFileSync(join(home, "piworkflows", "roles", "shadowed.md"), "---\ndescription: Hidden global\n---\nGlobal shadowed role");
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "Review role");
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "shadowed.md"), "Project shadowed role");
   const roles = loadAgentDefinitions(cwd, home);
-  assert.deepEqual(roles.global, { prompt: "Global role", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
+  assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
   assert.equal(roles.reviewer?.prompt, "Review role");
+  assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
 });
 
 void test("interrupted resume path preserves workflow agent roles", () => {

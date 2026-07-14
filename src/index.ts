@@ -7,13 +7,15 @@ import { Script } from "node:vm";
 import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { parseFrontmatter, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
+export const WORKFLOW_ASYNC_STARTED_EVENT = "workflow:async-started";
+export const WORKFLOW_ASYNC_COMPLETE_EVENT = "workflow:async-complete";
 const SETTLED_AGENT_STATES: ReadonlySet<AgentState> = new Set(["completed", "failed", "cancelled"]);
 export const ERROR_CODES = [
   "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "UNKNOWN_PHASE", "INVALID_SCHEMA",
@@ -169,7 +171,7 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
     if (end < 0) return { prompt: content };
     const meta: Record<string, string> = {};
     for (const line of content.slice(4, end).split("\n")) {
-      const match = /^(model|thinking|tools)\s*:\s*(.+)$/.exec(line.trim());
+      const match = /^(model|thinking|tools|description)\s*:\s*(.+)$/.exec(line.trim());
       if (match?.[1] && match[2]) meta[match[1]] = match[2].trim();
     }
     const tools = meta.tools ? meta.tools.replace(/^\[|\]$/g, "").split(",").map((tool) => tool.trim().replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "")).filter(Boolean) : undefined;
@@ -177,6 +179,7 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
     if (thinking && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking)) fail("INVALID_METADATA", `Invalid role thinking level: ${thinking}`);
     const definition: AgentDefinition = { prompt: content.slice(end + 4).replace(/^\n/, "") };
     if (meta.model) definition.model = meta.model.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
+    if (meta.description) definition.description = meta.description.replace(/^[']|[']$/g, "").replace(/^["]|["]$/g, "");
     if (thinking) definition.thinking = thinking as NonNullable<AgentDefinition["thinking"]>;
     if (tools) definition.tools = tools;
     return definition;
@@ -187,11 +190,11 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
   try { parsed = parseFrontmatter(content); }
   catch (error) { fail("INVALID_METADATA", `Invalid role frontmatter: ${(error as Error).message}`); }
   if (!object(parsed.frontmatter)) fail("INVALID_METADATA", "Role frontmatter must be an object");
-  const { model, thinking, tools } = parsed.frontmatter;
+  const { model, thinking, tools, description } = parsed.frontmatter;
   if (model !== undefined && (typeof model !== "string" || model.trim() === "")) fail("INVALID_METADATA", "Role model must be a non-empty string");
   if (thinking !== undefined && (typeof thinking !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking))) fail("INVALID_METADATA", `Invalid role thinking level: ${typeof thinking === "string" ? thinking : typeof thinking}`);
-  if (tools !== undefined && (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string" || tool.trim() === ""))) fail("INVALID_METADATA", "Role tools must be an array of non-empty strings");
-  return { prompt: parsed.body, ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}) };
+  if (description !== undefined && (typeof description !== "string" || description.trim() === "" || description.length > 1024)) fail("INVALID_METADATA", "Role description must be a non-empty string of at most 1024 characters");
+  return { prompt: parsed.body, ...(typeof description === "string" ? { description: description.trim() } : {}), ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}) };
 }
 
 function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
@@ -205,8 +208,8 @@ function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
   }
 }
 
-export function loadAgentDefinitions(cwd: string, agentDir = join(homedir(), ".pi", "agent")): Readonly<Record<string, AgentDefinition>> {
-  return deepFreeze({ ...readAgentDefinitions(join(agentDir, "agents")), ...readAgentDefinitions(join(cwd, ".pi", "agents")) });
+export function loadAgentDefinitions(cwd: string, piHome = join(homedir(), ".pi")): Readonly<Record<string, AgentDefinition>> {
+  return deepFreeze({ ...readAgentDefinitions(join(piHome, "piworkflows", "roles")), ...readAgentDefinitions(join(cwd, ".pi", "piworkflows", "roles")) });
 }
 
 const AST_DEPTH_LIMIT = 8;
@@ -1100,6 +1103,13 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
+  const events = (pi as unknown as { events?: ExtensionAPI["events"] }).events;
+  const emitAsyncStarted = (store: RunStore, metadata: WorkflowMetadata) => {
+    events?.emit(WORKFLOW_ASYNC_STARTED_EVENT, { id: store.runId, runId: store.runId, pid: process.pid, sessionId: store.sessionId, asyncDir: store.directory, agent: metadata.name });
+  };
+  const emitAsyncComplete = (store: RunStore, state: "complete" | "failed" | "stopped", error?: Error) => {
+    events?.emit(WORKFLOW_ASYNC_COMPLETE_EVENT, { id: store.runId, runId: store.runId, sessionId: store.sessionId, asyncDir: store.directory, success: state === "complete", state, ...(state === "stopped" ? { stopped: true } : {}), ...(error ? { error: error.message } : {}) });
+  };
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
   const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => {
     const loaded = await store.load();
@@ -1238,7 +1248,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       } finally { await run.lifecycle.leave(); }
     }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
     run.execution = execution;
-    void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); });
+    emitAsyncStarted(run.store, run.metadata);
+    void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); emitAsyncComplete(run.store, "complete"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); emitAsyncComplete(run.store, run.lifecycle.state === "stopped" ? "stopped" : "failed", typed); });
   };
   pi.on("session_start", async (_event, ctx) => {
     for (const runId of await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)) {
@@ -1258,7 +1269,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (interrupted.length > 0) {
         const labels = interrupted.map((r) => `Resume: ${r.metadata.name} (${r.store.runId.slice(0, 8)})`);
         const options = [...labels, ...(interrupted.length > 1 ? ["Resume all"] : []), "Skip"];
-        const choice = await ctx.ui.select(`${interrupted.length} interrupted workflow${interrupted.length > 1 ? "s" : ""} found`, options);
+        const choice = await ctx.ui.select(`${String(interrupted.length)} interrupted workflow${interrupted.length > 1 ? "s" : ""} found`, options);
         if (choice && choice !== "Skip") {
           const toResume = choice === "Resume all" ? interrupted : interrupted.filter((_, i) => labels[i] === choice);
           for (const run of toResume) {
@@ -1269,7 +1280,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       }
     }
   });
-
+  pi.on("before_agent_start", (event, ctx) => {
+    if (!pi.getActiveTools().includes("workflow")) return;
+    const roles = Object.entries(loadAgentDefinitions(ctx.cwd)).filter(([, definition]) => definition.description);
+    if (!roles.length) return;
+    const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- ${name}: ${String(definition.description)}`).join("\n")}`;
+    return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
+  });
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
@@ -1286,7 +1303,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       "For workflow synthesis, use prompt('REPORT: {report}', { report }) after awaiting agent results. Strings interpolate verbatim; other JSON-compatible values use formatted JSON; {{ and }} escape braces. Never serialize or interpolate an unawaited agent() Promise; await it first.",
       "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
       "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case recommended). Names drive journaling, replay after recovery, and live status; duplicate names are disambiguated by occurrence order.",
-      "For workflow, agent options are { name, model, role, agentType, tools, schema, retries, timeoutMs, isolation: 'worktree' }. role/agentType reference .pi/agents/<name>.md or global ~/.pi/agent/agents/<name>.md role prompts.",
+      "For workflow, agent options are { name, model, role, agentType, tools, schema, retries, timeoutMs, isolation: 'worktree' }. role/agentType reference .pi/piworkflows/roles/<name>.md or global ~/.pi/piworkflows/roles/<name>.md role prompts.",
       "For workflow, parallel(tasks, operation) takes named tasks plus a named operation: await parallel([{ name: 'lint', run: () => agent('...', { name: 'lint-agent' }) }], { name: 'verification' }). Results preserve input order.",
       "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
       "For workflow, agent() never throws; it returns { name, ok: true, value } or { name, ok: false, failedAt, error: { code, message } }. Branch on ok instead of try/catch. checkpoint() returns { name, ok: true, value: 'approved'|'rejected' }. In combinators, a failed agent fails its branch automatically.",
@@ -1366,12 +1383,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         } finally { await lifecycle.leave(); }
       }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
+      if (background) emitAsyncStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
       if (background) {
         void finish.then(async (value) => {
           const resultPath = await store.saveResult(value);
+          emitAsyncComplete(store, "complete");
           deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
-        }, (error: unknown) => { deliver(pi, `Workflow ${checked.metadata.name} failed: ${error instanceof Error ? error.message : String(error)}`); });
+        }, (error: unknown) => { emitAsyncComplete(store, lifecycle.state === "stopped" ? "stopped" : "failed", error as Error); deliver(pi, `Workflow ${checked.metadata.name} failed: ${error instanceof Error ? error.message : String(error)}`); });
         return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` } };
       }
       const value = await finish;
@@ -1448,10 +1467,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
             actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
           }
           if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
+          else actions.set("View script", "view-script");
           const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
           if (transcripts.length) actions.set("Transcript paths", "transcripts");
           if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
-          return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees()), actions, transcripts };
+          return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees()), actions, transcripts, script: loaded.snapshot.script };
         };
         for (;;) {
           let view = await loadDashboard();
@@ -1495,6 +1515,41 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
             : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Close"]);
           if (!actionChoice || actionChoice === "Close") return;
           if (actionChoice === "Refresh") continue;
+          if (actionChoice === "View script") {
+            await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+              const highlighted = highlightCode(view.script, "javascript");
+              let offset = 0;
+              let renderedLines: string[] = [];
+              const viewport = () => Math.max(1, tui.terminal.rows - 3);
+              const move = (delta: number) => {
+                const maxOffset = Math.max(0, renderedLines.length - viewport());
+                offset = Math.max(0, Math.min(maxOffset, offset + delta));
+              };
+              return {
+                render(width: number) {
+                  renderedLines = highlighted.flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
+                  const maxOffset = Math.max(0, renderedLines.length - viewport());
+                  offset = Math.min(offset, maxOffset);
+                  return [
+                    theme.fg("accent", "Workflow script"),
+                    ...renderedLines.slice(offset, offset + viewport()),
+                    "",
+                    theme.fg("dim", "↑↓/pgup/pgdn scroll · esc close"),
+                  ];
+                },
+                invalidate() {},
+                handleInput(data: string) {
+                  if (keybindings.matches(data, "tui.select.up")) move(-1);
+                  else if (keybindings.matches(data, "tui.select.down")) move(1);
+                  else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
+                  else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
+                  else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
+                  tui.requestRender();
+                },
+              };
+            });
+            continue;
+          }
           if (actionChoice === "Transcript paths") { await ctx.ui.select("Native Pi transcript paths", [...view.transcripts, "Back"]); continue; }
           command = view.actions.get(actionChoice) ?? "";
           break;

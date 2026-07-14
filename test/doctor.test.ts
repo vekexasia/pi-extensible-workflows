@@ -24,22 +24,23 @@ function fixture(): { root: string; cwd: string; agentDir: string; settingsPath:
   const root = mkdtempSync(join(tmpdir(), "pi-workflows-doctor-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
-  mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
   mkdirSync(join(agentDir, "agents"), { recursive: true });
+  mkdirSync(join(root, "piworkflows", "roles"), { recursive: true });
   return { root, cwd, agentDir, settingsPath: join(root, "missing-settings.json") };
 }
 
 void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.agentDir, "agents", "override.md"), "Global role");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "override.md"), "Project role");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "tool-typo.md"), "---\ntools: [read, cat]\n---\nCheck tools");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "thinking.md"), "---\nthinking: hihg\n---\nThink");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "malformed-model.md"), "---\nmodel: gpt-5\n---\nModel");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "unavailable-model.md"), "---\nmodel: other/model\n---\nModel");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "empty.md"), "---\ntools: [read]\n---\n");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "placeholder.md"), "Use {{tools}} here");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "empty-frontmatter.md"), "---\n---\nBody");
+  writeFileSync(join(paths.root, "piworkflows", "roles", "override.md"), "Global role");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "override.md"), "Project role");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "tool-typo.md"), "---\ntools: [read, cat]\n---\nCheck tools");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "thinking.md"), "---\nthinking: hihg\n---\nThink");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "malformed-model.md"), "---\nmodel: gpt-5\n---\nModel");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "unavailable-model.md"), "---\nmodel: other/model\n---\nModel");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "empty.md"), "---\ntools: [read]\n---\n");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "placeholder.md"), "Use {{tools}} here");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "empty-frontmatter.md"), "---\n---\nBody");
 
   const report = await doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) });
   const codes = report.diagnostics.map(({ code }) => code);
@@ -55,16 +56,25 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   const global = report.roles.find((role) => role.name === "override" && role.scope === "global");
   assert.ok(project);
   assert.ok(global);
-  assert.equal(project.overrides, join(paths.agentDir, "agents", "override.md"));
-  assert.equal(global.overriddenBy, join(paths.cwd, ".pi", "agents", "override.md"));
+  assert.equal(project.overrides, join(paths.root, "piworkflows", "roles", "override.md"));
+  assert.equal(global.overriddenBy, join(paths.cwd, ".pi", "piworkflows", "roles", "override.md"));
   assert.equal(global.active, false);
   assert.equal(doctorExitCode(report), 1);
   assert.match(formatDoctorReport(report), /Fix: Use a tool listed under Active tools/);
 });
 
+void test("doctor rejects invalid role descriptions", async () => {
+  const paths = fixture();
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "empty-description.md"), "---\ndescription: ''\n---\nRole");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "long-description.md"), `---\ndescription: ${"x".repeat(1025)}\n---\nRole`);
+  const report = await doctor({ ...paths, discoverPi: async () => pi() });
+  const sources = report.diagnostics.filter(({ code }) => code === "ROLE_FRONTMATTER").map(({ source }) => source);
+  assert.ok(sources.includes(join(paths.cwd, ".pi", "piworkflows", "roles", "empty-description.md")));
+  assert.ok(sources.includes(join(paths.cwd, ".pi", "piworkflows", "roles", "long-description.md")));
+});
 void test("doctor preflights every registered workflow", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.agentDir, "agents", "reviewer.md"), "Review");
+  writeFileSync(join(paths.root, "piworkflows", "roles", "reviewer.md"), "Review");
   const workflows = {
     "test.missing-role": { description: "missing role", script: `export const meta={name:"missing_role",description:"missing role"}; agent("x",{name:"a",role:"missing"});` },
     "test.missing-tool": { description: "missing tool", script: `export const meta={name:"missing_tool",description:"missing tool"}; agent("x",{name:"a",tools:["cat"]});` },
@@ -83,8 +93,8 @@ void test("doctor preflights every registered workflow", async () => {
 
 void test("doctor respects untrusted projects and does not mutate fixtures", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.agentDir, "agents", "same.md"), "Global");
-  writeFileSync(join(paths.cwd, ".pi", "agents", "same.md"), "---\ntools: [cat]\n---\nProject");
+  writeFileSync(join(paths.root, "piworkflows", "roles", "same.md"), "Global");
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "same.md"), "---\ntools: [cat]\n---\nProject");
   const before = readdirSync(paths.root, { recursive: true }).map(String).sort();
   const report = await doctor({ ...paths, discoverPi: async () => pi({ trust: { required: true, trusted: false, source: "saved Pi trust decision" } }) });
   const after = readdirSync(paths.root, { recursive: true }).map(String).sort();

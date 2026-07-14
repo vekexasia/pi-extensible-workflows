@@ -7,7 +7,7 @@ import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
 import { parseModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
-export interface AgentDefinition { prompt?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
+export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
 export interface AgentExecutionOptions {
   label: string;
   workflowName: string;

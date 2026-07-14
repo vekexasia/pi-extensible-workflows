@@ -130,7 +130,20 @@ const text = await agent("Review the implementation", {
 });
 ```
 
-`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/agent/agents/<name>.md` and `<cwd>/.pi/agents/<name>.md`; the role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
+Role files may add an optional single-line `description` (1-1024 characters):
+
+```yaml
+---
+description: Reviews code for correctness and regressions
+model: anthropic/claude-fable-5
+thinking: high
+tools: [read, grep, find]
+---
+```
+
+When the `workflow` tool is active, the main agent sees only the names and descriptions of effective described roles. Project roles replace same-named global roles completely. Role bodies, paths, models, thinking, and tools remain private to role loading and spawned-agent execution.
+
+`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/piworkflows/roles/<name>.md` and `<cwd>/.pi/piworkflows/roles/<name>.md`; project roles override same-named global roles. The role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
 
 Without `schema`, an agent returns its final text. With a plain JSON Schema:
 

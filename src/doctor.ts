@@ -197,14 +197,15 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const roles: DoctorRole[] = [];
   const definitions = new Map<string, AgentDefinition>();
   const globalPaths = new Map<string, string>();
-  for (const path of roleFiles(join(agentDir, "agents"))) {
+  const globalRoleDir = join(dirname(agentDir), "piworkflows", "roles");
+  for (const path of roleFiles(globalRoleDir)) {
     const name = basename(path, ".md");
     roles.push({ name, path, scope: "global", active: true });
     globalPaths.set(name, path);
     const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics);
     if (definition) definitions.set(name, definition);
   }
-  for (const path of roleFiles(join(cwd, ".pi", "agents"))) {
+  for (const path of roleFiles(join(cwd, ".pi", "piworkflows", "roles"))) {
     const name = basename(path, ".md");
     const globalPath = globalPaths.get(name);
     const active = pi.trust.trusted;
