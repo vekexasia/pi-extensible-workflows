@@ -144,7 +144,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.equal(existsSync(store.directory), false);
 });
 
-void test("navigator refresh reloads the selected run", async () => {
+void test("navigator dashboard auto-refreshes the selected run", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-refresh-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
@@ -152,12 +152,25 @@ void test("navigator refresh reloads the selected run", async () => {
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", phase: "before", agents: [], nativeSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
-  const prompts: string[] = [];
-  let call = 0;
-  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { prompts.push(prompt); call += 1; if (call === 1) return options[0]; if (call === 2) { const loaded = await store.load(); await store.saveState({ ...loaded.run, phase: "after" }); return "Refresh"; } return "Close"; } } };
+  let selectCall = 0;
+  const ctx = {
+    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
+    ui: {
+      notify() {}, confirm: async () => false,
+      select: async (_prompt: string, options: string[]) => { selectCall += 1; return selectCall === 1 ? options[0] : "Back"; },
+      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(): boolean }, done: (value?: string) => void) => { render(width: number): string[]; dispose?(): void }) => {
+        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: () => false }, () => {});
+        assert.match(component.render(200).join("\n"), /phase: before/);
+        const loaded = await store.load();
+        await store.saveState({ ...loaded.run, phase: "after" });
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        assert.match(component.render(200).join("\n"), /phase: after/);
+        component.dispose?.();
+        return "Close";
+      },
+    },
+  };
   await commands[0]?.handler("", ctx as never);
-  assert.match(prompts[1] ?? "", /phase: before/);
-  assert.match(prompts[2] ?? "", /phase: after/);
 });
 
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
@@ -176,9 +189,9 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /root > child/);
   assert.match(dashB, /phase: review/);
   assert.match(dashB, /1\/2 agents/);
-  assert.match(dashB, /37 tok \(in 10, out 5, cache read 20, cache write 2\)/);
+  assert.match(dashB, /37 tok/);
   assert.match(dashB, /reasoning: checking source/);
-  assert.match(dashB, /transcript attempt 1: \/sessions\/active\.jsonl/);
+  assert.doesNotMatch(dashB, /cache read|transcript attempt|openai\//);
 
   const dashC = formatNavigatorDashboard((await storeC.load()).run, [], []);
   assert.match(dashC, /error: AGENT_FAILED: timeout/);

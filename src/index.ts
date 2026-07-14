@@ -7,7 +7,7 @@ import { Script } from "node:vm";
 import * as acorn from "acorn";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { parseFrontmatter, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { parseFrontmatter, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
@@ -841,7 +841,7 @@ function formatAgentActivity(agent: AgentRecord, spinner: string): string {
 
 function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): string {
   const total = accounting.input + accounting.output + accounting.cacheRead + accounting.cacheWrite;
-  return `${String(total)} tok (in ${String(accounting.input)}, out ${String(accounting.output)}, cache read ${String(accounting.cacheRead)}, cache write ${String(accounting.cacheWrite)})`;
+  return `${new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(total).toLowerCase()} tok`;
 }
 
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
@@ -864,17 +864,16 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   for (const agent of prioritised) {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = agentBreadcrumb(agent, byId);
-    const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const model = `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
     const parts = [`${icon} ${breadcrumb}`, agent.state, model, tokens].filter(Boolean);
-    lines.push(parts.join("  "));
+    lines.push(parts.join(" · "));
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
       if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
     }
     const activity = !SETTLED_AGENT_STATES.has(agent.state) ? formatAgentActivity(agent, "⠦") : "";
     if (activity) lines.push(`  ${activity}`);
-    for (const attempt of agent.attemptDetails ?? []) lines.push(`  transcript attempt ${String(attempt.attempt)}: ${attempt.sessionFile}`);
   }
   if (checkpoints.length) { lines.push(""); for (const cp of checkpoints) lines.push(`● checkpoint ${cp.name}: ${cp.prompt}`); }
   if (worktrees.length) { lines.push(""); for (const wt of worktrees) lines.push(`branch ${wt.branch} (${wt.path})`); }
@@ -1321,10 +1320,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         const selected = sorted[runIndex];
         if (!selected) return;
         const { store } = selected;
-        for (;;) {
+        const loadDashboard = async () => {
           const loaded = await store.load();
           const checkpoints = await store.awaitingCheckpoints();
-          const dashboard = formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees());
           const actions = new Map<string, string>();
           const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
           if (loaded.run.state === "running") add("Pause", "pause");
@@ -1334,16 +1332,56 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
             actions.set(`Approve ${cp.name}`, `approve ${store.runId} ${cp.name}`);
             actions.set(`Reject ${cp.name}`, `reject ${store.runId} ${cp.name}`);
           }
-          actions.set("Refresh", "refresh");
+          if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
           const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
           if (transcripts.length) actions.set("Transcript paths", "transcripts");
           if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
-          const actionChoice = await ctx.ui.select(dashboard, [...actions.keys(), "Back", "Close"]);
+          return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, await store.worktrees()), actions, transcripts };
+        };
+        for (;;) {
+          let view = await loadDashboard();
+          const actionChoice = ctx.mode === "tui"
+            ? await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+                let options = [...view.actions.keys(), "Close"];
+                let selectedIndex = 0;
+                let refreshing = false;
+                let disposed = false;
+                const timer = setInterval(() => {
+                  if (refreshing) return;
+                  refreshing = true;
+                  const selectedOption = options[selectedIndex];
+                  void loadDashboard().then((next) => {
+                    if (disposed) return;
+                    view = next;
+                    options = [...view.actions.keys(), "Close"];
+                    selectedIndex = Math.max(0, options.indexOf(selectedOption ?? ""));
+                    tui.requestRender();
+                  }).catch(() => undefined).finally(() => { refreshing = false; });
+                }, 1000);
+                timer.unref();
+                return {
+                  render(width: number) {
+                    const dashboard = truncateToVisualLines(theme.fg("accent", view.dashboard), Number.MAX_SAFE_INTEGER, width, 1).visualLines;
+                    const rows = options.map((option, index) => truncateToVisualLines(`${index === selectedIndex ? "→ " : "  "}${option}`, Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "");
+                    const hint = truncateToVisualLines(theme.fg("dim", "↑↓ navigate · enter select · esc close · auto-refresh 1s"), Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "";
+                    return [...dashboard, "", ...rows, "", hint];
+                  },
+                  invalidate() {},
+                  handleInput(data: string) {
+                    if (keybindings.matches(data, "tui.select.up")) selectedIndex = (selectedIndex + options.length - 1) % options.length;
+                    else if (keybindings.matches(data, "tui.select.down")) selectedIndex = (selectedIndex + 1) % options.length;
+                    else if (keybindings.matches(data, "tui.select.confirm")) done(options[selectedIndex]);
+                    else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
+                    tui.requestRender();
+                  },
+                  dispose() { disposed = true; clearInterval(timer); },
+                };
+              })
+            : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Close"]);
           if (!actionChoice || actionChoice === "Close") return;
-          if (actionChoice === "Back") return;
           if (actionChoice === "Refresh") continue;
-          if (actionChoice === "Transcript paths") { await ctx.ui.select("Native Pi transcript paths", [...transcripts, "Back"]); continue; }
-          command = actions.get(actionChoice) ?? "";
+          if (actionChoice === "Transcript paths") { await ctx.ui.select("Native Pi transcript paths", [...view.transcripts, "Back"]); continue; }
+          command = view.actions.get(actionChoice) ?? "";
           break;
         }
       }
