@@ -76,9 +76,9 @@ void test("doctor preflights every registered workflow", async () => {
   const paths = fixture();
   writeFileSync(join(paths.root, "piworkflows", "roles", "reviewer.md"), "Review");
   const workflows = {
-    "test.missing-role": { description: "missing role", script: `export const meta={name:"missing_role",description:"missing role"}; agent("x",{name:"a",role:"missing"});` },
-    "test.missing-tool": { description: "missing tool", script: `export const meta={name:"missing_tool",description:"missing tool"}; agent("x",{name:"a",tools:["cat"]});` },
-    "test.bad-meta": { description: "bad meta", script: `const meta={name:"bad",description:"bad"};` },
+    "test.missing-role": { description: "missing role", script: `agent("x",{name:"a",role:"missing"});` },
+    "test.missing-tool": { description: "missing tool", script: `agent("x",{name:"a",tools:["cat"]});` },
+    "test.bad-meta": { description: "bad meta", script: `const x = ;` },
   };
   const report = await doctor({ ...paths, discoverPi: async () => pi({ workflows }) });
   assert.deepEqual(report.workflows.map(({ name, valid }) => [name, valid]), [
@@ -88,7 +88,7 @@ void test("doctor preflights every registered workflow", async () => {
   ]);
   assert.ok(report.diagnostics.some(({ code, message }) => code === "WORKFLOW_UNKNOWN_AGENT_TYPE" && /missing/.test(message)));
   assert.ok(report.diagnostics.some(({ code, message }) => code === "WORKFLOW_UNKNOWN_TOOL" && /cat/.test(message)));
-  assert.ok(report.diagnostics.some(({ code }) => code === "WORKFLOW_INVALID_METADATA"));
+  assert.ok(report.diagnostics.some(({ code }) => code === "WORKFLOW_INVALID_SYNTAX"));
 });
 
 void test("doctor respects untrusted projects and does not mutate fixtures", async () => {

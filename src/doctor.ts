@@ -228,7 +228,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
         tools: activeTools,
         agentTypes: new Set(definitions.keys()),
         extensions: pi.extensionVersions,
-      });
+      }, [], { name, description: workflow.description, ...(workflow.extensions ? { extensions: workflow.extensions } : {}) });
       for (const model of checked.referenced.models) if (!knownModels.has(model) || !availableModels.has(model)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${model}`, name));
     } catch (error) {
       valid = false;

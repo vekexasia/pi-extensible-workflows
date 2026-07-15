@@ -11,7 +11,7 @@ export interface AgentDefinition { prompt?: string; description?: string; model?
 export interface AgentExecutionOptions {
   label: string;
   workflowName: string;
-  workflowDescription: string;
+  workflowDescription?: string;
   phase?: string;
   parent?: string;
   parentIsolation?: "worktree";
@@ -19,8 +19,9 @@ export interface AgentExecutionOptions {
   thinking?: ThinkingLevel;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
   onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => void | Promise<void>;
+  onConfig?: (config: AgentSessionConfig) => void | Promise<void>;
+  continueFrom?: AgentContinuationSource;
   tools?: readonly string[];
-  agentType?: string;
   role?: string;
   schema?: JsonSchema;
   retries?: number;
@@ -39,10 +40,13 @@ export interface AgentExecutionRoot {
   providerPause?: () => Promise<void>;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+export interface AgentSessionConfig { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string; cwd: string; role?: string; schema?: JsonSchema; isolation?: "worktree"; worktreeOwner?: string }
+export interface AgentContinuationLineage { agentId: string; agentPath: string; sessionId: string; sessionFile: string }
+export interface AgentContinuationSource extends AgentContinuationLineage { accounting: AgentAccounting; config: AgentSessionConfig }
 export interface AgentToolCallProgress { id: string; name: string; state: "running" | "completed" | "failed" }
 export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
 export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; activity?: AgentActivity; persist: boolean }
-export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting }
+export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting; sessionAccounting?: AgentAccounting }
 export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
 
 export interface NativeSession {
@@ -56,7 +60,7 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; continueFrom?: string }
 type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
@@ -71,7 +75,7 @@ function text(messages: readonly AgentMessage[]): string {
   return message.content.filter((part: unknown): part is { type: "text"; text: string } => typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string").map((part) => part.text).join("");
 }
 
-function accounting(messages: readonly AgentMessage[]): AgentAccounting {
+function accounting(messages: readonly AgentMessage[], baseline?: AgentAccounting): AgentAccounting {
   const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
   for (const message of messages) if (message.role === "assistant" && message.usage) {
     total.input += message.usage.input;
@@ -80,11 +84,13 @@ function accounting(messages: readonly AgentMessage[]): AgentAccounting {
     total.cacheWrite += message.usage.cacheWrite;
     total.cost += message.usage.cost.total;
   }
-  return total;
+  return baseline ? { input: Math.max(0, total.input - baseline.input), output: Math.max(0, total.output - baseline.output), cacheRead: Math.max(0, total.cacheRead - baseline.cacheRead), cacheWrite: Math.max(0, total.cacheWrite - baseline.cacheWrite), cost: Math.max(0, total.cost - baseline.cost) } : total;
 }
 
 export async function createNativeAgentSession(input: SessionInput): Promise<NativeSession> {
-  const manager = SessionManager.create(input.cwd);
+  let manager: SessionManager;
+  try { manager = input.continueFrom ? SessionManager.forkFrom(input.continueFrom, input.cwd) : SessionManager.create(input.cwd); }
+  catch (error) { if (input.continueFrom) throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot fork native Pi session: ${error instanceof Error ? error.message : String(error)}`); throw error; }
   manager.appendSessionInfo(input.sessionLabel);
   const registry = ModelRegistry.create(AuthStorage.create());
   const model = registry.find(input.model.provider, input.model.model);
@@ -97,11 +103,17 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
   return session;
 }
 
+function sessionConfigEqual(left: AgentSessionConfig, right: AgentSessionConfig): boolean {
+  const normalize = (config: AgentSessionConfig) => ({ model: config.model, tools: [...config.tools], systemPromptAppend: config.systemPromptAppend, cwd: config.cwd, role: config.role ?? null, schema: config.schema ?? null, isolation: config.isolation ?? null, worktreeOwner: config.worktreeOwner ?? null });
+  return JSON.stringify(normalize(left)) === JSON.stringify(normalize(right));
+}
+
+
 export class WorkflowAgentExecutor {
   constructor(private readonly root: AgentExecutionRoot, private readonly createSession: SessionFactory = createNativeAgentSession) {}
 
   resolve(options: AgentExecutionOptions): { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string } {
-    const role = options.role ?? options.agentType;
+    const role = options.role;
     const definition = role ? this.root.agentDefinitions?.[role] : undefined;
     if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
     const requested = options.tools ?? definition?.tools ?? [...this.root.tools];
@@ -135,6 +147,12 @@ export class WorkflowAgentExecutor {
       }
     }
     const resolved = this.resolve(options);
+    const role = options.role;
+    const isolation = options.isolation ?? options.parentIsolation;
+    const sessionConfig: AgentSessionConfig = { model: resolved.model, tools: [...resolved.tools], systemPromptAppend: resolved.systemPromptAppend, cwd, ...(role ? { role } : {}), ...(options.schema ? { schema: structuredClone(options.schema) } : {}), ...(isolation ? { isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}) };
+    if (options.continueFrom && !sessionConfigEqual(sessionConfig, options.continueFrom.config)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Continuation agent configuration must match its completed source");
+    await options.onConfig?.(sessionConfig);
+    const continuationBaseline = options.continueFrom?.accounting;
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -162,11 +180,11 @@ export class WorkflowAgentExecutor {
       let unsubscribe: (() => void) | undefined;
       const report = (persist: boolean) => {
         if (!session || !options.onProgress) return;
-        const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
+        const update = { accounting: accounting(session.messages, continuationBaseline), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
-        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
+        session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}), ...(options.continueFrom ? { continueFrom: options.continueFrom.sessionFile } : {}) });
         await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile) });
         unsubscribe = session.subscribe?.((event) => {
           if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; }
@@ -186,7 +204,7 @@ export class WorkflowAgentExecutor {
           if (!session.steer) throw new WorkflowError("INTERNAL_ERROR", "Native Pi session does not support steering");
           setSteer((message) => session?.steer?.(message));
         }
-        const context = [`Workflow: ${options.workflowName} - ${options.workflowDescription}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
+        const context = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", options.continueFrom ? "Continuation safety: prior file contents are stale; inspect the current diff and reread changed sections. Continuation is verification, not a replacement for independent review." : "", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
         await promptWithProviderPause(session, `${context}\n\nTask:\n${task}`, remaining(options.timeoutMs, started), signal, this.root.providerPause);
         if (options.schema) {
           accepted = true;
@@ -203,7 +221,8 @@ export class WorkflowAgentExecutor {
         report(true);
         await progress;
         unsubscribe?.();
-        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: accounting(session.messages) });
+        const attemptAccounting = accounting(session.messages, continuationBaseline);
+        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(options.continueFrom ? { sessionAccounting: accounting(session.messages) } : {}) });
         session.dispose();
         return { value, attempts, cwd };
       } catch (error) {
@@ -212,7 +231,8 @@ export class WorkflowAgentExecutor {
           report(true);
           await progress;
           unsubscribe?.();
-          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: accounting(session.messages) });
+          const attemptAccounting = accounting(session.messages, continuationBaseline);
+          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting, ...(options.continueFrom ? { sessionAccounting: accounting(session.messages) } : {}) });
           session.dispose();
         }
         if (options.isolation && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label).catch(() => undefined);
@@ -231,8 +251,10 @@ export interface ScheduledAgentOptions {
   isolation?: "worktree";
   worktreeOwner?: string;
   model?: string;
+  thinking?: ThinkingLevel;
   role?: string;
   schema?: JsonSchema;
+  continueFrom?: AgentContinuationSource;
   retries?: number;
   timeoutMs?: number | null;
 }
@@ -299,6 +321,10 @@ export class FairAgentScheduler {
     const parent = parentId ? this.#nodes.get(parentId) : undefined;
     if (parentId && (!parent || parent.runId !== runId)) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Parent agent is not owned by this run");
     const effective = this.#inherit(parent, options);
+    if (effective.continueFrom) {
+      const overlap = [...this.#nodes.values()].find((node) => node.runId === runId && node.options.continueFrom?.sessionId === effective.continueFrom?.sessionId && !["completed", "failed", "cancelled"].includes(node.state));
+      if (overlap) throw new WorkflowError("RESUME_INCOMPATIBLE", `Continuation source session is already being continued by ${overlap.options.label}`);
+    }
     if (++run.logical > run.maxAgents) { run.logical -= 1; throw new WorkflowError("RUN_LIMIT_EXCEEDED", `Run ${runId} exceeded maxAgents`); }
     const id = `${runId}:${String(++this.#nextId)}`;
     let resolveResult: (result: ScheduledAgentResult) => void = () => undefined;
@@ -366,9 +392,9 @@ export class FairAgentScheduler {
     if (!parent.options.tools.includes("agent")) return [];
     const agentTool = {
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
-      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), role: Type.Optional(Type.String()), schema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
-      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; role?: string; schema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
-        const options = { label: params.label, cwd: parent.options.cwd, tools: params.tools ?? parent.options.tools, ...(params.model ? { model: params.model } : {}), ...(params.role ? { role: params.role } : {}), ...(params.schema ? { schema: params.schema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
+      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), role: Type.Optional(Type.String()), outputSchema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
+      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
+        const options = { label: params.label, cwd: parent.options.cwd, tools: params.tools ?? parent.options.tools, ...(params.model ? { model: params.model } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
         return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
       },
@@ -410,7 +436,7 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "role", "schema", "retries", "timeoutMs"].includes(key));
+    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "thinking", "role", "schema", "continueFrom", "retries", "timeoutMs"].includes(key));
     if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });

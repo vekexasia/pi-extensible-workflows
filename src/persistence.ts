@@ -8,7 +8,7 @@ import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
 import type { OwnershipRecord } from "./agent-execution.js";
 import { createLaunchSnapshot, WorkflowError } from "./index.js";
 
-export interface NativeSessionReference { sessionId: string; sessionFile: string }
+export interface NativeSessionReference { sessionId: string; sessionFile: string; parentSessionId?: string; parentSessionFile?: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }

@@ -1,14 +1,16 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
-import { Script } from "node:vm";
+import { basename, dirname, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as acorn from "acorn";
+import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentContinuationLineage, type AgentContinuationSource, type AgentDefinition, type AgentProgress, type AgentSessionConfig } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -18,7 +20,7 @@ export const WORKFLOW_ASYNC_STARTED_EVENT = "workflow:async-started";
 export const WORKFLOW_ASYNC_COMPLETE_EVENT = "workflow:async-complete";
 const SETTLED_AGENT_STATES: ReadonlySet<AgentState> = new Set(["completed", "failed", "cancelled"]);
 export const ERROR_CODES = [
-  "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "UNKNOWN_PHASE", "INVALID_SCHEMA",
+  "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "INVALID_SCHEMA",
   "MISSING_EXTENSION", "INCOMPATIBLE_EXTENSION", "UNKNOWN_MODEL", "UNKNOWN_TOOL", "UNKNOWN_AGENT_TYPE",
   "RUN_LIMIT_EXCEEDED", "RPC_LIMIT_EXCEEDED", "AGENT_TIMEOUT", "AGENT_FAILED", "RESULT_INVALID",
   "CANCELLED", "WORKER_UNRESPONSIVE", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "INTERNAL_ERROR",
@@ -36,10 +38,10 @@ export interface WorkFailure { name: string; ok: false; failedAt: string; error:
 export type WorkResult<T extends JsonValue = JsonValue> = WorkSuccess<T> | WorkFailure;
 export interface ModelSpec { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
 export interface ExtensionRequirement { name: string; version: string }
-export interface WorkflowMetadata { name: string; description: string; phases?: readonly string[]; extensions?: readonly ExtensionRequirement[] }
+export interface WorkflowMetadata { name: string; description?: string; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgents: number }
-export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
+export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; sessionAccounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined; sessionConfig?: AgentSessionConfig; continuedFrom?: AgentContinuationLineage }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
@@ -53,7 +55,7 @@ export interface WorkflowOrchestrationContext {
   log: (message: string) => void;
 }
 export interface WorkflowDslMethod { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowOrchestrationContext>) => Promise<JsonValue> | JsonValue }
-export interface WorkflowScriptDefinition { description: string; script: string }
+export interface WorkflowScriptDefinition { description: string; script: string; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowDslExtension { name: string; version: string; headline: string; description: string; methods?: Readonly<Record<string, WorkflowDslMethod>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>> }
 export interface WorkflowMacroJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
@@ -212,66 +214,40 @@ export function loadAgentDefinitions(cwd: string, piHome = join(homedir(), ".pi"
   return deepFreeze({ ...readAgentDefinitions(join(piHome, "piworkflows", "roles")), ...readAgentDefinitions(join(cwd, ".pi", "piworkflows", "roles")) });
 }
 
-const AST_DEPTH_LIMIT = 8;
-
-function astToValue(node: acorn.AnyNode, depth = 0): unknown {
-  if (depth > AST_DEPTH_LIMIT) fail("INVALID_METADATA", "Workflow metadata nesting exceeds depth limit");
-  switch (node.type) {
-    case "Literal":
-      if (typeof node.value === "string" || typeof node.value === "number" || typeof node.value === "boolean" || node.value === null) return node.value;
-      fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
-      break;
-    case "UnaryExpression":
-      if (node.operator === "-" && node.argument.type === "Literal" && typeof node.argument.value === "number") return -node.argument.value;
-      fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
-      break;
-    case "ArrayExpression": return node.elements.map((el) => { if (!el || el.type === "SpreadElement") fail("INVALID_METADATA", "Workflow metadata arrays must not use spread"); return astToValue(el, depth + 1); });
-    case "ObjectExpression": {
-      const obj: Record<string, unknown> = {};
-      for (const prop of node.properties) {
-        if (prop.type === "SpreadElement") fail("INVALID_METADATA", "Workflow metadata must not use spread");
-        if (prop.computed) fail("INVALID_METADATA", "Workflow metadata must not use computed keys");
-        if (prop.method) fail("INVALID_METADATA", "Workflow metadata must not contain methods");
-        if (prop.kind !== "init") fail("INVALID_METADATA", "Workflow metadata must not contain getters or setters");
-        const key = prop.key.type === "Identifier" ? prop.key.name : prop.key.type === "Literal" ? String(prop.key.value) : undefined;
-        if (key === undefined) fail("INVALID_METADATA", "Workflow metadata keys must be identifiers or string literals");
-        obj[key] = astToValue(prop.value, depth + 1);
-      }
-      return obj;
-    }
-    case "TemplateLiteral": fail("INVALID_METADATA", "Workflow metadata must not use template literals");
-      break;
-    default: fail("INVALID_METADATA", "Workflow metadata must contain only plain literals");
-  }
+function extensionRequirements(value: unknown): readonly ExtensionRequirement[] {
+  const extensions = value ?? [];
+  if (!Array.isArray(extensions) || extensions.some((item: unknown) => !object(item) || typeof item.name !== "string" || item.name.trim() === "" || typeof item.version !== "string" || item.version.trim() === "" || Object.keys(item).some((key) => key !== "name" && key !== "version"))) fail("INVALID_METADATA", "extensions must contain name/version objects");
+  const valid = extensions as Array<{ name: string; version: string }>;
+  if (new Set(valid.map(({ name }) => name)).size !== valid.length) fail("DUPLICATE_NAME", "Workflow extension requirements must be unique");
+  return Object.freeze(valid.map(({ name, version }) => Object.freeze({ name: name.trim(), version: version.trim() })));
 }
 
-function parseMetadata(source: string, parsed?: acorn.Program): WorkflowMetadata {
-  const match = /^\s*export\s+const\s+meta\s*=\s*/.exec(source);
-  if (!match) fail("INVALID_METADATA", "First statement must export const meta");
-  let program: acorn.Program;
-  try { program = parsed ?? acorn.parse(source, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true }); }
-  catch (error) { fail("INVALID_METADATA", `Invalid workflow metadata: ${(error as Error).message}`); }
-  const first = program.body[0];
-  if (!first || first.type !== "ExportNamedDeclaration" || !first.declaration || first.declaration.type !== "VariableDeclaration" || first.declaration.kind !== "const") fail("INVALID_METADATA", "First statement must export const meta");
-  const declarator = first.declaration.declarations[0];
-  if (!declarator || declarator.id.type !== "Identifier" || declarator.id.name !== "meta" || !declarator.init) fail("INVALID_METADATA", "First statement must export const meta");
-  if (declarator.init.type !== "ObjectExpression") fail("INVALID_METADATA", "Workflow metadata must be an object literal");
-  let value: unknown;
-  try { value = astToValue(declarator.init); }
-  catch (error) { if (error instanceof WorkflowError) throw error; fail("INVALID_METADATA", `Invalid workflow metadata: ${(error as Error).message}`); }
-  if (!object(value) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.description !== "string" || value.description.trim() === "") fail("INVALID_METADATA", "Workflow metadata requires non-empty name and description");
-  const allowed = new Set(["name", "description", "phases", "extensions"]);
-  const unknown = Object.keys(value).find((key) => !allowed.has(key));
-  if (unknown) fail("INVALID_METADATA", `Unknown workflow metadata: ${unknown}`);
-  const phases: unknown = value.phases ?? [];
-  if (!Array.isArray(phases) || phases.some((phase: unknown) => typeof phase !== "string" || phase.trim() === "")) fail("INVALID_METADATA", "phases must contain non-empty strings");
-  const validPhases = phases as string[];
-  if (new Set(validPhases).size !== validPhases.length) fail("DUPLICATE_NAME", "Workflow phases must be unique");
-  const extensions: unknown = value.extensions ?? [];
-  if (!Array.isArray(extensions) || extensions.some((item: unknown) => !object(item) || typeof item.name !== "string" || item.name === "" || typeof item.version !== "string" || item.version === "" || Object.keys(item).some((key) => key !== "name" && key !== "version"))) fail("INVALID_METADATA", "extensions must contain name/version objects");
-  const validExtensions = extensions as Array<{ name: string; version: string }>;
-  if (new Set(validExtensions.map(({ name }) => name)).size !== validExtensions.length) fail("DUPLICATE_NAME", "Workflow extension requirements must be unique");
-  return { name: value.name.trim(), description: value.description.trim(), phases: Object.freeze([...validPhases]), extensions: Object.freeze(validExtensions.map(({ name, version }) => Object.freeze({ name, version }))) };
+function validateWorkflowMetadata(value: unknown): WorkflowMetadata {
+  if (!object(value) || typeof value.name !== "string" || value.name.trim() === "") fail("INVALID_METADATA", "Workflow metadata requires a non-empty name");
+  if (value.description !== undefined && (typeof value.description !== "string" || value.description.trim() === "")) fail("INVALID_METADATA", "Workflow description must be a non-empty string when provided");
+  if (Object.keys(value).some((key) => !["name", "description", "extensions"].includes(key))) fail("INVALID_METADATA", "Unknown workflow metadata");
+  return Object.freeze({ name: value.name.trim(), ...(typeof value.description === "string" ? { description: value.description.trim() } : {}), extensions: extensionRequirements(value.extensions) });
+}
+
+function workflowBody(script: string): string {
+  if (typeof script !== "string" || script.trim() === "") fail("INVALID_SYNTAX", "Workflow script must be non-empty");
+  try {
+    const program = acorn.parse(script, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true });
+    const first = program.body[0];
+    if (first?.type === "ExportNamedDeclaration" && first.declaration?.type === "VariableDeclaration") {
+      const declarator = first.declaration.declarations[0];
+      if (declarator?.id.type === "Identifier" && declarator.id.name === "meta") return script.slice(first.end).replace(/^\s*/, "");
+    }
+    return script;
+  } catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
+}
+
+function parseWorkflow(script: string): acorn.Program {
+  const body = workflowBody(script);
+  try {
+    new Script(`(async()=>{${body}\n})`);
+    return acorn.parse(body, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true });
+  } catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
 }
 
 type WorkflowCall = acorn.CallExpression & { callee: acorn.Identifier };
@@ -325,17 +301,16 @@ function stableName(node: acorn.AnyNode | undefined): boolean | undefined {
   return result;
 }
 
-function stableNames(node: acorn.AnyNode | undefined): boolean | undefined {
-  if (!node) return false;
-  if (node.type !== "ArrayExpression") return undefined;
-  let unknown = false;
-  for (const element of node.elements) {
-    if (!element || element.type === "SpreadElement") { unknown = true; continue; }
-    const named = stableName(element);
-    if (named === false) return false;
-    if (named === undefined) unknown = true;
+function inheritedAgentRanges(program: acorn.Program): Array<readonly [number, number]> {
+  const ranges: Array<readonly [number, number]> = [];
+  for (const call of workflowCalls(program)) {
+    const record = call.callee.name === "parallel" ? call.arguments[1] : call.callee.name === "pipeline" ? call.arguments[2] : undefined;
+    if (record?.type !== "ObjectExpression") continue;
+    for (const property of record.properties) {
+      if (property.type === "Property" && (property.value.type === "ArrowFunctionExpression" || property.value.type === "FunctionExpression")) ranges.push([property.value.start, property.value.end]);
+    }
   }
-  return unknown ? undefined : true;
+  return ranges;
 }
 
 function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
@@ -376,7 +351,8 @@ export class WorkflowDslRegistry {
     }
     for (const [name, workflow] of Object.entries(workflows)) {
       if (!/^[A-Za-z0-9][\w.-]*$/.test(name) || !object(workflow) || typeof workflow.description !== "string" || workflow.description.trim() === "" || typeof workflow.script !== "string" || workflow.script.trim() === "") fail("INVALID_METADATA", `Invalid workflow script: ${extension.name}.${name}`);
-      parseMetadata(workflow.script);
+      parseWorkflow(workflow.script);
+      extensionRequirements(workflow.extensions);
     }
     this.#extensions.set(extension.name, deepFreeze({ ...extension, methods, workflows }));
   }
@@ -438,42 +414,26 @@ function versionCompatible(required: string, actual: string): boolean {
   return upperChanged >= 0 && (installed[upperChanged] ?? 0) < (upper[upperChanged] ?? 0);
 }
 
-export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown }): string {
-  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${typeof args.workflow === "string" ? args.workflow : "workflow"}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
-  try {
-    const metadata = parseMetadata(args.script);
-    return [`workflow ${metadata.name}`, metadata.description].filter(Boolean).join("\n");
-  } catch { return "workflow composing..."; }
+export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown; name?: unknown; description?: unknown }): string {
+  const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : typeof args.workflow === "string" && args.workflow.trim() ? args.workflow : "workflow";
+  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
+  return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
 
-export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = []): PreflightResult {
-  if (typeof script !== "string" || script.trim() === "") fail("INVALID_SYNTAX", "Workflow script must be non-empty");
-  let program: acorn.Program;
-  try {
-    new Script(`(async()=>{${script.replace(/^\s*export\s+const\s+meta/, "const meta")}\n})`);
-    program = acorn.parse(script, { ecmaVersion: "latest", sourceType: "module", allowReturnOutsideFunction: true });
-  } catch (error) { fail("INVALID_SYNTAX", `Invalid workflow syntax: ${(error as Error).message}`); }
-  const metadata = parseMetadata(script, program);
+export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }): PreflightResult {
+  const checkedMetadata = validateWorkflowMetadata(metadata);
+  const program = parseWorkflow(script);
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
   const calls = workflowCalls(program);
+  const inheritedRanges = inheritedAgentRanges(program);
   const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
-  const declared = new Set(metadata.phases);
-  const unknownPhase = phases.find((phase) => !declared.has(phase));
-  if (unknownPhase) fail("UNKNOWN_PHASE", `Undeclared phase: ${unknownPhase}`);
   for (const call of calls) {
     const operation = call.callee.name;
-    if ((operation === "agent" && stableName(call.arguments[1]) === false) || (operation === "checkpoint" && stableName(call.arguments[0]) === false)) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
-    if (operation === "parallel") {
-      if (stableNames(call.arguments[0]) === false) fail("INVALID_METADATA", "Every parallel task requires a stable explicit name");
-      if (call.arguments.length !== 2 || stableName(call.arguments[1]) === false) fail("INVALID_METADATA", "parallel requires a stable explicit name");
-    }
-    if (operation === "pipeline") {
-      if (stableNames(call.arguments[0]) === false) fail("INVALID_METADATA", "Every pipeline item requires a stable explicit name");
-      const stages = call.arguments.slice(1, -1);
-      if (stages.length === 0 || stages.some((stage) => stableName(stage) === false)) fail("INVALID_METADATA", "Every pipeline stage requires a stable explicit name");
-      if (stableName(call.arguments.at(-1)) === false) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
-    }
+    const inheritsName = operation === "agent" && inheritedRanges.some(([start, end]) => call.start >= start && call.end <= end);
+    if ((operation === "agent" && !inheritsName && stableName(call.arguments[1]) === false) || (operation === "checkpoint" && stableName(call.arguments[0]) === false)) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
+    if (operation === "parallel" && (call.arguments.length !== 2 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "parallel requires an operation name string and tasks record");
+    if (operation === "pipeline" && (call.arguments.length !== 3 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression" || call.arguments[2]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "pipeline requires an operation name string, items record, and stages record");
   }
   const agentCalls = calls.filter((call) => call.callee.name === "agent");
   const models = agentCalls.flatMap((call) => { const value = literalString(propertyNode(call.arguments[1], "model")); return value === undefined ? [] : [modelCapability(value)]; });
@@ -481,19 +441,19 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     const value = propertyNode(call.arguments[1], "tools");
     return value?.type === "ArrayExpression" ? value.elements.flatMap((element) => { const tool = element && element.type !== "SpreadElement" ? literalString(element) : undefined; return tool === undefined ? [] : [tool]; }) : [];
   });
-  const agentTypes = agentCalls.flatMap((call) => ["agentType", "role"].flatMap((key) => { const value = literalString(propertyNode(call.arguments[1], key)); return value === undefined ? [] : [value]; }));
+  const agentTypes = agentCalls.flatMap((call) => { const value = literalString(propertyNode(call.arguments[1], "role")); return value === undefined ? [] : [value]; });
   const missingModel = models.find((model) => !capabilities.models.has(model));
   if (missingModel) fail("UNKNOWN_MODEL", `Unknown model: ${missingModel}`);
   const missingTool = tools.find((tool) => !capabilities.tools.has(tool));
   if (missingTool) fail("UNKNOWN_TOOL", `Unknown tool: ${missingTool}`);
   const missingType = agentTypes.find((type) => !capabilities.agentTypes.has(type));
   if (missingType) fail("UNKNOWN_AGENT_TYPE", `Unknown agent type: ${missingType}`);
-  for (const requirement of metadata.extensions ?? []) {
+  for (const requirement of checkedMetadata.extensions ?? []) {
     const actual = capabilities.extensions[requirement.name];
     if (!actual) fail("MISSING_EXTENSION", `Required extension is unavailable: ${requirement.name}`);
     if (!versionCompatible(requirement.version, actual)) fail("INCOMPATIBLE_EXTENSION", `Extension ${requirement.name} requires ${requirement.version}, found ${actual}`);
   }
-  return Object.freeze({ metadata: deepFreeze(metadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze([...schemas]) as readonly JsonSchema[] });
+  return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze([...schemas]) as readonly JsonSchema[] });
 }
 
 function deepFreeze<T>(value: T): T {
@@ -512,7 +472,7 @@ export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
 export const HEARTBEAT_TIMEOUT_MS = 5000;
 
 export interface WorkflowBridge {
-  agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<JsonValue>;
+  agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, structuralName?: string) => Promise<JsonValue>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
   extension?: (extension: string, method: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal) => Promise<JsonValue>;
   extensions?: Readonly<Record<string, readonly string[]>>;
@@ -527,6 +487,7 @@ const WORK_RESULT_BRAND = "__workResult";
 
 const childSource = String.raw`
 "use strict";
+const { AsyncLocalStorage } = require("node:async_hooks");
 const vm = require("node:vm");
 const LIMIT = parseInt(process.argv[2], 10);
 const config = JSON.parse(process.argv[3]);
@@ -570,12 +531,16 @@ send({ type: "heartbeat" });
 const BRAND = "${WORK_RESULT_BRAND}";
 const workError = (code, message) => Object.assign(new Error(message), { code });
 const isBranded = value => value && typeof value === "object" && value[BRAND] === true;
-const named = (value, kind) => { if (!value || typeof value.name !== "string" || !value.name.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value.name; };
-const names = (values, kind) => values.map(value => named(value, kind));
-const occurrenceLabels = values => { const seen = new Map(); return values.map(value => { const count = (seen.get(value) || 0) + 1; seen.set(value, count); return count === 1 ? value : value + "#" + count; }); };
+const named = (value, kind) => { if (typeof value !== "string" || !value.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value; };
 const path = (...names) => names.map(encodeURIComponent).join("/");
+const inheritedAgentPath = new AsyncLocalStorage();
 const agent = (prompt, options = {}) => {
-  const result = rpc("agent", [prompt, options]);
+  if (!options || typeof options !== "object" || Array.isArray(options)) throw workError("INVALID_METADATA", "agent options must be an object");
+  const inherited = inheritedAgentPath.getStore();
+  const explicitName = options.name;
+  const name = named(explicitName === undefined && inherited ? inherited.at(-1) : explicitName, "agent");
+  const structuralName = explicitName === undefined && inherited ? path(...inherited) : name;
+  const result = rpc("agent", [prompt, { ...options, name }, structuralName]);
   Object.defineProperties(result, {
     toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
     toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
@@ -632,40 +597,42 @@ const checkpoint = input => rpc("checkpoint", [input]);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
 const extensions = Object.freeze(Object.fromEntries(Object.entries(config.extensions).map(([extension, methods]) => [extension, Object.freeze(Object.fromEntries(methods.map(method => [method, input => rpc("extension", [extension, method, input, path("extension", extension, method)])])))])));
-const parallel = async (tasks, operation) => {
-  const operationName = named(operation, "parallel");
-  if (!Array.isArray(tasks)) throw workError("INVALID_METADATA", "parallel tasks must be an array");
-  const taskNames = names(tasks, "parallel task");
-  const taskPaths = occurrenceLabels(taskNames);
-  return Promise.all(tasks.map(async (task, index) => {
-    const name = taskNames[index];
-    const failedAt = path(operationName, taskPaths[index]);
+const recordEntries = (value, kind) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw workError("INVALID_METADATA", kind + " must be a record");
+  return Object.entries(value);
+};
+const parallel = async (operationName, tasks) => {
+  named(operationName, "parallel");
+  const entries = recordEntries(tasks, "parallel tasks");
+  return Promise.all(entries.map(async ([name, run]) => {
+    named(name, "parallel task");
+    const failedAt = path(operationName, name);
     try {
-      const result = await task.run();
-      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, taskPaths[index], result.failedAt), error: result.error, [BRAND]: true };
+      if (typeof run !== "function") throw workError("INVALID_METADATA", "parallel task values must be run functions");
+      const parent = inheritedAgentPath.getStore() || [];
+      const result = await inheritedAgentPath.run([...parent, operationName, name], run);
+      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, result.failedAt), error: result.error, [BRAND]: true };
       return { name, ok: true, value: isBranded(result) ? result.value : result, [BRAND]: true };
-    }
-    catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
+    } catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
   }));
 };
-const pipeline = async (items, ...parts) => {
-  const operation = parts.pop();
-  const operationName = named(operation, "pipeline");
-  if (!Array.isArray(items)) throw workError("INVALID_METADATA", "pipeline items must be an array");
-  const itemNames = names(items, "pipeline item");
-  const itemPaths = occurrenceLabels(itemNames);
-  const stageNames = names(parts, "pipeline stage");
-  const stagePaths = occurrenceLabels(stageNames);
-  if (!stageNames.length) throw workError("INVALID_METADATA", "pipeline requires at least one named stage");
-  return Promise.all(items.map(async (item, index) => {
-    const name = itemNames[index];
-    let value = item.value;
-    let failedAt = path(operationName, itemPaths[index]);
+const pipeline = async (operationName, items, stages) => {
+  named(operationName, "pipeline");
+  const itemEntries = recordEntries(items, "pipeline items");
+  const stageEntries = recordEntries(stages, "pipeline stages");
+  if (!stageEntries.length) throw workError("INVALID_METADATA", "pipeline requires at least one stage");
+  return Promise.all(itemEntries.map(async ([name, initial]) => {
+    named(name, "pipeline item");
+    let value = initial;
+    let failedAt = path(operationName, name);
     try {
-      for (let stageIndex = 0; stageIndex < parts.length; stageIndex += 1) {
-        failedAt = path(operationName, itemPaths[index], stagePaths[stageIndex]);
-        const result = await parts[stageIndex].run(value);
-        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, itemPaths[index], stagePaths[stageIndex], result.failedAt), error: result.error, [BRAND]: true };
+      for (const [stageName, run] of stageEntries) {
+        named(stageName, "pipeline stage");
+        failedAt = path(operationName, name, stageName);
+        if (typeof run !== "function") throw workError("INVALID_METADATA", "pipeline stage values must be run functions");
+        const parent = inheritedAgentPath.getStore() || [];
+        const result = await inheritedAgentPath.run([...parent, operationName, name, stageName], () => run(value));
+        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, stageName, result.failedAt), error: result.error, [BRAND]: true };
         value = isBranded(result) ? result.value : result;
       }
       return { name, ok: true, value, [BRAND]: true };
@@ -676,7 +643,7 @@ const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name
 const sandbox = { agent, prompt, checkpoint, parallel, pipeline, phase, log, extensions, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
-const body = config.script.replace(/^\s*export\s+const\s+meta/, "const meta");
+const body = config.script;
 Promise.resolve().then(() => new vm.Script("(async()=>{" + body + "\n})()", { filename: "workflow.js" }).runInContext(context))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: { code: error.code || "INTERNAL_ERROR", message: error.message } }))
@@ -692,7 +659,8 @@ function encoded(value: unknown): string {
 
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
-  const config = JSON.stringify({ script, args: structuredClone(args), extensions: bridge.extensions ?? {} });
+  const body = workflowBody(script);
+  const config = JSON.stringify({ script: body, args: structuredClone(args), extensions: bridge.extensions ?? {} });
   const childDir = mkdtempSync(join(tmpdir(), "pi-wf-"));
   const childFile = join(childDir, "child.cjs");
   writeFileSync(childFile, childSource);
@@ -748,9 +716,9 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
         const opts = object(values[1]) ? values[1] : {};
-        const name = typeof opts.name === "string" ? opts.name : "agent";
+        const name = typeof opts.name === "string" && opts.name.trim() ? opts.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
         try {
-          const result = await bridge.agent(values[0], opts, controller.signal);
+          const result = await bridge.agent(values[0], opts, controller.signal, typeof values[2] === "string" ? values[2] : name);
           value = branded({ name, ok: true, value: result ?? null });
         } catch (error) {
           const code = (error instanceof WorkflowError ? error.code : typeof (error as Record<string, unknown>).code === "string" ? (error as Record<string, unknown>).code as string : "INTERNAL_ERROR") as WorkflowErrorCode;
@@ -807,22 +775,34 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
   return { result, cancel };
 }
+function nativeSessionReference(attempt: Pick<AgentAttempt, "sessionId" | "sessionFile">, lineage?: AgentContinuationLineage): { sessionId: string; sessionFile: string; parentSessionId?: string; parentSessionFile?: string } {
+  return { sessionId: attempt.sessionId, sessionFile: attempt.sessionFile, ...(lineage ? { parentSessionId: lineage.sessionId, parentSessionFile: lineage.sessionFile } : {}) };
+}
+
+export async function persistAgentConfig(store: RunStore, id: string, config: AgentSessionConfig): Promise<void> {
+  const loaded = await store.load();
+  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, sessionConfig: structuredClone(config) } : agent) });
+}
 
 export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">): Promise<void> {
   const loaded = await store.load();
-  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  const agent = loaded.run.agents.find((candidate) => candidate.id === id);
+  if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
   const accounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-  const nativeSessions = loaded.run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? loaded.run.nativeSessions : [...loaded.run.nativeSessions, { sessionId: active.sessionId, sessionFile: active.sessionFile }];
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : agent), nativeSessions });
+  const reference = nativeSessionReference(active, agent.continuedFrom);
+  const nativeSessions = loaded.run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? loaded.run.nativeSessions : [...loaded.run.nativeSessions, reference];
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : candidate), nativeSessions });
 }
 
 export async function persistAgentAttempts(store: RunStore, id: string, attempts: readonly AgentAttempt[]): Promise<void> {
   const loaded = await store.load();
-  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+  const agent = loaded.run.agents.find((candidate) => candidate.id === id);
+  if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
   const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-  const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting }));
+  const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting, sessionAccounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting, ...(sessionAccounting ? { sessionAccounting } : {}) }));
   const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, attempts: attempts.length, attemptDetails, accounting: total } : agent), nativeSessions: [...loaded.run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map(({ sessionId, sessionFile }) => ({ sessionId, sessionFile }))] });
+  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...loaded.run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt, agent.continuedFrom))] });
 }
 
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
@@ -1003,63 +983,56 @@ function utf8Prefix(value: string, maxBytes: number): string {
 function deliver(pi: ExtensionAPI, content: string): void {
   pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
 }
-
-function namedHostOperation(value: unknown, kind: string): { name: string; run?: (value?: JsonValue) => JsonValue | Promise<JsonValue>; value?: JsonValue } {
-  if (!object(value) || typeof value.name !== "string" || value.name.trim() === "") fail("INVALID_METADATA", `${kind} requires a stable explicit name`);
-  return value as { name: string; run?: (value?: JsonValue) => JsonValue | Promise<JsonValue>; value?: JsonValue };
-}
+const inheritedHostAgentPath = new AsyncLocalStorage<readonly string[]>();
 
 function isBrandedResult(value: unknown): value is Record<string, JsonValue> & { ok: boolean; name: string } {
   return object(value) && value[WORK_RESULT_BRAND] === true;
 }
 
-function occurrenceLabels(names: readonly string[]): string[] {
-  const seen = new Map<string, number>();
-  return names.map((name) => {
-    const count = (seen.get(name) ?? 0) + 1;
-    seen.set(name, count);
-    return count === 1 ? name : `${name}#${String(count)}`;
-  });
+function namedRecord(value: unknown, kind: string): Array<[string, unknown]> {
+  if (!object(value)) fail("INVALID_METADATA", `${kind} must be a record`);
+  return Object.entries(value);
 }
-async function hostParallel(rawTasks: unknown, rawOperation: unknown): Promise<JsonValue> {
-  if (!Array.isArray(rawTasks)) fail("INVALID_METADATA", "parallel tasks must be an array");
-  const operation = namedHostOperation(rawOperation, "parallel");
-  const tasks = rawTasks.map((task) => namedHostOperation(task, "parallel task"));
-  const taskPaths = occurrenceLabels(tasks.map(({ name }) => name));
-  return Promise.all(tasks.map(async ({ name, run }, index) => {
+
+async function hostParallel(rawOperation: unknown, rawTasks: unknown): Promise<JsonValue> {
+  if (typeof rawOperation !== "string" || !rawOperation.trim()) fail("INVALID_METADATA", "parallel requires a stable explicit name");
+  const tasks = namedRecord(rawTasks, "parallel tasks");
+  return Promise.all(tasks.map(async ([name, run]) => {
+    if (!name.trim()) fail("INVALID_METADATA", "parallel task requires a stable explicit name");
     try {
-      if (!run) fail("INVALID_METADATA", "parallel tasks require run functions");
-      const result: unknown = await run();
-      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, taskPaths[index] ?? name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+      if (typeof run !== "function") fail("INVALID_METADATA", "parallel task values must be run functions");
+      const parent = inheritedHostAgentPath.getStore() ?? [];
+      const result: unknown = await inheritedHostAgentPath.run([...parent, rawOperation, name], run as () => unknown);
+      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(rawOperation, name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
       return { name, ok: true, value: (isBrandedResult(result) ? result.value : result) as JsonValue, [WORK_RESULT_BRAND]: true };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt: operationPath(operation.name, taskPaths[index] ?? name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
+      return { name, ok: false, failedAt: operationPath(rawOperation, name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
     }
   }));
 }
 
-async function hostPipeline(rawItems: unknown, ...parts: unknown[]): Promise<JsonValue> {
-  if (!Array.isArray(rawItems)) fail("INVALID_METADATA", "pipeline items must be an array");
-  const operation = namedHostOperation(parts.pop(), "pipeline");
-  const items = rawItems.map((item) => namedHostOperation(item, "pipeline item"));
-  const stages = parts.map((stage) => namedHostOperation(stage, "pipeline stage"));
-  if (!stages.length) fail("INVALID_METADATA", "pipeline requires at least one named stage");
-  const itemPaths = occurrenceLabels(items.map(({ name }) => name));
-  const stagePaths = occurrenceLabels(stages.map(({ name }) => name));
-  return Promise.all(items.map(async ({ name, value }, index) => {
-    let current = value ?? null;
-    let failedAt = operationPath(operation.name, itemPaths[index] ?? name);
+async function hostPipeline(rawOperation: unknown, rawItems: unknown, rawStages: unknown): Promise<JsonValue> {
+  if (typeof rawOperation !== "string" || !rawOperation.trim()) fail("INVALID_METADATA", "pipeline requires a stable explicit name");
+  const items = namedRecord(rawItems, "pipeline items");
+  const stages = namedRecord(rawStages, "pipeline stages");
+  if (!stages.length) fail("INVALID_METADATA", "pipeline requires at least one stage");
+  return Promise.all(items.map(async ([name, initial]) => {
+    if (!name.trim()) fail("INVALID_METADATA", "pipeline item requires a stable explicit name");
+    let current = initial;
+    let failedAt = operationPath(rawOperation, name);
     try {
-      for (const [stageIndex, stage] of stages.entries()) {
-        failedAt = operationPath(operation.name, itemPaths[index] ?? name, stagePaths[stageIndex] ?? stage.name);
-        if (!stage.run) fail("INVALID_METADATA", "pipeline stages require run functions");
-        const result: unknown = await stage.run(current);
-        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(operation.name, itemPaths[index] ?? name, stagePaths[stageIndex] ?? stage.name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
-        current = (isBrandedResult(result) ? result.value : result) as JsonValue;
+      for (const [stageName, run] of stages) {
+        if (!stageName.trim()) fail("INVALID_METADATA", "pipeline stage requires a stable explicit name");
+        failedAt = operationPath(rawOperation, name, stageName);
+        if (typeof run !== "function") fail("INVALID_METADATA", "pipeline stage values must be run functions");
+        const parent = inheritedHostAgentPath.getStore() ?? [];
+        const result: unknown = await inheritedHostAgentPath.run([...parent, rawOperation, name, stageName], () => (run as (value: unknown) => unknown)(current));
+        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(rawOperation, name, stageName, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
+        current = isBrandedResult(result) ? result.value : result;
       }
-      return { name, ok: true, value: current, [WORK_RESULT_BRAND]: true };
+      return { name, ok: true, value: current as JsonValue, [WORK_RESULT_BRAND]: true };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
@@ -1074,6 +1047,58 @@ function nextStructuralLabel(counters: Map<string, number>, label: string): stri
   return count === 1 ? label : `${label}#${String(count)}`;
 }
 
+interface PreparedAgentOptions { source?: AgentContinuationSource; tools: readonly string[]; model?: string; thinking?: ModelSpec["thinking"]; role?: string; schema?: JsonSchema; isolation?: "worktree"; worktreeOwner?: string; cwd?: string }
+function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
+  switch (value) {
+    case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": return value;
+    default: return undefined;
+  }
+}
+
+function modelReference(model: ModelSpec): string { return `${model.provider}/${model.model}${model.thinking ? `:${model.thinking}` : ""}`; }
+
+function continuationSource(run: PersistedRun, reference: unknown): AgentContinuationSource {
+  if (typeof reference !== "string" || !reference.trim()) fail("RESUME_INCOMPATIBLE", "Continuation source must be a workflow agent name or path");
+  const matches = run.agents.filter((agent) => agent.name === reference || agent.path === reference || agent.id === reference || operationPath("agent", agent.path) === reference);
+  if (matches.length !== 1) fail("RESUME_INCOMPATIBLE", matches.length > 1 ? `Continuation source is ambiguous: ${reference}` : `Continuation source is missing from this workflow run: ${reference}`);
+  const agent = matches[0] as AgentRecord;
+  if (agent.state !== "completed") fail("RESUME_INCOMPATIBLE", `Continuation source is not completed: ${reference}`);
+  const config = agent.sessionConfig;
+  if (!config) fail("RESUME_INCOMPATIBLE", `Continuation source is unavailable or incomplete: ${reference}`);
+  const parent = agent.parentId ? run.agents.find((candidate) => candidate.id === agent.parentId) : undefined;
+  const unprovenNestedWorktree = Boolean(agent.parentId) && config.cwd !== run.cwd && config.isolation !== "worktree";
+  if ((config.isolation === "worktree" && !config.worktreeOwner) || unprovenNestedWorktree || (parent?.sessionConfig?.isolation === "worktree" && (config.isolation !== "worktree" || !config.worktreeOwner || config.worktreeOwner !== parent.sessionConfig.worktreeOwner || config.cwd !== parent.sessionConfig.cwd))) fail("RESUME_INCOMPATIBLE", `Cannot continue ${reference}: persisted worktree identity is unavailable`);
+  const attempt = agent.attemptDetails?.at(-1);
+  const native = attempt ? run.nativeSessions.find((session) => session.sessionId === attempt.sessionId && session.sessionFile === attempt.sessionFile) : undefined;
+  if (!attempt || attempt.error || !native || !existsSync(native.sessionFile)) fail("RESUME_INCOMPATIBLE", `Continuation source is unavailable or incomplete: ${reference}`);
+  return { agentId: agent.id, agentPath: agent.path, sessionId: attempt.sessionId, sessionFile: attempt.sessionFile, accounting: attempt.sessionAccounting ?? attempt.accounting, config };
+}
+
+function preparedAgentOptions(run: PersistedRun, options: Readonly<Record<string, JsonValue>>): PreparedAgentOptions | undefined {
+  if (options.continueFrom === undefined) return undefined;
+  const source = continuationSource(run, options.continueFrom);
+  const rawTools = options.tools;
+  if (rawTools !== undefined && (!Array.isArray(rawTools) || rawTools.some((tool) => typeof tool !== "string"))) fail("RESUME_INCOMPATIBLE", "Continuation tools must match the completed source");
+  const tools = rawTools === undefined ? source.config.tools : rawTools as string[];
+  const rawModel = options.model;
+  if (rawModel !== undefined && typeof rawModel !== "string") fail("RESUME_INCOMPATIBLE", "Continuation model must match the completed source");
+  const rawThinking = options.thinking;
+  const thinking = parseThinking(rawThinking);
+  if (rawThinking !== undefined && !thinking) fail("RESUME_INCOMPATIBLE", "Continuation thinking level must match the completed source");
+  const rawRole = options.role;
+  if (rawRole !== undefined && typeof rawRole !== "string") fail("RESUME_INCOMPATIBLE", "Continuation role must match the completed source");
+  const rawSchema = options.outputSchema;
+  if (rawSchema !== undefined && !object(rawSchema)) fail("RESUME_INCOMPATIBLE", "Continuation structured output must match the completed source");
+  const rawIsolation = options.isolation;
+  if (rawIsolation !== undefined && rawIsolation !== "worktree") fail("RESUME_INCOMPATIBLE", "Continuation worktree isolation must match the completed source");
+  const rawCwd = options.cwd;
+  if (rawCwd !== undefined && (typeof rawCwd !== "string" || rawCwd !== source.config.cwd)) fail("RESUME_INCOMPATIBLE", "Continuation cwd must match the completed source");
+  const rawOwner = options.worktreeOwner;
+  if (rawOwner !== undefined && (typeof rawOwner !== "string" || rawOwner !== source.config.worktreeOwner)) fail("RESUME_INCOMPATIBLE", "Continuation worktree must match the completed source");
+  if (rawIsolation !== undefined && !source.config.isolation) fail("RESUME_INCOMPATIBLE", "Continuation worktree isolation must match the completed source");
+  return { source, tools, model: rawModel ?? modelReference(source.config.model), ...(thinking ? { thinking } : {}), ...(rawRole !== undefined ? { role: rawRole } : source.config.role ? { role: source.config.role } : {}), ...(rawSchema !== undefined ? { schema: rawSchema } : source.config.schema ? { schema: source.config.schema } : {}), ...(source.config.isolation ? { isolation: source.config.isolation, ...(source.config.worktreeOwner ? { worktreeOwner: source.config.worktreeOwner } : {}), cwd: source.config.cwd } : { cwd: source.config.cwd }) };
+}
+
 function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge {
   const namespaces = workflowDslRegistry.namespaces();
   return { ...bridge, extensions: Object.fromEntries(Object.entries(namespaces).map(([name, methods]) => [name, Object.keys(methods)])), extension: async (extension, method, input, path, signal) => {
@@ -1084,10 +1109,15 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
       agent: async (...args: readonly unknown[]) => {
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
         const options = object(args[1]) && jsonValue(args[1]) ? args[1] as Readonly<Record<string, JsonValue>> : {};
-        return bridge.agent(args[0], options, signal);
+        const inherited = inheritedHostAgentPath.getStore();
+        const explicitName = options.name;
+        const name = explicitName === undefined && inherited ? inherited.at(-1) : explicitName;
+        if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "agent requires a stable explicit name");
+        const structuralName = explicitName === undefined && inherited ? operationPath(...inherited) : name;
+        return bridge.agent(args[0], { ...options, name }, signal, structuralName);
       },
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
-      pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], ...args.slice(1)),
+      pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);
@@ -1104,6 +1134,12 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   const events = (pi as unknown as { events?: ExtensionAPI["events"] }).events;
+  pi.on("resources_discover", () => {
+    if (!pi.getActiveTools().includes("workflow")) return;
+    const extensionDir = dirname(fileURLToPath(import.meta.url));
+    const skillPath = [join(extensionDir, "../skills"), join(extensionDir, "../../skills")].find((path) => existsSync(path));
+    return skillPath ? { skillPaths: [skillPath] } : undefined;
+  });
   const emitAsyncStarted = (store: RunStore, metadata: WorkflowMetadata) => {
     events?.emit(WORKFLOW_ASYNC_STARTED_EVENT, { id: store.runId, runId: store.runId, pid: process.pid, sessionId: store.sessionId, asyncDir: store.directory, agent: metadata.name });
   };
@@ -1128,12 +1164,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (progress.persist) await run.store.saveState(runState);
         run.update?.(workflowToolUpdate(runState));
       };
+      const onConfig = async (config: AgentSessionConfig) => { await scheduler.flush(); await persistAgentConfig(run.store, id, config); run.update?.(workflowToolUpdate((await run.store.load()).run)); };
       const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => {
         await scheduler.flush();
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, workflowDescription: run.metadata.description, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onConfig, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.continueFrom ? { continueFrom: options.continueFrom } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1149,7 +1186,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
     const agents = ownership.map((node) => {
       const previous = existing.get(node.id);
-      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(node.options.continueFrom ? { continuedFrom: { agentId: node.options.continueFrom.agentId, agentPath: node.options.continueFrom.agentPath, sessionId: node.options.continueFrom.sessionId, sessionFile: node.options.continueFrom.sessionFile } } : previous?.continuedFrom ? { continuedFrom: previous.continuedFrom } : {}), ...(previous?.sessionConfig ? { sessionConfig: previous.sessionConfig } : {}), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
     });
     const runState = { ...loaded.run, agents };
     await run.store.saveState(runState);
@@ -1222,23 +1259,30 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond"));
     const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
-    preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas);
+    preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas, loaded.snapshot.metadata);
     await scheduler.cancelRun(run.store.runId);
     await run.lifecycle.resume();
     const agentCounters = new Map<string, number>();
-    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal) => {
+    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal, structuralName) => {
       await run.lifecycle.enter();
       try {
-        const label = typeof options.name === "string" ? options.name : "agent";
-        const structuralLabel = nextStructuralLabel(agentCounters, label);
+        const label = typeof options.name === "string" && options.name.trim() ? options.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
+        const structuralLabel = nextStructuralLabel(agentCounters, structuralName ?? label);
         const path = operationPath("agent", structuralLabel);
         const replayed = await run.store.replay(path);
         if (replayed) return replayed.value;
-        const tools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools;
-        const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
-        const cwd = isolation ? (await run.store.worktree(structuralLabel)).cwd : run.store.cwd;
-        const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        if (options.continueFrom !== undefined) await scheduler.flush();
+        const current = await run.store.load();
+        const prepared = preparedAgentOptions(current.run, options);
+        const tools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools);
+        const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
+        const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
+        const cwd = isolation ? (prepared?.source ? (await run.store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await run.store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? run.store.cwd;
+        const role = typeof options.role === "string" ? options.role : prepared?.role;
+        const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
+        const thinking = prepared?.thinking ?? parseThinking(options.thinking);
+        const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
@@ -1284,7 +1328,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     if (!pi.getActiveTools().includes("workflow")) return;
     const roles = Object.entries(loadAgentDefinitions(ctx.cwd)).filter(([, definition]) => definition.description);
     if (!roles.length) return;
-    const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- ${name}: ${String(definition.description)}`).join("\n")}`;
+    const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- \`${name}\`: ${String(definition.description)}`).join("\n")}`;
     return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
   });
   pi.registerTool({
@@ -1292,33 +1336,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     label: "Workflow",
     description: "Run a deterministic JavaScript workflow",
     promptSnippet:
-      "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Required script header: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Runs in the background by default; completion arrives as a follow-up message.",
-    promptGuidelines: [
-      "Use workflow only when the user explicitly asks for a workflow, workflows, fan-out, or multi-agent orchestration.",
-      "For workflow, pass either one raw JavaScript string in script or a registered reusable workflow name in workflow; do not include Markdown fences or prose around script.",
-      "For workflow, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`; meta.name and meta.description are required non-empty strings, and meta.phases is an optional exhaustive list: phase(name) rejects undeclared phases.",
-      "For workflow, call phase(name) before each major stage such as scouting, synthesis, implementation, and verification so /workflow shows useful progress; skip phases only for tiny single-agent workflows.",
-      "For workflow, write plain JavaScript after the meta export. Do not use TypeScript syntax, imports, require(), fs, network, timers, environment access, Date.now(), Math.random(), or new Date().",
-      "For workflow, available globals are args, agent(prompt, options), prompt(template, values), parallel(tasks, operation), pipeline(items, ...stages, operation), phase(name), log(message), checkpoint({ name, prompt, context }), and extensions.<namespace>.<method>(input).",
-      "For workflow synthesis, use prompt('REPORT: {report}', { report }) after awaiting agent results. Strings interpolate verbatim; other JSON-compatible values use formatted JSON; {{ and }} escape braces. Never serialize or interpolate an unawaited agent() Promise; await it first.",
-      "For workflow, prefer it for decomposable work: repository inspection, independent research/checks, multi-perspective review, or fan-out/fan-in synthesis. Do not use it for a single quick file read/edit or when ordinary tools are enough.",
-      "For workflow, every agent() call, parallel() task, and pipeline() item and stage requires an explicit stable `name` (short kebab-case recommended). Names drive journaling, replay after recovery, and live status; duplicate names are disambiguated by occurrence order.",
-      "For workflow, agent options are { name, model, role, agentType, tools, schema, retries, timeoutMs, isolation: 'worktree' }. role/agentType reference .pi/piworkflows/roles/<name>.md or global ~/.pi/piworkflows/roles/<name>.md role prompts.",
-      "For workflow, parallel(tasks, operation) takes named tasks plus a named operation: await parallel([{ name: 'lint', run: () => agent('...', { name: 'lint-agent' }) }], { name: 'verification' }). Results preserve input order.",
-      "For workflow, pipeline(items, ...stages, operation) takes [{ name, value }] items and { name, run } stages; each stage receives the previous value. Different items run concurrently, stages per item run sequentially.",
-      "For workflow, agent() never throws; it returns { name, ok: true, value } or { name, ok: false, failedAt, error: { code, message } }. Branch on ok instead of try/catch. checkpoint() returns { name, ok: true, value: 'approved'|'rejected' }. In combinators, a failed agent fails its branch automatically.",
-      "For workflow, parallel() and pipeline() branch results are { name, ok: true, value } or { name, ok: false, failedAt, error }; branch failures do not cancel siblings. Check ok before synthesizing conclusions.",
-      "For workflow, keep synthesis agents bounded: tell them to only combine the supplied reports, not perform new investigation; pass compact summaries when possible and require a compact schema for implementation maps.",
-      "For workflow, include a final synthesis/assertion agent when combining multiple subagent results; return a compact JSON-compatible value with ok/verdict plus the important outputs, or a clear top-level { ok: false, failedAt, error } when a required child fails.",
-      "For workflow, timeoutMs is opt-in per agent: omit it unless the user requests a time budget or the step is intentionally bounded. Never add a workflow-level or default timeout.",
-      "For workflow, retries are opt-in only for idempotent/read-only work, or when the prompt explains how to avoid duplicate side effects.",
-      "For workflow, if agent() needs machine-readable output, pass a plain JSON Schema via options.schema; agent() will return the validated object. Use JSON Schema syntax, not TypeScript or TypeBox constructors.",
-      "For workflow, do not assume the parent assistant has repository code context inside subagents; include enough task context and relevant paths in each agent prompt.",
-      "For workflow, use checkpoint({ name, prompt, context }) for human approval gates; it returns { name, ok: true, value: 'approved' | 'rejected' } and pauses the run until answered via /workflow or workflow_respond.",
-      "For workflow, runs are backgrounded by default and return a runId immediately; completion arrives as a follow-up message, so do not poll. Set foreground: true only when the result is needed inline.",
-    ],
+      "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered workflows use their workflow name. Runs in the background by default; completion arrives as a follow-up message.",
     parameters: Type.Object({
-      script: Type.Optional(Type.String({ description: "Immutable JavaScript workflow source" })),
+      name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
+      description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
+      extensions: Type.Optional(Type.Array(Type.Object({ name: Type.String(), version: Type.String() }, { additionalProperties: false }))),
+      script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
       workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as namespace.name" })),
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
@@ -1335,10 +1358,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const availableModels = new Set((modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
-      const script = typeof params.script === "string" && params.script.trim() ? params.script : typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow).script : "";
+      const definition = typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow) : undefined;
+      const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
       if (!script) throw new WorkflowError("INVALID_SYNTAX", "Provide script or registered workflow");
+      const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
+      if (!workflowName) throw new WorkflowError("INVALID_METADATA", "Inline workflows require name");
+      const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}), extensions: params.extensions ?? definition?.extensions });
       const agentDefinitions = loadAgentDefinitions(ctx.cwd);
-      const checked = preflight(script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() });
+      const checked = preflight(script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() }, [], metadata);
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: checked.referenced.agentTypes, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
@@ -1352,23 +1379,29 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
       const topLevel = new Set<Promise<unknown>>();
       const agentCounters = new Map<string, number>();
-      const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal) => {
+      const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal, structuralName) => {
         await lifecycle.enter();
         try {
-        const requestedTools = Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools;
-        const label = typeof options.name === "string" ? options.name : "agent";
-        const structuralLabel = nextStructuralLabel(agentCounters, label);
-        const path = operationPath("agent", structuralLabel);
-        const replayed = await store.replay(path);
-        if (replayed) return replayed.value;
-        const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
-        const cwd = isolation ? (await store.worktree(structuralLabel)).cwd : ctx.cwd;
-        const role = typeof options.role === "string" ? options.role : typeof options.agentType === "string" ? options.agentType : undefined;
-        const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner: structuralLabel } : {}), ...(typeof options.model === "string" ? { model: options.model } : {}), ...(role ? { role } : {}), ...(object(options.schema) ? { schema: options.schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
-        topLevel.add(spawned.result);
-        const cancel = () => { scheduler.cancel(spawned.id); };
-        if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
-          const outcome = await spawned.result.finally(() => { topLevel.delete(spawned.result); agentSignal.removeEventListener("abort", cancel); });
+          const label = typeof options.name === "string" && options.name.trim() ? options.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
+          const structuralLabel = nextStructuralLabel(agentCounters, structuralName ?? label);
+          const path = operationPath("agent", structuralLabel);
+          const replayed = await store.replay(path);
+          if (replayed) return replayed.value;
+          if (options.continueFrom !== undefined) await scheduler.flush();
+          const loaded = await store.load();
+          const prepared = preparedAgentOptions(loaded.run, options);
+          const requestedTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools);
+          const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
+          const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
+          const cwd = isolation ? (prepared?.source ? (await store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? ctx.cwd;
+          const role = prepared?.role ?? (typeof options.role === "string" ? options.role : undefined);
+          const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
+          const thinking = prepared?.thinking ?? parseThinking(options.thinking);
+          const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
+          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const cancel = () => { scheduler.cancel(spawned.id); };
+          if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
+          const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
           if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
           await store.complete(path, outcome.value);
           return outcome.value;
@@ -1605,6 +1638,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress } from "./agent-execution.js";
+export type { AgentAccounting, AgentAttempt, AgentContinuationLineage, AgentContinuationSource, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentSessionConfig, AgentToolCallProgress } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
 export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";

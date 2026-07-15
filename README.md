@@ -46,7 +46,8 @@ Call the `workflow` tool with immutable JavaScript source:
 
 ```json
 {
-  "script": "export const meta = { name: 'release-check', description: 'Check a release', phases: ['inspect'] }; phase('inspect'); const result = await agent('Inspect the package', { name: 'package-inspection', tools: ['read'] }); return { result };",
+  "name": "release-check",
+  "script": "phase('inspect'); const result = await agent('Inspect the package', { name: 'package-inspection', tools: ['read'] }); return { result };",
   "args": { "target": "dist" }
 }
 ```
@@ -57,39 +58,40 @@ Invocation options:
 
 | Option | Type | Meaning |
 | --- | --- | --- |
+| `name` | string | Required for inline scripts; registered workflows use their registered name |
+| `description` | string | Optional human-readable description |
+| `extensions` | object[] | Optional `{ name, version }` extension requirements |
 | `script` | string | Immutable workflow source; required unless `workflow` is provided |
 | `workflow` | string | Registered reusable workflow name as `namespace.name`; required unless `script` is provided |
 | `args` | JSON value | Available to the script as `args`; defaults to `null` |
 | `foreground` | boolean | Wait for completion instead of returning the run ID |
 | `concurrency` | integer 1-16 | Per-run active-agent cap |
 | `maxAgents` | positive integer | Logical agent cap, including nested agents |
-
 A workflow final result and every worker RPC value must be JSON-compatible and at most 10 MB.
 
 ## Workflow source contract
 
-The first statement must be a metadata export:
+Workflow source is plain sandboxed JavaScript. Inline workflows receive their name from the tool call; registered workflows use their registered name:
 
-```js
-export const meta = {
-  name: "release-check",
-  description: "Check a release",
-  phases: ["inspect", "verify"],
-  extensions: [{ name: "git", version: "^1.0.0" }],
-};
+```json
+{
+  "name": "release-check",
+  "script": "phase('inspect'); return await agent('Inspect the package', { name: 'package-inspection' });",
+  "extensions": [{ "name": "git", "version": "^1.0.0" }]
+}
 ```
 
-`name` and `description` are required non-empty strings. `phases` is optional, unique, and exhaustive: `phase(name)` rejects undeclared phases. `extensions` declares required registered DSL extension versions.
+`description` and `extensions` are optional tool-call metadata. `extensions` declares required registered DSL extension versions. `phase(name)` is optional progress telemetry and accepts dynamic names.
 
-Preflight is synchronous and runs before a run directory is created. It rejects syntax errors, malformed metadata or schemas, missing stable names, undeclared phases, unavailable models/tools/agent types, and missing or incompatible DSL extensions. Duplicate workflow call names are allowed and disambiguated by occurrence order for structural replay.
+Preflight is synchronous and runs before a run directory is created. It rejects syntax errors, malformed schemas, missing stable names, unavailable models/tools/agent types, and missing or incompatible DSL extensions. Duplicate workflow call names are allowed and disambiguated by occurrence order for structural replay.
 
 The worker exposes only deterministic data operations plus:
 
 - `args`
 - `agent(prompt, options)`
 - `prompt(template, values)`
-- `parallel(tasks, operation)`
-- `pipeline(items, ...stages, operation)`
+- `parallel(operationName, tasksRecord)`
+- `pipeline(operationName, itemsRecord, stagesRecord)`
 - `phase(name)`
 - `log(message)`
 - `checkpoint({ name, prompt, context })`
@@ -104,7 +106,7 @@ Use the sandbox-only `prompt(template, values)` global to synthesize prompts fro
 ```js
 const report = await agent("Inspect role mechanics", {
   name: "role-mechanics",
-  schema: reportSchema,
+  outputSchema: reportSchema,
 });
 
 const synthesis = await agent(
@@ -143,14 +145,22 @@ tools: [read, grep, find]
 
 When the `workflow` tool is active, the main agent sees only the names and descriptions of effective described roles. Project roles replace same-named global roles completely. Role bodies, paths, models, thinking, and tools remain private to role loading and spawned-agent execution.
 
-`name` is required and stable. `role` and the older `agentType` alias reference markdown roles from `~/.pi/piworkflows/roles/<name>.md` and `<cwd>/.pi/piworkflows/roles/<name>.md`; project roles override same-named global roles. The role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
+`name` is required and stable for top-level agents. Inside a `parallel` task or `pipeline` stage it may be omitted and inherits that task or stage key; an explicit `name` overrides the inherited name. Inheritance is for one agent call per task or stage; name additional calls explicitly. `role` references markdown roles from `~/.pi/piworkflows/roles/<name>.md` and `<cwd>/.pi/piworkflows/roles/<name>.md`; project roles override same-named global roles. The role body is appended to that agent session's system prompt. Omitted model, reasoning, tools, and timeout inherit the launch snapshot. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
 
-Without `schema`, an agent returns its final text. With a plain JSON Schema:
+To continue from a completed agent, pass `continueFrom` with that agent's workflow `name` or persisted `path` in the same run:
+
+```js
+const implementation = await agent("Implement the fix", { name: "implementation", role: "developer", isolation: "worktree" });
+const verification = await agent("Verify the implementation", { name: "verification", continueFrom: "implementation" });
+```
+
+Continuation forks a new native Pi session, preserves the source transcript/configuration, and leaves the source immutable. The source must be completed and match the continuation's model, thinking, tools, role/system prompt, cwd/worktree, and structured-output schema; retries fork again from the original source. The continuation prompt automatically warns that prior file contents are stale, asks the agent to inspect the current diff and reread changed sections, and frames continuation as verification rather than independent review. Usage accounting includes only messages appended after the fork.
+Without `outputSchema`, an agent returns its final text. With a plain JSON Schema:
 
 ```js
 const result = await agent("Count failures", {
   name: "count-failures",
-  schema: {
+  outputSchema: {
     type: "object",
     properties: { count: { type: "number" } },
     required: ["count"],
@@ -165,25 +175,21 @@ If a top-level agent includes `agent` in its effective tools, it can create recu
 
 ## Parallel and pipeline railways
 
-Every operation, task, item, and stage has an explicit stable name.
+Object keys are stable task, item, and stage names; the first argument is the stable operation name.
 
 ```js
-const checked = await parallel(
-  [
-    { name: "lint", run: () => agent("Run lint", { name: "lint-agent" }) },
-    { name: "tests", run: () => agent("Run tests", { name: "test-agent" }) },
-  ],
-  { name: "verification" },
-);
+const checked = await parallel("verification", {
+  lint: () => agent("Run lint"),
+  tests: () => agent("Run tests", { name: "test-agent" }),
+});
 
 const built = await pipeline(
-  [
-    { name: "api", value: "src/api.ts" },
-    { name: "ui", value: "src/ui.ts" },
-  ],
-  { name: "normalize", run: (path) => ({ path }) },
-  { name: "summarize", run: (entry) => ({ ...entry, checked: true }) },
-  { name: "component-pipeline" },
+  "component-pipeline",
+  { api: "src/api.ts", ui: "src/ui.ts" },
+  {
+    normalize: (path) => ({ path }),
+    summarize: (entry) => ({ ...entry, checked: true }),
+  },
 );
 ```
 
@@ -191,7 +197,7 @@ Results preserve input order:
 
 ```js
 { name: "lint", ok: true, value: "..." }
-{ name: "tests", ok: false, failedAt: "verification/tests", error: { code: "AGENT_FAILED", message: "..." } }
+{ name: "tests", ok: false, failedAt: "verification/tests/test-agent", error: { code: "AGENT_FAILED", message: "..." } }
 ```
 
 Ordinary branch failures are contained and do not cancel siblings. Run cancellation aborts the whole combinator and cannot be converted into a branch failure.
@@ -199,14 +205,15 @@ Ordinary branch failures are contained and do not cancel siblings. Run cancellat
 ## Checkpoints
 
 ```js
-const approved = await checkpoint({
+const decision = await checkpoint({
   name: "ship",
   prompt: "Ship this build?",
   context: { commit: args.commit },
 });
+if (decision.value !== "approved") return { approved: false };
 ```
 
-Checkpoints return only `true` or `false`. Prompt size is limited to 1 KB UTF-8 and serialized context to 4 KB. The run enters `awaiting_input`; answer it with Approve/Reject in `/workflow` or:
+Direct `checkpoint()` returns a named result with `value: "approved"` or `"rejected"`. Prompt size is limited to 1 KB UTF-8 and serialized context to 4 KB. The run enters `awaiting_input`; answer it with Approve/Reject in `/workflow` or:
 
 ```json
 { "runId": "...", "name": "ship", "approved": true }
@@ -245,13 +252,14 @@ registerWorkflowDslExtension({
   workflows: {
     releaseCheck: {
       description: "Reusable release check workflow",
-      script: `export const meta={name:'release-check',description:'Check a release'}; return agent('Check release', {name:'release', role:'reviewer'});`,
+      extensions: [{ name: "git", version: "^1.0.0" }],
+      script: `return agent('Check a release', {name:'release', role:'reviewer'});`,
     },
   },
 });
 ```
 
-A workflow declaring `{ name: "git", version: "^1.0.0" }` can call `extensions.git.status({})`. A caller can also run the registered script directly with `{ "workflow": "git.releaseCheck" }`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, output schema, and valid workflow scripts with literal metadata. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. Duplicate namespaces fail extension load.
+A workflow can call `extensions.git.status({})` when the `git` extension is registered. A caller can run the registered script directly with `{ "workflow": "git.releaseCheck" }`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, output schema, and valid plain JavaScript workflow scripts. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. Duplicate namespaces fail extension load.
 
 ## Lifecycle and recovery
 
@@ -329,7 +337,7 @@ Unknown keys or invalid values block new workflow launches, not Pi startup. Invo
 Failures use `WorkflowError` with a stable `code` and message. Codes are:
 
 ```text
-INVALID_SETTINGS INVALID_SYNTAX INVALID_METADATA DUPLICATE_NAME UNKNOWN_PHASE
+INVALID_SETTINGS INVALID_SYNTAX INVALID_METADATA DUPLICATE_NAME
 INVALID_SCHEMA MISSING_EXTENSION INCOMPATIBLE_EXTENSION UNKNOWN_MODEL UNKNOWN_TOOL
 UNKNOWN_AGENT_TYPE RUN_LIMIT_EXCEEDED RPC_LIMIT_EXCEEDED AGENT_TIMEOUT AGENT_FAILED
 RESULT_INVALID CANCELLED WORKER_UNRESPONSIVE WORKTREE_FAILED RESUME_INCOMPATIBLE

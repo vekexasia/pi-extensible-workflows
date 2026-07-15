@@ -8,40 +8,37 @@ import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentSch
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
 };
-const valid = `export const meta = { name: "review", description: "Review code", phases: ["check"], extensions: [{name:"git",version:"^1.0.0"}] };
-phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], agentType: "reviewer" });`;
+const valid = `phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], role: "reviewer" });`;
 
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
-  const preview = formatWorkflowPreview({ script: valid });
+  const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
   assert.match(preview, /^workflow review\nReview code/m);
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
   assert.equal(formatWorkflowPreview({ workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
   assert.equal(formatWorkflowPreview({ script: "", workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
-  assert.equal(formatWorkflowPreview({ script: "not javascript" }), "workflow composing...");
+  assert.equal(formatWorkflowPreview({ script: "not javascript", name: "review" }), "workflow review");
 });
 
-void test("registers the workflow tool and singular command", async () => {
+void test("registers the workflow tool, command, and conditional skill", async () => {
   const tools: Array<{ name: string; promptGuidelines?: string[]; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
   const commands: Array<{ name: string; options: { handler: (args: string, ctx: unknown) => Promise<void> } }> = [];
+  let discover: (() => { skillPaths?: string[] } | undefined) | undefined;
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
     registerCommand(name: string, options: (typeof commands)[number]["options"]) { commands.push({ name, options }); },
     getThinkingLevel() { return "medium"; },
     getActiveTools() { return ["read", "workflow"]; },
-    on() {},
+    on(name: string, candidate: unknown) { if (name === "resources_discover") discover = candidate as typeof discover; },
   };
   workflowExtension(pi as never);
   assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
-  const guidelines = tool.promptGuidelines?.join("\n") ?? "";
-  assert.match(guidelines, /call phase\(name\) before each major stage/);
-  assert.match(guidelines, /only combine the supplied reports/);
-  assert.match(guidelines, /prompt\(template, values\)/);
-  assert.match(guidelines, /unawaited agent\(\) Promise; await it first/);
-  assert.match(guidelines, /timeoutMs is opt-in per agent/);
-  assert.match(guidelines, /retries are opt-in only/);
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.ok(discover);
+  assert.ok(discover()?.skillPaths?.some((path) => existsSync(path)));
+  await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
@@ -58,7 +55,7 @@ void test("advertises only described effective roles in the system prompt while 
   const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
   const guidance = result?.systemPrompt ?? "";
   assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
-  assert.match(guidance, /reviewer: Reviews correctness/);
+  assert.match(guidance, /`reviewer`: Reviews correctness/);
   assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool/);
 });
 
@@ -71,7 +68,7 @@ void test("background workflows emit compatible lifecycle events", async () => {
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data: data as Record<string, unknown> }); if (channel === WORKFLOW_ASYNC_COMPLETE_EVENT) completed(); } } } as never, home);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
-  const result = await execute("id", { script: `export const meta={name:'events',description:'events'}; return true;` }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const result = await execute("id", { name: "events", script: `return true;` }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   await done;
   const runId = (JSON.parse(result.content[0]?.text ?? "{}") as { runId?: string }).runId;
   assert.ok(runId);
@@ -91,7 +88,7 @@ void test("/workflow doctor formats the shared doctor report with active session
 void test("registered extension workflows can run by name", async () => {
   registerWorkflowDslExtension({
     name: "reuseTest", version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", methods: {},
-    workflows: { hello: { description: "Say hello", script: `export const meta={name:'hello',description:'hello'}; return args.name;` } },
+    workflows: { hello: { description: "Say hello", script: `return args.name;` } },
   });
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never);
@@ -112,7 +109,7 @@ void test("streams foreground workflow progress into its tool card", async () =>
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   const updates: Update[] = [];
-  const result = await tool.execute("id", { script: `export const meta={name:'progress',description:'progress',phases:['work']}; phase('work'); return true;`, foreground: true }, new AbortController().signal, (update: Update) => { updates.push(update); }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
+  const result = await tool.execute("id", { name: "progress", script: `phase('work'); return true;`, foreground: true }, new AbortController().signal, (update: Update) => { updates.push(update); }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
   assert.ok(updates.some(({ details }) => details.run.phase === "work"));
   assert.equal(updates.at(-1)?.details.run.state, "completed");
   assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
@@ -336,20 +333,20 @@ void test("production checkpoints resolve in foreground navigator and background
   const base = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   const script = `export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
   let selections = 0;
-  const foreground = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, mode: "rpc", hasUI: true, ui: { select: async () => ++selections === 1 ? undefined : "Approve" } }) as { content: Array<{ text: string }> };
+  const foreground = await workflow.execute("id", { name: "gate", script, foreground: true }, new AbortController().signal, undefined, { ...base, mode: "rpc", hasUI: true, ui: { select: async () => ++selections === 1 ? undefined : "Approve" } }) as { content: Array<{ text: string }> };
   assert.deepEqual(JSON.parse(foreground.content[0]?.text ?? ""), { name: "ship", ok: true, value: "approved", __workResult: true });
   assert.equal(selections, 2);
-  await assert.rejects(workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: false }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await assert.rejects(workflow.execute("id", { name: "gate", script, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: false }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   const teardown = new AbortController();
-  await assert.rejects(workflow.execute("id", { script, foreground: true }, teardown.signal, undefined, { ...base, hasUI: true, ui: { select: async () => { teardown.abort(); throw new Error("UI closed"); } } }), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+  await assert.rejects(workflow.execute("id", { name: "gate", script, foreground: true }, teardown.signal, undefined, { ...base, hasUI: true, ui: { select: async () => { teardown.abort(); throw new Error("UI closed"); } } }), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   const duplicateScript = `export const meta={name:'duplicate-gate',description:'duplicate'}; return Promise.all([checkpoint({name:'first',prompt:'?',context:null,...{name:args.name}}),checkpoint({name:'second',prompt:'?',context:null,...{name:args.name}})]);`;
-  const duplicate = await workflow.execute("id", { script: duplicateScript, args: { name: "same" } }, new AbortController().signal, undefined, base) as { details: { runId: string } };
+  const duplicate = await workflow.execute("id", { name: "duplicate-gate", script: duplicateScript, args: { name: "same" } }, new AbortController().signal, undefined, base) as { details: { runId: string } };
   const duplicateStore = new RunStore(home, "session", duplicate.details.runId, home);
   for (let attempt = 0; attempt < 1000 && (await duplicateStore.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.deepEqual((await duplicateStore.awaitingCheckpoints()).map((checkpoint) => checkpoint.name).sort(), ["same", "same#2"]);
   assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same", approved: true }) as { details: { accepted: boolean } }).details.accepted, true);
   assert.equal((await respond.execute("id", { runId: duplicate.details.runId, name: "same#2", approved: false }) as { details: { accepted: boolean } }).details.accepted, true);
-  const background = await workflow.execute("id", { script }, new AbortController().signal, undefined, base) as { details: { runId: string } };
+  const background = await workflow.execute("id", { name: "gate", script }, new AbortController().signal, undefined, base) as { details: { runId: string } };
   const { runId } = background.details;
   let first: { details: { accepted: boolean } } | undefined;
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -371,7 +368,7 @@ void test("two concurrent checkpoints keep the run awaiting until both are answe
   const respond = tools.find(({ name }) => name === "workflow_respond");
   assert.ok(workflow && respond);
   const script = `export const meta={name:'gates',description:'gates'}; return Promise.all([checkpoint({name:'one',prompt:'One?',context:null}),checkpoint({name:'two',prompt:'Two?',context:null})]);`;
-  const launched = await workflow.execute("id", { script }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
+  const launched = await workflow.execute("id", { name: "gates", script }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
   const store = new RunStore(home, "session", launched.details.runId, home);
   for (let attempt = 0; attempt < 1000 && (await store.awaitingCheckpoints()).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "awaiting_input"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -411,7 +408,7 @@ void test("a checkpoint answer persisted before resolver registration cannot han
   };
   const timeout = setTimeout(() => { completed(); }, 2000);
   try {
-    const result = await workflow.execute("id", { script: `export const meta={name:'race-gate',description:'race gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:null});` }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
+    const result = await workflow.execute("id", { name: "race-gate", script: `return checkpoint({name:'ship',prompt:'Ship?',context:null});` }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { runId: string } };
     releaseRunId(result.details.runId);
     await completion;
     assert.equal(answered, true);
@@ -437,7 +434,7 @@ void test("background delivery is minimal and capped while foreground stays inli
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
   const ctx = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  const background = await execute("id", { script: `export const meta={name:"large",description:"large"}; return "😀".repeat(5000);` }, new AbortController().signal, undefined, ctx);
+  const background = await execute("id", { name: "large", script: `return "😀".repeat(5000);` }, new AbortController().signal, undefined, ctx);
   assert.match(background.content[0]?.text ?? "", /"state":"running"/);
   await delivered;
   assert.equal(messages.length, 1);
@@ -446,7 +443,7 @@ void test("background delivery is minimal and capped while foreground stays inli
   assert.match(messages[0]?.message.content ?? "", /^Workflow large completed:/);
   assert.match(messages[0]?.message.content ?? "", /Full result: .*result\.json/);
   assert.deepEqual(messages[0]?.options, { deliverAs: "followUp", triggerTurn: true });
-  const foreground = await execute("id", { script: `export const meta={name:"inline",description:"inline"}; return {ok:true};`, foreground: true }, new AbortController().signal, undefined, ctx);
+  const foreground = await execute("id", { name: "inline", script: `return {ok:true};`, foreground: true }, new AbortController().signal, undefined, ctx);
   assert.equal(foreground.content[0]?.text, `{"ok":true}`);
   assert.equal(messages.length, 1);
 });
@@ -541,48 +538,44 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
 });
 
 void test("preflight accepts the complete static contract", () => {
-  const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }]);
+  const metadata = { name: "review", description: "Review code", extensions: [{ name: "git", version: "^1.0.0" }] };
+  const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);
   assert.equal(result.metadata.name, "review");
   assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
-  assert.deepEqual(preflight(valid.replace("agentType", "role"), capabilities).referenced.agentTypes, ["reviewer"]);
-  assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities).referenced.models, ["openai/gpt"]);
+  assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities, [], metadata).referenced.models, ["openai/gpt"]);
   assert.ok(Object.isFrozen(result.metadata));
 });
 
 void test("preflight rejects every static boundary before run creation", () => {
   let created = 0;
-  const createRun = (script: string) => { preflight(script, capabilities); created += 1; };
+  const createRun = (script: string) => { preflight(script, capabilities, [], { name: "test" }); created += 1; };
   const cases: Array<[string, string]> = [
     ["const x = ;", "INVALID_SYNTAX"],
-    ["export const meta = {name:'',description:'x'};", "INVALID_METADATA"],
-    [`export const meta={name:'x',description:'x'}; agent('a')`, "INVALID_METADATA"],
-    [`export const meta={name:'x',description:'x',phases:['a','a']};`, "DUPLICATE_NAME"],
-    [`export const meta={name:'x',description:'x',phases:['a']}; phase('b')`, "UNKNOWN_PHASE"],
-    [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',model:'missing'})`, "UNKNOWN_MODEL"],
-    [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
-    [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
-    [`export const meta={name:'x',description:'x'}; agent('a',{name:'n',agentType:'writer'})`, "UNKNOWN_AGENT_TYPE"],
-    [`export const meta={name:'x',description:'x',extensions:[{name:'nope',version:'1.0.0'}]};`, "MISSING_EXTENSION"],
+    [`agent('a')`, "INVALID_METADATA"],
+    [`agent('a',{name:'n',model:'missing'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{name:'n',model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
+    [`agent('a',{name:'n',role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
-  assert.throws(() => preflight(`export const meta={name:'x',description:'x'};`, capabilities, [{}]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
+  assert.equal(preflight("phase('dynamic')", capabilities, [], { name: "minimal" }).metadata.name, "minimal");
+  assert.throws(() => preflight("return 1", capabilities, [], { name: "" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => preflight("return 1", capabilities, [{}]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
 });
 
-void test("preflight rejects non-JSON schemas, incompatible extension versions, and unnamed structured work", () => {
-  const base = `export const meta={name:'x',description:'x'};`;
+void test("preflight enforces object-key combinators and contextual agent names", () => {
+  const base = "return 1;";
   assert.throws(() => preflight(base, capabilities, [{ type: "object", properties: { bad: () => true } }]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
-  assert.throws(() => preflight(`export const meta={name:'x',description:'x',extensions:[{name:'git',version:'^1.2.3'}]};`, { ...capabilities, extensions: { git: "1.0.0" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INCOMPATIBLE_EXTENSION");
-  assert.throws(() => preflight(`${base} parallel([{run:()=>1}], {name:'batch'})`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && /Every parallel task/.test(error.message));
-  assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}])`, capabilities), /parallel requires/);
-  assert.throws(() => preflight(`${base} pipeline([{value:1}], {name:'stage',run:value=>value})`, capabilities), /Every pipeline item/);
-  assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], value=>value, {name:'pipe'})`, capabilities), /Every pipeline stage/);
-  preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'}); pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities);
-});
+  assert.throws(() => preflight("return 1", { ...capabilities, extensions: { git: "1.0.0" } }, [], { name: "x", extensions: [{ name: "git", version: "^1.2.3" }] }), (error: unknown) => error instanceof WorkflowError && error.code === "INCOMPATIBLE_EXTENSION");
+  assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'})`, capabilities), /operation name string and tasks record/);
+  assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities), /operation name string, items record, and stages record/);
+  assert.throws(() => preflight(`${base} agent('top-level')`, capabilities), /agent requires a stable explicit name/);
+  preflight(`${base} parallel('batch',{task:()=>agent('inherited')}); pipeline('pipe',{item:1},{stage:value=>agent(String(value))})`, capabilities);
+} );
 
 void test("AST preflight ignores DSL-looking non-executable text and member calls", () => {
-  const script = `export const meta={name:'x',description:'x',phases:['real']};
-    const text = "agent() checkpoint({}) phase('ghost') name: 'fake' model: 'missing' tools: ['bash'] role: 'writer'";
+  const script = `const text = "agent() checkpoint({}) phase('ghost') name: 'fake' model: 'missing' tools: ['bash'] role: 'writer'";
     const pattern = /agent() checkpoint({}) phase('ghost') model:'missing'/;
     const template = \`parallel() pipeline() agent() phase('ghost') model: 'missing'\`;
     // agent('comment') checkpoint({name:'comment'}) phase('ghost') model:'missing' tools:['bash'] role:'writer'
@@ -594,34 +587,17 @@ void test("AST preflight ignores DSL-looking non-executable text and member call
 });
 
 void test("AST preflight detects executable template expressions and false prompt names", () => {
-  const base = `export const meta={name:'x',description:'x'};`;
+  const base = "";
   assert.throws(() => preflight(`${base} agent("name: 'fake'")`, capabilities), /agent requires a stable explicit name/);
   assert.throws(() => preflight(`${base} checkpoint({prompt:"name: 'fake'",context:null})`, capabilities), /checkpoint requires a stable explicit name/);
   assert.throws(() => preflight(`${base} const text = \`\${agent("name: 'fake'")}\`;`, capabilities), /agent requires a stable explicit name/);
 });
 
-void test("AST preflight validates combinator names from their arguments", () => {
-  const base = `export const meta={name:'x',description:'x'};`;
-  assert.throws(() => preflight(`${base} parallel([{run:()=>agent("name: 'fake'",{name:'inner'})}], {name:'batch'})`, capabilities), /Every parallel task/);
-  assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}], {label:'fake'})`, capabilities), /parallel requires/);
-  assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {label:'fake'})`, capabilities), /pipeline requires/);
-  preflight(`${base} agent('x', options); agent('x', {name:'x',model:'missing',tools:['bash'],role:'writer',...options}); checkpoint(input); parallel(...batch); pipeline(...pipe);`, capabilities);
-});
-
-void test("AST meta parsing rejects non-literal constructs and accepts valid meta", () => {
-  const valid = (s: string) => { preflight(s, capabilities); };
-  const invalid = (s: string) => { assert.throws(() => preflight(s, capabilities), (e: unknown) => e instanceof WorkflowError && e.code === "INVALID_METADATA"); };
-  valid(`export const meta = { name: 'ok', description: 'ok' };`);
-  valid(`export const meta = { name: 'ok', description: 'ok', phases: ['a', 'b'] };`);
-  valid(`export const meta = { name: 'ok', description: 'ok' }; return 1;`);
-  invalid(`export const meta = { name: 'ok', description: 'ok', [Symbol()]: 1 };`);
-  invalid(`export const meta = { name: 'ok', description: 'ok', ...defaults };`);
-  invalid(`export const meta = { name: \`template\`, description: 'ok' };`);
-  invalid(`export const meta = { name: getName(), description: 'ok' };`);
-  invalid(`export const meta = { name: 'ok', description: 'ok', get phases() { return []; } };`);
-  invalid(`export const meta = { name: 'ok', description: 'ok', run() {} };`);
-  const deep = 'export const meta = { name: "ok", description: "ok", phases: ' + '['.repeat(10) + '1' + ']'.repeat(10) + ' };';
-  invalid(deep);
+void test("AST preflight validates combinator signatures", () => {
+  const base = "";
+  assert.throws(() => preflight(`${base} parallel({task:()=>1}, 'batch')`, capabilities), /parallel requires/);
+  assert.throws(() => preflight(`${base} pipeline('pipe', {item:1})`, capabilities), /pipeline requires/);
+  preflight(`${base} agent('x', options); checkpoint(input); parallel(...batch); pipeline(...pipe);`, capabilities);
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
@@ -754,60 +730,59 @@ void test("agent Promises reject serialization and string coercion but retain aw
   ]);
 });
 
-void test("named parallel and pipeline preserve order, contain failures, and expose stable paths", async () => {
+void test("object-key combinators preserve order, railway paths, and inherited agent names", async () => {
   const pending = new Map<string, (value: JsonValue) => void>();
-  const started: string[] = [];
+  const calls: Array<{ prompt: string; name: unknown; structuralName: unknown }> = [];
   const bridge = {
-    agent(prompt: string) {
-      started.push(prompt);
+    agent(prompt: string, options: Readonly<Record<string, JsonValue>>, _signal: AbortSignal, structuralName?: string) {
+      calls.push({ prompt, name: options.name, structuralName });
       if (prompt === "fail") throw new WorkflowError("AGENT_FAILED", "expected failure");
       return new Promise<JsonValue>((resolve) => { pending.set(prompt, resolve); });
     },
   };
-  const parallelRun = runWorkflow(`export const meta={name:'x',description:'x'};
-    return parallel([
-      {name:'first/item',run:()=>agent('slow',{name:'slow'})},
-      {name:'second',run:()=>agent('fast',{name:'fast'})},
-      {name:'broken',run:()=>agent('fail',{name:'fail'})}
-    ],{name:'batch'});`, null, bridge);
-  while (started.length < 3) await new Promise((resolve) => setImmediate(resolve));
+  const parallelRun = runWorkflow(`return parallel('batch', {
+    'first/item': async()=>{await Promise.resolve();return agent('slow')},
+    second: ()=>agent('fast',{name:'override'}),
+    broken: ()=>agent('fail')
+  });`, null, bridge);
+  while (calls.length < 3) await new Promise((resolve) => setImmediate(resolve));
   pending.get("fast")?.(2); pending.get("slow")?.(1);
-  const parallelResult = await parallelRun.result;
-  assert.ok(Array.isArray(parallelResult));
-  const [pFirst, pSecond, pBroken] = parallelResult as Array<{ name: string; ok: boolean; value?: JsonValue; failedAt?: string; error?: { code: string; message: string } }>;
-  assert.ok(pFirst && pSecond && pBroken);
-  assert.equal(pFirst.name, "first/item");
-  assert.equal(pFirst.ok, true);
-  assert.equal(pFirst.value, 1);
-  assert.equal(pSecond.name, "second");
-  assert.equal(pSecond.ok, true);
-  assert.equal(pSecond.value, 2);
-  assert.equal(pBroken.name, "broken");
-  assert.equal(pBroken.ok, false);
-  assert.ok(typeof pBroken.failedAt === "string" && /batch\/broken/.test(pBroken.failedAt));
-  assert.equal(pBroken.error?.code, "AGENT_FAILED");
-
-  const pipelineRun = runWorkflow(`export const meta={name:'x',description:'x'};
-    return pipeline([{name:'one',value:1},{name:'two',value:2}],
-      {name:'double',run:value=>value*2},
-      {name:'reject odd',run:value=>{if(value===2)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value+1}},
-      {name:'pipe/name'});`);
-  const pipelineResult = await pipelineRun.result;
-  assert.ok(Array.isArray(pipelineResult));
-  const [ppOne, ppTwo] = pipelineResult as Array<{ name: string; ok: boolean; value?: JsonValue; failedAt?: string; error?: { code: string; message: string } }>;
-  assert.ok(ppOne && ppTwo);
-  assert.equal(ppOne.name, "one");
-  assert.equal(ppOne.ok, false);
-  assert.ok(typeof ppOne.failedAt === "string" && /pipe%2Fname\/one\/reject%20odd/.test(ppOne.failedAt));
-  assert.equal(ppTwo.name, "two");
-  assert.equal(ppTwo.ok, true);
-  assert.equal(ppTwo.value, 5);
-
-  const duplicate = runWorkflow(`export const meta={name:'x',description:'x'}; return parallel([{name:'same',run:()=>1},{name:'same',run:()=>2}],{name:'batch'});`);
-  assert.deepEqual(await duplicate.result, [
-    { name: "same", ok: true, value: 1, __workResult: true },
-    { name: "same", ok: true, value: 2, __workResult: true },
+  assert.deepEqual(await parallelRun.result, [
+    { name: "first/item", ok: true, value: 1, __workResult: true },
+    { name: "second", ok: true, value: 2, __workResult: true },
+    { name: "broken", ok: false, failedAt: "batch/broken/broken", error: { code: "AGENT_FAILED", message: "expected failure" }, __workResult: true },
   ]);
+  assert.deepEqual(Object.fromEntries(calls.map(({ prompt, name }) => [prompt, name])), { slow: "first/item", fast: "override", fail: "broken" });
+  assert.deepEqual(Object.fromEntries(calls.map(({ prompt, structuralName }) => [prompt, structuralName])), { slow: "batch/first%2Fitem", fast: "override", fail: "batch/broken" });
+
+  const pipelineResult = await runWorkflow(`return pipeline('pipe/name', {one:1,two:2}, {
+    double: value=>value*2,
+    'reject odd': async value=>{await Promise.resolve();if(value===2)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value+1}
+  });`).result;
+  assert.deepEqual(pipelineResult, [
+    { name: "one", ok: false, failedAt: "pipe%2Fname/one/reject%20odd", error: { code: "AGENT_FAILED", message: "no" }, __workResult: true },
+    { name: "two", ok: true, value: 5, __workResult: true },
+  ]);
+});
+
+void test("parallel name inheritance is isolated across async branches and top-level agents stay named", async () => {
+  const releases = new Map<string, () => void>();
+  const seen: Array<[string, unknown, unknown]> = [];
+  const result = runWorkflow(`return parallel('concurrent',{first:async()=>{await agent('gate-first');return agent('after-first')},second:async()=>{await agent('gate-second');return agent('after-second')}});`, null, {
+    agent: async (prompt, options, _signal, structuralName) => {
+      seen.push([prompt, options.name, structuralName]);
+      if (prompt.startsWith("gate-")) await new Promise<void>((resolve) => { releases.set(prompt, resolve); });
+      return prompt;
+    },
+  });
+  while (releases.size < 2) await new Promise((resolve) => setImmediate(resolve));
+  releases.get("gate-second")?.(); releases.get("gate-first")?.();
+  await result.result;
+  assert.deepEqual(seen, [["gate-first", "first", "concurrent/first"], ["gate-second", "second", "concurrent/second"], ["after-second", "second", "concurrent/second"], ["after-first", "first", "concurrent/first"]]);
+  const pipelineNames: Array<[unknown, unknown]> = [];
+  await runWorkflow(`return pipeline('named',{first:1,second:2},{transform:value=>agent(String(value))});`, null, { agent: async (_prompt, options, _signal, structuralName) => { pipelineNames.push([options.name, structuralName]); return null; } }).result;
+  assert.deepEqual(pipelineNames, [["transform", "named/first/transform"], ["transform", "named/second/transform"]]);
+  await assert.rejects(runWorkflow(`return agent('unnamed');`, null, { agent: async () => null }).result, /stable explicit name/);
 });
 
 void test("worker cancellation is immediate even for runaway synchronous code", async () => {

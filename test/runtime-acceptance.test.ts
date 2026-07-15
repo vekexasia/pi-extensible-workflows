@@ -60,6 +60,28 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
 });
 
+void test("cold resume replays a completed continuation before checking its missing native source", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-continuation-replay-"));
+  const cwd = join(home, "project");
+  const missingSessionFile = join(home, "missing-source.jsonl");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const config = { model: { provider: "openai", model: "gpt", thinking: "medium" as const }, tools: [], systemPromptAppend: "", cwd };
+  const attempt = { attempt: 1, sessionId: "source-session", sessionFile: missingSessionFile, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } };
+  const script = `return agent("must replay", { name: "continuation", continueFrom: "source" });`;
+  await store.create({ id: "run-a", workflowName: "continuation-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [{ id: "run-a:1", name: "source", path: "run-a:1", state: "completed", model: config.model, tools: [], attempts: 1, attemptDetails: [attempt], accounting: attempt.accounting, sessionConfig: config }], nativeSessions: [{ sessionId: attempt.sessionId, sessionFile: missingSessionFile }] }, createLaunchSnapshot({ script, args: null, metadata: { name: "continuation-replay" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.complete("agent/continuation", "replayed");
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  await command("resume run-a", ctx);
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal((await store.load()).run.state, "completed");
+  assert.deepEqual(await store.replay("agent/continuation"), { path: "agent/continuation", value: "replayed" });
+});
+
 void test("production lifecycle commands persist pause, resume, and Pi-close interruption", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
   const cwd = join(home, "project");
@@ -130,7 +152,7 @@ void test("production worker runs named combinators with railway lifecycle seman
   let cancelStarted!: () => void;
   const started = new Promise<void>((resolve) => { cancelStarted = resolve; });
   const run = runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
-    return parallel([{name:'waiting',run:()=>agent('wait',{name:'wait'})},{name:'failure',run:()=>{throw Object.assign(new Error('branch failed'),{code:'AGENT_FAILED'})}}],{name:'batch'});`, null, {
+    return parallel('batch',{waiting:()=>agent('wait'),failure:()=>{throw Object.assign(new Error('branch failed'),{code:'AGENT_FAILED'})}});`, null, {
     agent: async (_prompt, _options, signal) => { cancelStarted(); await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); }); throw new WorkflowError("CANCELLED", "cancelled"); },
   }, controller.signal);
   await started;
@@ -138,7 +160,7 @@ void test("production worker runs named combinators with railway lifecycle seman
   await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
 
   assert.deepEqual(await runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
-    return pipeline([{name:'first',value:1},{name:'second',value:2}],{name:'double',run:value=>value*2},{name:'fail-two',run:value=>{if(value===4)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value}},{name:'pipe'});`).result,
+    return pipeline('pipe',{first:1,second:2},{double:value=>value*2,'fail-two':value=>{if(value===4)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value}});`).result,
   [{ name: "first", ok: true, value: 2, __workResult: true }, { name: "second", ok: false, failedAt: "pipe/second/fail-two", error: { code: "AGENT_FAILED", message: "no" }, __workResult: true }]);
 });
 
@@ -168,11 +190,21 @@ void test("production workflow exposes registered extension macros and replays t
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const script = `export const meta={name:'extension-e2e',description:'extension e2e',phases:['verify'],extensions:[{name:'issue16Acceptance',version:'^1.0.0'}]}; phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first.value,replayed.value];`;
-  const result = await workflow.execute("id", { script, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const script = `phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first.value,replayed.value];`;
+  const result = await workflow.execute("id", { name: "extension-e2e", script, extensions: [{ name: "issue16Acceptance", version: "^1.0.0" }], foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.deepEqual(result.details.value, [{ value: "first" }, { value: "first" }]);
   assert.equal(calls, 1);
   const store = new RunStore(home, "session", result.details.runId, home);
   assert.equal((await store.load()).run.phase, "verify");
   assert.deepEqual(await store.replay("extension/issue16Acceptance/echo"), { path: "extension/issue16Acceptance/echo", value: { value: "first" } });
+});
+
+void test("persists continuation lineage with the forked native session", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-lineage-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const continuedFrom = { agentId: "run-a:source", agentPath: "run-a:source", sessionId: "source-session", sessionFile: "/sessions/source.jsonl" };
+  await store.create({ id: "run-a", workflowName: "lineage", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "continued", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0, continuedFrom }], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "lineage" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "forked-session", sessionFile: "/sessions/forked.jsonl" });
+  assert.deepEqual((await store.load()).run.nativeSessions, [{ sessionId: "forked-session", sessionFile: "/sessions/forked.jsonl", parentSessionId: "source-session", parentSessionFile: "/sessions/source.jsonl" }]);
 });

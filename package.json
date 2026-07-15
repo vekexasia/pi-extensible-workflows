@@ -12,7 +12,8 @@
   },
   "files": [
     "dist/src",
-    "src"
+    "src",
+    "skills"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
