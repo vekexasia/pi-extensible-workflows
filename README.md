@@ -66,7 +66,7 @@ Invocation options:
 | `args` | JSON value | Available to the script as `args`; defaults to `null` |
 | `foreground` | boolean | Wait for completion instead of returning the run ID |
 | `concurrency` | integer 1-16 | Per-run active-agent cap |
-| `maxAgents` | positive integer | Logical agent cap, including nested agents |
+| `maxAgentLaunches` | positive integer | Total logical agent-launch cap, including continuations and nested agents |
 A workflow final result and every worker RPC value must be JSON-compatible and at most 10 MB.
 
 ## Workflow source contract
@@ -332,7 +332,7 @@ Optional strict settings live only at `~/.pi/workflows/settings.json`:
 ```json
 {
   "concurrency": 8,
-  "maxAgents": 1000
+  "maxAgentLaunches": 1000
 }
 ```
 

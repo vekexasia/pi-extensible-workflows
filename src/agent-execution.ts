@@ -291,7 +291,7 @@ type ScheduledNode = {
   steer?: (message: string) => void | Promise<void>;
 };
 
-type ScheduledRun = { limit: number; maxAgents: number; logical: number; active: number; queue: Array<() => void> };
+type ScheduledRun = { limit: number; maxAgentLaunches: number; logical: number; active: number; queue: Array<() => void> };
 export type OwnershipRecord = { id: string; parentId?: string; label: string; state: ScheduledNode["state"]; options: Readonly<ScheduledAgentOptions> };
 type OwnershipWriter = (runId: string, ownership: readonly OwnershipRecord[]) => void | Promise<void>;
 
@@ -308,10 +308,10 @@ export class FairAgentScheduler {
     if (!Number.isInteger(sessionLimit) || sessionLimit < 1 || sessionLimit > 16) throw new WorkflowError("INVALID_SETTINGS", "Session concurrency must be an integer from 1 to 16");
   }
 
-  addRun(runId: string, limit = 8, maxAgents = 1000): void {
+  addRun(runId: string, limit = 8, maxAgentLaunches = 1000): void {
     if (this.#runs.has(runId)) throw new WorkflowError("DUPLICATE_NAME", `Scheduler run already exists: ${runId}`);
-    if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit || !Number.isInteger(maxAgents) || maxAgents < 1) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency or maxAgents");
-    this.#runs.set(runId, { limit, maxAgents, logical: 0, active: 0, queue: [] });
+    if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit || !Number.isInteger(maxAgentLaunches) || maxAgentLaunches < 1) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency or maxAgentLaunches");
+    this.#runs.set(runId, { limit, maxAgentLaunches, logical: 0, active: 0, queue: [] });
     this.#runOrder.push(runId);
   }
 
@@ -325,7 +325,7 @@ export class FairAgentScheduler {
       const overlap = [...this.#nodes.values()].find((node) => node.runId === runId && node.options.continueFrom?.sessionId === effective.continueFrom?.sessionId && !["completed", "failed", "cancelled"].includes(node.state));
       if (overlap) throw new WorkflowError("RESUME_INCOMPATIBLE", `Continuation source session is already being continued by ${overlap.options.label}`);
     }
-    if (++run.logical > run.maxAgents) { run.logical -= 1; throw new WorkflowError("RUN_LIMIT_EXCEEDED", `Run ${runId} exceeded maxAgents`); }
+    if (++run.logical > run.maxAgentLaunches) { run.logical -= 1; throw new WorkflowError("RUN_LIMIT_EXCEEDED", `Run ${runId} exceeded maxAgentLaunches`); }
     const id = `${runId}:${String(++this.#nextId)}`;
     let resolveResult: (result: ScheduledAgentResult) => void = () => undefined;
     const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
@@ -419,8 +419,8 @@ export class FairAgentScheduler {
     return [...this.#nodes.values()].map(({ id, parentId, options, state }) => ({ id, ...(parentId ? { parentId } : {}), label: options.label, state, options }));
   }
 
-  restoreRun(runId: string, limit: number, maxAgents: number, ownership: readonly OwnershipRecord[]): void {
-    this.addRun(runId, limit, maxAgents);
+  restoreRun(runId: string, limit: number, maxAgentLaunches: number, ownership: readonly OwnershipRecord[]): void {
+    this.addRun(runId, limit, maxAgentLaunches);
     const run = this.#runs.get(runId) as ScheduledRun;
     for (const record of ownership) {
       if (record.id.split(":").slice(0, -1).join(":") !== runId) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted agent belongs to another run: ${record.id}`);

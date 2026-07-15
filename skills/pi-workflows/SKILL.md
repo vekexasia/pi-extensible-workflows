@@ -71,11 +71,15 @@ A continuation forks the completed agent's native session and inherits its exact
 - Do not create a workflow for one agent. Phases must have distinct work, not ceremonial wrappers around the same task.
 - Inline workflows and top-level agents need stable names. `parallel(operationName, tasksRecord)` task keys and `pipeline(operationName, itemsRecord, stagesRecord)` item/stage keys are names; one agent call per task/stage may inherit the nearest key, but additional calls need explicit names.
 - `continueFrom` accepts a completed agent's name or persisted path from the same run. Omit configuration overrides unless they exactly match the source.
+- A request for repeated or iterative passes must be implemented inside one workflow run. Do not issue one `workflow` tool call per pass.
+- When the topology repeats, the workflow script must use a JavaScript loop and continuation chains for every recurring responsibility, including reviewers and developers. Only deliberately independent verification starts fresh. Generate stable internal names; users should not need to know names or request continuation explicitly.
 - A continuation must reread changed sections because prior file contents are stale. It does not replace a fresh final review when independence matters.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
+- Omit `maxAgentLaunches` unless the user requests an explicit total launch budget. It counts all logical launches, including continuations and nested agents, not concurrent agents.
 - `parallel()`/`pipeline()` return keyed bare values. Ordinary failures propagate automatically after all siblings settle; await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
 - A specified launch/session model overrides routing tables for every agent. Omit `model` unless the user explicitly requests per-agent routing.
-- Set only roles the user requests. Grant minimum tools; pure synthesis needs `tools: []`.
+- Select the narrowest available role from each agent's responsibility unless the user overrides role selection. Grant minimum tools; pure synthesis needs `tools: []`.
 - With `outputSchema`, agents must call `workflow_result`. Retry only idempotent work; add timeouts only when needed.
 - Put `isolation: "worktree"` on top-level file-changing agents. Use `checkpoint()` only for human gates. `phase()` is optional.
+- Keep generated agent names, continuation references, and DSL details out of user-facing results unless the user asks for them.

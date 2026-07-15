@@ -14,7 +14,7 @@ void test("production session_start cold-restores ownership and /workflow stop c
   const sessionId = "session-a";
   const runId = "run-a";
   const store = new RunStore(cwd, sessionId, runId, home);
-  const settings = { concurrency: 1, maxAgents: 2 };
+  const settings = { concurrency: 1, maxAgentLaunches: 2 };
   await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   const options = { label: "parent", cwd, tools: ["agent"] };
   await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { ...options, label: "child" } }]);
@@ -37,7 +37,7 @@ void test("cold resume rejects pre-0.3 snapshots", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-old-snapshot-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start);
@@ -49,7 +49,7 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -80,7 +80,7 @@ void test("cold resume replays a completed continuation before checking its miss
   const config = { model: { provider: "openai", model: "gpt", thinking: "medium" as const }, tools: [], systemPromptAppend: "", cwd };
   const attempt = { attempt: 1, sessionId: "source-session", sessionFile: missingSessionFile, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } };
   const script = `return agent("must replay", { name: "continuation", continueFrom: "source" });`;
-  await store.create({ id: "run-a", workflowName: "continuation-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [{ id: "run-a:1", name: "source", path: "run-a:1", state: "completed", model: config.model, tools: [], attempts: 1, attemptDetails: [attempt], accounting: attempt.accounting, sessionConfig: config }], nativeSessions: [{ sessionId: attempt.sessionId, sessionFile: missingSessionFile }] }, createLaunchSnapshot({ script, args: null, metadata: { name: "continuation-replay" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "continuation-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [{ id: "run-a:1", name: "source", path: "run-a:1", state: "completed", model: config.model, tools: [], attempts: 1, attemptDetails: [attempt], accounting: attempt.accounting, sessionConfig: config }], nativeSessions: [{ sessionId: attempt.sessionId, sessionFile: missingSessionFile }] }, createLaunchSnapshot({ script, args: null, metadata: { name: "continuation-replay" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   await store.complete("agent/continuation", "replayed");
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -98,7 +98,7 @@ void test("production lifecycle commands persist pause, resume, and Pi-close int
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -205,7 +205,7 @@ void test("terminal failed attempts remain persisted", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-attempts-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed", description: "failed" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
   await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" });
   const active = (await store.load()).run;
   assert.equal(active.agents[0]?.attemptDetails?.[0]?.sessionFile, "/sessions/failed.jsonl");
@@ -259,7 +259,7 @@ void test("persists continuation lineage with the forked native session", async 
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const continuedFrom = { agentId: "run-a:source", agentPath: "run-a:source", sessionId: "source-session", sessionFile: "/sessions/source.jsonl" };
-  await store.create({ id: "run-a", workflowName: "lineage", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "continued", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0, continuedFrom }], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "lineage" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "lineage", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "continued", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0, continuedFrom }], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "lineage" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
   await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "forked-session", sessionFile: "/sessions/forked.jsonl" });
   assert.deepEqual((await store.load()).run.nativeSessions, [{ sessionId: "forked-session", sessionFile: "/sessions/forked.jsonl", parentSessionId: "source-session", parentSessionFile: "/sessions/source.jsonl" }]);
 });

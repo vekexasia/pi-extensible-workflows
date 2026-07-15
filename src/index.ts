@@ -36,7 +36,7 @@ export interface WorkflowErrorShape { code: WorkflowErrorCode; message: string }
 export interface ModelSpec { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description?: string; extensions?: readonly ExtensionRequirement[] }
-export interface WorkflowSettings { concurrency: number; maxAgents: number }
+export interface WorkflowSettings { concurrency: number; maxAgentLaunches: number }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; sessionAccounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
 export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined; sessionConfig?: AgentSessionConfig; continuedFrom?: AgentContinuationLineage }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
@@ -119,7 +119,7 @@ export class RunLifecycle {
   async #set(state: RunState): Promise<void> { this.#state = state; await this.changed?.(state); }
 }
 
-export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgents: 1000 });
+export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgentLaunches: 1000 });
 
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
@@ -153,14 +153,14 @@ export function loadSettings(path = join(homedir(), ".pi", "workflows", "setting
     fail("INVALID_SETTINGS", `Invalid workflow settings: ${(error as Error).message}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", "Workflow settings must be an object");
-  const allowed = new Set(["concurrency", "maxAgents"]);
+  const allowed = new Set(["concurrency", "maxAgentLaunches"]);
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting: ${unknown}`);
   const concurrency = parsed.concurrency === undefined ? DEFAULT_SETTINGS.concurrency : parsed.concurrency;
-  const maxAgents = parsed.maxAgents === undefined ? DEFAULT_SETTINGS.maxAgents : parsed.maxAgents;
+  const maxAgentLaunches = parsed.maxAgentLaunches === undefined ? DEFAULT_SETTINGS.maxAgentLaunches : parsed.maxAgentLaunches;
   if (!positiveInteger(concurrency) || concurrency > 16) fail("INVALID_SETTINGS", "concurrency must be an integer from 1 to 16");
-  if (!positiveInteger(maxAgents)) fail("INVALID_SETTINGS", "maxAgents must be a positive integer");
-  return Object.freeze({ concurrency, maxAgents });
+  if (!positiveInteger(maxAgentLaunches)) fail("INVALID_SETTINGS", "maxAgentLaunches must be a positive integer");
+  return Object.freeze({ concurrency, maxAgentLaunches });
 }
 
 export function parseRoleMarkdown(content: string, strict = false): AgentDefinition {
@@ -1468,7 +1468,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
       runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
-      scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
+      scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgentLaunches, await store.loadOwnership());
     }
     if (ctx.hasUI) {
       const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
@@ -1508,12 +1508,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
       concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
-      maxAgents: Type.Optional(Type.Integer({ minimum: 1 })),
+      maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including continuations and nested agents; not concurrency" })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const defaults = loadSettings();
-      const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgents: params.maxAgents ?? defaults.maxAgents });
+      const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, maxAgentLaunches: params.maxAgentLaunches ?? defaults.maxAgentLaunches });
       const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
       const rootModelName = `${rootModel.provider}/${rootModel.model}`;
       const modelRegistry = (ctx as unknown as { modelRegistry?: { getAvailable(): Array<{ provider: string; id: string }> } }).modelRegistry;
@@ -1546,7 +1546,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), agentDefinitions, runStore: store, providerPause });
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
-      scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
+      scheduler.addRun(runId, settings.concurrency, settings.maxAgentLaunches);
       const agentCounters = new Map<string, number>();
       const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal, structuralName) => {
         await lifecycle.enter();

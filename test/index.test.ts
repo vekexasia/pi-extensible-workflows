@@ -561,8 +561,8 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   const dir = mkdtempSync(join(tmpdir(), "pi-workflows-"));
   assert.equal(loadSettings(join(dir, "missing.json")), DEFAULT_SETTINGS);
   const path = join(dir, "settings.json");
-  writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgents: 20 }));
-  assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgents: 20 });
+  writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgentLaunches: 20 }));
+  assert.deepEqual(loadSettings(path), { concurrency: 4, maxAgentLaunches: 20 });
   writeFileSync(path, JSON.stringify({ agentTimeoutMs: 500 }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
   writeFileSync(path, JSON.stringify({ concurrency: 17 }));
@@ -652,7 +652,7 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
+  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
