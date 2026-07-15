@@ -55,6 +55,8 @@ async function json<T>(path: string): Promise<T> { return JSON.parse(await readF
 export class RunStore {
   readonly directory: string;
   private journalWrite: Promise<void> = Promise.resolve();
+  // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
+  private stateWrite: Promise<void> = Promise.resolve();
   private worktreeWrite: Promise<void> = Promise.resolve();
 
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
@@ -73,14 +75,33 @@ export class RunStore {
   }
 
   async load(): Promise<{ run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }> {
+    await this.stateWrite;
     const run = await json<PersistedRun>(join(this.directory, "state.json"));
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run belongs to another cwd or Pi session");
     return { run, snapshot: createLaunchSnapshot(await json<LaunchSnapshot>(join(this.directory, "snapshot.json"))) };
   }
 
   async saveState(run: PersistedRun): Promise<void> {
-    if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("INTERNAL_ERROR", "Run identity does not match its session-scoped store");
-    await atomicJson(join(this.directory, "state.json"), run);
+    const write = this.stateWrite.then(async () => {
+      if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("INTERNAL_ERROR", "Run identity does not match its session-scoped store");
+      await atomicJson(join(this.directory, "state.json"), run);
+    });
+    this.stateWrite = write.catch(() => undefined);
+    await write;
+  }
+
+  async updateState(update: (run: PersistedRun) => PersistedRun | Promise<PersistedRun>): Promise<PersistedRun> {
+    let result!: PersistedRun;
+    const write = this.stateWrite.then(async () => {
+      const current = await json<PersistedRun>(join(this.directory, "state.json"));
+      if (resolve(current.cwd) !== this.cwd || current.sessionId !== this.sessionId || current.id !== this.runId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run belongs to another cwd or Pi session");
+      result = await update(current);
+      if (resolve(result.cwd) !== this.cwd || result.sessionId !== this.sessionId || result.id !== this.runId) throw new WorkflowError("INTERNAL_ERROR", "Run identity does not match its session-scoped store");
+      await atomicJson(join(this.directory, "state.json"), result);
+    });
+    this.stateWrite = write.catch(() => undefined);
+    await write;
+    return result;
   }
 
   async saveOwnership(nodes: readonly PersistedOwnershipNode[]): Promise<void> {

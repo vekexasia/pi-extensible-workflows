@@ -24,6 +24,7 @@ void test("passes role prompt as system append, not task text", async () => {
   const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { input = sessionInput; return { sessionId: "role", sessionFile: "/sessions/role.jsonl", messages: [assistant("done")], prompt: async (text) => { prompt = text; }, dispose() {} }; });
   await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", role: "reviewer" });
   assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "Review carefully");
+  assert.deepEqual((input as { tools?: readonly string[] }).tools, ["read"]);
   assert.doesNotMatch(prompt, /Review carefully/);
   assert.doesNotMatch(prompt, /Workflow: flow - desc/);
   assert.match(prompt, /Task:\nDo work/);
@@ -370,6 +371,13 @@ void test("persisted ownership restores cancellation and scoped runtime state", 
   scheduler.cancel("run:1");
   assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled"]);
 });
+void test("cold replacement does not consume restored logical agent slots", async () => {
+  const scheduler = new FairAgentScheduler(async () => "replacement", 1);
+  scheduler.restoreRun("run", 1, 1, [{ id: "run:1", label: "restored", state: "running", options: { label: "restored", cwd: "/repo", tools: [] } }]);
+  await scheduler.cancelRun("run");
+  const replacement = scheduler.spawn("run", "replacement", { label: "replacement", cwd: "/repo", tools: [] });
+  assert.deepEqual(await replacement.result, { id: replacement.id, ok: true, value: "replacement" });
+});
 
 void test("scoped tools honor the root capability boundary and cancel orphan descendants", async () => {
   let scheduler: FairAgentScheduler;
@@ -402,6 +410,21 @@ void test("scoped tools honor the root capability boundary and cancel orphan des
   await assert.rejects(resultTool.execute("x", { id: orphanId }, undefined, undefined, {} as never), /direct children/);
   scheduler.cancel(outsider.id);
   await outsider.result;
+});
+
+void test("nested agent roles resolve tools before scheduler spawn", async () => {
+  const scheduler = new FairAgentScheduler(async ({ signal }) => {
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read", "bash"] });
+  const agentTool = scheduler.toolsFor(parent.id, (role, tools) => role === "reviewer" && tools === undefined ? ["read"] : tools ?? ["bash"])[0];
+  assert.ok(agentTool);
+  await agentTool.execute("call", { prompt: "child", label: "child", role: "reviewer" }, undefined, undefined, {} as never);
+  assert.deepEqual(scheduler.snapshot().find(({ options }) => options.label === "child")?.options.tools, ["read"]);
+  scheduler.cancel(parent.id);
+  await parent.result;
 });
 
 void test("explicit null timeout remains unlimited", async () => {

@@ -33,9 +33,6 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type JsonSchema = { [key: string]: JsonValue };
 
 export interface WorkflowErrorShape { code: WorkflowErrorCode; message: string }
-export interface WorkSuccess<T extends JsonValue = JsonValue> { name: string; ok: true; value: T }
-export interface WorkFailure { name: string; ok: false; failedAt: string; error: WorkflowErrorShape }
-export type WorkResult<T extends JsonValue = JsonValue> = WorkSuccess<T> | WorkFailure;
 export interface ModelSpec { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description?: string; extensions?: readonly ExtensionRequirement[] }
@@ -43,9 +40,9 @@ export interface WorkflowSettings { concurrency: number; maxAgents: number }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; sessionAccounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
 export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined; sessionConfig?: AgentSessionConfig; continuedFrom?: AgentContinuationLineage }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
-export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
+export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
-export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[] }
+export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
 export interface WorkflowOrchestrationContext {
   agent: (...args: readonly unknown[]) => Promise<JsonValue>;
   parallel: (...args: readonly unknown[]) => Promise<JsonValue>;
@@ -195,7 +192,8 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
   const { model, thinking, tools, description } = parsed.frontmatter;
   if (model !== undefined && (typeof model !== "string" || model.trim() === "")) fail("INVALID_METADATA", "Role model must be a non-empty string");
   if (thinking !== undefined && (typeof thinking !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking))) fail("INVALID_METADATA", `Invalid role thinking level: ${typeof thinking === "string" ? thinking : typeof thinking}`);
-  if (description !== undefined && (typeof description !== "string" || description.trim() === "" || description.length > 1024)) fail("INVALID_METADATA", "Role description must be a non-empty string of at most 1024 characters");
+  if (description !== undefined && (typeof description !== "string" || description.trim() === "" || description.length > 1024 || /[\r\n]/.test(description))) fail("INVALID_METADATA", "Role description must be a non-empty single-line string of at most 1024 characters");
+  if (tools !== undefined && (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string" || tool.trim() === ""))) fail("INVALID_METADATA", "Role tools must be an array of non-empty strings");
   return { prompt: parsed.body, ...(typeof description === "string" ? { description: description.trim() } : {}), ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}) };
 }
 
@@ -203,15 +201,24 @@ function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
   try {
     return Object.fromEntries(readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && extname(entry.name) === ".md")
-      .map((entry) => [basename(entry.name, ".md"), parseRoleMarkdown(readFileSync(join(dir, entry.name), "utf8"))]));
+      .map((entry) => [basename(entry.name, ".md"), parseRoleMarkdown(readFileSync(join(dir, entry.name), "utf8"), true)]));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw error;
   }
 }
 
-export function loadAgentDefinitions(cwd: string, piHome = join(homedir(), ".pi")): Readonly<Record<string, AgentDefinition>> {
-  return deepFreeze({ ...readAgentDefinitions(join(piHome, "piworkflows", "roles")), ...readAgentDefinitions(join(cwd, ".pi", "piworkflows", "roles")) });
+export function loadAgentDefinitions(cwd: string, piHome = join(homedir(), ".pi"), projectTrusted = true): Readonly<Record<string, AgentDefinition>> {
+  return deepFreeze({ ...readAgentDefinitions(join(piHome, "piworkflows", "roles")), ...(projectTrusted ? readAgentDefinitions(join(cwd, ".pi", "piworkflows", "roles")) : {}) });
+}
+function validateRolePolicies(definitions: Readonly<Record<string, AgentDefinition>>, roles: readonly string[], availableModels: ReadonlySet<string>, rootTools: ReadonlySet<string>): void {
+  for (const role of roles) {
+    const definition = definitions[role];
+    if (!definition) continue;
+    if (definition.model !== undefined && !availableModels.has(modelCapability(definition.model))) fail("UNKNOWN_MODEL", `Unknown model for role ${role}: ${definition.model}`);
+    const missingTool = (definition.tools ?? [...rootTools]).find((tool) => !rootTools.has(tool));
+    if (missingTool) fail("UNKNOWN_TOOL", `Unknown tool for role ${role}: ${missingTool}`);
+  }
 }
 
 function extensionRequirements(value: unknown): readonly ExtensionRequirement[] {
@@ -334,6 +341,99 @@ function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonS
   if (schema.properties !== undefined && !object(schema.properties)) fail("INVALID_SCHEMA", `${at}.properties must be an object`);
 }
 
+const AGENT_OPTION_KEYS = new Set(["name", "model", "thinking", "tools", "role", "outputSchema", "continueFrom", "retries", "timeoutMs", "isolation"]);
+
+function validateAgentOption(key: string, value: unknown): void {
+  switch (key) {
+    case "name":
+      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent requires a stable explicit name");
+      break;
+    case "model":
+      if (typeof value !== "string") fail("INVALID_METADATA", "agent model must be a string");
+      parseModelReference(value);
+      break;
+    case "thinking":
+      if (typeof value !== "string" || !parseThinking(value)) fail("INVALID_METADATA", "agent thinking must be off, minimal, low, medium, high, xhigh, or max");
+      break;
+    case "tools":
+      if (!Array.isArray(value) || value.some((tool) => typeof tool !== "string")) fail("INVALID_METADATA", "agent tools must be an array of strings");
+      break;
+    case "role":
+      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent role must be a non-empty string");
+      break;
+    case "outputSchema":
+      validateSchema(value, "agent outputSchema");
+      break;
+    case "continueFrom":
+      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent continueFrom must be a non-empty string");
+      break;
+    case "retries":
+      if (!Number.isInteger(value) || (value as number) < 0) fail("INVALID_METADATA", "agent retries must be a non-negative integer");
+      break;
+    case "timeoutMs":
+      if (value !== null && !positiveInteger(value)) fail("INVALID_METADATA", "agent timeoutMs must be null or a positive integer");
+      break;
+    case "isolation":
+      if (value !== "worktree") fail("INVALID_METADATA", "agent isolation must be worktree");
+      break;
+  }
+}
+
+function validateAgentOptions(value: unknown, requireName = true): Readonly<Record<string, JsonValue>> {
+  if (!object(value) || !jsonValue(value)) fail("INVALID_METADATA", "agent options must be a JSON object");
+  const unknown = Object.keys(value).find((key) => !AGENT_OPTION_KEYS.has(key));
+  if (unknown) fail("INVALID_METADATA", `Unknown agent option: ${unknown}`);
+  if (requireName && value.name === undefined) fail("INVALID_METADATA", "agent requires a stable explicit name");
+  for (const [key, option] of Object.entries(value)) validateAgentOption(key, option);
+  return value;
+}
+
+type StaticValue = { known: true; value: unknown } | { known: false };
+
+function staticValue(node: acorn.AnyNode | undefined): StaticValue {
+  if (!node) return { known: false };
+  if (node.type === "Literal") return { known: true, value: node.value };
+  if (node.type === "UnaryExpression" && (node.operator === "-" || node.operator === "+")) {
+    const argument = staticValue(node.argument);
+    return argument.known && typeof argument.value === "number" ? { known: true, value: node.operator === "-" ? -argument.value : argument.value } : { known: false };
+  }
+  if (node.type === "ArrayExpression") {
+    const values: unknown[] = [];
+    for (const element of node.elements) {
+      if (!element || element.type === "SpreadElement") return { known: false };
+      const value = staticValue(element);
+      if (!value.known) return { known: false };
+      values.push(value.value);
+    }
+    return { known: true, value: values };
+  }
+  if (node.type === "ObjectExpression") {
+    const value: Record<string, unknown> = {};
+    for (const property of node.properties) {
+      if (property.type === "SpreadElement" || property.computed) return { known: false };
+      const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+      const child = staticValue(property.value);
+      if (!key || !child.known) return { known: false };
+      value[key] = child.value;
+    }
+    return { known: true, value };
+  }
+  return { known: false };
+}
+
+function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {
+  if (node?.type !== "ObjectExpression") return;
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement" || property.computed) continue;
+    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    if (key && !AGENT_OPTION_KEYS.has(key)) fail("INVALID_METADATA", `Unknown agent option: ${key}`);
+  }
+  for (const key of AGENT_OPTION_KEYS) {
+    const value = staticValue(propertyNode(node, key));
+    if (value.known) validateAgentOption(key, value.value);
+  }
+}
+
 export class WorkflowDslRegistry {
   readonly #extensions = new Map<string, Readonly<WorkflowDslExtension>>();
 
@@ -420,6 +520,18 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
 
+function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
+  if (!node) return false;
+  if (node.type !== "ObjectExpression") return true;
+  for (let index = node.properties.length - 1; index >= 0; index -= 1) {
+    const property = node.properties[index];
+    if (!property || property.type === "SpreadElement" || property.computed) return true;
+    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    if (key === "role") return literalString(property.value) === undefined;
+  }
+  return false;
+}
+
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }): PreflightResult {
   const checkedMetadata = validateWorkflowMetadata(metadata);
   const program = parseWorkflow(script);
@@ -429,6 +541,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
   for (const call of calls) {
     const operation = call.callee.name;
+    if (operation === "agent") validateStaticAgentOptions(call.arguments[1]);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
     const inheritsName = operation === "agent" && inheritedRanges.some(([start, end]) => call.start >= start && call.end <= end);
     if ((operation === "agent" && !inheritsName && stableName(call.arguments[1]) === false) || (operation === "checkpoint" && stableName(call.arguments[0]) === false)) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
@@ -436,6 +549,10 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (operation === "pipeline" && (call.arguments.length !== 3 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression" || call.arguments[2]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "pipeline requires an operation name string, items record, and stages record");
   }
   const agentCalls = calls.filter((call) => call.callee.name === "agent");
+  const dynamicAgentRoles = agentCalls.some((call) => hasDynamicAgentRole(call.arguments[1]));
+  const staticSchemas = agentCalls.flatMap((call) => { const value = staticValue(propertyNode(call.arguments[1], "outputSchema")); return value.known ? [value.value] : []; });
+  for (const [index, schema] of staticSchemas.entries()) validateSchema(schema, `agent outputSchema[${String(index)}]`);
+  const checkedSchemas = [...schemas, ...staticSchemas];
   const models = agentCalls.flatMap((call) => { const value = literalString(propertyNode(call.arguments[1], "model")); return value === undefined ? [] : [modelCapability(value)]; });
   const tools = agentCalls.flatMap((call) => {
     const value = propertyNode(call.arguments[1], "tools");
@@ -453,7 +570,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (!actual) fail("MISSING_EXTENSION", `Required extension is unavailable: ${requirement.name}`);
     if (!versionCompatible(requirement.version, actual)) fail("INCOMPATIBLE_EXTENSION", `Extension ${requirement.name} requires ${requirement.version}, found ${actual}`);
   }
-  return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze([...schemas]) as readonly JsonSchema[] });
+  return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze(checkedSchemas) as readonly JsonSchema[], dynamicAgentRoles });
 }
 
 function deepFreeze<T>(value: T): T {
@@ -531,6 +648,11 @@ send({ type: "heartbeat" });
 const BRAND = "${WORK_RESULT_BRAND}";
 const workError = (code, message) => Object.assign(new Error(message), { code });
 const isBranded = value => value && typeof value === "object" && value[BRAND] === true;
+const unwrap = result => {
+  if (!isBranded(result)) return result;
+  if (result.ok) return result.value;
+  throw Object.assign(new Error(result.error.message), { code: result.error.code, failedAt: result.failedAt });
+};
 const named = (value, kind) => { if (typeof value !== "string" || !value.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value; };
 const path = (...names) => names.map(encodeURIComponent).join("/");
 const inheritedAgentPath = new AsyncLocalStorage();
@@ -540,7 +662,7 @@ const agent = (prompt, options = {}) => {
   const explicitName = options.name;
   const name = named(explicitName === undefined && inherited ? inherited.at(-1) : explicitName, "agent");
   const structuralName = explicitName === undefined && inherited ? path(...inherited) : name;
-  const result = rpc("agent", [prompt, { ...options, name }, structuralName]);
+  const result = rpc("agent", [prompt, { ...options, name }, structuralName]).then(unwrap);
   Object.defineProperties(result, {
     toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
     toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
@@ -593,10 +715,17 @@ const prompt = (template, values) => {
   for (const key of keys) promptProperty(values, key, key, new Set());
   return template.replace(/{{|}}|{([A-Za-z_$][\w$]*)}/g, (match, key) => match === "{{" ? "{" : match === "}}" ? "}" : typeof values[key] === "string" ? values[key] : JSON.stringify(values[key], null, 2));
 };
-const checkpoint = input => rpc("checkpoint", [input]);
+const checkpoint = input => rpc("checkpoint", [input]).then(unwrap);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
-const extensions = Object.freeze(Object.fromEntries(Object.entries(config.extensions).map(([extension, methods]) => [extension, Object.freeze(Object.fromEntries(methods.map(method => [method, input => rpc("extension", [extension, method, input, path("extension", extension, method)])])))])));
+const extensionOccurrences = new Map();
+const extensionPath = (extension, method) => {
+  const key = path(extension, method);
+  const occurrence = (extensionOccurrences.get(key) || 0) + 1;
+  extensionOccurrences.set(key, occurrence);
+  return occurrence === 1 ? path("extension", extension, method) : path("extension", extension, method, String(occurrence));
+};
+const extensions = Object.freeze(Object.fromEntries(Object.entries(config.extensions).map(([extension, methods]) => [extension, Object.freeze(Object.fromEntries(methods.map(method => [method, input => rpc("extension", [extension, method, input, extensionPath(extension, method)]).then(unwrap)])))])));
 const recordEntries = (value, kind) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw workError("INVALID_METADATA", kind + " must be a record");
   return Object.entries(value);
@@ -604,40 +733,51 @@ const recordEntries = (value, kind) => {
 const parallel = async (operationName, tasks) => {
   named(operationName, "parallel");
   const entries = recordEntries(tasks, "parallel tasks");
-  return Promise.all(entries.map(async ([name, run]) => {
+  for (const [name, run] of entries) {
     named(name, "parallel task");
-    const failedAt = path(operationName, name);
+    if (typeof run !== "function") throw workError("INVALID_METADATA", "parallel task values must be run functions");
+  }
+  const results = await Promise.all(entries.map(async ([name, run]) => {
     try {
-      if (typeof run !== "function") throw workError("INVALID_METADATA", "parallel task values must be run functions");
       const parent = inheritedAgentPath.getStore() || [];
-      const result = await inheritedAgentPath.run([...parent, operationName, name], run);
-      if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, result.failedAt), error: result.error, [BRAND]: true };
-      return { name, ok: true, value: isBranded(result) ? result.value : result, [BRAND]: true };
-    } catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
+      return { name, ok: true, value: await inheritedAgentPath.run([...parent, operationName, name], run) };
+    } catch (error) {
+      if (error.code === "CANCELLED") throw error;
+      return { name, ok: false, failedAt: error.failedAt ? path(operationName, name, error.failedAt) : path(operationName, name), error: { code: error.code || "INTERNAL_ERROR", message: error.message } };
+    }
   }));
+  const failure = results.find(result => !result.ok);
+  if (failure) throw Object.assign(new Error(failure.error.message), { code: failure.error.code, failedAt: failure.failedAt });
+  return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
 const pipeline = async (operationName, items, stages) => {
   named(operationName, "pipeline");
   const itemEntries = recordEntries(items, "pipeline items");
   const stageEntries = recordEntries(stages, "pipeline stages");
   if (!stageEntries.length) throw workError("INVALID_METADATA", "pipeline requires at least one stage");
-  return Promise.all(itemEntries.map(async ([name, initial]) => {
-    named(name, "pipeline item");
+  for (const [name] of itemEntries) named(name, "pipeline item");
+  for (const [stageName, run] of stageEntries) {
+    named(stageName, "pipeline stage");
+    if (typeof run !== "function") throw workError("INVALID_METADATA", "pipeline stage values must be run functions");
+  }
+  const results = await Promise.all(itemEntries.map(async ([name, initial]) => {
     let value = initial;
     let failedAt = path(operationName, name);
     try {
       for (const [stageName, run] of stageEntries) {
-        named(stageName, "pipeline stage");
         failedAt = path(operationName, name, stageName);
-        if (typeof run !== "function") throw workError("INVALID_METADATA", "pipeline stage values must be run functions");
         const parent = inheritedAgentPath.getStore() || [];
-        const result = await inheritedAgentPath.run([...parent, operationName, name, stageName], () => run(value));
-        if (isBranded(result) && !result.ok) return { name, ok: false, failedAt: path(operationName, name, stageName, result.failedAt), error: result.error, [BRAND]: true };
-        value = isBranded(result) ? result.value : result;
+        value = await inheritedAgentPath.run([...parent, operationName, name, stageName], () => run(value));
       }
-      return { name, ok: true, value, [BRAND]: true };
-    } catch (error) { if (error.code === "CANCELLED") throw error; return { name, ok: false, failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message }, [BRAND]: true }; }
+      return { name, ok: true, value };
+    } catch (error) {
+      if (error.code === "CANCELLED") throw error;
+      return { name, ok: false, failedAt: error.failedAt ? path(failedAt, error.failedAt) : failedAt, error: { code: error.code || "INTERNAL_ERROR", message: error.message } };
+    }
   }));
+  const failure = results.find(result => !result.ok);
+  if (failure) throw Object.assign(new Error(failure.error.message), { code: failure.error.code, failedAt: failure.failedAt });
+  return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
 const sandbox = { agent, prompt, checkpoint, parallel, pipeline, phase, log, extensions, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
@@ -715,7 +855,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       if (method === "agent") {
         if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
-        const opts = object(values[1]) ? values[1] : {};
+        const opts = validateAgentOptions(values[1]);
         const name = typeof opts.name === "string" && opts.name.trim() ? opts.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
         try {
           const result = await bridge.agent(values[0], opts, controller.signal, typeof values[2] === "string" ? values[2] : name);
@@ -780,29 +920,32 @@ function nativeSessionReference(attempt: Pick<AgentAttempt, "sessionId" | "sessi
 }
 
 export async function persistAgentConfig(store: RunStore, id: string, config: AgentSessionConfig): Promise<void> {
-  const loaded = await store.load();
-  if (!loaded.run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, sessionConfig: structuredClone(config) } : agent) });
+  await store.updateState((run) => {
+    if (!run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+    return { ...run, agents: run.agents.map((agent) => agent.id === id ? { ...agent, sessionConfig: structuredClone(config) } : agent) };
+  });
 }
 
 export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">): Promise<void> {
-  const loaded = await store.load();
-  const agent = loaded.run.agents.find((candidate) => candidate.id === id);
-  if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
-  const accounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-  const reference = nativeSessionReference(active, agent.continuedFrom);
-  const nativeSessions = loaded.run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? loaded.run.nativeSessions : [...loaded.run.nativeSessions, reference];
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : candidate), nativeSessions });
+  await store.updateState((run) => {
+    const agent = run.agents.find((candidate) => candidate.id === id);
+    if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+    const accounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+    const reference = nativeSessionReference(active, agent.continuedFrom);
+    const nativeSessions = run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? run.nativeSessions : [...run.nativeSessions, reference];
+    return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : candidate), nativeSessions };
+  });
 }
 
 export async function persistAgentAttempts(store: RunStore, id: string, attempts: readonly AgentAttempt[]): Promise<void> {
-  const loaded = await store.load();
-  const agent = loaded.run.agents.find((candidate) => candidate.id === id);
-  if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
-  const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-  const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting, sessionAccounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting, ...(sessionAccounting ? { sessionAccounting } : {}) }));
-  const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
-  await store.saveState({ ...loaded.run, agents: loaded.run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...loaded.run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt, agent.continuedFrom))] });
+  await store.updateState((run) => {
+    const agent = run.agents.find((candidate) => candidate.id === id);
+    if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
+    const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+    const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting, sessionAccounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting, ...(sessionAccounting ? { sessionAccounting } : {}) }));
+    const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
+    return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt, agent.continuedFrom))] };
+  });
 }
 
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
@@ -985,9 +1128,6 @@ function deliver(pi: ExtensionAPI, content: string): void {
 }
 const inheritedHostAgentPath = new AsyncLocalStorage<readonly string[]>();
 
-function isBrandedResult(value: unknown): value is Record<string, JsonValue> & { ok: boolean; name: string } {
-  return object(value) && value[WORK_RESULT_BRAND] === true;
-}
 
 function namedRecord(value: unknown, kind: string): Array<[string, unknown]> {
   if (!object(value)) fail("INVALID_METADATA", `${kind} must be a record`);
@@ -997,20 +1137,23 @@ function namedRecord(value: unknown, kind: string): Array<[string, unknown]> {
 async function hostParallel(rawOperation: unknown, rawTasks: unknown): Promise<JsonValue> {
   if (typeof rawOperation !== "string" || !rawOperation.trim()) fail("INVALID_METADATA", "parallel requires a stable explicit name");
   const tasks = namedRecord(rawTasks, "parallel tasks");
-  return Promise.all(tasks.map(async ([name, run]) => {
+  for (const [name, run] of tasks) {
     if (!name.trim()) fail("INVALID_METADATA", "parallel task requires a stable explicit name");
+    if (typeof run !== "function") fail("INVALID_METADATA", "parallel task values must be run functions");
+  }
+  const results = await Promise.all(tasks.map(async ([name, run]) => {
     try {
-      if (typeof run !== "function") fail("INVALID_METADATA", "parallel task values must be run functions");
       const parent = inheritedHostAgentPath.getStore() ?? [];
-      const result: unknown = await inheritedHostAgentPath.run([...parent, rawOperation, name], run as () => unknown);
-      if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(rawOperation, name, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
-      return { name, ok: true, value: (isBrandedResult(result) ? result.value : result) as JsonValue, [WORK_RESULT_BRAND]: true };
+      return { name, value: await inheritedHostAgentPath.run([...parent, rawOperation, name], run as () => unknown) as JsonValue };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt: operationPath(rawOperation, name), error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
+      return { name, error: typed };
     }
   }));
+  const failure = results.find((result) => result.error);
+  if (failure?.error) throw failure.error;
+  return Object.fromEntries(results.map((result) => [result.name, result.value as JsonValue]));
 }
 
 async function hostPipeline(rawOperation: unknown, rawItems: unknown, rawStages: unknown): Promise<JsonValue> {
@@ -1018,27 +1161,28 @@ async function hostPipeline(rawOperation: unknown, rawItems: unknown, rawStages:
   const items = namedRecord(rawItems, "pipeline items");
   const stages = namedRecord(rawStages, "pipeline stages");
   if (!stages.length) fail("INVALID_METADATA", "pipeline requires at least one stage");
-  return Promise.all(items.map(async ([name, initial]) => {
-    if (!name.trim()) fail("INVALID_METADATA", "pipeline item requires a stable explicit name");
+  for (const [name] of items) if (!name.trim()) fail("INVALID_METADATA", "pipeline item requires a stable explicit name");
+  for (const [stageName, run] of stages) {
+    if (!stageName.trim()) fail("INVALID_METADATA", "pipeline stage requires a stable explicit name");
+    if (typeof run !== "function") fail("INVALID_METADATA", "pipeline stage values must be run functions");
+  }
+  const results = await Promise.all(items.map(async ([name, initial]) => {
     let current = initial;
-    let failedAt = operationPath(rawOperation, name);
     try {
       for (const [stageName, run] of stages) {
-        if (!stageName.trim()) fail("INVALID_METADATA", "pipeline stage requires a stable explicit name");
-        failedAt = operationPath(rawOperation, name, stageName);
-        if (typeof run !== "function") fail("INVALID_METADATA", "pipeline stage values must be run functions");
         const parent = inheritedHostAgentPath.getStore() ?? [];
-        const result: unknown = await inheritedHostAgentPath.run([...parent, rawOperation, name, stageName], () => (run as (value: unknown) => unknown)(current));
-        if (isBrandedResult(result) && !result.ok) { const e = result.error as Record<string, JsonValue>; return { name, ok: false, failedAt: operationPath(rawOperation, name, stageName, result.failedAt as string), error: { code: e.code as string, message: e.message as string }, [WORK_RESULT_BRAND]: true }; }
-        current = isBrandedResult(result) ? result.value : result;
+        current = await inheritedHostAgentPath.run([...parent, rawOperation, name, stageName], () => (run as (value: unknown) => unknown)(current));
       }
-      return { name, ok: true, value: current as JsonValue, [WORK_RESULT_BRAND]: true };
+      return { name, value: current as JsonValue };
     } catch (error) {
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", error instanceof Error ? error.message : String(error));
       if (typed.code === "CANCELLED") throw typed;
-      return { name, ok: false, failedAt, error: { code: typed.code, message: typed.message }, [WORK_RESULT_BRAND]: true };
+      return { name, error: typed };
     }
   }));
+  const failure = results.find((result) => result.error);
+  if (failure?.error) throw failure.error;
+  return Object.fromEntries(results.map((result) => [result.name, result.value as JsonValue]));
 }
 
 function nextStructuralLabel(counters: Map<string, number>, label: string): string {
@@ -1108,7 +1252,7 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
     const context: WorkflowOrchestrationContext = Object.freeze({
       agent: async (...args: readonly unknown[]) => {
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
-        const options = object(args[1]) && jsonValue(args[1]) ? args[1] as Readonly<Record<string, JsonValue>> : {};
+        const options = validateAgentOptions(args[1] === undefined ? {} : args[1], false);
         const inherited = inheritedHostAgentPath.getStore();
         const explicitName = options.name;
         const name = explicitName === undefined && inherited ? inherited.at(-1) : explicitName;
@@ -1132,6 +1276,11 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
   } };
 }
 
+function projectTrusted(ctx: unknown): boolean {
+  const check = object(ctx) ? ctx.isProjectTrusted : undefined;
+  return typeof check === "function" ? Boolean(Reflect.apply(check, ctx, [])) : true;
+}
+
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   const events = (pi as unknown as { events?: ExtensionAPI["events"] }).events;
   pi.on("resources_discover", () => {
@@ -1148,9 +1297,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   };
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; execution?: WorkflowExecution; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
   const lifecycleFor = (store: RunStore, state: RunState) => new RunLifecycle(state, async (next) => {
-    const loaded = await store.load();
-    const run = { ...loaded.run, state: next };
-    await store.saveState(run);
+    const run = await store.updateState((current) => {
+      const nextRun = { ...current, state: next };
+      if (next === "running" || next === "completed") delete nextRun.error;
+      return nextRun;
+    });
     runs.get(store.runId)?.update?.(workflowToolUpdate(run));
   });
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
@@ -1158,10 +1309,15 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${runId}`);
     try {
       const onProgress = async (progress: AgentProgress) => {
-        const loaded = await run.store.load();
-        if (!loaded.run.agents.some((agent) => agent.id === id)) return;
-        const runState = { ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls, activity: progress.activity } : agent) };
-        if (progress.persist) await run.store.saveState(runState);
+        let runState: PersistedRun;
+        if (progress.persist) {
+          runState = await run.store.updateState((current) => current.agents.some((agent) => agent.id === id) ? { ...current, agents: current.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls, activity: progress.activity } : agent) } : current);
+        } else {
+          const loaded = await run.store.load();
+          if (!loaded.run.agents.some((agent) => agent.id === id)) return;
+          runState = { ...loaded.run, agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls, activity: progress.activity } : agent) };
+        }
+        if (!runState.agents.some((agent) => agent.id === id)) return;
         run.update?.(workflowToolUpdate(runState));
       };
       const onConfig = async (config: AgentSessionConfig) => { await scheduler.flush(); await persistAgentConfig(run.store, id, config); run.update?.(workflowToolUpdate((await run.store.load()).run)); };
@@ -1170,7 +1326,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onConfig, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.continueFrom ? { continueFrom: options.continueFrom } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onConfig, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.continueFrom ? { continueFrom: options.continueFrom } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1182,14 +1338,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const run = runs.get(runId);
     if (!run) return;
     await run.store.saveOwnership(ownership);
-    const loaded = await run.store.load();
-    const existing = new Map(loaded.run.agents.map((agent) => [agent.id, agent]));
-    const agents = ownership.map((node) => {
-      const previous = existing.get(node.id);
-      return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(node.options.continueFrom ? { continuedFrom: { agentId: node.options.continueFrom.agentId, agentPath: node.options.continueFrom.agentPath, sessionId: node.options.continueFrom.sessionId, sessionFile: node.options.continueFrom.sessionFile } } : previous?.continuedFrom ? { continuedFrom: previous.continuedFrom } : {}), ...(previous?.sessionConfig ? { sessionConfig: previous.sessionConfig } : {}), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+    const runState = await run.store.updateState((current) => {
+      const existing = new Map(current.agents.map((agent) => [agent.id, agent]));
+      const agents = ownership.map((node) => {
+        const previous = existing.get(node.id);
+        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(node.options.continueFrom ? { continuedFrom: { agentId: node.options.continueFrom.agentId, agentPath: node.options.continueFrom.agentPath, sessionId: node.options.continueFrom.sessionId, sessionFile: node.options.continueFrom.sessionFile } } : previous?.continuedFrom ? { continuedFrom: previous.continuedFrom } : {}), ...(previous?.sessionConfig ? { sessionConfig: previous.sessionConfig } : {}), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+      });
+      return { ...current, agents };
     });
-    const runState = { ...loaded.run, agents };
-    await run.store.saveState(runState);
     run.update?.(workflowToolUpdate(runState));
   });
   const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
@@ -1274,13 +1430,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (options.continueFrom !== undefined) await scheduler.flush();
         const current = await run.store.load();
         const prepared = preparedAgentOptions(current.run, options);
-        const tools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : loaded.snapshot.tools);
+        const explicitTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : undefined);
         const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
         const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
         const cwd = isolation ? (prepared?.source ? (await run.store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await run.store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? run.store.cwd;
         const role = typeof options.role === "string" ? options.role : prepared?.role;
         const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
         const thinking = prepared?.thinking ?? parseThinking(options.thinking);
+        const tools = run.executor.resolve({ label, workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(explicitTools !== undefined ? { tools: explicitTools } : {}) }).tools;
         const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
         const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         const cancel = () => { scheduler.cancel(spawned.id); };
@@ -1290,10 +1447,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         await run.store.complete(path, outcome.value);
         return outcome.value;
       } finally { await run.lifecycle.leave(); }
-    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { const current = await run.store.load(); await run.store.saveState({ ...current.run, phase }); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
+    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { await run.store.updateState((current) => ({ ...current, phase })); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
     run.execution = execution;
     emitAsyncStarted(run.store, run.metadata);
-    void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); emitAsyncComplete(run.store, "complete"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const current = await run.store.load(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.saveState({ ...current.run, error: { code: typed.code, message: typed.message } }); emitAsyncComplete(run.store, run.lifecycle.state === "stopped" ? "stopped" : "failed", typed); });
+    void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); emitAsyncComplete(run.store, "complete"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); emitAsyncComplete(run.store, run.lifecycle.state === "stopped" ? "stopped" : "failed", typed); });
   };
   pi.on("session_start", async (_event, ctx) => {
     for (const runId of await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)) {
@@ -1304,7 +1461,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: loadAgentDefinitions(ctx.cwd), runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
+      if (loaded.snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Interrupted workflows created before 0.3.0 must be relaunched");
+      const roleDefinitions = loaded.snapshot.roles;
+      if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !projectTrusted(ctx)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
+      const missingRole = loaded.snapshot.agentTypes.find((role) => !roleDefinitions[role]);
+      if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgents, await store.loadOwnership());
     }
@@ -1326,7 +1488,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
   });
   pi.on("before_agent_start", (event, ctx) => {
     if (!pi.getActiveTools().includes("workflow")) return;
-    const roles = Object.entries(loadAgentDefinitions(ctx.cwd)).filter(([, definition]) => definition.description);
+    const roles = Object.entries(loadAgentDefinitions(ctx.cwd, undefined, projectTrusted(ctx))).filter(([, definition]) => definition.description);
     if (!roles.length) return;
     const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- \`${name}\`: ${String(definition.description)}`).join("\n")}`;
     return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
@@ -1358,17 +1520,25 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const availableModels = new Set((modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
+      if (params.script !== undefined && params.workflow !== undefined) throw new WorkflowError("INVALID_METADATA", "Provide either script or workflow, not both");
       const definition = typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow) : undefined;
       const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
       if (!script) throw new WorkflowError("INVALID_SYNTAX", "Provide script or registered workflow");
       const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
       if (!workflowName) throw new WorkflowError("INVALID_METADATA", "Inline workflows require name");
       const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}), extensions: params.extensions ?? definition?.extensions });
-      const agentDefinitions = loadAgentDefinitions(ctx.cwd);
+      const trustedProject = projectTrusted(ctx);
+      const globalAgentDefinitions = loadAgentDefinitions(ctx.cwd, undefined, false);
+      const projectAgentDefinitions = trustedProject ? readAgentDefinitions(join(ctx.cwd, ".pi", "piworkflows", "roles")) : {};
+      const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
       const checked = preflight(script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() }, [], metadata);
+      const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
+      validateRolePolicies(agentDefinitions, roleNames, availableModels, new Set(rootTools));
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
-      const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: checked.referenced.agentTypes, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
+      const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;
+      const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
+      const snapshot = createLaunchSnapshot({ script, args: (params.args ?? null) as JsonValue, metadata: checked.metadata, settings, models: [rootModelName, ...checked.referenced.models.filter((model) => model !== rootModelName)], tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, extensions: workflowDslRegistry.versions(), schemas: checked.schemas });
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", agents: [], nativeSessions: [] }, snapshot);
       const lifecycle = lifecycleFor(store, "running");
       const background = !params.foreground;
@@ -1377,7 +1547,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgents);
-      const topLevel = new Set<Promise<unknown>>();
       const agentCounters = new Map<string, number>();
       const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal, structuralName) => {
         await lifecycle.enter();
@@ -1390,15 +1559,16 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           if (options.continueFrom !== undefined) await scheduler.flush();
           const loaded = await store.load();
           const prepared = preparedAgentOptions(loaded.run, options);
-          const requestedTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : rootTools);
+          const explicitTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : undefined);
           const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
           const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
           const cwd = isolation ? (prepared?.source ? (await store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? ctx.cwd;
           const role = prepared?.role ?? (typeof options.role === "string" ? options.role : undefined);
           const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
           const thinking = prepared?.thinking ?? parseThinking(options.thinking);
+          const tools = executor.resolve({ label, workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(explicitTools !== undefined ? { tools: explicitTools } : {}) }).tools;
           const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
-          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools: requestedTools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
@@ -1409,15 +1579,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       }, checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => {
         await lifecycle.enter();
         try {
-          const loaded = await store.load();
-          const run = { ...loaded.run, phase };
-          await store.saveState(run);
+          const run = await store.updateState((current) => ({ ...current, phase }));
           runs.get(runId)?.update?.(workflowToolUpdate(run));
         } finally { await lifecycle.leave(); }
       }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       if (background) emitAsyncStarted(store, checked.metadata);
-      const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await Promise.allSettled(topLevel); await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); const loaded = await store.load(); await store.saveState({ ...loaded.run, error: { code: typed.code, message: typed.message } }); throw typed; });
+      const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); await store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); throw typed; });
       if (background) {
         void finish.then(async (value) => {
           const resultPath = await store.saveResult(value);

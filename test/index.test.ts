@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import { listRunIds } from "../src/persistence.js";
 
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
@@ -39,11 +40,12 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.ok(discover);
   assert.ok(discover()?.skillPaths?.some((path) => existsSync(path)));
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 
 void test("advertises only described effective roles in the system prompt while workflow is active", () => {
-  type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string }) => { systemPrompt?: string } | undefined;
+  type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
   let handler: StartHandler | undefined;
   const activeTools = ["workflow"];
   const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-role-guidance-"));
@@ -57,6 +59,7 @@ void test("advertises only described effective roles in the system prompt while 
   assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
   assert.match(guidance, /`reviewer`: Reviews correctness/);
   assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool/);
+  assert.equal(handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false }), undefined);
 });
 
 void test("background workflows emit compatible lifecycle events", async () => {
@@ -311,7 +314,7 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
 
 void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async () => {
   const accepted: unknown[] = [];
-  assert.deepEqual(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, { name: "ship", ok: true, value: "rejected", __workResult: true });
+  assert.equal(await runWorkflow(`export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`, null, { checkpoint(input) { accepted.push(input); return false; } }).result, "rejected");
   assert.deepEqual(accepted, [{ name: "ship", prompt: "Ship?", context: { sha: "abc" } }]);
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "😀".repeat(257), context: null }), /1024/);
   assert.throws(() => validateCheckpoint({ name: "x", prompt: "ok", context: "😀".repeat(1025) }), /4096/);
@@ -334,7 +337,7 @@ void test("production checkpoints resolve in foreground navigator and background
   const script = `export const meta={name:'gate',description:'gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
   let selections = 0;
   const foreground = await workflow.execute("id", { name: "gate", script, foreground: true }, new AbortController().signal, undefined, { ...base, mode: "rpc", hasUI: true, ui: { select: async () => ++selections === 1 ? undefined : "Approve" } }) as { content: Array<{ text: string }> };
-  assert.deepEqual(JSON.parse(foreground.content[0]?.text ?? ""), { name: "ship", ok: true, value: "approved", __workResult: true });
+  assert.equal(JSON.parse(foreground.content[0]?.text ?? ""), "approved");
   assert.equal(selections, 2);
   await assert.rejects(workflow.execute("id", { name: "gate", script, foreground: true }, new AbortController().signal, undefined, { ...base, hasUI: false }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   const teardown = new AbortController();
@@ -396,15 +399,16 @@ void test("a checkpoint answer persisted before resolver registration cannot han
   assert.ok(workflow && respond);
   let releaseRunId!: (runId: string) => void;
   const runIdReady = new Promise<string>((resolve) => { releaseRunId = resolve; });
-  const saveState = Object.getOwnPropertyDescriptor(RunStore.prototype, "saveState")?.value as RunStore["saveState"];
+  const updateState = Object.getOwnPropertyDescriptor(RunStore.prototype, "updateState")?.value as RunStore["updateState"];
   let answered = false;
-  RunStore.prototype.saveState = async function (run) {
-    await saveState.call(this, run);
+  RunStore.prototype.updateState = async function (update) {
+    const run = await updateState.call(this, update);
     if (!answered && run.state === "awaiting_input" && this.cwd === home) {
       answered = true;
       const response = await respond.execute("id", { runId: await runIdReady, name: "ship", approved: false }) as { details: { accepted: boolean } };
       assert.equal(response.details.accepted, true);
     }
+    return run;
   };
   const timeout = setTimeout(() => { completed(); }, 2000);
   try {
@@ -415,7 +419,7 @@ void test("a checkpoint answer persisted before resolver registration cannot han
     assert.equal((await new RunStore(home, "session", result.details.runId, home).load()).run.state, "completed");
   } finally {
     clearTimeout(timeout);
-    RunStore.prototype.saveState = saveState;
+    RunStore.prototype.updateState = updateState;
   }
 });
 
@@ -501,12 +505,42 @@ void test("loads markdown agent roles with frontmatter from global and project d
   mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
   writeFileSync(join(home, "piworkflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
   writeFileSync(join(home, "piworkflows", "roles", "shadowed.md"), "---\ndescription: Hidden global\n---\nGlobal shadowed role");
+  writeFileSync(join(home, "piworkflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
   writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "Review role");
   writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "shadowed.md"), "Project shadowed role");
   const roles = loadAgentDefinitions(cwd, home);
   assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
   assert.equal(roles.reviewer?.prompt, "Review role");
   assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
+  assert.deepEqual(roles.multiline, { prompt: "Multiline role", tools: ["read", "grep"] });
+  const untrusted = loadAgentDefinitions(cwd, home, false);
+  assert.equal(untrusted.reviewer, undefined);
+  assert.deepEqual(untrusted.shadowed, { prompt: "Global shadowed role", description: "Hidden global" });
+});
+
+void test("strict role frontmatter rejects malformed metadata", () => {
+  const invalid = [
+    "---\ntools: read\n---\nbody",
+    "---\ntools: [read, 2]\n---\nbody",
+    "---\ntools: [read, '']\n---\nbody",
+    "---\ndescription: |\n  line one\n  line two\n---\nbody",
+  ];
+  for (const content of invalid) assert.throws(() => parseRoleMarkdown(content, true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
+
+void test("rejects invalid role policy before persisting a run", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-policy-"));
+  const cwd = join(home, "project");
+  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "broken.md"), "---\ntools: [missing]\n---\nBroken role");
+  const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  await assert.rejects(workflow.execute("id", { name: "invalid-role", script: `return agent("inspect", { name: "inspect", role: "broken" });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  assert.deepEqual(await listRunIds(cwd, "session", home), []);
+  await assert.rejects(workflow.execute("id", { name: "invalid-schema", script: `return agent("inspect", { name: "inspect", outputSchema: [] });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
+  assert.deepEqual(await listRunIds(cwd, "session", home), []);
 });
 
 void test("interrupted resume path preserves workflow agent roles", () => {
@@ -541,9 +575,15 @@ void test("preflight accepts the complete static contract", () => {
   const metadata = { name: "review", description: "Review code", extensions: [{ name: "git", version: "^1.0.0" }] };
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);
   assert.equal(result.metadata.name, "review");
+  assert.equal(result.dynamicAgentRoles, false);
+  assert.equal(preflight(`agent("x", { name: "x", role: args.role })`, capabilities).dynamicAgentRoles, true);
   assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
   assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities, [], metadata).referenced.models, ["openai/gpt"]);
   assert.ok(Object.isFrozen(result.metadata));
+  const staticSchema = { type: "object", properties: { answer: { type: "number" } } };
+  assert.deepEqual(preflight(`agent("x",{name:"n",outputSchema:${JSON.stringify(staticSchema)}})`, capabilities).schemas, [staticSchema]);
+  preflight(`agent("x",{name:"n",timeoutMs:0,timeoutMs:10})`, capabilities);
+  preflight(`agent("x",{name:"n",timeoutMs:0,...{timeoutMs:10}})`, capabilities);
 });
 
 void test("preflight rejects every static boundary before run creation", () => {
@@ -556,6 +596,10 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`agent('a',{name:'n',model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
     [`agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
     [`agent('a',{name:'n',role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
+    [`agent('a',{name:'n',outputSchema:[]})`, "INVALID_SCHEMA"],
+    [`agent('a',{name:'n',timeoutMs:0})`, "INVALID_METADATA"],
+    [`agent('a',{name:'n',retries:-1})`, "INVALID_METADATA"],
+    [`agent('a',{name:'n',isolation:'typo'})`, "INVALID_METADATA"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
@@ -564,6 +608,13 @@ void test("preflight rejects every static boundary before run creation", () => {
   assert.throws(() => preflight("return 1", capabilities, [{}]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
 });
 
+void test("host rejects malformed dynamic agent options before launching", async () => {
+  let launched = false;
+  for (const options of ["{name:'a',tools:1}", "{name:'a',timeoutMs:0}", "{name:'a',retries:-1}", "{name:'a',isolation:'typo'}"]) {
+    await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.equal(launched, false);
+});
 void test("preflight enforces object-key combinators and contextual agent names", () => {
   const base = "return 1;";
   assert.throws(() => preflight(base, capabilities, [{ type: "object", properties: { bad: () => true } }]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
@@ -601,10 +652,12 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
+  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
+  input.roles.reviewer.prompt = "mutated";
   assert.deepEqual(snapshot.args, { nested: [1] });
+  assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
 });
@@ -613,13 +666,13 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   const phases: string[] = [];
   const script = `export const meta={name:'x',description:'x'};
     if (typeof process !== 'undefined' || typeof require !== 'undefined' || typeof console !== 'undefined' || typeof Date !== 'undefined' || typeof setTimeout !== 'undefined' || typeof Math.random !== 'undefined') throw new Error('unsafe global');
-    await phase('build'); const cp = await checkpoint({name:'gate'}); if (cp.value !== 'approved') throw new Error('rejected'); const r = await agent('echo', {name:'echo', value: args}); return r.value;`;
+    await phase('build'); const decision = await checkpoint({name:'gate'}); if (decision !== 'approved') throw new Error('rejected'); return agent('echo', {name:'echo'});`
   const run = runWorkflow(script, { n: 2 }, {
     phase(name) { phases.push(name); },
     checkpoint() { return true; },
     agent(prompt, options) { return Promise.resolve({ prompt, options }); },
   });
-  assert.deepEqual(await run.result, { prompt: "echo", options: { name: "echo", value: { n: 2 } } });
+  assert.deepEqual(await run.result, { prompt: "echo", options: { name: "echo" } });
   assert.deepEqual(phases, ["build"]);
 });
 
@@ -724,45 +777,73 @@ void test("agent Promises reject serialization and string coercion but retain aw
   assert.match(result.interpolated, /report.*Promise.*await.*prompt/i);
   for (const error of [result.stringified, result.coerced, result.agentInput, result.logInput, result.promptTemplate]) assert.match(error, /agent result.*Promise.*await.*interpolation/i);
   assert.deepEqual(started, ["first", "second"]);
-  assert.deepEqual(JSON.parse(result.awaited), [
-    { name: "first", ok: true, value: "first", __workResult: true },
-    { name: "second", ok: true, value: "second", __workResult: true },
-  ]);
+  assert.deepEqual(JSON.parse(result.awaited), ["first", "second"]);
 });
 
-void test("object-key combinators preserve order, railway paths, and inherited agent names", async () => {
-  const pending = new Map<string, (value: JsonValue) => void>();
-  const calls: Array<{ prompt: string; name: unknown; structuralName: unknown }> = [];
-  const bridge = {
-    agent(prompt: string, options: Readonly<Record<string, JsonValue>>, _signal: AbortSignal, structuralName?: string) {
-      calls.push({ prompt, name: options.name, structuralName });
-      if (prompt === "fail") throw new WorkflowError("AGENT_FAILED", "expected failure");
-      return new Promise<JsonValue>((resolve) => { pending.set(prompt, resolve); });
-    },
-  };
-  const parallelRun = runWorkflow(`return parallel('batch', {
-    'first/item': async()=>{await Promise.resolve();return agent('slow')},
-    second: ()=>agent('fast',{name:'override'}),
-    broken: ()=>agent('fail')
-  });`, null, bridge);
-  while (calls.length < 3) await new Promise((resolve) => setImmediate(resolve));
-  pending.get("fast")?.(2); pending.get("slow")?.(1);
-  assert.deepEqual(await parallelRun.result, [
-    { name: "first/item", ok: true, value: 1, __workResult: true },
-    { name: "second", ok: true, value: 2, __workResult: true },
-    { name: "broken", ok: false, failedAt: "batch/broken/broken", error: { code: "AGENT_FAILED", message: "expected failure" }, __workResult: true },
-  ]);
-  assert.deepEqual(Object.fromEntries(calls.map(({ prompt, name }) => [prompt, name])), { slow: "first/item", fast: "override", fail: "broken" });
-  assert.deepEqual(Object.fromEntries(calls.map(({ prompt, structuralName }) => [prompt, structuralName])), { slow: "batch/first%2Fitem", fast: "override", fail: "batch/broken" });
+void test("agent, checkpoint, and extension calls expose bare values and typed failures", async () => {
+  assert.equal(await runWorkflow(`return agent('direct',{name:'direct'});`, null, { agent: async () => "value" }).result, "value");
+  for (const [code, message] of [["AGENT_FAILED", "failed"], ["AGENT_TIMEOUT", "timed out"], ["RESULT_INVALID", "invalid"]] as const) {
+    await assert.rejects(runWorkflow(`return agent('direct',{name:'direct'});`, null, { agent: async () => { throw new WorkflowError(code, message); } }).result,
+      (error: unknown) => error instanceof WorkflowError && error.code === code && error.message === message);
+  }
+  assert.deepEqual(await runWorkflow(`return extensions.demo.run({});`, null, {
+    extensions: { demo: ["run"] },
+    extension: async () => ({ answer: 42 }),
+  }).result, { answer: 42 });
+});
 
-  const pipelineResult = await runWorkflow(`return pipeline('pipe/name', {one:1,two:2}, {
-    double: value=>value*2,
-    'reject odd': async value=>{await Promise.resolve();if(value===2)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value+1}
-  });`).result;
-  assert.deepEqual(pipelineResult, [
-    { name: "one", ok: false, failedAt: "pipe%2Fname/one/reject%20odd", error: { code: "AGENT_FAILED", message: "no" }, __workResult: true },
-    { name: "two", ok: true, value: 5, __workResult: true },
-  ]);
+void test("parallel and pipeline return keyed bare values in input order", async () => {
+  assert.deepEqual(await runWorkflow(`return parallel('batch',{first:()=>1,second:()=>0,third:()=>null});`).result, { first: 1, second: 0, third: null });
+  assert.deepEqual(await runWorkflow(`return pipeline('pipe',{first:1,second:2},{double:value=>value*2,increment:value=>value+1});`).result, { first: 3, second: 5 });
+  assert.deepEqual(await runWorkflow(`const reports=await parallel('reports',{lint:()=>agent('lint'),tests:()=>agent('tests')}); return {reports,rendered:prompt('{reports}',{reports})};`, null, { agent: async (prompt) => prompt === "lint" ? "clean" : { passed: true } }).result, {
+    reports: { lint: "clean", tests: { passed: true } },
+    rendered: `{
+  "lint": "clean",
+  "tests": {
+    "passed": true
+  }
+}`,
+  });
+  assert.deepEqual(await runWorkflow(`return {parallel:await parallel('empty',{}),pipeline:await pipeline('empty',{}, {pass:value=>value})};`).result, { parallel: {}, pipeline: {} });
+  let launched = false;
+  await assert.rejects(runWorkflow(`return parallel('invalid',{first:()=>agent('no launch'),broken:1});`, null, { agent: async () => { launched = true; return null; } }).result, /task values must be run functions/);
+  await assert.rejects(runWorkflow(`return pipeline('invalid',{first:1},{start:value=>agent(String(value)),broken:1});`, null, { agent: async () => { launched = true; return null; } }).result, /stage values must be run functions/);
+  assert.equal(launched, false);
+});
+
+void test("combinator failures wait for siblings and preserve deterministic typed errors", async () => {
+  let releaseParallel!: () => void;
+  const parallelSibling = new Promise<JsonValue>((resolve) => { releaseParallel = () => { resolve("done"); }; });
+  let settled = false;
+  const parallelCalls: string[] = [];
+  const parallelRun = runWorkflow(`return parallel('batch',{first:()=>agent('fail',{name:'fail'}),second:()=>agent('slow',{name:'slow'})});`, null, {
+    agent: async (prompt) => { parallelCalls.push(prompt); if (prompt === "fail") throw new WorkflowError("AGENT_FAILED", "first failed"); return parallelSibling; },
+  });
+  void parallelRun.result.finally(() => { settled = true; }).catch(() => undefined);
+  while (parallelCalls.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releaseParallel();
+  await assert.rejects(parallelRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "first failed");
+
+  let releasePipeline!: () => void;
+  const pipelineSibling = new Promise<JsonValue>((resolve) => { releasePipeline = () => { resolve(2); }; });
+  settled = false;
+  const pipelineCalls: string[] = [];
+  const pipelineRun = runWorkflow(`return pipeline('pipe',{first:1,second:2},{run:value=>agent(String(value))});`, null, {
+    agent: async (prompt) => { pipelineCalls.push(prompt); if (prompt === "1") throw new WorkflowError("RESULT_INVALID", "bad item"); return pipelineSibling; },
+  });
+  void pipelineRun.result.finally(() => { settled = true; }).catch(() => undefined);
+  while (pipelineCalls.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releasePipeline();
+  await assert.rejects(pipelineRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID" && error.message === "bad item");
+
+  await assert.rejects(runWorkflow(`return parallel('ordered',{first:()=>{throw Object.assign(new Error('first'),{code:'AGENT_TIMEOUT'})},second:()=>{throw Object.assign(new Error('second'),{code:'AGENT_FAILED'})}});`).result,
+    (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && error.message === "first");
+  await assert.rejects(runWorkflow(`return parallel('outer',{nested:()=>pipeline('inner',{item:1},{fail:()=>{throw Object.assign(new Error('nested'),{code:'AGENT_FAILED'})}})});`).result,
+    (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "nested");
 });
 
 void test("parallel name inheritance is isolated across async branches and top-level agents stay named", async () => {

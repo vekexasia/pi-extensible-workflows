@@ -27,6 +27,19 @@ void test("stores exact cwd and Pi session snapshots atomically and rejects cros
   assert.notEqual(projectStorageKey(join(home, "a", "same-name")), projectStorageKey(join(home, "b", "same-name")));
   assert.deepEqual(readFileSync(join(store.directory, "state.json"), "utf8").trim().startsWith("{"), true);
 });
+void test("serializes concurrent state updates without losing fields", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-state-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  await Promise.all([
+    store.updateState((current) => ({ ...current, phase: "review" })),
+    store.updateState((current) => ({ ...current, error: { code: "AGENT_FAILED", message: "boom" } })),
+  ]);
+  const saved = (await store.load()).run;
+  assert.equal(saved.phase, "review");
+  assert.deepEqual(saved.error, { code: "AGENT_FAILED", message: "boom" });
+});
 
 void test("cold reload restores persisted ownership for cascading cancellation", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-ownership-"));

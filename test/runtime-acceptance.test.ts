@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, WorkflowAgentExecutor, WorkflowError, type JsonValue } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
 
@@ -15,7 +15,7 @@ void test("production session_start cold-restores ownership and /workflow stop c
   const runId = "run-a";
   const store = new RunStore(cwd, sessionId, runId, home);
   const settings = { concurrency: 1, maxAgents: 2 };
-  await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   const options = { label: "parent", cwd, tools: ["agent"] };
   await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { ...options, label: "child" } }]);
 
@@ -33,12 +33,23 @@ void test("production session_start cold-restores ownership and /workflow stop c
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
 });
 
+void test("cold resume rejects pre-0.3 snapshots", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-old-snapshot-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start);
+  await assert.rejects(start({}, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+});
+
 void test("cold recovery delivers a persisted checkpoint only once before replay", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-recovery-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -57,6 +68,7 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
   assert.equal((await respond.execute(undefined as never, { runId: "run-a", name: "ship", approved: true } as never)).details.accepted, true);
   for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal((await store.load()).run.state, "completed");
+  assert.equal((await store.load()).run.error, undefined);
   assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
 });
 
@@ -68,7 +80,7 @@ void test("cold resume replays a completed continuation before checking its miss
   const config = { model: { provider: "openai", model: "gpt", thinking: "medium" as const }, tools: [], systemPromptAppend: "", cwd };
   const attempt = { attempt: 1, sessionId: "source-session", sessionFile: missingSessionFile, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } };
   const script = `return agent("must replay", { name: "continuation", continueFrom: "source" });`;
-  await store.create({ id: "run-a", workflowName: "continuation-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [{ id: "run-a:1", name: "source", path: "run-a:1", state: "completed", model: config.model, tools: [], attempts: 1, attemptDetails: [attempt], accounting: attempt.accounting, sessionConfig: config }], nativeSessions: [{ sessionId: attempt.sessionId, sessionFile: missingSessionFile }] }, createLaunchSnapshot({ script, args: null, metadata: { name: "continuation-replay" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "continuation-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [{ id: "run-a:1", name: "source", path: "run-a:1", state: "completed", model: config.model, tools: [], attempts: 1, attemptDetails: [attempt], accounting: attempt.accounting, sessionConfig: config }], nativeSessions: [{ sessionId: attempt.sessionId, sessionFile: missingSessionFile }] }, createLaunchSnapshot({ script, args: null, metadata: { name: "continuation-replay" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   await store.complete("agent/continuation", "replayed");
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -86,7 +98,7 @@ void test("production lifecycle commands persist pause, resume, and Pi-close int
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgents: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -147,21 +159,46 @@ void test("concurrency-1 cancellation and nested containment retain accounting a
   assert.equal(cleaned, 1); assert.equal(retried.attempts.length, 2); assert.deepEqual(retried.attempts.map(({ accounting }) => accounting.cost), [0.5, 0.5]);
 });
 
-void test("production worker runs named combinators with railway lifecycle semantics", async () => {
+void test("production worker returns bare combinator values and waits before typed failure", async () => {
+  assert.deepEqual(await runWorkflow(`return pipeline('pipe',{first:1,second:2},{double:value=>value*2});`).result, { first: 2, second: 4 });
+
+  let releaseParallel!: () => void;
+  const parallelWait = new Promise<JsonValue>((resolve) => { releaseParallel = () => { resolve("done"); }; });
+  let settled = false;
+  const parallelCalls: string[] = [];
+  const parallelRun = runWorkflow(`return parallel('batch',{failure:()=>{throw Object.assign(new Error('branch failed'),{code:'AGENT_FAILED'})},waiting:()=>agent('wait')});`, null, {
+    agent: async (prompt) => { parallelCalls.push(prompt); return parallelWait; },
+  });
+  void parallelRun.result.finally(() => { settled = true; }).catch(() => undefined);
+  while (parallelCalls.length < 1) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releaseParallel();
+  await assert.rejects(parallelRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "branch failed");
+
+  let releasePipeline!: () => void;
+  const pipelineWait = new Promise<JsonValue>((resolve) => { releasePipeline = () => { resolve(2); }; });
+  settled = false;
+  const pipelineCalls: string[] = [];
+  const pipelineRun = runWorkflow(`return pipeline('pipe',{first:1,second:2},{run:value=>agent(String(value))});`, null, {
+    agent: async (prompt) => { pipelineCalls.push(prompt); if (prompt === "1") throw new WorkflowError("RESULT_INVALID", "invalid first"); return pipelineWait; },
+  });
+  void pipelineRun.result.finally(() => { settled = true; }).catch(() => undefined);
+  while (pipelineCalls.length < 2) await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  releasePipeline();
+  await assert.rejects(pipelineRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID" && error.message === "invalid first");
+
   const controller = new AbortController();
-  let cancelStarted!: () => void;
-  const started = new Promise<void>((resolve) => { cancelStarted = resolve; });
-  const run = runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
-    return parallel('batch',{waiting:()=>agent('wait'),failure:()=>{throw Object.assign(new Error('branch failed'),{code:'AGENT_FAILED'})}});`, null, {
-    agent: async (_prompt, _options, signal) => { cancelStarted(); await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); }); throw new WorkflowError("CANCELLED", "cancelled"); },
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const cancelled = runWorkflow(`return parallel('cancel',{waiting:()=>agent('wait'),failure:()=>{throw Object.assign(new Error('failed'),{code:'AGENT_FAILED'})}});`, null, {
+    agent: async (_prompt, _options, signal) => { markStarted(); await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); }); throw new WorkflowError("CANCELLED", "cancelled"); },
   }, controller.signal);
   await started;
   controller.abort();
-  await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
-
-  assert.deepEqual(await runWorkflow(`export const meta={name:'acceptance',description:'acceptance'};
-    return pipeline('pipe',{first:1,second:2},{double:value=>value*2,'fail-two':value=>{if(value===4)throw Object.assign(new Error('no'),{code:'AGENT_FAILED'});return value}});`).result,
-  [{ name: "first", ok: true, value: 2, __workResult: true }, { name: "second", ok: false, failedAt: "pipe/second/fail-two", error: { code: "AGENT_FAILED", message: "no" }, __workResult: true }]);
+  await assert.rejects(cancelled.result, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
 });
 
 void test("terminal failed attempts remain persisted", async () => {
@@ -184,19 +221,37 @@ void test("production workflow exposes registered extension macros and replays t
   let calls = 0;
   registerWorkflowDslExtension({
     name: "issue16Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance macro",
-    methods: { echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { calls += 1; return { value: input.value as string }; } } },
+    methods: {
+      echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { calls += 1; return { value: input.value as string }; } },
+      orchestrate: {
+        description: "Exercise host combinators", input: { type: "object", additionalProperties: false }, output: { type: "object" },
+        async run(_input, context) {
+          const parallel = await context.parallel("host-parallel", { first: () => 1, second: () => 2 });
+          const pipeline = await context.pipeline("host-pipeline", { first: 1, second: 2 }, { double: (value: number) => value * 2 });
+          let parallelWaited = false;
+          let parallelFailure!: WorkflowError;
+          try { await context.parallel("host-failure", { first: () => { throw new WorkflowError("AGENT_FAILED", "host parallel failed"); }, second: async () => { await Promise.resolve(); parallelWaited = true; return 2; } }); }
+          catch (error) { parallelFailure = error as WorkflowError; }
+          let pipelineWaited = false;
+          try { await context.pipeline("host-pipeline-failure", { first: 1, second: 2 }, { fail: (value: number) => { if (value === 1) throw new WorkflowError("RESULT_INVALID", "host pipeline failed"); return value; }, finish: async (value: number) => { await Promise.resolve(); pipelineWaited = true; return value; } }); }
+          catch (error) { return { parallel, pipeline, parallelWaited, parallelCode: parallelFailure.code, pipelineWaited, pipelineCode: (error as WorkflowError).code }; }
+          throw new Error("expected host pipeline failure");
+        },
+      },
+    },
   });
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId: string; value: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const script = `phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); return [first.value,replayed.value];`;
+  const script = `phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); const orchestrated=await extensions.issue16Acceptance.orchestrate({}); return {first,replayed,orchestrated};`;
   const result = await workflow.execute("id", { name: "extension-e2e", script, extensions: [{ name: "issue16Acceptance", version: "^1.0.0" }], foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  assert.deepEqual(result.details.value, [{ value: "first" }, { value: "first" }]);
-  assert.equal(calls, 1);
+  assert.deepEqual(result.details.value, { first: { value: "first" }, replayed: { value: "second" }, orchestrated: { parallel: { first: 1, second: 2 }, pipeline: { first: 2, second: 4 }, parallelWaited: true, parallelCode: "AGENT_FAILED", pipelineWaited: true, pipelineCode: "RESULT_INVALID" } });
+  assert.equal(calls, 2);
   const store = new RunStore(home, "session", result.details.runId, home);
   assert.equal((await store.load()).run.phase, "verify");
   assert.deepEqual(await store.replay("extension/issue16Acceptance/echo"), { path: "extension/issue16Acceptance/echo", value: { value: "first" } });
+  assert.deepEqual(await store.replay("extension/issue16Acceptance/echo/2"), { path: "extension/issue16Acceptance/echo/2", value: { value: "second" } });
 });
 
 void test("persists continuation lineage with the forked native session", async () => {
