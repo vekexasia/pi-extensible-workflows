@@ -6,9 +6,9 @@ import { homedir } from "node:os";
 import { promisify } from "node:util";
 import type { JsonValue, LaunchSnapshot, RunRecord } from "./index.js";
 import type { OwnershipRecord } from "./agent-execution.js";
-import { createLaunchSnapshot, WorkflowError } from "./index.js";
+import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
-export interface NativeSessionReference { sessionId: string; sessionFile: string; parentSessionId?: string; parentSessionFile?: string }
+export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
@@ -78,7 +78,7 @@ export class RunStore {
     await this.stateWrite;
     const run = await json<PersistedRun>(join(this.directory, "state.json"));
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run belongs to another cwd or Pi session");
-    return { run, snapshot: createLaunchSnapshot(await json<LaunchSnapshot>(join(this.directory, "snapshot.json"))) };
+    return { run, snapshot: loadLaunchSnapshot(await json<LaunchSnapshot>(join(this.directory, "snapshot.json"))) };
   }
 
   async saveState(run: PersistedRun): Promise<void> {

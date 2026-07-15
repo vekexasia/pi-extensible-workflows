@@ -9,7 +9,7 @@ import { listRunIds } from "../src/persistence.js";
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
 };
-const valid = `phase("check"); agent("do it", { name: "reviewer", model: "openai/gpt", tools: ["read"], role: "reviewer" });`;
+const valid = `phase("check"); agent("do it", { model: "openai/gpt", tools: ["read"], role: "reviewer" });`;
 
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
@@ -537,9 +537,9 @@ void test("rejects invalid role policy before persisting a run", async () => {
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  await assert.rejects(workflow.execute("id", { name: "invalid-role", script: `return agent("inspect", { name: "inspect", role: "broken" });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  await assert.rejects(workflow.execute("id", { name: "invalid-role", script: `return agent("inspect", { role: "broken" });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
   assert.deepEqual(await listRunIds(cwd, "session", home), []);
-  await assert.rejects(workflow.execute("id", { name: "invalid-schema", script: `return agent("inspect", { name: "inspect", outputSchema: [] });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
+  await assert.rejects(workflow.execute("id", { name: "invalid-schema", script: `return agent("inspect", { outputSchema: [] });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
   assert.deepEqual(await listRunIds(cwd, "session", home), []);
 });
 
@@ -576,14 +576,14 @@ void test("preflight accepts the complete static contract", () => {
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);
   assert.equal(result.metadata.name, "review");
   assert.equal(result.dynamicAgentRoles, false);
-  assert.equal(preflight(`agent("x", { name: "x", role: args.role })`, capabilities).dynamicAgentRoles, true);
+  assert.equal(preflight(`agent("x", { role: args.role })`, capabilities).dynamicAgentRoles, true);
   assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
   assert.deepEqual(preflight(valid.replace("openai/gpt", "openai/gpt:high"), capabilities, [], metadata).referenced.models, ["openai/gpt"]);
   assert.ok(Object.isFrozen(result.metadata));
   const staticSchema = { type: "object", properties: { answer: { type: "number" } } };
-  assert.deepEqual(preflight(`agent("x",{name:"n",outputSchema:${JSON.stringify(staticSchema)}})`, capabilities).schemas, [staticSchema]);
-  preflight(`agent("x",{name:"n",timeoutMs:0,timeoutMs:10})`, capabilities);
-  preflight(`agent("x",{name:"n",timeoutMs:0,...{timeoutMs:10}})`, capabilities);
+  assert.deepEqual(preflight(`agent("x",{outputSchema:${JSON.stringify(staticSchema)}})`, capabilities).schemas, [staticSchema]);
+  preflight(`agent("x",{timeoutMs:0,timeoutMs:10})`, capabilities);
+  preflight(`agent("x",{timeoutMs:0,...{timeoutMs:10}})`, capabilities);
 });
 
 void test("preflight rejects every static boundary before run creation", () => {
@@ -591,15 +591,14 @@ void test("preflight rejects every static boundary before run creation", () => {
   const createRun = (script: string) => { preflight(script, capabilities, [], { name: "test" }); created += 1; };
   const cases: Array<[string, string]> = [
     ["const x = ;", "INVALID_SYNTAX"],
-    [`agent('a')`, "INVALID_METADATA"],
-    [`agent('a',{name:'n',model:'missing'})`, "UNKNOWN_MODEL"],
-    [`agent('a',{name:'n',model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
-    [`agent('a',{name:'n',tools:['bash']})`, "UNKNOWN_TOOL"],
-    [`agent('a',{name:'n',role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
-    [`agent('a',{name:'n',outputSchema:[]})`, "INVALID_SCHEMA"],
-    [`agent('a',{name:'n',timeoutMs:0})`, "INVALID_METADATA"],
-    [`agent('a',{name:'n',retries:-1})`, "INVALID_METADATA"],
-    [`agent('a',{name:'n',isolation:'typo'})`, "INVALID_METADATA"],
+    [`agent('a',{model:'missing'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{tools:['bash']})`, "UNKNOWN_TOOL"],
+    [`agent('a',{role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
+    [`agent('a',{outputSchema:[]})`, "INVALID_SCHEMA"],
+    [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
+    [`agent('a',{retries:-1})`, "INVALID_METADATA"],
+    [`agent('a',{isolation:'typo'})`, "INVALID_METADATA"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
@@ -610,20 +609,20 @@ void test("preflight rejects every static boundary before run creation", () => {
 
 void test("host rejects malformed dynamic agent options before launching", async () => {
   let launched = false;
-  for (const options of ["{name:'a',tools:1}", "{name:'a',timeoutMs:0}", "{name:'a',retries:-1}", "{name:'a',isolation:'typo'}"]) {
+  for (const options of ["{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{isolation:'typo'}"]) {
     await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
   assert.equal(launched, false);
 });
-void test("preflight enforces object-key combinators and contextual agent names", () => {
+void test("preflight enforces object-key combinators without agent names", () => {
   const base = "return 1;";
   assert.throws(() => preflight(base, capabilities, [{ type: "object", properties: { bad: () => true } }]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
   assert.throws(() => preflight("return 1", { ...capabilities, extensions: { git: "1.0.0" } }, [], { name: "x", extensions: [{ name: "git", version: "^1.2.3" }] }), (error: unknown) => error instanceof WorkflowError && error.code === "INCOMPATIBLE_EXTENSION");
   assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'})`, capabilities), /operation name string and tasks record/);
   assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities), /operation name string, items record, and stages record/);
-  assert.throws(() => preflight(`${base} agent('top-level')`, capabilities), /agent requires a stable explicit name/);
+  assert.doesNotThrow(() => preflight(`${base} agent('top-level')`, capabilities));
   preflight(`${base} parallel('batch',{task:()=>agent('inherited')}); pipeline('pipe',{item:1},{stage:value=>agent(String(value))})`, capabilities);
-} );
+});
 
 void test("AST preflight ignores DSL-looking non-executable text and member calls", () => {
   const script = `const text = "agent() checkpoint({}) phase('ghost') name: 'fake' model: 'missing' tools: ['bash'] role: 'writer'";
@@ -633,15 +632,15 @@ void test("AST preflight ignores DSL-looking non-executable text and member call
     object.agent('member'); object.checkpoint({}); object.phase('ghost'); object.parallel([]); object.pipeline([]);
     const unrelated = {model:'missing', tools:['bash'], role:'writer'};
     phase('real');
-    agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {name:'actual',model:'openai/gpt',tools:['read'],role:'reviewer'});`;
+    agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {model:'openai/gpt',tools:['read'],role:'reviewer'});`;
   assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
 });
 
-void test("AST preflight detects executable template expressions and false prompt names", () => {
-  const base = "";
-  assert.throws(() => preflight(`${base} agent("name: 'fake'")`, capabilities), /agent requires a stable explicit name/);
-  assert.throws(() => preflight(`${base} checkpoint({prompt:"name: 'fake'",context:null})`, capabilities), /checkpoint requires a stable explicit name/);
-  assert.throws(() => preflight(`${base} const text = \`\${agent("name: 'fake'")}\`;`, capabilities), /agent requires a stable explicit name/);
+void test("AST preflight distinguishes executable calls from prompt text", () => {
+  const capabilitiesWithNames = capabilities;
+  assert.doesNotThrow(() => preflight(`agent("name: 'fake'")`, capabilitiesWithNames));
+  assert.throws(() => preflight(`checkpoint({prompt:"name: 'fake'",context:null})`, capabilitiesWithNames), /checkpoint requires a stable explicit name/);
+  assert.doesNotThrow(() => preflight("const text = `${agent(\"name: 'fake'\")}`;", capabilitiesWithNames));
 });
 
 void test("AST preflight validates combinator signatures", () => {
@@ -657,6 +656,7 @@ void test("launch snapshots are detached and deeply immutable", () => {
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
   assert.deepEqual(snapshot.args, { nested: [1] });
+  assert.equal(snapshot.identityVersion, 1);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
@@ -666,13 +666,13 @@ void test("worker exposes deterministic core globals and JSON RPC only", async (
   const phases: string[] = [];
   const script = `export const meta={name:'x',description:'x'};
     if (typeof process !== 'undefined' || typeof require !== 'undefined' || typeof console !== 'undefined' || typeof Date !== 'undefined' || typeof setTimeout !== 'undefined' || typeof Math.random !== 'undefined') throw new Error('unsafe global');
-    await phase('build'); const decision = await checkpoint({name:'gate'}); if (decision !== 'approved') throw new Error('rejected'); return agent('echo', {name:'echo'});`
+    await phase('build'); const decision = await checkpoint({name:'gate'}); if (decision !== 'approved') throw new Error('rejected'); return agent('echo');`
   const run = runWorkflow(script, { n: 2 }, {
     phase(name) { phases.push(name); },
     checkpoint() { return true; },
     agent(prompt, options) { return Promise.resolve({ prompt, options }); },
   });
-  assert.deepEqual(await run.result, { prompt: "echo", options: { name: "echo" } });
+  assert.deepEqual(await run.result, { prompt: "echo", options: {} });
   assert.deepEqual(phases, ["build"]);
 });
 
@@ -760,12 +760,12 @@ void test("prompt rejects missing, unused, and recursively unsafe values with ke
 void test("agent Promises reject serialization and string coercion but retain await and concurrency", async () => {
   const started: string[] = [];
   const run = runWorkflow(`export const meta={name:'agent-promises',description:'agent promises'};
-    const first=agent('first',{name:'first'}); const second=agent('second',{name:'second'});
+    const first=agent('first'); const second=agent('second');
     let serialized; try{JSON.stringify(first)}catch(error){serialized=error.message}
     let interpolated; try{prompt('{report}',{report:first})}catch(error){interpolated=error.message}
     let stringified; try{first.toString()}catch(error){stringified=error.message}
     let coerced; try{'prefix '+first}catch(error){coerced=error.message}
-    let agentInput; try{agent('prefix '+first,{name:'third'})}catch(error){agentInput=error.message}
+    let agentInput; try{agent('prefix '+first)}catch(error){agentInput=error.message}
     let logInput; try{log('prefix '+first)}catch(error){logInput=error.message}
     let promptTemplate; try{prompt('prefix '+first,{})}catch(error){promptTemplate=error.message}
     const values=await Promise.all([first,second]);
@@ -781,9 +781,9 @@ void test("agent Promises reject serialization and string coercion but retain aw
 });
 
 void test("agent, checkpoint, and extension calls expose bare values and typed failures", async () => {
-  assert.equal(await runWorkflow(`return agent('direct',{name:'direct'});`, null, { agent: async () => "value" }).result, "value");
+  assert.equal(await runWorkflow(`return agent('direct');`, null, { agent: async () => "value" }).result, "value");
   for (const [code, message] of [["AGENT_FAILED", "failed"], ["AGENT_TIMEOUT", "timed out"], ["RESULT_INVALID", "invalid"]] as const) {
-    await assert.rejects(runWorkflow(`return agent('direct',{name:'direct'});`, null, { agent: async () => { throw new WorkflowError(code, message); } }).result,
+    await assert.rejects(runWorkflow(`return agent('direct');`, null, { agent: async () => { throw new WorkflowError(code, message); } }).result,
       (error: unknown) => error instanceof WorkflowError && error.code === code && error.message === message);
   }
   assert.deepEqual(await runWorkflow(`return extensions.demo.run({});`, null, {
@@ -816,7 +816,7 @@ void test("combinator failures wait for siblings and preserve deterministic type
   const parallelSibling = new Promise<JsonValue>((resolve) => { releaseParallel = () => { resolve("done"); }; });
   let settled = false;
   const parallelCalls: string[] = [];
-  const parallelRun = runWorkflow(`return parallel('batch',{first:()=>agent('fail',{name:'fail'}),second:()=>agent('slow',{name:'slow'})});`, null, {
+  const parallelRun = runWorkflow(`return parallel('batch',{first:()=>agent('fail'),second:()=>agent('slow')});`, null, {
     agent: async (prompt) => { parallelCalls.push(prompt); if (prompt === "fail") throw new WorkflowError("AGENT_FAILED", "first failed"); return parallelSibling; },
   });
   void parallelRun.result.finally(() => { settled = true; }).catch(() => undefined);
@@ -845,25 +845,53 @@ void test("combinator failures wait for siblings and preserve deterministic type
   await assert.rejects(runWorkflow(`return parallel('outer',{nested:()=>pipeline('inner',{item:1},{fail:()=>{throw Object.assign(new Error('nested'),{code:'AGENT_FAILED'})}})});`).result,
     (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "nested");
 });
+void test("direct workflow agents use call-site and occurrence identity", async () => {
+  const source = `let values=[]; for(let index=0;index<2;index+=1) values.push(await agent("loop")); values.push(await agent("once")); return values;`;
+  let launched = false;
+  await assert.rejects(runWorkflow("return agent()", null, { agent: async () => { launched = true; return null; } }).result, /agent prompt must be a string/);
+  assert.equal(launched, false);
+  const identities: Array<{ structuralPath: string[]; callSite: string; occurrence: number }> = [];
+  const run = runWorkflow(source, null, { agent: async (prompt, _options, _signal, identity) => { identities.push(identity as typeof identities[number]); return prompt; } });
+  assert.deepEqual(await run.result, ["loop", "loop", "once"]);
+  const [firstIdentity, secondIdentity, thirdIdentity] = identities;
+  assert.ok(firstIdentity && secondIdentity && thirdIdentity);
+  assert.equal(firstIdentity.occurrence, 1);
+  assert.equal(secondIdentity.occurrence, 2);
+  assert.notEqual(firstIdentity.callSite, thirdIdentity.callSite);
+});
 
-void test("parallel name inheritance is isolated across async branches and top-level agents stay named", async () => {
-  const releases = new Map<string, () => void>();
-  const seen: Array<[string, unknown, unknown]> = [];
-  const result = runWorkflow(`return parallel('concurrent',{first:async()=>{await agent('gate-first');return agent('after-first')},second:async()=>{await agent('gate-second');return agent('after-second')}});`, null, {
-    agent: async (prompt, options, _signal, structuralName) => {
-      seen.push([prompt, options.name, structuralName]);
-      if (prompt.startsWith("gate-")) await new Promise<void>((resolve) => { releases.set(prompt, resolve); });
-      return prompt;
+void test("parallel identities do not depend on completion order", async () => {
+  const resolvers = new Map<string, () => void>();
+  const identities: Array<{ structuralPath: string[]; callSite: string; occurrence: number }> = [];
+  const run = runWorkflow(`return parallel("batch",{first:()=>agent("first"),second:()=>agent("second")});`, null, {
+    agent: async (prompt, _options, _signal, identity) => {
+      identities.push(identity as typeof identities[number]);
+      return new Promise<string>((resolve) => { resolvers.set(prompt, () => { resolve(prompt); }); });
     },
   });
-  while (releases.size < 2) await new Promise((resolve) => setImmediate(resolve));
-  releases.get("gate-second")?.(); releases.get("gate-first")?.();
-  await result.result;
-  assert.deepEqual(seen, [["gate-first", "first", "concurrent/first"], ["gate-second", "second", "concurrent/second"], ["after-second", "second", "concurrent/second"], ["after-first", "first", "concurrent/first"]]);
-  const pipelineNames: Array<[unknown, unknown]> = [];
-  await runWorkflow(`return pipeline('named',{first:1,second:2},{transform:value=>agent(String(value))});`, null, { agent: async (_prompt, options, _signal, structuralName) => { pipelineNames.push([options.name, structuralName]); return null; } }).result;
-  assert.deepEqual(pipelineNames, [["transform", "named/first/transform"], ["transform", "named/second/transform"]]);
-  await assert.rejects(runWorkflow(`return agent('unnamed');`, null, { agent: async () => null }).result, /stable explicit name/);
+  while (resolvers.size < 2) await new Promise((resolve) => setImmediate(resolve));
+  const second = resolvers.get("second");
+  const first = resolvers.get("first");
+  assert.ok(second && first);
+  second(); first();
+  assert.deepEqual(await run.result, { first: "first", second: "second" });
+  assert.deepEqual(identities.map(({ structuralPath, occurrence }) => ({ structuralPath, occurrence })).sort((left, right) => left.structuralPath.join("/").localeCompare(right.structuralPath.join("/"))), [{ structuralPath: ["batch", "first"], occurrence: 1 }, { structuralPath: ["batch", "second"], occurrence: 1 }]);
+});
+
+void test("aliases, reserved internals, and removed options are rejected before the agent bridge", async () => {
+  let launched = false;
+  await assert.rejects(runWorkflow(`const alias=agent; return alias("no");`, null, { agent: async () => { launched = true; return null; } }).result, /direct agent.*aliases.*unsupported/i);
+  assert.equal(launched, false);
+  assert.throws(() => preflight(`__pi_workflows_agent("x", {}, "0:1")`, capabilities), /reserved for workflow agent instrumentation/);
+  assert.throws(() => runWorkflow(`return __pi_workflows_agent("x", {}, "0:1")`, null, { agent: async () => { launched = true; return null; } }), /reserved for workflow agent instrumentation/);
+  await assert.rejects(runWorkflow(`const internal=globalThis["__pi_workflows"+"_agent"]; return internal("x", {}, "0:1");`, null, { agent: async () => { launched = true; return null; } }).result, /not a function/);
+  assert.equal(launched, false);
+  assert.throws(() => preflight(`agent("x",{name:"old"})`, capabilities), /Unknown agent option: name/);
+  assert.throws(() => preflight(`agent("x",{continueFrom:"old"})`, capabilities), /Unknown agent option: continueFrom/);
+  for (const option of ["name", "continueFrom"]) {
+    await assert.rejects(runWorkflow(`return agent("x",{[args.key]:"old"});`, { key: option }, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.equal(launched, false);
 });
 
 void test("worker cancellation is immediate even for runaway synchronous code", async () => {
@@ -891,7 +919,7 @@ void test("workflow cancellation reaches an active top-level scheduler agent", a
     throw new WorkflowError("CANCELLED", "cancelled");
   }, 1);
   scheduler.addRun("run", 1);
-  const run = runWorkflow(`export const meta={name:'x',description:'x'}; return await agent('wait',{name:'wait'});`, null, {
+  const run = runWorkflow(`export const meta={name:'x',description:'x'}; return await agent('wait');`, null, {
     agent: async (_prompt, _options, signal) => {
       const spawned = scheduler.spawn("run", "wait", { label: "wait", cwd: "/repo", tools: [] });
       const cancel = () => { scheduler.cancel(spawned.id); };
@@ -922,7 +950,7 @@ void test("worker enforces 10 MB boundaries on individual and final JSON values"
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; return 'x'.repeat(${String(RPC_LIMIT_BYTES)});`);
   await assert.rejects(run.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   let called = false;
-  const rendered = runWorkflow(`export const meta={name:'x',description:'x'}; return agent(prompt('{text}',{text:'x'.repeat(${String(RPC_LIMIT_BYTES)})}),{name:'large'});`, null, { agent: async () => { called = true; return null; } });
+  const rendered = runWorkflow(`export const meta={name:'x',description:'x'}; return agent(prompt('{text}',{text:'x'.repeat(${String(RPC_LIMIT_BYTES)})}));`, null, { agent: async () => { called = true; return null; } });
   await assert.rejects(rendered.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   assert.equal(called, false);
 });

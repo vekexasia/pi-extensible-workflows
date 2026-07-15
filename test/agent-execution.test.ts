@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentContinuationSource, type AgentExecutionRoot, type AgentProgress } from "../src/agent-execution.js";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress } from "../src/agent-execution.js";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { WorkflowError } from "../src/index.js";
 import type { RunStore } from "../src/persistence.js";
@@ -30,34 +30,6 @@ void test("passes role prompt as system append, not task text", async () => {
   assert.match(prompt, /Task:\nDo work/);
 });
 
-void test("continues from a completed session with stale-file safety and appended-only accounting", async () => {
-  const source: AgentContinuationSource = { agentId: "run:1", agentPath: "run:1", sessionId: "source", sessionFile: "/sessions/source.jsonl", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, config: { model: root.model, tools: ["read"], systemPromptAppend: "", cwd: root.cwd } };
-  const messages = [assistant("old")];
-  let input: { continueFrom?: string } | undefined;
-  let prompt = "";
-  const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { input = sessionInput; return { sessionId: "forked", sessionFile: "/sessions/forked.jsonl", messages, prompt: async (text) => { prompt = text; messages.push(assistant("new")); }, dispose() {} }; });
-  const result = await executor.execute("Verify the implementation", { label: "verification", workflowName: "flow", tools: ["read"], continueFrom: source });
-  assert.ok(input);
-  assert.equal(input.continueFrom, source.sessionFile);
-  assert.match(prompt, /prior file contents are stale; inspect the current diff and reread changed sections/i);
-  assert.match(prompt, /continuation is verification, not a replacement for independent review/i);
-  const attempt = result.attempts[0];
-  assert.ok(attempt);
-  assert.deepEqual(attempt.accounting, { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 });
-  assert.deepEqual(attempt.sessionAccounting, { input: 4, output: 6, cacheRead: 8, cacheWrite: 10, cost: 0.5 });
-});
-
-void test("retries continuations from the original fork point and rejects config changes", async () => {
-  const source: AgentContinuationSource = { agentId: "run:1", agentPath: "run:1", sessionId: "source", sessionFile: "/sessions/source.jsonl", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, config: { model: root.model, tools: ["read"], systemPromptAppend: "", cwd: root.cwd } };
-  const inputs: string[] = [];
-  let created = 0;
-  const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { inputs.push(sessionInput.continueFrom ?? ""); const attempt = ++created; const messages = [assistant("old")]; return { sessionId: `forked-${String(attempt)}`, sessionFile: `/sessions/forked-${String(attempt)}.jsonl`, messages, prompt: async () => { messages.push(assistant("new")); if (attempt === 1) throw new Error("retry"); }, dispose() {} }; });
-  const result = await executor.execute("Verify", { label: "verification", workflowName: "flow", tools: ["read"], continueFrom: source, retries: 1 });
-  assert.deepEqual(inputs, [source.sessionFile, source.sessionFile]);
-  assert.equal(result.attempts.length, 2);
-  assert.deepEqual(result.attempts.map(({ accounting }) => accounting), [source.accounting, source.accounting]);
-  await assert.rejects(executor.execute("Verify", { label: "verification", workflowName: "flow", tools: ["bash"], continueFrom: source }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
-});
 
 void test("provider limits pause and retry the same native session", async () => {
   let prompts = 0;
@@ -162,17 +134,6 @@ void test("top-level worktree cwd is inherited and reused by retries", async () 
   await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", workflowDescription: "desc", parent: "worker", isolation: "worktree" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 
-void test("nested isolated continuations retain their parent worktree identity", async () => {
-  const cwd = "/runs/parent/repo";
-  const source: AgentContinuationSource = { agentId: "run:parent-child", agentPath: "run:parent-child", sessionId: "source", sessionFile: "/sessions/source.jsonl", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, config: { model: root.model, tools: ["read"], systemPromptAppend: "", cwd, isolation: "worktree", worktreeOwner: "parent" } };
-  let config: unknown;
-  let launchedCwd = "";
-  const isolatedRoot = { ...root, runStore: { validateWorktree: async (owner: string, requested: string) => { assert.equal(owner, "parent"); assert.equal(requested, cwd); return { owner, path: "/runs/parent", branch: "branch/parent", cwd }; } } as unknown as RunStore };
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async (input) => { launchedCwd = input.cwd; return { sessionId: "continued", sessionFile: "/sessions/continued.jsonl", messages: [assistant("done")], prompt: async () => {}, dispose() {} }; });
-  await executor.execute("continue child", { label: "continued", workflowName: "flow", parent: "parent", parentIsolation: "worktree", worktreeOwner: "parent", cwd, tools: ["read"], continueFrom: source, onConfig: (value) => { config = value; } });
-  assert.equal(launchedCwd, cwd);
-  assert.deepEqual(config, source.config);
-});
 
 void test("concurrent siblings keep their own cwd and non-isolated top-level calls use root cwd", async () => {
   const cwds: Record<string, string> = {};
@@ -305,15 +266,6 @@ void test("scheduler flush waits for terminal ownership persistence", async () =
   assert.equal((writes.at(-1)?.[0] as { state: string }).state, "completed");
 });
 
-void test("rejects overlapping live continuations from one source session", async () => {
-  const source: AgentContinuationSource = { agentId: "run:source", agentPath: "run:source", sessionId: "source", sessionFile: "/sessions/source.jsonl", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, config: { model: root.model, tools: [], systemPromptAppend: "", cwd: root.cwd } };
-  const scheduler = new FairAgentScheduler(async ({ signal }) => { await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); }); throw new WorkflowError("CANCELLED", "cancelled"); }, 2);
-  scheduler.addRun("run", 2);
-  const first = scheduler.spawn("run", "first", { label: "first", cwd: root.cwd, tools: [], continueFrom: source });
-  assert.throws(() => scheduler.spawn("run", "second", { label: "second", cwd: root.cwd, tools: [], continueFrom: source }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /already being continued/.test(error.message));
-  scheduler.cancel(first.id);
-  assert.equal((await first.result).ok, false);
-});
 
 void test("nested ownership releases permits, contains child failure, and blocks escalation", async () => {
   let scheduler: FairAgentScheduler;

@@ -76,8 +76,8 @@ void test("doctor preflights every registered workflow", async () => {
   const paths = fixture();
   writeFileSync(join(paths.root, "piworkflows", "roles", "reviewer.md"), "Review");
   const workflows = {
-    "test.missing-role": { description: "missing role", script: `agent("x",{name:"a",role:"missing"});` },
-    "test.missing-tool": { description: "missing tool", script: `agent("x",{name:"a",tools:["cat"]});` },
+    "test.missing-role": { description: "missing role", script: `agent("x",{role:"missing"});` },
+    "test.missing-tool": { description: "missing tool", script: `agent("x",{tools:["cat"]});` },
     "test.bad-meta": { description: "bad meta", script: `const x = ;` },
   };
   const report = await doctor({ ...paths, discoverPi: async () => pi({ workflows }) });

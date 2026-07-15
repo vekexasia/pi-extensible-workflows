@@ -5,25 +5,18 @@ description: Use when the task is complex enough to require multiple subagents o
 
 # pi-workflows
 
-Use `workflow` exclusively for genuinely multi-agent orchestration. For one agent, use ordinary tools or `Agent` directly. Do not wrap a single agent in a workflow; either define distinct phases with separate responsibilities or do the work yourself. Once the task and phases are clear, the next tool call must be `workflow`; never inspect targets delegated to agents.
+Use `workflow` exclusively for genuinely multi-agent orchestration. For one agent, use ordinary tools or `Agent` directly. Do not wrap a single agent in a workflow; define distinct responsibilities and keep the result flow explicit.
 
 ## Pattern
 
 ```js
 const reports = await parallel("parallel-work", {
-  scan: () => agent(
-    "Read the target; return concise facts for the final agent.",
-    { role: "scout", tools: ["read"] },
-  ),
-  check: () => agent(
-    "Run the requested command; report completion.",
-    { tools: ["bash"] },
-  ),
+  scan: () => agent("Read the target; return concise facts.", { role: "scout", tools: ["read"] }),
+  check: () => agent("Run the requested command.", { tools: ["bash"] }),
 });
-
 const summary = await agent(
   prompt("Use only these reports:\n\n{reports}", { reports }),
-  { name: "summary", tools: [] },
+  { tools: [] },
 );
 return summary;
 ```
@@ -32,54 +25,32 @@ Pass downstream only needed results. Workflow JavaScript has no imports, filesys
 
 ## `agent()` options
 
-When calling agent, you can specify options
-
 ```typescript
 interface AgentOptions {
-  name?: string; // Required at top level; may inherit a parallel task or pipeline stage key.
   model?: `${provider}/${model}` | `${provider}/${model}:${thinking}`;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  role?: string; // must be one of the available workflow roles
-  tools?: string[]; // [] = no tools; omitted uses role tools when a role is set, otherwise launch tools at top level or the parent's effective tools for nested agents
-  outputSchema?: JsonSchema; // optional JSON Schema for the final value
-  continueFrom?: string; // Completed agent name or persisted path in this run.
-  retries?: number; // Non-negative; use only for safe, repeatable work.
-  timeoutMs?: number | null; // Positive milliseconds; null means unlimited.
-  isolation?: "worktree"; // Top-level file-changing agents only.
+  role?: string; // one of the available workflow roles
+  tools?: string[]; // [] = no tools; omitted uses role or launch tools
+  outputSchema?: JsonSchema;
+  retries?: number; // non-negative; use for safe, repeatable work
+  timeoutMs?: number | null; // positive milliseconds; null means unlimited
+  isolation?: "worktree"; // top-level file-changing agents
 }
 ```
 
-## Continuation
-
-Use `continueFrom` when the same completed agent should verify remediation against its earlier findings:
-
-```js
-const review = await agent(
-  "Review the implementation and report actionable findings.",
-  { name: "initial-review", role: "reviewer", tools: ["read", "bash"] },
-);
-return agent(
-  "The workspace changed. Verify the fixes against your previous findings.",
-  { name: "verify-fixes", continueFrom: "initial-review" },
-);
-```
-
-A continuation forks the completed agent's native session and inherits its exact model, thinking, tools, role, output schema, cwd, and worktree. Use it to verify existing findings. Use a fresh agent for independent regression review.
+Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; aliases are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
 ## Rules
 
-- Do not create a workflow for one agent. Phases must have distinct work, not ceremonial wrappers around the same task.
-- Inline workflows and top-level agents need stable names. `parallel(operationName, tasksRecord)` task keys and `pipeline(operationName, itemsRecord, stagesRecord)` item/stage keys are names; one agent call per task/stage may inherit the nearest key, but additional calls need explicit names.
-- `continueFrom` accepts a completed agent's name or persisted path from the same run. Omit configuration overrides unless they exactly match the source.
-- A request for repeated or iterative passes must be implemented inside one workflow run. Do not issue one `workflow` tool call per pass.
-- When the topology repeats, the workflow script must use a JavaScript loop and continuation chains for every recurring responsibility, including reviewers and developers. Only deliberately independent verification starts fresh. Generate stable internal names; users should not need to know names or request continuation explicitly.
-- A continuation must reread changed sections because prior file contents are stale. It does not replace a fresh final review when independence matters.
+- Do not create a workflow for one agent. Phases must have distinct work.
+- `parallel(operationName, tasksRecord)` task keys and `pipeline(operationName, itemsRecord, stagesRecord)` item/stage keys are names.
+- Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
-- Omit `maxAgentLaunches` unless the user requests an explicit total launch budget. It counts all logical launches, including continuations and nested agents, not concurrent agents.
-- `parallel()`/`pipeline()` return keyed bare values. Ordinary failures propagate automatically after all siblings settle; await results before use.
+- Omit `maxAgentLaunches` unless an explicit total launch budget is required.
+- `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
-- A specified launch/session model overrides routing tables for every agent. Omit `model` unless the user explicitly requests per-agent routing.
-- Select the narrowest available role from each agent's responsibility unless the user overrides role selection. Grant minimum tools; pure synthesis needs `tools: []`.
-- With `outputSchema`, agents must call `workflow_result`. Retry only idempotent work; add timeouts only when needed.
-- Put `isolation: "worktree"` on top-level file-changing agents. Use `checkpoint()` only for human gates. `phase()` is optional.
-- Keep generated agent names, continuation references, and DSL details out of user-facing results unless the user asks for them.
+- Select the narrowest role and minimum tools. Pure synthesis can use `tools: []`.
+- With `outputSchema`, agents must call `workflow_result`. Retry only idempotent work.
+- Put `isolation: "worktree"` on top-level file-changing agents. Use `checkpoint()` only for human gates.
+
+If a top-level agent includes `agent` in its effective tools, it can create nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Put one isolated coordinator in a worktree when agents must collaborate on shared files, and have that coordinator use nested children; per-agent worktree isolation remains enabled.

@@ -10,7 +10,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentContinuationLineage, type AgentContinuationSource, type AgentDefinition, type AgentProgress, type AgentSessionConfig } from "./agent-execution.js";
+import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -37,10 +37,11 @@ export interface ModelSpec { provider: string; model: string; thinking?: "off" |
 export interface ExtensionRequirement { name: string; version: string }
 export interface WorkflowMetadata { name: string; description?: string; extensions?: readonly ExtensionRequirement[] }
 export interface WorkflowSettings { concurrency: number; maxAgentLaunches: number }
-export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; sessionAccounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined; sessionConfig?: AgentSessionConfig; continuedFrom?: AgentContinuationLineage }
+export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
+export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
-export interface LaunchSnapshot { script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
+const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 1;
+export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; extensions: Readonly<Record<string, string>>; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; extensions: Readonly<Record<string, string>> }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
 export interface WorkflowOrchestrationContext {
@@ -276,6 +277,42 @@ function workflowCalls(program: acorn.Program): WorkflowCall[] {
   return calls.sort((left, right) => left.start - right.start);
 }
 
+function hasIdentifier(node: acorn.AnyNode, name: string): boolean {
+  if (node.type === "Identifier" && node.name === name) return true;
+  return Object.values(node).some((value) => Array.isArray(value) ? value.some((child) => astNode(child) && hasIdentifier(child, name)) : astNode(value) && hasIdentifier(value, name));
+}
+
+const INTERNAL_AGENT_NAME = "__pi_workflows_agent";
+
+function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
+  let previous: acorn.Token | undefined;
+  let current: acorn.Token | undefined;
+  for (const token of acorn.tokenizer(source.slice(call.start, call.end), { ecmaVersion: "latest", sourceType: "module" })) {
+    previous = current;
+    current = token;
+  }
+  return current?.type.label === ")" && previous?.type.label === ",";
+}
+
+function instrumentWorkflow(script: string): string {
+  const body = workflowBody(script);
+  if (!body.trim()) return body;
+  const program = parseWorkflow(body);
+  if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
+  const calls = workflowCalls(program).filter((call) => call.callee.name === "agent");
+  const edits = calls.flatMap((call) => {
+    const callSite = `${String(call.start)}:${String(call.end)}`;
+    const hiddenArgument = call.arguments.length === 0 || callHasTrailingComma(body, call) ? "" : ", ";
+    return [
+      { start: call.callee.start, end: call.callee.end, text: INTERNAL_AGENT_NAME },
+      { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` },
+    ];
+  }).sort((left, right) => right.start - left.start);
+  let instrumented = body;
+  for (const edit of edits) instrumented = instrumented.slice(0, edit.start) + edit.text + instrumented.slice(edit.end);
+  return instrumented;
+}
+
 function literalString(node: acorn.AnyNode | undefined): string | undefined {
   return node?.type === "Literal" && typeof node.value === "string" ? node.value : undefined;
 }
@@ -308,17 +345,6 @@ function stableName(node: acorn.AnyNode | undefined): boolean | undefined {
   return result;
 }
 
-function inheritedAgentRanges(program: acorn.Program): Array<readonly [number, number]> {
-  const ranges: Array<readonly [number, number]> = [];
-  for (const call of workflowCalls(program)) {
-    const record = call.callee.name === "parallel" ? call.arguments[1] : call.callee.name === "pipeline" ? call.arguments[2] : undefined;
-    if (record?.type !== "ObjectExpression") continue;
-    for (const property of record.properties) {
-      if (property.type === "Property" && (property.value.type === "ArrowFunctionExpression" || property.value.type === "FunctionExpression")) ranges.push([property.value.start, property.value.end]);
-    }
-  }
-  return ranges;
-}
 
 function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
@@ -341,13 +367,9 @@ function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonS
   if (schema.properties !== undefined && !object(schema.properties)) fail("INVALID_SCHEMA", `${at}.properties must be an object`);
 }
 
-const AGENT_OPTION_KEYS = new Set(["name", "model", "thinking", "tools", "role", "outputSchema", "continueFrom", "retries", "timeoutMs", "isolation"]);
-
+const AGENT_OPTION_KEYS = new Set(["model", "thinking", "tools", "role", "outputSchema", "retries", "timeoutMs", "isolation"]);
 function validateAgentOption(key: string, value: unknown): void {
   switch (key) {
-    case "name":
-      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent requires a stable explicit name");
-      break;
     case "model":
       if (typeof value !== "string") fail("INVALID_METADATA", "agent model must be a string");
       parseModelReference(value);
@@ -364,9 +386,6 @@ function validateAgentOption(key: string, value: unknown): void {
     case "outputSchema":
       validateSchema(value, "agent outputSchema");
       break;
-    case "continueFrom":
-      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent continueFrom must be a non-empty string");
-      break;
     case "retries":
       if (!Number.isInteger(value) || (value as number) < 0) fail("INVALID_METADATA", "agent retries must be a non-negative integer");
       break;
@@ -379,11 +398,10 @@ function validateAgentOption(key: string, value: unknown): void {
   }
 }
 
-function validateAgentOptions(value: unknown, requireName = true): Readonly<Record<string, JsonValue>> {
+function validateAgentOptions(value: unknown): Readonly<Record<string, JsonValue>> {
   if (!object(value) || !jsonValue(value)) fail("INVALID_METADATA", "agent options must be a JSON object");
   const unknown = Object.keys(value).find((key) => !AGENT_OPTION_KEYS.has(key));
   if (unknown) fail("INVALID_METADATA", `Unknown agent option: ${unknown}`);
-  if (requireName && value.name === undefined) fail("INVALID_METADATA", "agent requires a stable explicit name");
   for (const [key, option] of Object.entries(value)) validateAgentOption(key, option);
   return value;
 }
@@ -535,16 +553,15 @@ function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }): PreflightResult {
   const checkedMetadata = validateWorkflowMetadata(metadata);
   const program = parseWorkflow(script);
+  if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
   const calls = workflowCalls(program);
-  const inheritedRanges = inheritedAgentRanges(program);
   const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
   for (const call of calls) {
     const operation = call.callee.name;
     if (operation === "agent") validateStaticAgentOptions(call.arguments[1]);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
-    const inheritsName = operation === "agent" && inheritedRanges.some(([start, end]) => call.start >= start && call.end <= end);
-    if ((operation === "agent" && !inheritsName && stableName(call.arguments[1]) === false) || (operation === "checkpoint" && stableName(call.arguments[0]) === false)) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
+    if (operation === "checkpoint" && stableName(call.arguments[0]) === false) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
     if (operation === "parallel" && (call.arguments.length !== 2 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "parallel requires an operation name string and tasks record");
     if (operation === "pipeline" && (call.arguments.length !== 3 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression" || call.arguments[2]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "pipeline requires an operation name string, items record, and stages record");
   }
@@ -581,15 +598,22 @@ function deepFreeze<T>(value: T): T {
   return value;
 }
 
-export function createLaunchSnapshot(input: LaunchSnapshot): Readonly<LaunchSnapshot> {
+type LaunchSnapshotInput = Omit<LaunchSnapshot, "identityVersion"> & { identityVersion?: number };
+
+export function createLaunchSnapshot(input: LaunchSnapshotInput): Readonly<LaunchSnapshot> {
+  return deepFreeze(structuredClone({ ...input, identityVersion: input.identityVersion ?? LAUNCH_SNAPSHOT_IDENTITY_VERSION }));
+}
+
+export function loadLaunchSnapshot(input: LaunchSnapshot): Readonly<LaunchSnapshot> {
   return deepFreeze(structuredClone(input));
 }
 
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
 export const HEARTBEAT_TIMEOUT_MS = 5000;
 
+export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number }
 export interface WorkflowBridge {
-  agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, structuralName?: string) => Promise<JsonValue>;
+  agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
   extension?: (extension: string, method: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal) => Promise<JsonValue>;
   extensions?: Readonly<Record<string, readonly string[]>>;
@@ -656,13 +680,19 @@ const unwrap = result => {
 const named = (value, kind) => { if (typeof value !== "string" || !value.trim()) throw workError("INVALID_METADATA", kind + " requires a stable explicit name"); return value; };
 const path = (...names) => names.map(encodeURIComponent).join("/");
 const inheritedAgentPath = new AsyncLocalStorage();
-const agent = (prompt, options = {}) => {
-  if (!options || typeof options !== "object" || Array.isArray(options)) throw workError("INVALID_METADATA", "agent options must be an object");
-  const inherited = inheritedAgentPath.getStore();
-  const explicitName = options.name;
-  const name = named(explicitName === undefined && inherited ? inherited.at(-1) : explicitName, "agent");
-  const structuralName = explicitName === undefined && inherited ? path(...inherited) : name;
-  const result = rpc("agent", [prompt, { ...options, name }, structuralName]).then(unwrap);
+const agentOccurrences = new Map();
+const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
+const internalAgent = (...values) => {
+  const callSite = values.pop();
+  if (typeof callSite !== "string") throw workError("INTERNAL_ERROR", "Missing workflow agent call-site identity");
+  const inherited = inheritedAgentPath.getStore() || [];
+  // ponytail: same-callsite races outside parallel/pipeline lack a stable structural scope and are unsupported.
+  const occurrenceKey = JSON.stringify([inherited, callSite]);
+  const occurrence = (agentOccurrences.get(occurrenceKey) || 0) + 1;
+  agentOccurrences.set(occurrenceKey, occurrence);
+  const options = values.length < 2 || values[1] === undefined ? {} : values[1];
+  const identity = { structuralPath: [...inherited], callSite, occurrence };
+  const result = rpc("agent", [values[0], options, identity]).then(unwrap);
   Object.defineProperties(result, {
     toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
     toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
@@ -670,6 +700,7 @@ const agent = (prompt, options = {}) => {
   });
   return result;
 };
+const agent = rejectAgent;
 const promptPath = (at, key) => /^[A-Za-z_$][\w$]*$/.test(key) ? at + "." + key : at + "[" + JSON.stringify(key) + "]";
 const plainPromptObject = value => {
   const proto = Object.getPrototypeOf(value);
@@ -784,7 +815,7 @@ const sandbox = { agent, prompt, checkpoint, parallel, pipeline, phase, log, ext
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = config.script;
-Promise.resolve().then(() => new vm.Script("(async()=>{" + body + "\n})()", { filename: "workflow.js" }).runInContext(context))
+Promise.resolve().then(() => new vm.Script("(async(__pi_workflows_agent)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: { code: error.code || "INTERNAL_ERROR", message: error.message } }))
   .finally(() => clearInterval(heartbeat));
@@ -797,10 +828,21 @@ function encoded(value: unknown): string {
   return json;
 }
 
+function readAgentIdentity(value: unknown): AgentIdentity {
+  if (!object(value)) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
+  const structuralPath = value.structuralPath;
+  const callSite = value.callSite;
+  const occurrence = value.occurrence;
+  if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || typeof callSite !== "string" || !callSite || !positiveInteger(occurrence)) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
+  return { structuralPath: [...structuralPath], callSite, occurrence };
+}
+
+function agentIdentityPath(identity: AgentIdentity): string {
+  return operationPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`);
+}
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
-  const body = workflowBody(script);
-  const config = JSON.stringify({ script: body, args: structuredClone(args), extensions: bridge.extensions ?? {} });
+  const config = JSON.stringify({ script: instrumentWorkflow(script), args: structuredClone(args), extensions: bridge.extensions ?? {} });
   const childDir = mkdtempSync(join(tmpdir(), "pi-wf-"));
   const childFile = join(childDir, "child.cjs");
   writeFileSync(childFile, childSource);
@@ -856,15 +898,17 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
         const opts = validateAgentOptions(values[1]);
-        const name = typeof opts.name === "string" && opts.name.trim() ? opts.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
+        const identity = readAgentIdentity(values[2]);
+        const path = agentIdentityPath(identity);
+        const label = typeof opts.role === "string" ? opts.role : "agent";
         try {
-          const result = await bridge.agent(values[0], opts, controller.signal, typeof values[2] === "string" ? values[2] : name);
-          value = branded({ name, ok: true, value: result ?? null });
+          const result = await bridge.agent(values[0], opts, controller.signal, identity);
+          value = branded({ name: label, ok: true, value: result ?? null });
         } catch (error) {
           const code = (error instanceof WorkflowError ? error.code : typeof (error as Record<string, unknown>).code === "string" ? (error as Record<string, unknown>).code as string : "INTERNAL_ERROR") as WorkflowErrorCode;
           const typed = new WorkflowError(code, (error as Error).message);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
-          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message } });
+          value = branded({ name: label, ok: false, failedAt: path, error: { code: typed.code, message: typed.message } });
         }
       } else if (method === "checkpoint") {
         if (!bridge.checkpoint || !object(values[0])) fail("INTERNAL_ERROR", "checkpoint requires an available bridge and object input");
@@ -915,15 +959,8 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
   return { result, cancel };
 }
-function nativeSessionReference(attempt: Pick<AgentAttempt, "sessionId" | "sessionFile">, lineage?: AgentContinuationLineage): { sessionId: string; sessionFile: string; parentSessionId?: string; parentSessionFile?: string } {
-  return { sessionId: attempt.sessionId, sessionFile: attempt.sessionFile, ...(lineage ? { parentSessionId: lineage.sessionId, parentSessionFile: lineage.sessionFile } : {}) };
-}
-
-export async function persistAgentConfig(store: RunStore, id: string, config: AgentSessionConfig): Promise<void> {
-  await store.updateState((run) => {
-    if (!run.agents.some((agent) => agent.id === id)) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
-    return { ...run, agents: run.agents.map((agent) => agent.id === id ? { ...agent, sessionConfig: structuredClone(config) } : agent) };
-  });
+function nativeSessionReference(attempt: Pick<AgentAttempt, "sessionId" | "sessionFile">): { sessionId: string; sessionFile: string } {
+  return { sessionId: attempt.sessionId, sessionFile: attempt.sessionFile };
 }
 
 export async function persistActiveAgentAttempt(store: RunStore, id: string, active: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">): Promise<void> {
@@ -931,8 +968,7 @@ export async function persistActiveAgentAttempt(store: RunStore, id: string, act
     const agent = run.agents.find((candidate) => candidate.id === id);
     if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
     const accounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-    const reference = nativeSessionReference(active, agent.continuedFrom);
-    const nativeSessions = run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? run.nativeSessions : [...run.nativeSessions, reference];
+    const nativeSessions = run.nativeSessions.some(({ sessionId }) => sessionId === active.sessionId) ? run.nativeSessions : [...run.nativeSessions, nativeSessionReference(active)];
     return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: active.attempt, attemptDetails: [{ ...active, accounting }] } : candidate), nativeSessions };
   });
 }
@@ -942,9 +978,9 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
     const agent = run.agents.find((candidate) => candidate.id === id);
     if (!agent) throw new WorkflowError("INTERNAL_ERROR", `Missing production ownership record: ${id}`);
     const total = attempts.reduce((sum, attempt) => ({ input: sum.input + attempt.accounting.input, output: sum.output + attempt.accounting.output, cacheRead: sum.cacheRead + attempt.accounting.cacheRead, cacheWrite: sum.cacheWrite + attempt.accounting.cacheWrite, cost: sum.cost + attempt.accounting.cost }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
-    const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting, sessionAccounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting, ...(sessionAccounting ? { sessionAccounting } : {}) }));
+    const attemptDetails = attempts.map(({ attempt, sessionId, sessionFile, error, accounting }) => ({ attempt, sessionId, sessionFile, ...(error ? { error } : {}), accounting }));
     const sessionIds = new Set(attempts.map(({ sessionId }) => sessionId));
-    return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt, agent.continuedFrom))] };
+    return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), nativeSessions: [...run.nativeSessions.filter(({ sessionId }) => !sessionIds.has(sessionId)), ...attempts.map((attempt) => nativeSessionReference(attempt))] };
   });
 }
 
@@ -1185,66 +1221,16 @@ async function hostPipeline(rawOperation: unknown, rawItems: unknown, rawStages:
   return Object.fromEntries(results.map((result) => [result.name, result.value as JsonValue]));
 }
 
-function nextStructuralLabel(counters: Map<string, number>, label: string): string {
+function nextNamedOccurrence(counters: Map<string, number>, label: string): string {
   const count = (counters.get(label) ?? 0) + 1;
   counters.set(label, count);
   return count === 1 ? label : `${label}#${String(count)}`;
 }
 
-interface PreparedAgentOptions { source?: AgentContinuationSource; tools: readonly string[]; model?: string; thinking?: ModelSpec["thinking"]; role?: string; schema?: JsonSchema; isolation?: "worktree"; worktreeOwner?: string; cwd?: string }
-function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
-  switch (value) {
-    case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": return value;
-    default: return undefined;
-  }
-}
-
-function modelReference(model: ModelSpec): string { return `${model.provider}/${model.model}${model.thinking ? `:${model.thinking}` : ""}`; }
-
-function continuationSource(run: PersistedRun, reference: unknown): AgentContinuationSource {
-  if (typeof reference !== "string" || !reference.trim()) fail("RESUME_INCOMPATIBLE", "Continuation source must be a workflow agent name or path");
-  const matches = run.agents.filter((agent) => agent.name === reference || agent.path === reference || agent.id === reference || operationPath("agent", agent.path) === reference);
-  if (matches.length !== 1) fail("RESUME_INCOMPATIBLE", matches.length > 1 ? `Continuation source is ambiguous: ${reference}` : `Continuation source is missing from this workflow run: ${reference}`);
-  const agent = matches[0] as AgentRecord;
-  if (agent.state !== "completed") fail("RESUME_INCOMPATIBLE", `Continuation source is not completed: ${reference}`);
-  const config = agent.sessionConfig;
-  if (!config) fail("RESUME_INCOMPATIBLE", `Continuation source is unavailable or incomplete: ${reference}`);
-  const parent = agent.parentId ? run.agents.find((candidate) => candidate.id === agent.parentId) : undefined;
-  const unprovenNestedWorktree = Boolean(agent.parentId) && config.cwd !== run.cwd && config.isolation !== "worktree";
-  if ((config.isolation === "worktree" && !config.worktreeOwner) || unprovenNestedWorktree || (parent?.sessionConfig?.isolation === "worktree" && (config.isolation !== "worktree" || !config.worktreeOwner || config.worktreeOwner !== parent.sessionConfig.worktreeOwner || config.cwd !== parent.sessionConfig.cwd))) fail("RESUME_INCOMPATIBLE", `Cannot continue ${reference}: persisted worktree identity is unavailable`);
-  const attempt = agent.attemptDetails?.at(-1);
-  const native = attempt ? run.nativeSessions.find((session) => session.sessionId === attempt.sessionId && session.sessionFile === attempt.sessionFile) : undefined;
-  if (!attempt || attempt.error || !native || !existsSync(native.sessionFile)) fail("RESUME_INCOMPATIBLE", `Continuation source is unavailable or incomplete: ${reference}`);
-  return { agentId: agent.id, agentPath: agent.path, sessionId: attempt.sessionId, sessionFile: attempt.sessionFile, accounting: attempt.sessionAccounting ?? attempt.accounting, config };
-}
-
-function preparedAgentOptions(run: PersistedRun, options: Readonly<Record<string, JsonValue>>): PreparedAgentOptions | undefined {
-  if (options.continueFrom === undefined) return undefined;
-  const source = continuationSource(run, options.continueFrom);
-  const rawTools = options.tools;
-  if (rawTools !== undefined && (!Array.isArray(rawTools) || rawTools.some((tool) => typeof tool !== "string"))) fail("RESUME_INCOMPATIBLE", "Continuation tools must match the completed source");
-  const tools = rawTools === undefined ? source.config.tools : rawTools as string[];
-  const rawModel = options.model;
-  if (rawModel !== undefined && typeof rawModel !== "string") fail("RESUME_INCOMPATIBLE", "Continuation model must match the completed source");
-  const rawThinking = options.thinking;
-  const thinking = parseThinking(rawThinking);
-  if (rawThinking !== undefined && !thinking) fail("RESUME_INCOMPATIBLE", "Continuation thinking level must match the completed source");
-  const rawRole = options.role;
-  if (rawRole !== undefined && typeof rawRole !== "string") fail("RESUME_INCOMPATIBLE", "Continuation role must match the completed source");
-  const rawSchema = options.outputSchema;
-  if (rawSchema !== undefined && !object(rawSchema)) fail("RESUME_INCOMPATIBLE", "Continuation structured output must match the completed source");
-  const rawIsolation = options.isolation;
-  if (rawIsolation !== undefined && rawIsolation !== "worktree") fail("RESUME_INCOMPATIBLE", "Continuation worktree isolation must match the completed source");
-  const rawCwd = options.cwd;
-  if (rawCwd !== undefined && (typeof rawCwd !== "string" || rawCwd !== source.config.cwd)) fail("RESUME_INCOMPATIBLE", "Continuation cwd must match the completed source");
-  const rawOwner = options.worktreeOwner;
-  if (rawOwner !== undefined && (typeof rawOwner !== "string" || rawOwner !== source.config.worktreeOwner)) fail("RESUME_INCOMPATIBLE", "Continuation worktree must match the completed source");
-  if (rawIsolation !== undefined && !source.config.isolation) fail("RESUME_INCOMPATIBLE", "Continuation worktree isolation must match the completed source");
-  return { source, tools, model: rawModel ?? modelReference(source.config.model), ...(thinking ? { thinking } : {}), ...(rawRole !== undefined ? { role: rawRole } : source.config.role ? { role: source.config.role } : {}), ...(rawSchema !== undefined ? { schema: rawSchema } : source.config.schema ? { schema: source.config.schema } : {}), ...(source.config.isolation ? { isolation: source.config.isolation, ...(source.config.worktreeOwner ? { worktreeOwner: source.config.worktreeOwner } : {}), cwd: source.config.cwd } : { cwd: source.config.cwd }) };
-}
 
 function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge {
   const namespaces = workflowDslRegistry.namespaces();
+  const extensionAgentOccurrences = new Map<string, number>();
   return { ...bridge, extensions: Object.fromEntries(Object.entries(namespaces).map(([name, methods]) => [name, Object.keys(methods)])), extension: async (extension, method, input, path, signal) => {
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
@@ -1252,13 +1238,12 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
     const context: WorkflowOrchestrationContext = Object.freeze({
       agent: async (...args: readonly unknown[]) => {
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
-        const options = validateAgentOptions(args[1] === undefined ? {} : args[1], false);
-        const inherited = inheritedHostAgentPath.getStore();
-        const explicitName = options.name;
-        const name = explicitName === undefined && inherited ? inherited.at(-1) : explicitName;
-        if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "agent requires a stable explicit name");
-        const structuralName = explicitName === undefined && inherited ? operationPath(...inherited) : name;
-        return bridge.agent(args[0], { ...options, name }, signal, structuralName);
+        const options = validateAgentOptions(args[1] === undefined ? {} : args[1]);
+        const structuralPath = inheritedHostAgentPath.getStore() ?? [];
+        const key = `${path}\0${JSON.stringify(structuralPath)}`;
+        const occurrence = (extensionAgentOccurrences.get(key) ?? 0) + 1;
+        extensionAgentOccurrences.set(key, occurrence);
+        return bridge.agent(args[0], options, signal, { structuralPath: [...structuralPath], callSite: `extension:${path}`, occurrence });
       },
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
       pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
@@ -1279,6 +1264,13 @@ function withExtensions(bridge: WorkflowBridge, store: RunStore): WorkflowBridge
 function projectTrusted(ctx: unknown): boolean {
   const check = object(ctx) ? ctx.isProjectTrusted : undefined;
   return typeof check === "function" ? Boolean(Reflect.apply(check, ctx, [])) : true;
+}
+
+function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
+  switch (value) {
+    case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": return value;
+    default: return undefined;
+  }
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
@@ -1320,13 +1312,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (!runState.agents.some((agent) => agent.id === id)) return;
         run.update?.(workflowToolUpdate(runState));
       };
-      const onConfig = async (config: AgentSessionConfig) => { await scheduler.flush(); await persistAgentConfig(run.store, id, config); run.update?.(workflowToolUpdate((await run.store.load()).run)); };
       const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => {
         await scheduler.flush();
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onConfig, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.continueFrom ? { continueFrom: options.continueFrom } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), tools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1342,7 +1333,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const existing = new Map(current.agents.map((agent) => [agent.id, agent]));
       const agents = ownership.map((node) => {
         const previous = existing.get(node.id);
-        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(node.options.continueFrom ? { continuedFrom: { agentId: node.options.continueFrom.agentId, agentPath: node.options.continueFrom.agentPath, sessionId: node.options.continueFrom.sessionId, sessionFile: node.options.continueFrom.sessionFile } } : previous?.continuedFrom ? { continuedFrom: previous.continuedFrom } : {}), ...(previous?.sessionConfig ? { sessionConfig: previous.sessionConfig } : {}), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), model: { ...(node.options.model ? modelSpec(node.options.model, run.model) : run.model), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
       });
       return { ...current, agents };
     });
@@ -1363,7 +1354,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     const checkpointCounters = new Map<string, number>();
     return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
     const input = validateCheckpoint(raw);
-    const label = nextStructuralLabel(checkpointCounters, input.name);
+    const label = nextNamedOccurrence(checkpointCounters, input.name);
     const path = operationPath("checkpoint", label);
     if (foreground && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
     const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
@@ -1410,36 +1401,34 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
     },
   });
 
-  const coldResumeRun = async (run: NonNullable<ReturnType<typeof runs.get>>, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => {
+  const coldResumeRun = async (run: NonNullable<ReturnType<typeof runs.get>>, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean) => {
     const loaded = await run.store.load();
+    if (loaded.snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
+    if (loaded.snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow role definitions are missing from the launch snapshot");
+    if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
+    const missingRole = loaded.snapshot.agentTypes.find((role) => !loaded.snapshot.roles?.[role]);
+    if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
     const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond"));
     const missing = loaded.snapshot.tools.find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
     preflight(loaded.snapshot.script, { models: new Set(loaded.snapshot.models), tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), extensions: workflowDslRegistry.versions() }, loaded.snapshot.schemas, loaded.snapshot.metadata);
     await scheduler.cancelRun(run.store.runId);
     await run.lifecycle.resume();
-    const agentCounters = new Map<string, number>();
-    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal, structuralName) => {
+    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withExtensions({ agent: async (prompt, options, signal, identity) => {
       await run.lifecycle.enter();
       try {
-        const label = typeof options.name === "string" && options.name.trim() ? options.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
-        const structuralLabel = nextStructuralLabel(agentCounters, structuralName ?? label);
-        const path = operationPath("agent", structuralLabel);
+        const path = agentIdentityPath(identity);
         const replayed = await run.store.replay(path);
         if (replayed) return replayed.value;
-        if (options.continueFrom !== undefined) await scheduler.flush();
-        const current = await run.store.load();
-        const prepared = preparedAgentOptions(current.run, options);
-        const explicitTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : undefined);
-        const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
-        const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
-        const cwd = isolation ? (prepared?.source ? (await run.store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await run.store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? run.store.cwd;
-        const role = typeof options.role === "string" ? options.role : prepared?.role;
-        const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
-        const thinking = prepared?.thinking ?? parseThinking(options.thinking);
-        const tools = run.executor.resolve({ label, workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(explicitTools !== undefined ? { tools: explicitTools } : {}) }).tools;
-        const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
+        const worktreeOwner = path;
+        const cwd = isolation ? (await run.store.worktree(worktreeOwner)).cwd : run.store.cwd;
+        const role = typeof options.role === "string" ? options.role : undefined;
+        const model = typeof options.model === "string" ? options.model : undefined;
+        const thinking = parseThinking(options.thinking);
+        const tools = run.executor.resolve({ label: role ?? "agent", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) }).tools;
+        const schema = object(options.outputSchema) ? options.outputSchema : undefined;
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label: role ?? "agent", cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
@@ -1461,11 +1450,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       const model = modelSpec(loaded.snapshot.models[0] ?? "", { provider: ctx.model?.provider ?? "", model: ctx.model?.id ?? "", thinking: pi.getThinkingLevel() });
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      if (loaded.snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Interrupted workflows created before 0.3.0 must be relaunched");
-      const roleDefinitions = loaded.snapshot.roles;
-      if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !projectTrusted(ctx)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
-      const missingRole = loaded.snapshot.agentTypes.find((role) => !roleDefinitions[role]);
-      if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
+      const roleDefinitions = loaded.snapshot.roles ?? {};
       runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgentLaunches, await store.loadOwnership());
@@ -1479,7 +1464,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         if (choice && choice !== "Skip") {
           const toResume = choice === "Resume all" ? interrupted : interrupted.filter((_, i) => labels[i] === choice);
           for (const run of toResume) {
-            try { await coldResumeRun(run, true, ctx.ui); ctx.ui.notify(`Resumed workflow ${run.metadata.name}.`, "info"); }
+            try { await coldResumeRun(run, true, ctx.ui, projectTrusted(ctx)); ctx.ui.notify(`Resumed workflow ${run.metadata.name}.`, "info"); }
             catch (err) { ctx.ui.notify(`Cannot resume ${run.metadata.name}: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
           }
         }
@@ -1508,7 +1493,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
       foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
       concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
-      maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including continuations and nested agents; not concurrency" })),
+      maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including nested agents; not concurrency" })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
@@ -1547,28 +1532,21 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgentLaunches);
-      const agentCounters = new Map<string, number>();
-      const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal, structuralName) => {
+      const execution = runWorkflow(script, (params.args ?? null) as JsonValue, withExtensions({ agent: async (prompt, options, agentSignal, identity) => {
         await lifecycle.enter();
         try {
-          const label = typeof options.name === "string" && options.name.trim() ? options.name : fail("INVALID_METADATA", "agent requires a stable explicit name");
-          const structuralLabel = nextStructuralLabel(agentCounters, structuralName ?? label);
-          const path = operationPath("agent", structuralLabel);
+          const path = agentIdentityPath(identity);
           const replayed = await store.replay(path);
           if (replayed) return replayed.value;
-          if (options.continueFrom !== undefined) await scheduler.flush();
-          const loaded = await store.load();
-          const prepared = preparedAgentOptions(loaded.run, options);
-          const explicitTools = prepared?.tools ?? (Array.isArray(options.tools) && options.tools.every((tool) => typeof tool === "string") ? options.tools : undefined);
-          const isolation = prepared?.isolation ?? (options.isolation === "worktree" ? "worktree" as const : undefined);
-          const worktreeOwner = prepared?.worktreeOwner ?? structuralLabel;
-          const cwd = isolation ? (prepared?.source ? (await store.validateWorktree(worktreeOwner, prepared.cwd)).cwd : (await store.worktree(worktreeOwner)).cwd) : prepared?.cwd ?? ctx.cwd;
-          const role = prepared?.role ?? (typeof options.role === "string" ? options.role : undefined);
-          const model = prepared?.model ?? (typeof options.model === "string" ? options.model : undefined);
-          const thinking = prepared?.thinking ?? parseThinking(options.thinking);
-          const tools = executor.resolve({ label, workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(explicitTools !== undefined ? { tools: explicitTools } : {}) }).tools;
-          const schema = prepared?.schema ?? (object(options.outputSchema) ? options.outputSchema : undefined);
-          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(prepared?.source ? { continueFrom: prepared.source } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const isolation = options.isolation === "worktree" ? "worktree" as const : undefined;
+          const worktreeOwner = path;
+          const cwd = isolation ? (await store.worktree(worktreeOwner)).cwd : ctx.cwd;
+          const role = typeof options.role === "string" ? options.role : undefined;
+          const model = typeof options.model === "string" ? options.model : undefined;
+          const thinking = parseThinking(options.thinking);
+          const tools = executor.resolve({ label: role ?? "agent", workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) }).tools;
+          const schema = object(options.outputSchema) ? options.outputSchema : undefined;
+          const spawned = scheduler.spawn(runId, prompt, { label: role ?? "agent", cwd, tools, ...(isolation ? { isolation, worktreeOwner } : {}), ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
@@ -1772,7 +1750,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
       if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return; }
       if (action === "resume" && run) {
         if (run.lifecycle.state === "interrupted") {
-          await coldResumeRun(run, ctx.hasUI, ctx.ui);
+          await coldResumeRun(run, ctx.hasUI, ctx.ui, projectTrusted(ctx));
         } else await run.lifecycle.resume();
         ctx.ui.notify(`Resumed workflow ${run.store.runId}.`, "info"); return;
       }
@@ -1806,6 +1784,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 export { projectStorageKey, RunStore, runsDirectory, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAccounting, AgentAttempt, AgentContinuationLineage, AgentContinuationSource, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentSessionConfig, AgentToolCallProgress } from "./agent-execution.js";
+export type { AgentAccounting, AgentAttempt, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
 export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";
