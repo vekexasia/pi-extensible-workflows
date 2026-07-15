@@ -97,6 +97,8 @@ The worker exposes only deterministic data operations plus:
 - `checkpoint({ name, prompt, context })`
 - `extensions.<namespace>.<method>(input)`
 
+`log(message)` appends a TUI-only entry to the main transcript, capped at 4 KB. It does not enter LLM context or trigger a turn. Calls replayed during recovery may appear again.
+
 Clocks, random numbers, timers, environment/process access, imports, `require`, dynamic code generation, filesystem, and network globals are unavailable. Workflow source runs in a permissioned child process with a VM sandbox. Cancellation is immediate; a missing heartbeat for five seconds fails with `WORKER_UNRESPONSIVE`.
 
 ## Safe prompt interpolation

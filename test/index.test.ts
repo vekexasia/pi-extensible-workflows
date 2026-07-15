@@ -452,6 +452,31 @@ void test("background delivery is minimal and capped while foreground stays inli
   assert.equal(messages.length, 1);
 });
 
+void test("workflow log appends capped TUI-only transcript entries", async () => {
+  type LogData = { workflowName: string; message: string };
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-log-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const entries: Array<{ type: string; data: LogData }> = [];
+  let renderer: ((entry: { data?: LogData }, options: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
+  workflowExtension({
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    registerEntryRenderer(type: string, candidate: NonNullable<typeof renderer>) { assert.equal(type, "workflow-log"); renderer = candidate; },
+    appendEntry(type: string, data: LogData) { entries.push({ type, data }); },
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"],
+  } as never, home);
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
+  assert.ok(execute);
+  await execute("id", { name: "logger", script: `await log("working"); await log("😀".repeat(2000)); return true;`, foreground: true }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries[0], { type: "workflow-log", data: { workflowName: "logger", message: "working" } });
+  const truncated = entries[1];
+  assert.ok(truncated);
+  assert.ok(Buffer.byteLength(truncated.data.message) <= 4096);
+  assert.doesNotMatch(truncated.data.message, /�/);
+  assert.ok(renderer);
+  assert.equal(renderer({ data: entries[0].data }, {}, {}).render(100).join("\n"), "Workflow logger: working");
+});
+
 void test("run lifecycle pauses cooperatively, resumes waiters, and keeps terminal states irreversible", async () => {
   const states: string[] = [];
   const lifecycle = new RunLifecycle("running", (state) => { states.push(state); });

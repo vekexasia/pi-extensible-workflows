@@ -1141,6 +1141,8 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
 }
 
 const DELIVERY_LIMIT_BYTES = 4 * 1024;
+const WORKFLOW_LOG_ENTRY = "workflow-log";
+interface WorkflowLogEntry { workflowName: string; message: string }
 
 function completionDelivery(name: string, value: JsonValue, resultPath: string, worktrees: readonly { branch: string; path: string }[]): string {
   const locations = worktrees.length ? ` Changes: ${worktrees.map(({ branch, path }) => `${branch} (${path})`).join(", ")}.` : "";
@@ -1274,6 +1276,16 @@ function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
 }
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string) {
+  const registerEntryRenderer = (pi as unknown as Partial<Pick<ExtensionAPI, "registerEntryRenderer">>).registerEntryRenderer;
+  registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
+    const data = entry.data;
+    return textBlock(data ? `Workflow ${data.workflowName}: ${data.message}` : "");
+  });
+  const logBridge = (lifecycle: RunLifecycle, workflowName: string) => async (message: string) => {
+    await lifecycle.enter();
+    try { pi.appendEntry<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, { workflowName, message: utf8Prefix(message, DELIVERY_LIMIT_BYTES) }); }
+    finally { await lifecycle.leave(); }
+  };
   const events = (pi as unknown as { events?: ExtensionAPI["events"] }).events;
   pi.on("resources_discover", () => {
     if (!pi.getActiveTools().includes("workflow")) return;
@@ -1436,7 +1448,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
         await run.store.complete(path, outcome.value);
         return outcome.value;
       } finally { await run.lifecycle.leave(); }
-    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { await run.store.updateState((current) => ({ ...current, phase })); } finally { await run.lifecycle.leave(); } }, log: async () => { await run.lifecycle.enter(); await run.lifecycle.leave(); } }, run.store));
+    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { await run.store.updateState((current) => ({ ...current, phase })); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store));
     run.execution = execution;
     emitAsyncStarted(run.store, run.metadata);
     void execution.result.then(async () => { await scheduler.flush(); await run.lifecycle.terminal("completed"); emitAsyncComplete(run.store, "complete"); }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); await run.store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); emitAsyncComplete(run.store, run.lifecycle.state === "stopped" ? "stopped" : "failed", typed); });
@@ -1560,7 +1572,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string) {
           const run = await store.updateState((current) => ({ ...current, phase }));
           runs.get(runId)?.update?.(workflowToolUpdate(run));
         } finally { await lifecycle.leave(); }
-      }, log: async () => { await lifecycle.enter(); await lifecycle.leave(); } }, store), signal);
+      }, log: logBridge(lifecycle, checked.metadata.name) }, store), signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       if (background) emitAsyncStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => { await scheduler.flush(); await lifecycle.terminal("completed"); return value; }, async (error: unknown) => { await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); await store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); throw typed; });
