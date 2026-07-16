@@ -1693,7 +1693,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const setStatus = (ctx.ui as unknown as { setStatus?: (key: string, text?: string) => void }).setStatus;
         setStatus?.call(ctx.ui, "workflow-stop", text);
       };
-      const runAction = async (actionCommand: string, keepContext: boolean): Promise<"dashboard" | "picker" | "done"> => {
+      const runAction = async (actionCommand: string, keepContext: boolean, status: (text: string | undefined) => void = setWorkflowStatus): Promise<"dashboard" | "picker" | "done"> => {
         const [action, runId, ...rest] = actionCommand.split(/\s+/);
         try {
           const run = runId ? runs.get(runId) : undefined;
@@ -1718,9 +1718,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           if (action === "stop" && run) {
             const workflowName = stored?.loaded.run.workflowName ?? run.metadata.name;
             if (keepContext && !await ctx.ui.confirm("Stop workflow?", `Stop workflow ${workflowName} (${run.store.runId})? This cannot be undone.`)) return "dashboard";
-            if (keepContext) setWorkflowStatus(`Stopping workflow ${workflowName}...`);
+            if (keepContext) status(`Stopping workflow ${workflowName}...`);
             await run.lifecycle.terminal("stopped"); run.execution?.cancel(); await scheduler.cancelRun(run.store.runId); await scheduler.flush();
-            if (keepContext) setWorkflowStatus(`Workflow ${run.store.runId} stopped.`);
+            if (keepContext) status(`Workflow ${run.store.runId} stopped.`);
             ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return keepContext ? "dashboard" : "done";
           }
           if (keepContext && action && runId) { ctx.ui.notify(`Cannot ${action} workflow ${runId}: the run is no longer available.`, "warning"); return "dashboard"; }
@@ -1729,12 +1729,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         } catch (error) {
           if (!keepContext) throw error;
           const message = error instanceof Error ? error.message : String(error);
-          if (action === "stop") setWorkflowStatus(`Could not stop workflow ${runId ?? ""}: ${message}`);
+          if (action === "stop") status(`Could not stop workflow ${runId ?? ""}: ${message}`);
           ctx.ui.notify(`Cannot ${action ?? "workflow action"}${runId ? ` for ${runId}` : ""}: ${message}`, "warning");
           return "dashboard";
         }
       };
-      const STOP_ACTION = "__workflow_stop__";
       if (!command) {
         for (;;) {
           if (!stores.length) { ctx.ui.notify("No workflow runs in this session.", "info"); return; }
@@ -1815,6 +1814,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   let refreshing = false;
                   let disposed = false;
                   let stopRequested = false;
+                  let stopStatus: string | undefined;
                   const terminalRows = () => Math.max(1, ((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24);
                   const keyLabels: Record<string, string> = { up: "↑", down: "↓", pageUp: "pgup", pageDown: "pgdn", escape: "esc" };
                   const keyLabel = (binding: string, fallback: string) => {
@@ -1830,27 +1830,44 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     const actionViewport = Math.min(options.length, Math.max(1, Math.floor(available / 2)));
                     return { rows, hintRows, separatorRows, actionViewport, dashboardViewport: available - actionViewport };
                   };
+                  const updateDashboard = async (selectedOption: string | undefined) => {
+                    const next = await loadDashboard();
+                    if (disposed) return;
+                    view = next;
+                    options = [...view.actions.keys(), "Close"];
+                    selectedIndex = Math.max(0, options.indexOf(selectedOption ?? ""));
+                    tui.requestRender();
+                  };
                   const requestStop = () => {
                     if (stopRequested) return;
                     stopRequested = true;
-                    done(STOP_ACTION);
+                    stopStatus = undefined;
+                    setWorkflowStatus(undefined);
+                    const selectedOption = options[selectedIndex];
+                    void runAction(`stop ${store.runId}`, true, (status) => {
+                      stopStatus = status;
+                      setWorkflowStatus(status);
+                      if (!disposed) tui.requestRender();
+                    }).then(() => updateDashboard(selectedOption)).catch((error: unknown) => {
+                      if (disposed) return;
+                      stopStatus = `Could not stop workflow ${store.runId}: ${error instanceof Error ? error.message : String(error)}`;
+                      tui.requestRender();
+                    }).finally(() => {
+                      stopRequested = false;
+                      if (!disposed) tui.requestRender();
+                    });
                   };
                   const timer = setInterval(() => {
                     if (refreshing || stopRequested) return;
                     refreshing = true;
                     const selectedOption = options[selectedIndex];
-                    void loadDashboard().then((next) => {
-                      if (disposed) return;
-                      view = next;
-                      options = [...view.actions.keys(), "Close"];
-                      selectedIndex = Math.max(0, options.indexOf(selectedOption ?? ""));
-                      tui.requestRender();
-                    }).catch(() => undefined).finally(() => { refreshing = false; });
+                    void updateDashboard(selectedOption).catch(() => undefined).finally(() => { refreshing = false; });
                   }, 1000);
                   timer.unref();
                   return {
                     render(width: number) {
-                      const dashboardLines = truncateToVisualLines(theme.fg("accent", view.dashboard), Number.MAX_SAFE_INTEGER, width, 1).visualLines;
+                      const dashboard = stopStatus ? `${view.dashboard}\n\n${stopStatus}` : view.dashboard;
+                      const dashboardLines = truncateToVisualLines(theme.fg("accent", dashboard), Number.MAX_SAFE_INTEGER, width, 1).visualLines;
                       const actionLines = options.map((option, index) => truncateToVisualLines(`${index === selectedIndex ? "→ " : "  "}${option}`, Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "");
                       const layout = dashboardLayout();
                       const hint = truncateToVisualLines(theme.fg("dim", `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} navigate${dashboardLines.length > layout.dashboardViewport ? ` · ${keyLabel("tui.select.pageUp", "pgup")}/${keyLabel("tui.select.pageDown", "pgdn")} scroll` : ""} · ${keyLabel("tui.select.confirm", "enter")} select · ${keyLabel("tui.select.cancel", "esc")} close · auto-refresh 1s`), Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "";
@@ -1868,6 +1885,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     },
                     invalidate() {},
                     handleInput(data: string) {
+                      if (stopRequested) return;
                       if (keybindings.matches(data, "tui.select.up")) selectedIndex = (selectedIndex + options.length - 1) % options.length;
                       else if (keybindings.matches(data, "tui.select.down")) selectedIndex = (selectedIndex + 1) % options.length;
                       else if (keybindings.matches(data, "tui.select.pageUp")) {
@@ -1883,12 +1901,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                       else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
                       tui.requestRender();
                     },
-                    dispose() { disposed = true; clearInterval(timer); },
+                    dispose() { disposed = true; clearInterval(timer); setWorkflowStatus(undefined); },
                   };
-                })
+                }, { overlay: true })
               : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Close"]);
             if (!actionChoice || actionChoice === "Close") return;
-            if (actionChoice === STOP_ACTION) { await runAction(`stop ${store.runId}`, true); setWorkflowStatus(undefined); continue; }
             if (actionChoice === "Refresh") continue;
             if (actionChoice === "View script") {
               await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {

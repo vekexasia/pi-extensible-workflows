@@ -288,6 +288,7 @@ void test("navigator stop asks for confirmation before cancelling", async () => 
   const confirmations: string[] = [];
   let customCalls = 0;
   let disposed = false;
+  let closeNavigator = () => {};
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && commands[0]);
   const ctx = {
@@ -295,17 +296,19 @@ void test("navigator stop asks for confirmation before cancelling", async () => 
     ui: {
       notify() {}, setStatus() {}, confirm: async (_title: string, message: string) => { confirmations.push(message); return false; },
       select: async (_prompt: string, options: string[]) => options[0] ?? "Close",
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
+      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
         customCalls += 1;
-        if (customCalls > 1) return "Close";
+        assert.equal(options?.overlay, true);
         let result: string | undefined;
-        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { disposed = true; result = value; });
+        let resolveCustom!: (value: string | undefined) => void;
+        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
+        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { disposed = true; result = value; resolveCustom(value); });
+        closeNavigator = () => component.handleInput?.("tui.select.cancel");
         assert.match(component.render(200).join("\n"), /Stop/);
         component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
+        await completed;
         component.dispose?.();
-        assert.equal(disposed, true);
-        assert.equal(result, "__workflow_stop__");
         return result;
       },
     },
@@ -317,8 +320,11 @@ void test("navigator stop asks for confirmation before cancelling", async () => 
   for (let attempt = 0; attempt < 100 && confirmations.length === 0; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(confirmations.length, 1);
   assert.match(confirmations[0] ?? "", /live|run/);
+  assert.equal(disposed, false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  closeNavigator();
   await pending;
-  assert.equal(customCalls, 2);
+  assert.equal(customCalls, 1);
   assert.equal((await store.load()).run.state, "running");
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["running"]);
 });
@@ -340,8 +346,9 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
   const confirmations: string[] = [];
   const statuses: Array<string | undefined> = [];
   const notices: string[] = [];
-  let customCalls = 0;
   let componentDisposed = false;
+  let rendered = "";
+  let closeNavigator = () => {};
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && commands[0]);
   const ctx = {
@@ -349,15 +356,18 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
     ui: {
       notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async (_title: string, message: string) => { confirmations.push(message); return true; },
       select: async (_prompt: string, options: string[]) => options[0] ?? "Close",
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        customCalls += 1;
-        if (customCalls > 1) return "Close";
+      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
+        assert.equal(options?.overlay, true);
         let result: string | undefined;
-        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; });
+        let resolveCustom!: (value: string | undefined) => void;
+        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
+        const component = factory({ requestRender() { rendered = component.render(200).join("\n"); } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; resolveCustom(value); });
+        closeNavigator = () => component.handleInput?.("tui.select.cancel");
         component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
+        component.handleInput?.("tui.select.confirm");
+        await completed;
         component.dispose?.();
-        assert.equal(componentDisposed, true);
         return result;
       },
     },
@@ -371,13 +381,21 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(isCleanupStarted(), true);
-  assert.equal(componentDisposed, true);
-  assert.ok(statuses.some((status) => status?.includes("Stopping workflow")));
+  assert.equal(componentDisposed, false);
+  assert.match(rendered, /Stopping workflow live/);
   assert.equal(confirmations.length, 1);
+  assert.equal((await store.load()).run.state, "stopped");
   releaseCleanup();
+  for (let attempt = 0; attempt < 100 && !rendered.includes("Workflow run stopped."); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(rendered, /Workflow run stopped\.|state=stopped/);
+  assert.equal(componentDisposed, false);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  closeNavigator();
   await pending;
   delayedOwnership.delete(store.directory);
+  assert.equal(componentDisposed, true);
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled"]);
+  assert.ok(statuses.some((status) => status?.includes("Stopping workflow")));
   assert.ok(statuses.some((status) => status?.includes("Workflow run stopped")));
   assert.equal(statuses.at(-1), undefined);
   assert.ok(notices.some((notice) => notice.includes("Stopped workflow run.")));
@@ -1551,6 +1569,9 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
   const notices: string[] = [];
   const statuses: Array<string | undefined> = [];
   let customCalls = 0;
+  let componentDisposed = false;
+  let rendered = "";
+  let closeNavigator = () => {};
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && commands[0]);
   const ctx = {
@@ -1558,13 +1579,18 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
     ui: {
       notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async () => true,
       select: async (_prompt: string, options: string[]) => options[0] ?? "Close",
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
+      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
         customCalls += 1;
-        if (customCalls > 1) return "Close";
+        assert.equal(options?.overlay, true);
         let result: string | undefined;
-        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
+        let resolveCustom!: (value: string | undefined) => void;
+        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
+        const component = factory({ requestRender() { rendered = component.render(200).join("\n"); } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; resolveCustom(value); });
+        closeNavigator = () => component.handleInput?.("tui.select.cancel");
         component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
+        await completed;
+        component.dispose?.();
         return result;
       },
     },
@@ -1572,9 +1598,16 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
   const command = commands[0];
   assert.ok(command);
   await start({}, ctx);
-  await command.handler("", ctx as never);
-  failedOwnership.delete(store.directory);
+  const pending = command.handler("", ctx as never);
+  for (let attempt = 0; attempt < 100 && !statuses.some((status) => status?.includes("Could not stop workflow")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(statuses.some((status) => status?.includes("Could not stop workflow")));
+  assert.equal(componentDisposed, false);
+  assert.match(rendered, /scheduler cleanup failed/);
+  failedOwnership.delete(store.directory);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  closeNavigator();
+  await pending;
+  assert.equal(customCalls, 1);
   assert.ok(notices.some((notice) => notice.includes("scheduler cleanup failed")));
 });
 
