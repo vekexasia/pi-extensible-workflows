@@ -8,9 +8,9 @@ import { assertEvalScriptSafe, captureValidationReports, evalExpectationErrors, 
 
 const schema = { type: "object", properties: { answer: { type: "number" }, label: { type: "string" } }, required: ["answer", "label"], additionalProperties: false };
 void test("defines the cheap initial evaluation matrix", () => {
-  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["direct-answer", "two-agents", "required-role", "custom-model-no-tools", "custom-model-read", "role-model-mixed", "parallel", "pipeline", "mixed-parallel-pipeline", "output-schema", "multiple-workflows"]);
+  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["direct-answer", "two-agents", "required-role", "custom-model-read", "role-model-mixed", "parallel", "pipeline", "mixed-parallel-pipeline", "output-schema"]);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.every(({ timeoutMs, maxCost }) => timeoutMs === undefined && maxCost > 0), true);
-  assert.equal(INITIAL_WORKFLOW_EVAL_CASES.slice(1, -1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
+  assert.equal(INITIAL_WORKFLOW_EVAL_CASES.slice(1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
   assert.match(resolveWorkflowSkillPath(), /skills\/pi-workflows\/SKILL\.md$/);
 });
 

@@ -379,7 +379,7 @@ npm run evals -- --provider "$PROVIDER" --model "$MODEL" --case direct-answer,pa
 npm run evals -- --provider "$PROVIDER" --model "$MODEL" --spend-ceiling 0.50
 ```
 
-The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent only `read`, `grep`, and `find` inside the disposable project. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files and workflow roles are copied into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--case`, `--artifacts`, and `--pi` are supported, with optional `--timeout-ms` when a bounded run is desired.
+The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent `read`, `grep`, `find`, and `bash` inside the disposable project. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files and workflow roles are copied into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--case`, `--artifacts`, and `--pi` are supported, with optional `--timeout-ms` when a bounded run is desired.
 
 ### Ambient Tier D
 
