@@ -17,20 +17,21 @@ void test("production session_start cold-restores ownership and /workflow stop c
   const store = new RunStore(cwd, sessionId, runId, home);
   const settings = { concurrency: 1, maxAgentLaunches: 2 };
   await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
-  const options = { label: "parent", cwd, tools: ["agent"] };
-  await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { ...options, label: "child" } }]);
+  const parentOptions = { label: "parent", cwd, tools: ["agent"], model: "runtime/runtime-model" };
+  await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options: parentOptions }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { label: "child", cwd, tools: [], model: "runtime/runtime-model" } }]);
 
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const notices: string[] = [];
   const ctx = { cwd, model: { provider: "openai-codex", id: "gpt-5.6-sol" }, sessionManager: { getSessionId: () => sessionId }, ui: { notify: (message: string) => { notices.push(message); } } };
-  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["agent", "workflow"] } as never, home);
+  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && command);
   await start({}, ctx);
   await command(`stop ${runId}`, ctx);
   assert.equal((await store.load()).run.state, "stopped");
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled", "cancelled"]);
   assert.deepEqual((await store.load()).run.agents.map(({ state }) => state), ["cancelled", "cancelled"]);
+  assert.deepEqual((await store.load()).run.agents.map(({ model, tools }) => ({ model, tools })), [{ model: { provider: "runtime", model: "runtime-model", thinking: "medium" }, tools: ["agent"] }, { model: { provider: "runtime", model: "runtime-model", thinking: "medium" }, tools: [] }]);
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
 });
 
@@ -126,6 +127,8 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   assert.match(detail, /nested-role .*model=role-provider\/role-model:high role=reviewer tools=read/);
   assert.match(detail, /model-only .*model=case-provider\/model-only:medium tools=agent,read/);
   assert.match(detail, /combined .*model=case-provider\/model-and-thinking:high tools=read/);
+  assert.match(detail, /thinking-only .*model=root-provider\/root-model:low tools=agent,read/);
+  assert.match(detail, /tools-only .*model=root-provider\/root-model:medium tools=read/);
 });
 
 void test("cold resume rejects obsolete identity snapshots", async () => {
