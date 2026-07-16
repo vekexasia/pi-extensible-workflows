@@ -372,24 +372,14 @@ Direct calls and combinators return bare values. Failures propagate automaticall
 
 Deterministic eval helpers run captured inline workflow scripts through `runWorkflow` with a fake bridge, so `npm test` and `npm run check` make zero model calls. They assert only the parent Pi session: ordered assistant batches, ordered content parts, parent tool sequences, workflow-call counts, and parent token/cost usage. Captured scripts never launch real workflow agents.
 
-The gated model runner starts one isolated OS process per case, records JSON artifacts under `.tmp/workflow-evals`, enforces per-case timeouts/costs plus a run spend ceiling, and prints a compact summary. It uses Pi print/JSON mode with an isolated `HOME`, cwd, and session directory. Configure the provider and model explicitly; neither is guessed:
+The gated model runner starts one isolated OS process per case, copies the repository into a temporary project, records JSON artifacts under `.tmp/workflow-evals`, enforces per-case cost caps plus a run spend ceiling, and prints a compact summary. The parent uses a capture-only workflow tool that calls the same production validation function as the real tool boundary, returns validation failures for correction, and never creates runs or launches workflow agents. Hidden static criteria select the first production-valid candidate, then one no-tools judge evaluates case-specific semantic criteria. Artifacts retain failed calls, candidate indices, criterion evidence, and raw token, cost, tool, and validation metrics. Model runs have no timeout by default; `--timeout-ms` is available as an explicit opt-in. Configure the provider and model explicitly; neither is guessed:
 
 ```sh
 npm run evals -- --provider "$PROVIDER" --model "$MODEL" --case direct-answer,parallel
 npm run evals -- --provider "$PROVIDER" --model "$MODEL" --spend-ceiling 0.50
 ```
 
-The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent the safe `read`, `grep`, and `find` alternatives. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files are copied with mode `0600` into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--timeout-ms`, `--case`, `--artifacts`, and `--pi` are supported.
-
-The capture extension exposes the production workflow tool contract but is a no-op with a zero launch budget. Captured scripts are replayed with fake agents; retries greater than zero are rejected. Cases cover role-owned policy, explicit custom models, omitted versus empty tools, exact tool subsets, parallel/pipeline composition, and structured results.
-
-### Controlled Tier C
-
-```sh
-npm run evals:controlled
-```
-
-Tier C currently emits a deterministic JSON `skipped` result with zero launches. Real-agent execution is refused until `maxAgentLaunches` can be clamped independently of model-supplied workflow arguments at the actual production tool boundary. This entrypoint documents and tests the safety gate without spending tokens or pretending real E2E ran.
+The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent only `read`, `grep`, and `find` inside the disposable project. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files and workflow roles are copied into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--case`, `--artifacts`, and `--pi` are supported, with optional `--timeout-ms` when a bounded run is desired.
 
 ### Ambient Tier D
 

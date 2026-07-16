@@ -450,6 +450,8 @@ export interface StaticWorkflowCall {
   role: string | null;
   retries?: number | null;
   outputSchema?: JsonSchema | null;
+  options?: Readonly<Record<string, JsonValue>> | null;
+  optionKeys?: readonly string[];
 }
 
 function callArgument(call: WorkflowCall, index: number): acorn.AnyNode | undefined {
@@ -470,8 +472,14 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
     if (kind === "agent") {
       const retries = staticValue(propertyNode(options, "retries"));
       const outputSchema = staticValue(propertyNode(options, "outputSchema"));
+      const optionKeys = options?.type === "ObjectExpression" ? options.properties.flatMap((property) => {
+        if (property.type === "SpreadElement" || property.computed) return [];
+        const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+        return key ? [key] : [];
+      }) : [];
+      const knownOptions = Object.fromEntries(optionKeys.flatMap((key) => { const value = staticValue(propertyNode(options, key)); return value.known && jsonValue(value.value) ? [[key, value.value]] : []; })) as Record<string, JsonValue>;
       const base = { kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), role: staticString(propertyNode(options, "role")) };
-      return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(outputSchema.known && object(outputSchema.value) ? { outputSchema: outputSchema.value as JsonSchema } : {}) };
+      return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(outputSchema.known && object(outputSchema.value) ? { outputSchema: outputSchema.value as JsonSchema } : {}), ...(optionKeys.length ? { options: knownOptions, optionKeys } : {}) };
     }
     if (kind === "checkpoint") return { kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
     return { kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null, role: null };
@@ -594,12 +602,6 @@ export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
   maxAgentLaunches: Type.Optional(Type.Integer({ minimum: 1, description: "Total logical agent launches for the run, including nested agents; not concurrency" })),
 });
-export const CONTROLLED_EVAL_MAX_CONCURRENCY = 2;
-export const CONTROLLED_EVAL_MAX_AGENT_LAUNCHES = 2;
-export const PRODUCTION_EVAL_CAPTURE_IDENTITY = "pi-workflows-eval-production-capture-v1";
-export function controlledEvalSettings(concurrency: number | undefined, maxAgentLaunches: number | undefined): WorkflowSettings {
-  return { concurrency: Math.min(concurrency ?? DEFAULT_SETTINGS.concurrency, CONTROLLED_EVAL_MAX_CONCURRENCY), maxAgentLaunches: Math.min(maxAgentLaunches ?? DEFAULT_SETTINGS.maxAgentLaunches, CONTROLLED_EVAL_MAX_AGENT_LAUNCHES) };
-}
 
 function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
   if (!node) return false;
@@ -651,6 +653,46 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (!versionCompatible(requirement.version, actual)) fail("INCOMPATIBLE_EXTENSION", `Extension ${requirement.name} requires ${requirement.version}, found ${actual}`);
   }
   return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze(checkedSchemas) as readonly JsonSchema[], dynamicAgentRoles });
+}
+
+export interface WorkflowValidationParameters {
+  name?: string;
+  description?: string;
+  extensions?: readonly ExtensionRequirement[];
+  script?: string;
+  workflow?: string;
+}
+
+export interface WorkflowValidationContext {
+  cwd: string;
+  projectTrusted: boolean;
+  availableModels: ReadonlySet<string>;
+  rootTools: ReadonlySet<string>;
+}
+
+export interface ValidatedWorkflowLaunch {
+  script: string;
+  checked: PreflightResult;
+  agentDefinitions: Readonly<Record<string, AgentDefinition>>;
+  projectAgentDefinitions: Readonly<Record<string, AgentDefinition>>;
+  roleNames: readonly string[];
+}
+
+export function validateWorkflowLaunch(params: WorkflowValidationParameters, context: WorkflowValidationContext): ValidatedWorkflowLaunch {
+  if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
+  const definition = typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow) : undefined;
+  const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
+  if (!script) fail("INVALID_SYNTAX", "Provide script or registered workflow");
+  const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
+  if (!workflowName) fail("INVALID_METADATA", "Inline workflows require name");
+  const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}), extensions: params.extensions ?? definition?.extensions });
+  const globalAgentDefinitions = loadAgentDefinitions(context.cwd, undefined, false);
+  const projectAgentDefinitions = context.projectTrusted ? readAgentDefinitions(join(context.cwd, ".pi", "piworkflows", "roles")) : {};
+  const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
+  const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() }, [], metadata);
+  const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
+  validateRolePolicies(agentDefinitions, roleNames, context.availableModels, context.rootTools);
+  return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames };
 }
 
 function deepFreeze<T>(value: T): T {
@@ -1579,20 +1621,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const availableModels = new Set((modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond");
-      if (params.script !== undefined && params.workflow !== undefined) throw new WorkflowError("INVALID_METADATA", "Provide either script or workflow, not both");
-      const definition = typeof params.workflow === "string" ? workflowDslRegistry.workflow(params.workflow) : undefined;
-      const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
-      if (!script) throw new WorkflowError("INVALID_SYNTAX", "Provide script or registered workflow");
-      const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
-      if (!workflowName) throw new WorkflowError("INVALID_METADATA", "Inline workflows require name");
-      const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}), extensions: params.extensions ?? definition?.extensions });
       const trustedProject = projectTrusted(ctx);
-      const globalAgentDefinitions = loadAgentDefinitions(ctx.cwd, undefined, false);
-      const projectAgentDefinitions = trustedProject ? readAgentDefinitions(join(ctx.cwd, ".pi", "piworkflows", "roles")) : {};
-      const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
-      const checked = preflight(script, { models: availableModels, tools: new Set(rootTools), agentTypes: new Set(Object.keys(agentDefinitions)), extensions: workflowDslRegistry.versions() }, [], metadata);
-      const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
-      validateRolePolicies(agentDefinitions, roleNames, availableModels, new Set(rootTools));
+      const validated = validateWorkflowLaunch(params, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools) });
+      const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames } = validated;
       const runId = randomUUID();
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;

@@ -24,7 +24,6 @@
     "check": "npm run lint && npm test",
     "test:deterministic": "npm test",
     "evals": "npm run build && node dist/src/workflow-evals.js",
-    "evals:controlled": "npm run build && node dist/src/workflow-evals.js --controlled-real",
     "evals:ambient": "node -e \"if (process.env.PI_WORKFLOW_EVAL_AMBIENT !== '1') { console.error('Ambient Tier D evals are opt-in. Set PI_WORKFLOW_EVAL_AMBIENT=1 to run them.'); process.exit(1); }\" && npm run build && node dist/src/ambient-workflow-evals.js",
     "prepack": "npm run build"
   },

@@ -1,33 +1,35 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
+import { CAPTURE_ERROR_PREFIX, CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 export { resolveWorkflowSkillPath } from "./eval-capture-extension.js";
-import { inspectWorkflowScript, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall } from "./index.js";
+import { ERROR_CODES, inspectWorkflowScript, loadAgentDefinitions, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type WorkflowErrorCode } from "./index.js";
 
 export type SignificantAction = { kind: "tool"; name: string } | { kind: "text" } | { kind: "thinking" };
 export type SequenceExpectation = readonly string[] | { equals?: readonly string[]; startsWith?: readonly string[] };
 export type JsonResultType = "null" | "boolean" | "number" | "integer" | "string" | "array" | "object";
-export interface JsonResultShape { type?: JsonResultType; equals?: JsonValue; requiredKeys?: readonly string[]; propertyTypes?: Readonly<Record<string, JsonResultType>>; forbiddenProperties?: readonly string[]; count?: number; minCount?: number; properties?: Readonly<Record<string, JsonResultShape>>; }
+export interface JsonResultShape { type?: JsonResultType; equals?: JsonValue; nonEmpty?: boolean; requiredKeys?: readonly string[]; propertyTypes?: Readonly<Record<string, JsonResultType>>; forbiddenProperties?: readonly string[]; count?: number; minCount?: number; properties?: Readonly<Record<string, JsonResultShape>>; }
 export interface ExpectedReplayResult { workflowIndex?: number; equals?: JsonValue; match?: JsonResultShape }
 export interface OutputSchemaShape { type?: string; requiredKeys?: readonly string[]; propertyTypes?: Readonly<Record<string, string>>; forbiddenProperties?: readonly string[]; count?: number; minCount?: number; }
 export interface AgentPolicyExpectation {
   callIndex: number;
   role?: string;
   model?: string;
-  forbidOptions?: readonly ("role" | "model" | "thinking" | "tools")[];
+  forbidOptions?: readonly ("role" | "model" | "thinking" | "tools" | "isolation" | "retries")[];
   tools?: { mode: "omitted" | "empty" | "exact"; values?: readonly string[] };
 }
-export interface ParentAssistantBatch { index: number; parts: readonly JsonValue[]; tools: readonly string[] }
-export interface ParentToolResult { toolCallId?: string; details?: JsonValue; isError?: boolean }
+export interface AgentOrderExpectation { role?: string; model?: string; promptIncludes?: string }
+export interface DataFlowExpectation { binding: string; toAgentIndex: number }
+export interface ParentAssistantBatch { index: number; parts: readonly JsonValue[]; tools: readonly string[]; usage?: ParentUsage }
+export interface ParentToolResult { toolCallId?: string; details?: JsonValue; isError?: boolean; text?: string }
 export interface ParentUsage { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; models: readonly { model: string; cost: number }[] }
 export interface ParentOracle { assistantBatches: readonly ParentAssistantBatch[]; workflowToolResults: readonly ParentToolResult[]; skillReads: readonly string[]; firstSignificantAction?: SignificantAction; firstTool?: string; firstBatchToolSequence: readonly string[]; toolsBeforeFirstWorkflow: readonly string[]; firstWorkflowBatchToolSequence: readonly string[]; parentToolSequence: readonly string[]; workflowCallCount: number; usage: ParentUsage }
-export interface CapturedWorkflowCall { batch: number; arguments: Readonly<Record<string, JsonValue>>; script?: string }
+export interface CapturedWorkflowCall { batch: number; toolCallId?: string; arguments: JsonValue; script?: string }
 
 export interface EvalExpectations {
   firstSignificantAction?: SignificantAction;
@@ -36,24 +38,49 @@ export interface EvalExpectations {
   parentToolSequence?: SequenceExpectation;
   workflowCallCount?: number | { min?: number; max?: number };
   requiredOperations?: readonly StaticWorkflowCall["kind"][];
+  forbiddenOperations?: readonly StaticWorkflowCall["kind"][];
   requiredRoles?: readonly string[];
   minimumAgentCalls?: number;
   requireOutputSchema?: OutputSchemaShape | boolean;
   expectedResults?: readonly ExpectedReplayResult[];
   agentPolicies?: readonly AgentPolicyExpectation[];
+  requiredAgentOrder?: readonly AgentOrderExpectation[];
+  requiredDataFlow?: readonly DataFlowExpectation[];
 }
-export interface WorkflowEvalCase { id: string; prompt: string; timeoutMs: number; maxCost: number; expectations: EvalExpectations }
+export interface SemanticCriterion { id: string; description: string }
+export interface WorkflowEvalCase { id: string; prompt: string; timeoutMs?: number; maxCost: number; expectations: EvalExpectations; expectedWorkflowCalls?: number; semanticCriteria?: readonly SemanticCriterion[] }
 export interface ReplayAgentCall { prompt: string; options: Readonly<Record<string, JsonValue>>; identity: AgentIdentity }
 export interface ReplayTrace { agentCalls: readonly ReplayAgentCall[]; phases: readonly string[]; logs: readonly string[]; maxConcurrentAgents: number }
 export interface ReplayReport { script: string; result?: JsonValue; trace?: ReplayTrace; error?: string }
+export interface ProductionValidationReport { callIndex: number; valid: boolean; errorCode?: WorkflowErrorCode; message?: string }
+export interface CriterionResult { id: string; pass: boolean; evidence: string }
+export interface StaticCandidateReport { callIndices: readonly number[]; criteria: readonly CriterionResult[]; passed: boolean }
+export interface SemanticJudgeReport { criteria: readonly CriterionResult[]; usage: ParentUsage; raw: string }
 export type EvalAccounting = ParentUsage;
+export interface EvalMetrics {
+  parentUsageThroughCandidate: ParentUsage | null;
+  parentOutputTokensThroughCandidate: number | null;
+  nonWorkflowToolSequenceBeforeCandidate: readonly string[];
+  nonWorkflowToolCallCountBeforeCandidate: number;
+  workflowCallCountBeforeCandidate: number;
+  invalidWorkflowCallCount: number;
+  productionValidationErrorCodes: readonly string[];
+  candidateCallIndices: readonly number[];
+  staticCandidates: readonly StaticCandidateReport[];
+  semanticCriteria: readonly CriterionResult[];
+  anyValidCandidate: boolean;
+  requiredWorkflowCallCount: number;
+  surplusWorkflowCallCount: number;
+}
 export interface EvalCaseResult {
   id: string;
   status: "passed" | "failed" | "timed_out" | "budget_exceeded" | "skipped";
-  limits: { timeoutMs: number; maxCost: number };
+  limits: { timeoutMs?: number; maxCost: number };
   oracle?: ParentOracle;
   workflows: readonly CapturedWorkflowCall[];
-  replay: readonly ReplayReport[];
+  productionValidation: readonly ProductionValidationReport[];
+  semanticJudge?: SemanticJudgeReport;
+  metrics: EvalMetrics;
   accounting: EvalAccounting;
   accountingTrustworthy: boolean;
   diagnostics: readonly string[];
@@ -61,40 +88,26 @@ export interface EvalCaseResult {
   cleanup: { processExited: boolean; processGroupTerminated: boolean; tempRootRemoved: boolean; captureIdentityVerified: boolean; realWorkflowAgentsLaunched: number | null };
 }
 
-export const REPLAY_TIMEOUT_MS = 5_000;
 const CASE_PROCESS_GRACE_MS = 1_000;
 export const SAFE_PARENT_EVAL_TOOLS = Object.freeze(["read", "grep", "find", "workflow"] as const);
-export const CONTROLLED_REAL_E2E_REFUSAL = "Controlled Tier C real-agent E2E is refused safely: maxAgentLaunches cannot yet be clamped independently of model-supplied workflow arguments at the actual production tool boundary.";
-export interface ControlledRealE2EResult { status: "skipped"; reason: string; realWorkflowAgentsLaunched: 0 }
-export function runControlledRealE2E(): ControlledRealE2EResult {
-  return { status: "skipped", reason: CONTROLLED_REAL_E2E_REFUSAL, realWorkflowAgentsLaunched: 0 };
-}
 const EVAL_MODEL_TOKEN = "$EVAL_MODEL";
-const baseScript = (body: string) => `return ${body};`;
-const schema = { type: "object", properties: { count: { type: "number" }, summary: { type: "string" } }, required: ["count", "summary"], additionalProperties: false };
-const naturalAction = { kind: "tool", name: "workflow" } as const;
-const naturalExpectations = (expectedResults: readonly ExpectedReplayResult[], extra: EvalExpectations = {}): EvalExpectations => ({ workflowCallCount: { min: 1, max: 1 }, expectedResults, ...extra });
+const naturalExpectations = (extra: EvalExpectations = {}): EvalExpectations => ({ workflowCallCount: { min: 1 }, ...extra });
+const semantic = (description: string): readonly SemanticCriterion[] => [{ id: "intent", description }];
 
 export const INITIAL_WORKFLOW_EVAL_CASES: readonly WorkflowEvalCase[] = Object.freeze([
-  { id: "direct-answer", prompt: "Answer this directly in one short sentence: what is two plus two? Do not use tools.", timeoutMs: 30_000, maxCost: 0.1, expectations: { firstSignificantAction: { kind: "text" }, workflowCallCount: 0, parentToolSequence: [] } },
-  { id: "two-agents", prompt: "Investigate this repository from two independent angles: inspect the API surface and inspect the user-facing behavior. Combine both findings into one concise comparison.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "object", minCount: 2 } }], { minimumAgentCalls: 2 }) },
-  { id: "required-role", prompt: "Have a reviewer assess the change and return a short review. Choose the repository's reviewer role rather than improvising a role.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "string" } }], { requiredRoles: ["reviewer"], agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }] }) },
-  { id: "custom-model-no-tools", prompt: `Delegate a short synthesis to one subagent using the explicit model ${EVAL_MODEL_TOKEN}, without filesystem access and with an explicit empty tools list.`, timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "string" } }], { agentPolicies: [{ callIndex: 0, model: EVAL_MODEL_TOKEN, tools: { mode: "empty" } }] }) },
-  { id: "custom-model-read", prompt: `Delegate inspection of README.md to one subagent using the explicit model ${EVAL_MODEL_TOKEN}, with exactly the read tool and no others.`, timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "string" } }], { agentPolicies: [{ callIndex: 0, model: EVAL_MODEL_TOKEN, tools: { mode: "exact", values: ["read"] } }] }) },
-  { id: "role-model-mixed", prompt: `Obtain a reviewer-role assessment first, then use a separate subagent with the explicit model ${EVAL_MODEL_TOKEN} and tools: [] to synthesize the final text.`, timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "string" } }], { minimumAgentCalls: 2, agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }, { callIndex: 1, model: EVAL_MODEL_TOKEN, tools: { mode: "empty" } }] }) },
-  { id: "parallel", prompt: "Run the independent API and UI checks at the same time, then report both outcomes together.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "object", minCount: 2 } }], { requiredOperations: ["parallel"], minimumAgentCalls: 2 }) },
-  { id: "pipeline", prompt: "Process the API and UI artifacts through the same ordered normalization and finalization stages, preserving each item's result.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "object", minCount: 2 } }], { requiredOperations: ["pipeline"] }) },
-  { id: "mixed-parallel-pipeline", prompt: "Run the API and UI reviews concurrently, then pass each review through the same ordered summarization stage before combining the results.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "object", minCount: 2 } }], { requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2 }) },
-  { id: "output-schema", prompt: "Use one scout-role subagent for a structured report containing a numeric count and a text summary, and use that structured result in the final answer.", timeoutMs: 30_000, maxCost: 0.1, expectations: naturalExpectations([{ match: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"] } }], { requiredRoles: ["scout"], agentPolicies: [{ callIndex: 0, role: "scout", forbidOptions: ["model", "thinking", "tools"] }], requireOutputSchema: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"], count: 1 } }) },
-  { id: "multiple-workflows", prompt: "Use two separate workflow runs: one to inspect the API and one to inspect the UI. Each run should return a short textual result, then combine those results.", timeoutMs: 30_000, maxCost: 0.1, expectations: { workflowCallCount: 2, expectedResults: [{ match: { type: "string" } }, { match: { type: "string" } }] } },
- ]);
+  { id: "direct-answer", prompt: "Answer this directly in one short sentence: what is two plus two? Do not use tools.", maxCost: 0.1, expectations: { firstSignificantAction: { kind: "text" }, workflowCallCount: 0, parentToolSequence: [] }, expectedWorkflowCalls: 0 },
+  { id: "two-agents", prompt: "Investigate this repository from two independent angles: inspect the API surface and inspect the user-facing behavior. Combine both findings into one concise plain-text comparison.", maxCost: 0.1, expectations: naturalExpectations({ minimumAgentCalls: 2 }), semanticCriteria: semantic("The workflow independently inspects API and user-facing behavior, then combines both findings into one concise comparison.") },
+  { id: "required-role", prompt: "Have a reviewer assess the change and return a short review. Choose the repository's reviewer role rather than improvising a role.", maxCost: 0.1, expectations: naturalExpectations({ requiredRoles: ["reviewer"], agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }] }), semanticCriteria: semantic("A reviewer-role agent assesses the change and its result is returned.") },
+  { id: "custom-model-no-tools", prompt: `Delegate a short synthesis to one subagent using the explicit model ${EVAL_MODEL_TOKEN}, without filesystem access and with an explicit empty tools list.`, maxCost: 0.1, expectations: naturalExpectations({ agentPolicies: [{ callIndex: 0, model: EVAL_MODEL_TOKEN, tools: { mode: "empty" } }] }), semanticCriteria: semantic("One explicitly selected no-tools model performs the requested synthesis.") },
+  { id: "custom-model-read", prompt: `Delegate inspection of README.md to one subagent using the explicit model ${EVAL_MODEL_TOKEN}, with exactly the read tool and no others.`, maxCost: 0.1, expectations: naturalExpectations({ agentPolicies: [{ callIndex: 0, model: EVAL_MODEL_TOKEN, tools: { mode: "exact", values: ["read"] } }] }), semanticCriteria: semantic("The selected model reads README.md with only the read tool.") },
+  { id: "role-model-mixed", prompt: `Obtain a reviewer-role assessment first, then use a separate subagent with the explicit model ${EVAL_MODEL_TOKEN} and tools: [] to synthesize the final text.`, maxCost: 0.1, expectations: naturalExpectations({ minimumAgentCalls: 2, agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }, { callIndex: 1, model: EVAL_MODEL_TOKEN, tools: { mode: "empty" } }] }), semanticCriteria: semantic("The reviewer assessment is produced first and passed to a separate no-tools synthesis agent.") },
+  { id: "parallel", prompt: "Run the independent API and UI checks at the same time, then report both outcomes together.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel"], minimumAgentCalls: 2 }), semanticCriteria: semantic("Independent API and UI checks run in parallel and both outcomes are combined.") },
+  { id: "pipeline", prompt: "Process the API and UI artifacts through the same ordered normalization and finalization stages, preserving each item's result.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["pipeline"] }), semanticCriteria: semantic("API and UI items pass through the same ordered normalization and finalization stages.") },
+  { id: "mixed-parallel-pipeline", prompt: "Run the API and UI reviews concurrently, then pass each review through the same ordered summarization stage before combining the results.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2 }), semanticCriteria: semantic("API and UI reviews run concurrently before each follows the same ordered summarization path.") },
+  { id: "output-schema", prompt: "Use one scout-role subagent for a structured report containing a numeric count and a text summary, and use that structured result in the final answer.", maxCost: 0.1, expectations: naturalExpectations({ requiredRoles: ["scout"], agentPolicies: [{ callIndex: 0, role: "scout", forbidOptions: ["model", "thinking", "tools"] }], requireOutputSchema: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"], count: 1 } }), semanticCriteria: semantic("A scout returns the requested count/summary structure and that result feeds the final answer.") },
+  { id: "multiple-workflows", prompt: "Use two separate workflow runs: one to inspect the API and one to inspect the UI. Each run should return a short textual result, then combine those results.", maxCost: 0.1, expectations: { workflowCallCount: { min: 2 } }, expectedWorkflowCalls: 2, semanticCriteria: semantic("Two separate workflows inspect API and UI respectively and provide results that can be combined.") },
+]);
 
-export const REFERENCE_WORKFLOW_EVAL_CASES: readonly WorkflowEvalCase[] = Object.freeze([
-  { id: "reference-two-agents", prompt: `Call the workflow tool exactly once with this capture script: ${baseScript(`({ left: await agent("Read the API"), right: await agent("Read the UI") })`)}. Set foreground true. Do not call another tool.`, timeoutMs: 30_000, maxCost: 0.1, expectations: { firstSignificantAction: naturalAction, firstTool: "workflow", firstBatchToolSequence: ["workflow"], parentToolSequence: ["workflow"], workflowCallCount: 1, minimumAgentCalls: 2 } },
-  { id: "reference-reviewer", prompt: `Call the workflow tool exactly once with this capture script: ${baseScript(`await agent("Review", { role: "reviewer" })`)}. Set foreground true.`, timeoutMs: 30_000, maxCost: 0.1, expectations: { firstSignificantAction: naturalAction, firstTool: "workflow", workflowCallCount: 1, requiredRoles: ["reviewer"] } },
-  { id: "reference-combinators", prompt: `Call the workflow tool exactly once with this capture script: ${baseScript(`pipeline("reports", await parallel("review", { api: () => agent("API"), ui: () => agent("UI") }), { summarize: value => value })`)}. Set foreground true.`, timeoutMs: 30_000, maxCost: 0.1, expectations: { firstSignificantAction: naturalAction, firstTool: "workflow", workflowCallCount: 1, requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2 } },
-  { id: "reference-schema", prompt: `Call the workflow tool exactly once with this capture script: ${baseScript(`await agent("Report", { outputSchema: ${JSON.stringify(schema)} })`)}. Set foreground true.`, timeoutMs: 30_000, maxCost: 0.1, expectations: { firstSignificantAction: naturalAction, firstTool: "workflow", workflowCallCount: 1, requireOutputSchema: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"], count: 1 }, expectedResults: [{ match: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" } } }] } },
- ]);
 
 function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function isJson(value: unknown): value is JsonValue { if (value === null || typeof value === "string" || typeof value === "boolean") return true; if (typeof value === "number") return Number.isFinite(value); if (Array.isArray(value)) return value.every(isJson); return isObject(value) && Object.values(value).every(isJson); }
@@ -109,6 +122,7 @@ function countFor(value: JsonValue): number | undefined { if (Array.isArray(valu
 export function matchesJsonResult(shape: JsonResultShape, value: JsonValue): boolean {
   if (shape.equals !== undefined && !equalJson(shape.equals, value)) return false;
   if (shape.type !== undefined && !jsonTypeMatches(value, shape.type)) return false;
+  if (shape.nonEmpty && (value === "" || value === null || Array.isArray(value) && value.length === 0 || isObject(value) && Object.keys(value).length === 0)) return false;
   const objectValue = isObject(value) ? value : undefined;
   if (shape.requiredKeys && (!objectValue || shape.requiredKeys.some((key) => !Object.prototype.hasOwnProperty.call(objectValue, key)))) return false;
   if (shape.forbiddenProperties && objectValue && shape.forbiddenProperties.some((key) => Object.prototype.hasOwnProperty.call(objectValue, key))) return false;
@@ -150,15 +164,16 @@ export function extractParentOracle(entries: readonly unknown[]): ParentOracle {
     const message = entry.message;
     if (message.role === "toolResult" && message.toolName === "workflow") {
       const details = isJson(message.details) ? { details: message.details } : {};
-      workflowToolResults.push({ ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}), ...details, ...(typeof message.isError === "boolean" ? { isError: message.isError } : {}) });
+      const text = Array.isArray(message.content) ? message.content.flatMap((part) => isObject(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n") : "";
+      workflowToolResults.push({ ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}), ...details, ...(typeof message.isError === "boolean" ? { isError: message.isError } : {}), ...(text ? { text } : {}) });
       continue;
     }
     if (message.role !== "assistant") continue;
     const rawParts = Array.isArray(message.content) ? message.content : [];
     const parts = rawParts.filter(isJson);
     const tools = parts.flatMap((part) => isObject(part) && part.type === "toolCall" && typeof part.name === "string" ? [part.name] : []);
-    batches.push({ index: batches.length, parts, tools });
     const usage = usageFrom(message);
+    batches.push({ index: batches.length, parts, tools, ...(usage ? { usage: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, totalTokens: usage.totalTokens, cost: usage.cost, models: [{ model: usage.model, cost: usage.cost }] } } : {}) });
     if (usage) {
       totals.input += usage.input; totals.output += usage.output; totals.cacheRead += usage.cacheRead; totals.cacheWrite += usage.cacheWrite; totals.totalTokens += usage.totalTokens; totals.cost += usage.cost;
       modelCosts.set(usage.model, (modelCosts.get(usage.model) ?? 0) + usage.cost);
@@ -187,25 +202,50 @@ export function extractParentOracleFile(path: string): ParentOracle {
   return extractParentOracle(entries);
 }
 
+function resultForCall(oracle: ParentOracle, call: CapturedWorkflowCall, callIndex: number): ParentToolResult | undefined {
+  return call.toolCallId ? oracle.workflowToolResults.find(({ toolCallId }) => toolCallId === call.toolCallId) ?? oracle.workflowToolResults[callIndex] : oracle.workflowToolResults[callIndex];
+}
+
 export function extractCapturedWorkflows(oracle: ParentOracle): CapturedWorkflowCall[] {
+  let callIndex = 0;
   return oracle.assistantBatches.flatMap((batch) => batch.parts.flatMap((part) => {
     if (!isObject(part) || part.type !== "toolCall" || part.name !== "workflow") return [];
-    const args = asJsonObject(part.arguments);
-    if (!args) return [];
-    return [{ batch: batch.index, arguments: args, ...(typeof args.script === "string" ? { script: args.script } : {}) }];
+    const index = callIndex++;
+    const args = isJson(part.arguments) ? part.arguments : null;
+    const toolCallId = typeof part.id === "string" ? part.id : undefined;
+    const call = { batch: batch.index, ...(toolCallId ? { toolCallId } : {}), arguments: args };
+    const result = resultForCall(oracle, call, index);
+    const details = result ? asJsonObject(result.details) : undefined;
+    const validation = details && isObject(details.validation) ? details.validation : undefined;
+    const validatedScript = validation && typeof validation.script === "string" ? validation.script : undefined;
+    const argsObject = asJsonObject(args);
+    return [{ ...call, ...(typeof argsObject?.script === "string" ? { script: argsObject.script } : validatedScript ? { script: validatedScript } : {}) }];
   }));
 }
 
-function captureIdentityErrors(oracle: ParentOracle, workflowCount: number): { errors: string[]; verified: boolean; launches: number | null } {
-  if (oracle.workflowToolResults.length !== workflowCount) return { errors: [`capture identity had ${String(oracle.workflowToolResults.length)} workflow tool results for ${String(workflowCount)} calls`], verified: false, launches: null };
-  let launches = 0;
+function validationErrorCode(text: string): WorkflowErrorCode | undefined {
+  const prefixed = text.match(new RegExp(`${CAPTURE_ERROR_PREFIX}([A-Z_]+):`))?.[1];
+  if (prefixed && ERROR_CODES.includes(prefixed as WorkflowErrorCode)) return prefixed as WorkflowErrorCode;
+  return ERROR_CODES.find((code) => text.includes(code));
+}
+
+export function captureValidationReports(oracle: ParentOracle, calls: readonly CapturedWorkflowCall[]): { reports: ProductionValidationReport[]; errors: string[]; verified: boolean } {
   const errors: string[] = [];
-  for (const result of oracle.workflowToolResults) {
-    const details = asJsonObject(result.details);
-    if (result.isError || !details || details.captureIdentity !== CAPTURE_IDENTITY || details.realWorkflowAgentsLaunched !== 0) { errors.push("parent workflow toolResult did not prove capture-only identity"); continue; }
-    launches += 0;
-  }
-  return { errors, verified: errors.length === 0, launches: errors.length === 0 ? launches : null };
+  const reports = calls.map((call, callIndex): ProductionValidationReport => {
+    const result = resultForCall(oracle, call, callIndex);
+    const details = result ? asJsonObject(result.details) : undefined;
+    const validation = details && isObject(details.validation) ? details.validation : undefined;
+    if (result && !result.isError && details?.captureIdentity === CAPTURE_IDENTITY && details.realWorkflowAgentsLaunched === 0 && validation?.valid === true) return { callIndex, valid: true };
+    const text = result?.text ?? "";
+    if (result?.isError) {
+      const errorCode = validationErrorCode(text);
+      return { callIndex, valid: false, ...(errorCode ? { errorCode } : {}), ...(text ? { message: text } : {}) };
+    }
+    errors.push(`workflow ${String(callIndex)} did not return a recognized production-validation capture result`);
+    return { callIndex, valid: false, ...(text ? { message: text } : {}) };
+  });
+  if (oracle.workflowToolResults.length !== calls.length) errors.push(`capture had ${String(oracle.workflowToolResults.length)} workflow tool results for ${String(calls.length)} calls`);
+  return { reports, errors, verified: errors.length === 0 };
 }
 
 export function evalExpectationErrors(oracle: ParentOracle, expectations: EvalExpectations): string[] {
@@ -262,6 +302,84 @@ export function replayExpectationErrors(calls: readonly CapturedWorkflowCall[], 
     if (expected.match && !matchesJsonResult(expected.match, report.result)) errors.push(`replay result ${String(index)} did not match the expected shape`);
   }
   return errors;
+}
+
+function staticCallRows(calls: readonly CapturedWorkflowCall[]): Array<{ call: StaticWorkflowCall; source: string }> {
+  return calls.flatMap(({ script }) => {
+    if (!script) return [];
+    try { return inspectWorkflowScript(script).map((call) => ({ call, source: script.slice(call.start, call.end) })); }
+    catch { return []; }
+  });
+}
+
+export function staticExpectationResults(calls: readonly CapturedWorkflowCall[], expectations: EvalExpectations): CriterionResult[] {
+  const rows = staticCallRows(calls);
+  const staticCalls = rows.map(({ call }) => call);
+  const agentRows = rows.filter(({ call }) => call.kind === "agent");
+  const agentCalls = agentRows.map(({ call }) => call);
+  const results: CriterionResult[] = [];
+  const add = (id: string, pass: boolean, evidence: string) => { results.push({ id, pass, evidence }); };
+  if (calls.some((call) => !call.script)) add("script", false, "A selected workflow had no resolved script.");
+  for (const kind of expectations.requiredOperations ?? []) add(`operation:${kind}`, staticCalls.some((call) => call.kind === kind), `Required ${kind} operation.`);
+  for (const kind of expectations.forbiddenOperations ?? []) add(`forbidden-operation:${kind}`, !staticCalls.some((call) => call.kind === kind), `Forbidden ${kind} operation.`);
+  for (const role of expectations.requiredRoles ?? []) add(`role:${role}`, agentCalls.some((call) => call.role === role), `Required agent role ${role}.`);
+  if (expectations.minimumAgentCalls !== undefined) add("minimum-agent-calls", agentCalls.length >= expectations.minimumAgentCalls, `Found ${String(agentCalls.length)} static agent calls; required ${String(expectations.minimumAgentCalls)}.`);
+  for (const policy of expectations.agentPolicies ?? []) {
+    const call = agentCalls[policy.callIndex];
+    const options = call?.options ?? {};
+    const optionKeys = new Set(call?.optionKeys ?? Object.keys(options));
+    const failures: string[] = [];
+    if (!call) failures.push("missing call");
+    if (call && policy.role !== undefined && call.role !== policy.role) failures.push(`role ${JSON.stringify(call.role)}`);
+    if (call && policy.model !== undefined && call.model !== policy.model) failures.push(`model ${JSON.stringify(call.model)}`);
+    for (const option of policy.forbidOptions ?? []) if (optionKeys.has(option)) failures.push(`specified ${option}`);
+    if (policy.tools) {
+      const present = optionKeys.has("tools");
+      const tools = Array.isArray(options.tools) ? options.tools : [];
+      if (policy.tools.mode === "omitted" && present) failures.push("tools present");
+      if (policy.tools.mode === "empty" && (!present || tools.length !== 0)) failures.push("tools not empty");
+      if (policy.tools.mode === "exact" && (!present || JSON.stringify(tools) !== JSON.stringify(policy.tools.values ?? []))) failures.push(`tools ${JSON.stringify(tools)}`);
+    }
+    add(`agent-policy:${String(policy.callIndex)}`, failures.length === 0, failures.length ? failures.join(", ") : "Agent policy matched.");
+  }
+  if (expectations.requireOutputSchema) {
+    const schemas = agentCalls.flatMap((call) => call.outputSchema ? [call.outputSchema] : []);
+    const shape = expectations.requireOutputSchema;
+    const pass = typeof shape === "boolean" ? schemas.length > 0 : (shape.count === undefined || schemas.length === shape.count) && (shape.minCount === undefined || schemas.length >= shape.minCount) && schemas.some((schemaValue) => matchesOutputSchemaShape(shape, schemaValue));
+    add("output-schema", pass, `Found ${String(schemas.length)} matching candidate schemas.`);
+  }
+  if (expectations.requiredAgentOrder) {
+    const order = expectations.requiredAgentOrder;
+    const pass = order.every((expected, index) => { const call = agentCalls[index]; return Boolean(call) && (expected.role === undefined || call?.role === expected.role) && (expected.model === undefined || call?.model === expected.model) && (expected.promptIncludes === undefined || call?.prompt?.includes(expected.promptIncludes)); });
+    add("agent-order", pass, `Checked ${String(order.length)} ordered agent selectors.`);
+  }
+  for (const flow of expectations.requiredDataFlow ?? []) {
+    const source = agentRows[flow.toAgentIndex]?.source ?? "";
+    const escaped = flow.binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pass = new RegExp(`prompt\\s*\\([\\s\\S]*\\{${escaped}\\}[\\s\\S]*\\{[\\s\\S]*\\b${escaped}\\b`).test(source);
+    add(`data-flow:${flow.binding}:${String(flow.toAgentIndex)}`, pass, `Expected prompt interpolation of ${flow.binding} into agent ${String(flow.toAgentIndex)}.`);
+  }
+  return results;
+}
+
+function combinations(values: readonly number[], count: number, start = 0, prefix: readonly number[] = []): number[][] {
+  if (prefix.length === count) return [[...prefix]];
+  const output: number[][] = [];
+  for (let index = start; index <= values.length - (count - prefix.length); index += 1) output.push(...combinations(values, count, index + 1, [...prefix, values[index] as number]));
+  return output;
+}
+
+export function selectStaticCandidate(calls: readonly CapturedWorkflowCall[], validations: readonly ProductionValidationReport[], expectations: EvalExpectations, requiredCount = 1): { callIndices: readonly number[]; reports: readonly StaticCandidateReport[] } {
+  if (requiredCount === 0) return { callIndices: [], reports: [] };
+  const validIndices = validations.filter(({ valid }) => valid).map(({ callIndex }) => callIndex);
+  const reports: StaticCandidateReport[] = [];
+  for (const callIndices of combinations(validIndices, requiredCount)) {
+    const criteria = staticExpectationResults(callIndices.map((index) => calls[index] as CapturedWorkflowCall), expectations);
+    const report = { callIndices, criteria, passed: criteria.every(({ pass }) => pass) };
+    reports.push(report);
+    if (report.passed) return { callIndices, reports };
+  }
+  return { callIndices: [], reports };
 }
 
 export function assertEvalScriptSafe(script: string): void {
@@ -354,11 +472,90 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
   child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
   child.once("error", (error: Error) => { spawnError = error.message; });
   const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
-  const exitCode = await close; clearTimeout(timer);
+  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
+  const exitCode = await close; if (timer) clearTimeout(timer);
   if (lineBuffer) inspectLine(lineBuffer);
   if (killPromise) processGroupTerminated ||= await killPromise;
   return { exitCode, timedOut, budgetExceeded, processGroupTerminated, stderr, ...(spawnError ? { error: spawnError } : {}) };
+}
+
+function addUsage(left: ParentUsage, right: ParentUsage): ParentUsage {
+  const models = new Map<string, number>();
+  for (const item of [...left.models, ...right.models]) models.set(item.model, (models.get(item.model) ?? 0) + item.cost);
+  return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, totalTokens: left.totalTokens + right.totalTokens, cost: left.cost + right.cost, models: [...models].map(([model, cost]) => ({ model, cost })) };
+}
+
+export function parseSemanticJudge(raw: string, criteria: readonly SemanticCriterion[]): CriterionResult[] {
+  const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+  const parsed = JSON.parse(cleaned) as unknown;
+  const parsedCriteria = isObject(parsed) ? parsed.criteria : undefined;
+  if (!Array.isArray(parsedCriteria)) throw new Error("Semantic judge must return a criteria array.");
+  const criteriaValues = parsedCriteria as unknown[];
+  return criteria.map(({ id }) => {
+    const item = criteriaValues.find((candidate) => isObject(candidate) && candidate.id === id);
+    if (!isObject(item) || typeof item.pass !== "boolean" || typeof item.evidence !== "string" || !item.evidence.trim()) throw new Error(`Semantic judge omitted criterion ${id}.`);
+    return { id, pass: item.pass, evidence: item.evidence.trim() };
+  });
+}
+
+interface JudgeProcessResult extends PiRunResult { raw: string; usage: ParentUsage }
+
+function semanticJudgePrompt(evalCase: WorkflowEvalCase, calls: readonly CapturedWorkflowCall[], cwd: string, home: string): string {
+  const roles = loadAgentDefinitions(cwd, join(home, ".pi"));
+  const usedRoles = new Set(calls.flatMap(({ script }) => { try { return script ? inspectWorkflowScript(script).flatMap((call) => call.kind === "agent" && call.role ? [call.role] : []) : []; } catch { return []; } }));
+  const roleText = [...usedRoles].map((role) => `${role}: ${roles[role]?.description ?? "no description"}`).join("\n") || "none";
+  const docs = "agent(prompt, options) delegates; parallel(name, tasks) runs independent tasks concurrently; pipeline(name, items, stages) applies ordered stages; prompt(template, data) carries values into prompts. A role owns model/thinking/tools policy.";
+  return `Judge whether the captured workflow design satisfies each criterion. Do not execute it. Return only JSON: {"criteria":[{"id":"criterion id","pass":true,"evidence":"specific script evidence"}]}.\n\nOriginal request:\n${evalCase.prompt}\n\nCriteria:\n${JSON.stringify(evalCase.semanticCriteria ?? [])}\n\nDSL:\n${docs}\n\nRelevant roles:\n${roleText}\n\nCaptured workflow script(s):\n${calls.map((call, index) => `--- ${String(index)} ---\n${call.script ?? "<missing>"}`).join("\n")}`;
+}
+
+async function runSemanticJudge(input: CaptureCaseInput, calls: readonly CapturedWorkflowCall[], cwd: string, home: string, sessionDir: string, maxCost: number): Promise<JudgeProcessResult> {
+  const args = ["--offline", "--no-extensions", "--no-skills", "--no-context-files", "--no-tools", "--mode", "json", "--session-dir", sessionDir, "--session-id", randomUUID()];
+  if (input.model.includes("/")) args.push("--model", input.model); else { if (input.provider) args.push("--provider", input.provider); args.push("--model", input.model); }
+  args.push("--thinking", "off", "--print", semanticJudgePrompt(input.case, calls, cwd, home));
+  const controller = new AbortController();
+  let timedOut = false; let budgetExceeded = false; let processGroupTerminated = false; let stderr = ""; let spawnError: string | undefined; let killPromise: Promise<boolean> | undefined; let lineBuffer = ""; let raw = ""; let usage = emptyAccounting();
+  const child = spawn(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, { cwd, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), PI_CODING_AGENT_SESSION_DIR: sessionDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], signal: controller.signal });
+  const requestKill = (): Promise<boolean> => { killPromise ??= killProcessGroup(child); return killPromise; };
+  const inspectLine = (line: string) => {
+    try {
+      const event: unknown = JSON.parse(line);
+      if (!isObject(event) || event.type !== "message_end" || !isObject(event.message) || event.message.role !== "assistant") return;
+      const measured = usageFrom(event.message);
+      if (measured) usage = addUsage(usage, { input: measured.input, output: measured.output, cacheRead: measured.cacheRead, cacheWrite: measured.cacheWrite, totalTokens: measured.totalTokens, cost: measured.cost, models: [{ model: measured.model, cost: measured.cost }] });
+      if (Array.isArray(event.message.content)) raw = event.message.content.flatMap((part) => isObject(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n");
+      if (usage.cost > maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+    } catch { /* Ignore diagnostics in the JSON stream. */ }
+  };
+  child.stdout.on("data", (chunk: Buffer) => { lineBuffer += chunk.toString(); const lines = lineBuffer.split("\n"); lineBuffer = lines.pop() ?? ""; for (const line of lines) if (line) inspectLine(line); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
+  child.once("error", (error: Error) => { spawnError = error.message; });
+  const close = new Promise<number | null>((resolve) => { child.once("close", resolve); });
+  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
+  const exitCode = await close; if (timer) clearTimeout(timer); if (lineBuffer) inspectLine(lineBuffer); if (killPromise) processGroupTerminated ||= await killPromise;
+  return { raw, usage, exitCode, timedOut, budgetExceeded, processGroupTerminated, stderr, ...(spawnError ? { error: spawnError } : {}) };
+}
+
+function seedEvalProject(cwd: string, home: string, model: string): void {
+  const source = process.env.PI_WORKFLOW_EVAL_SOURCE_PROJECT_DIR;
+  if (!source) return;
+  const excluded = new Set([".git", "node_modules", "dist", ".tmp"]);
+  for (const entry of readdirSync(source)) {
+    if (excluded.has(entry)) continue;
+    cpSync(join(source, entry), join(cwd, entry), { recursive: true, filter: (path) => !excluded.has(basename(path)) });
+  }
+  const roles = join(source, ".pi", "piworkflows", "roles");
+  const roleTargets = [join(home, ".pi", "piworkflows", "roles"), join(cwd, ".pi", "piworkflows", "roles")];
+  if (!existsSync(roles)) return;
+  cpSync(roles, roleTargets[0] as string, { recursive: true });
+  for (const target of roleTargets) {
+    if (!existsSync(target)) continue;
+    for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
+      const path = join(target, name);
+      const content = readFileSync(path, "utf8");
+      const frontmatterEnd = content.startsWith("---\n") ? content.indexOf("\n---", 4) : -1;
+      if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
+    }
+  }
 }
 
 async function findParentSession(cwd: string, sessionDir: string, sessionId: string): Promise<string | undefined> {
@@ -378,7 +575,8 @@ async function findParentSession(cwd: string, sessionDir: string, sessionId: str
 }
 
 function emptyAccounting(cost = 0): EvalAccounting { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost, models: [] }; }
-function resultFromFailure(input: CaptureCaseInput, status: EvalCaseResult["status"], errors: readonly string[], processExited = true, processGroupTerminated = false, diagnostics: readonly string[] = [], cost = 0): EvalCaseResult { return { id: input.case.id, status, limits: { timeoutMs: input.case.timeoutMs, maxCost: input.maxCost }, workflows: [], replay: [], accounting: emptyAccounting(cost), accountingTrustworthy: false, diagnostics, errors, cleanup: { processExited, processGroupTerminated, tempRootRemoved: false, captureIdentityVerified: false, realWorkflowAgentsLaunched: null } }; }
+function emptyMetrics(requiredWorkflowCallCount = 1): EvalMetrics { return { parentUsageThroughCandidate: null, parentOutputTokensThroughCandidate: null, nonWorkflowToolSequenceBeforeCandidate: [], nonWorkflowToolCallCountBeforeCandidate: 0, workflowCallCountBeforeCandidate: 0, invalidWorkflowCallCount: 0, productionValidationErrorCodes: [], candidateCallIndices: [], staticCandidates: [], semanticCriteria: [], anyValidCandidate: false, requiredWorkflowCallCount, surplusWorkflowCallCount: 0 }; }
+function resultFromFailure(input: CaptureCaseInput, status: EvalCaseResult["status"], errors: readonly string[], processExited = true, processGroupTerminated = false, diagnostics: readonly string[] = [], cost = 0): EvalCaseResult { const required = input.case.expectedWorkflowCalls ?? (input.case.expectations.workflowCallCount === 0 ? 0 : 1); return { id: input.case.id, status, limits: { ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs }), maxCost: input.maxCost }, workflows: [], productionValidation: [], metrics: emptyMetrics(required), accounting: emptyAccounting(cost), accountingTrustworthy: false, diagnostics, errors, cleanup: { processExited, processGroupTerminated, tempRootRemoved: false, captureIdentityVerified: false, realWorkflowAgentsLaunched: null } }; }
 
 function withTempRootRemoved(result: EvalCaseResult): EvalCaseResult { return { ...result, cleanup: { ...result.cleanup, tempRootRemoved: true } }; }
 
@@ -397,13 +595,29 @@ function seedPiIdentity(home: string): void {
   }
 }
 
+function usageThroughCandidate(oracle: ParentOracle, calls: readonly CapturedWorkflowCall[], indices: readonly number[]): ParentUsage | null {
+  const last = indices.at(-1);
+  if (last === undefined) return null;
+  return oracle.assistantBatches.filter(({ index }) => index <= (calls[last]?.batch ?? -1)).reduce((sum, batch) => addUsage(sum, batch.usage ?? emptyAccounting()), emptyAccounting());
+}
+
+function preliminaryTools(oracle: ParentOracle, firstCandidateIndex: number | undefined): string[] {
+  if (firstCandidateIndex === undefined) return [];
+  let seen = 0; const tools: string[] = [];
+  for (const tool of oracle.parentToolSequence) {
+    if (tool === "workflow") { if (seen === firstCandidateIndex) break; seen += 1; }
+    else tools.push(tool);
+  }
+  return tools;
+}
+
 export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCaseResult> {
   const root = mkdtempSync(join(process.env.PI_WORKFLOW_EVAL_CASE_ROOT ?? tmpdir(), "pi-workflow-capture-"));
   const cwd = join(root, "project"); const home = join(root, "home"); const sessionDir = join(root, "sessions"); const sessionId = randomUUID();
   try {
-    mkdirSync(cwd, { recursive: true }); mkdirSync(home, { recursive: true }); mkdirSync(sessionDir, { recursive: true }); seedPiIdentity(home);
+    mkdirSync(cwd, { recursive: true }); mkdirSync(home, { recursive: true }); mkdirSync(sessionDir, { recursive: true }); seedPiIdentity(home); seedEvalProject(cwd, home, input.model.includes("/") ? input.model : input.provider ? `${input.provider}/${input.model}` : input.model);
     const pi = await runPiCapture(input, cwd, home, sessionDir, sessionId);
-    const diagnostics = [pi.stderr, pi.error ? `Pi capture process error: ${pi.error}` : ""].filter(Boolean);
+    const diagnostics = [pi.stderr, pi.error ? `Pi process error: ${pi.error}` : ""].filter(Boolean);
     const sessionFile = await findParentSession(cwd, sessionDir, sessionId);
     if (!sessionFile) {
       const status = pi.timedOut ? "timed_out" : pi.budgetExceeded ? "budget_exceeded" : "failed";
@@ -411,25 +625,57 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
     }
     const oracle = extractParentOracleFile(sessionFile);
     const workflows = extractCapturedWorkflows(oracle);
-    const identity = captureIdentityErrors(oracle, workflows.length);
+    const validation = captureValidationReports(oracle, workflows);
+    const requiredCount = input.case.expectedWorkflowCalls ?? (input.case.expectations.workflowCallCount === 0 ? 0 : 1);
+    const selection = selectStaticCandidate(workflows, validation.reports, input.case.expectations, requiredCount);
     const unsafeTool = oracle.parentToolSequence.find((tool) => !SAFE_PARENT_EVAL_TOOLS.includes(tool as (typeof SAFE_PARENT_EVAL_TOOLS)[number]));
-    const errors = [...evalExpectationErrors(oracle, input.case.expectations), ...identity.errors, ...(unsafeTool ? [`parent tool is outside the safe eval allowlist: ${unsafeTool}`] : [])];
-    const replayController = new AbortController();
-    const replayTimer = setTimeout(() => { replayController.abort(); }, REPLAY_TIMEOUT_MS);
-    let replay: ReplayReport[];
-    try { replay = await replayCapturedWorkflows(workflows, null, replayController.signal); } finally { clearTimeout(replayTimer); }
-    errors.push(...replayExpectationErrors(workflows, replay, input.case.expectations));
-    for (const report of replay) if (report.error) errors.push(`replay failed: ${report.error}`);
-    const replayTimedOut = replayController.signal.aborted;
-    const status: EvalCaseResult["status"] = pi.timedOut || replayTimedOut ? "timed_out" : pi.budgetExceeded ? "budget_exceeded" : errors.length || pi.exitCode !== 0 ? "failed" : "passed";
-    const result: EvalCaseResult = { id: input.case.id, status, limits: { timeoutMs: input.case.timeoutMs, maxCost: input.maxCost }, oracle, workflows, replay, accounting: oracle.usage, accountingTrustworthy: !pi.timedOut && !replayTimedOut && pi.exitCode === 0, diagnostics, errors, cleanup: { processExited: pi.exitCode !== null, processGroupTerminated: pi.processGroupTerminated, tempRootRemoved: false, captureIdentityVerified: identity.verified, realWorkflowAgentsLaunched: identity.launches } };
+    const errors = [...evalExpectationErrors(oracle, input.case.expectations), ...validation.errors, ...(unsafeTool ? [`parent tool is outside the safe eval allowlist: ${unsafeTool}`] : [])];
+    if (requiredCount > 0 && selection.callIndices.length === 0) errors.push("Catastrophic validity failure: no production-valid workflow candidate satisfied static expectations.");
+    let judge: SemanticJudgeReport | undefined;
+    let judgeProcess: JudgeProcessResult | undefined;
+    if (selection.callIndices.length > 0) {
+      const criteria = input.case.semanticCriteria ?? semantic("The workflow design is semantically appropriate for the original request.");
+      const judgeCase = { ...input.case, semanticCriteria: criteria };
+      judgeProcess = await runSemanticJudge({ ...input, case: judgeCase }, selection.callIndices.map((index) => workflows[index] as CapturedWorkflowCall), cwd, home, sessionDir, Math.max(0, input.maxCost - oracle.usage.cost));
+      diagnostics.push(judgeProcess.stderr, judgeProcess.error ? `Judge process error: ${judgeProcess.error}` : "");
+      if (judgeProcess.exitCode !== 0 || judgeProcess.error) errors.push("Semantic judge process failed.");
+      else {
+        try {
+          const criterionResults = parseSemanticJudge(judgeProcess.raw, criteria);
+          judge = { criteria: criterionResults, usage: judgeProcess.usage, raw: judgeProcess.raw };
+          if (criterionResults.some(({ pass }) => !pass)) errors.push("Semantic judge rejected one or more criteria.");
+        } catch (error) { errors.push(`Invalid semantic judge output: ${error instanceof Error ? error.message : String(error)}`); }
+      }
+    }
+    const parentUsageThroughCandidate = usageThroughCandidate(oracle, workflows, selection.callIndices);
+    const before = preliminaryTools(oracle, selection.callIndices[0]);
+    const accounting = addUsage(oracle.usage, judgeProcess?.usage ?? emptyAccounting());
+    const metrics: EvalMetrics = {
+      parentUsageThroughCandidate,
+      parentOutputTokensThroughCandidate: parentUsageThroughCandidate?.output ?? null,
+      nonWorkflowToolSequenceBeforeCandidate: before,
+      nonWorkflowToolCallCountBeforeCandidate: before.length,
+      workflowCallCountBeforeCandidate: selection.callIndices[0] ?? oracle.workflowCallCount,
+      invalidWorkflowCallCount: validation.reports.filter(({ valid }) => !valid).length,
+      productionValidationErrorCodes: validation.reports.flatMap(({ errorCode }) => errorCode ? [errorCode] : []),
+      candidateCallIndices: selection.callIndices,
+      staticCandidates: selection.reports,
+      semanticCriteria: judge?.criteria ?? [],
+      anyValidCandidate: selection.callIndices.length > 0,
+      requiredWorkflowCallCount: requiredCount,
+      surplusWorkflowCallCount: Math.max(0, validation.reports.filter(({ valid }) => valid).length - requiredCount),
+    };
+    const timedOut = pi.timedOut || Boolean(judgeProcess?.timedOut);
+    const overBudget = pi.budgetExceeded || Boolean(judgeProcess?.budgetExceeded) || accounting.cost > input.maxCost;
+    const status: EvalCaseResult["status"] = timedOut ? "timed_out" : overBudget ? "budget_exceeded" : errors.length || pi.exitCode !== 0 ? "failed" : "passed";
+    const result: EvalCaseResult = { id: input.case.id, status, limits: { ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs }), maxCost: input.maxCost }, oracle, workflows, productionValidation: validation.reports, ...(judge ? { semanticJudge: judge } : {}), metrics, accounting, accountingTrustworthy: !timedOut && pi.exitCode === 0 && (!judgeProcess || judgeProcess.exitCode === 0), diagnostics: diagnostics.filter(Boolean), errors, cleanup: { processExited: pi.exitCode !== null && (!judgeProcess || judgeProcess.exitCode !== null), processGroupTerminated: pi.processGroupTerminated || Boolean(judgeProcess?.processGroupTerminated), tempRootRemoved: false, captureIdentityVerified: validation.verified, realWorkflowAgentsLaunched: validation.verified ? 0 : null } };
     return withTempRootRemoved(result);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }
 
-export interface IsolatedProcessOptions { childPath: string; timeoutMs: number; env?: NodeJS.ProcessEnv }
+export interface IsolatedProcessOptions { childPath: string; timeoutMs?: number; env?: NodeJS.ProcessEnv }
 export interface IsolatedProcessResult<T> { value?: T; timedOut: boolean; exitCode: number | null; processGroupTerminated: boolean; stderr: string; error?: string }
 export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedProcessOptions): Promise<IsolatedProcessResult<T>> {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-case-")); const inputPath = join(root, "input.json"); const outputPath = join(root, "output.json");
@@ -441,8 +687,8 @@ export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedP
     child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
     child.once("error", (error: Error) => { processError = error.message; });
     const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); killPromise ??= killProcessGroup(child); void killPromise.then((terminated) => { processGroupTerminated ||= terminated; }); }, options.timeoutMs);
-    const exitCode = await close; clearTimeout(timer);
+    const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); killPromise ??= killProcessGroup(child); void killPromise.then((terminated) => { processGroupTerminated ||= terminated; }); }, options.timeoutMs);
+    const exitCode = await close; if (timer) clearTimeout(timer);
     if (killPromise) processGroupTerminated ||= await killPromise;
     if (!existsSync(outputPath)) return { timedOut, exitCode, processGroupTerminated, stderr, ...(processError ? { error: processError } : {}) };
     try {
@@ -477,12 +723,12 @@ export async function runWorkflowEvals(options: WorkflowEvalRunOptions = {}): Pr
   for (const candidate of cases) {
     const remaining = ceiling - spent;
     if (remaining <= 0) {
-      const skippedResult = resultFromFailure({ case: { ...candidate, timeoutMs: options.timeoutMs ?? candidate.timeoutMs }, model, maxCost: candidate.maxCost }, "skipped", ["Run spend ceiling reached."]);
+      const skippedResult = resultFromFailure({ case: { ...candidate, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, model, maxCost: candidate.maxCost }, "skipped", ["Run spend ceiling reached."]);
       skipped.push(candidate.id); results.push(skippedResult); writeFileSync(join(artifactDir, `${candidate.id}.json`), `${JSON.stringify(skippedResult, null, 2)}\n`, { mode: 0o600 });
       continue;
     }
-    const input: CaptureCaseInput = { case: { ...candidate, timeoutMs: options.timeoutMs ?? candidate.timeoutMs }, model, ...(options.provider ? { provider: options.provider } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.piCommand ? { piCommand: options.piCommand } : {}), maxCost: Math.min(candidate.maxCost, remaining) };
-    const isolated = await runIsolatedProcess<EvalCaseResult>(input, { childPath: fileURLToPath(new URL("./workflow-evals-child.js", import.meta.url)), timeoutMs: input.case.timeoutMs + REPLAY_TIMEOUT_MS + CASE_PROCESS_GRACE_MS, env: { PI_WORKFLOW_EVAL_SOURCE_AGENT_DIR: sourceAgentDir } });
+    const input: CaptureCaseInput = { case: { ...candidate, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, model, ...(options.provider ? { provider: options.provider } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.piCommand ? { piCommand: options.piCommand } : {}), maxCost: Math.min(candidate.maxCost, remaining) };
+    const isolated = await runIsolatedProcess<EvalCaseResult>(input, { childPath: fileURLToPath(new URL("./workflow-evals-child.js", import.meta.url)), ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs * 2 + CASE_PROCESS_GRACE_MS }), env: { PI_WORKFLOW_EVAL_SOURCE_AGENT_DIR: sourceAgentDir, PI_WORKFLOW_EVAL_SOURCE_PROJECT_DIR: process.cwd() } });
     const diagnostics = [isolated.stderr, isolated.error ? `Case process error: ${isolated.error}` : ""].filter(Boolean);
     const trustworthy = Boolean(isolated.value) && !isolated.timedOut && isolated.exitCode === 0 && !isolated.error && Boolean(isolated.value?.accountingTrustworthy);
     const untrustedStatus: EvalCaseResult["status"] = isolated.timedOut ? "timed_out" : isolated.value?.status === "timed_out" || isolated.value?.status === "budget_exceeded" ? isolated.value.status : "failed";
@@ -501,7 +747,6 @@ export function formatEvalSummary(result: WorkflowEvalRunResult): string {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2); const value = (name: string) => { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; };
-  if (args.includes("--controlled-real")) { process.stdout.write(`${JSON.stringify(runControlledRealE2E(), null, 2)}\n`); return; }
   const caseIds = value("--case")?.split(",").map((item) => item.trim()).filter(Boolean);
   const model = value("--model");
   const provider = value("--provider");
