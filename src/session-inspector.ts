@@ -1,19 +1,20 @@
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { highlightCode, initTheme, SessionManager, truncateToVisualLines, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { inspectWorkflowScript, type StaticWorkflowCall } from "./index.js";
+import { inspectWorkflowScript, type ModelSpec, type StaticWorkflowCall } from "./index.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 
 export interface ModelUsage { model: string; cost: number }
-export interface AttemptReport { attempt: number; prompt: string; cost: number; models: readonly ModelUsage[]; error?: string }
-export interface AgentReport { name: string; state: string; model: string; cost: number; attempts: readonly AttemptReport[] }
+export interface AttemptReport { attempt: number; prompt: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; models: readonly ModelUsage[]; error?: string }
+export interface AgentReport { name: string; state: string; role?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
 export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[] }
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
 
-type TranscriptSummary = { prompt?: string; cost: number; models: readonly ModelUsage[] };
+type TranscriptSummary = { prompt?: string; cost: number; models: readonly ModelUsage[]; model?: string; thinking?: ModelSpec["thinking"] };
 type ToolResult = { toolCallId: string; isError: boolean; content: unknown; details?: unknown };
 type WorkflowCall = { id: string; arguments: Record<string, unknown> };
 type LoadedRun = { run: PersistedRun; snapshot: Readonly<{ script: string; metadata: { description?: string } }> };
@@ -31,11 +32,32 @@ function mergedModels(groups: readonly (readonly ModelUsage[])[]): ModelUsage[] 
   return [...totals].map(([model, cost]) => ({ model, cost })).sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model));
 }
 
+const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+function parsedThinking(value: unknown): ModelSpec["thinking"] | undefined {
+  return typeof value === "string" && thinkingLevels.includes(value as (typeof thinkingLevels)[number]) ? value as ModelSpec["thinking"] : undefined;
+}
+
+function modelName(provider: unknown, model: unknown): string | undefined {
+  return typeof provider === "string" && provider && typeof model === "string" && model ? `${provider}/${model}` : undefined;
+}
+
 function transcript(manager: SessionManager): TranscriptSummary {
   const models = new Map<string, number>();
   let cost = 0;
   let prompt: string | undefined;
+  let model: string | undefined;
+  let thinking: ModelSpec["thinking"] | undefined;
   for (const entry of manager.getEntries()) {
+    if (entry.type === "model_change") {
+      model = modelName(entry.provider, entry.modelId);
+      if (!model) throw new Error("Invalid model policy");
+      continue;
+    }
+    if (entry.type === "thinking_level_change") {
+      thinking = parsedThinking(entry.thinkingLevel);
+      if (thinking === undefined) throw new Error("Invalid thinking policy");
+      continue;
+    }
     if (entry.type !== "message") continue;
     const message = entry.message;
     if (message.role === "user" && prompt === undefined) {
@@ -44,17 +66,25 @@ function transcript(manager: SessionManager): TranscriptSummary {
       prompt = full.includes(marker) ? full.slice(full.indexOf(marker) + marker.length) : full;
     }
     if (message.role === "assistant") {
-      const model = `${message.provider}/${message.model}`;
+      const actualModel = modelName(message.provider, message.model);
       const messageCost = message.usage.cost.total;
+      if (!actualModel || typeof messageCost !== "number" || !Number.isFinite(messageCost)) throw new Error("Invalid assistant policy");
+      model = actualModel;
       cost += messageCost;
-      models.set(model, (models.get(model) ?? 0) + messageCost);
+      models.set(actualModel, (models.get(actualModel) ?? 0) + messageCost);
     }
   }
-  return { ...(prompt !== undefined ? { prompt } : {}), cost, models: [...models].map(([model, modelCost]) => ({ model, cost: modelCost })) };
+  return { ...(prompt !== undefined ? { prompt } : {}), cost, models: [...models].map(([model, modelCost]) => ({ model, cost: modelCost })), ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}) };
 }
 
 function readTranscript(path: string): TranscriptSummary | undefined {
-  try { return transcript(SessionManager.open(path)); } catch { return undefined; }
+  try {
+    if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size === 0) return undefined;
+    const manager = SessionManager.open(path);
+    if (!manager.getHeader()) return undefined;
+    const summary = transcript(manager);
+    return summary.model === undefined ? undefined : summary;
+  } catch { return undefined; }
 }
 
 function resultRunId(result: ToolResult | undefined): string | undefined {
@@ -90,24 +120,42 @@ async function loadRuns(cwd: string, sessionId: string, home: string): Promise<M
 }
 
 async function agentReport(agent: PersistedRun["agents"][number]): Promise<AgentReport> {
-  const fallbackModel = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+  const fallbackModel = `${agent.model.provider}/${agent.model.model}`;
+  const fallbackThinking = agent.model.thinking;
   const attempts: AttemptReport[] = [];
   for (const attempt of agent.attemptDetails ?? []) {
     const log = readTranscript(attempt.sessionFile);
-    const cost = log?.cost ?? attempt.accounting.cost;
+    if (log) {
+      const model = log.model ?? fallbackModel;
+      const cost = log.cost;
+      attempts.push({
+        attempt: attempt.attempt,
+        prompt: log.prompt ?? "(transcript unavailable)",
+        model,
+        ...(log.thinking !== undefined ? { thinking: log.thinking } : {}),
+        cost,
+        models: log.models.length ? log.models : [{ model, cost }],
+        ...(attempt.error ? { error: `${attempt.error.code}: ${attempt.error.message}` } : {}),
+      });
+      continue;
+    }
+    const cost = attempt.accounting.cost;
     attempts.push({
       attempt: attempt.attempt,
-      prompt: log?.prompt ?? "(transcript unavailable)",
+      prompt: "(transcript unavailable)",
+      model: fallbackModel,
+      ...(fallbackThinking !== undefined ? { thinking: fallbackThinking } : {}),
       cost,
-      models: log?.models.length ? log.models : [{ model: fallbackModel, cost }],
+      models: [{ model: fallbackModel, cost }],
       ...(attempt.error ? { error: `${attempt.error.code}: ${attempt.error.message}` } : {}),
     });
   }
   if (!attempts.length) {
     const cost = agent.accounting?.cost ?? 0;
-    attempts.push({ attempt: 1, prompt: "(transcript unavailable)", cost, models: [{ model: fallbackModel, cost }] });
+    attempts.push({ attempt: 1, prompt: "(transcript unavailable)", model: fallbackModel, ...(fallbackThinking !== undefined ? { thinking: fallbackThinking } : {}), cost, models: [{ model: fallbackModel, cost }] });
   }
-  return { name: agent.name, state: agent.state, model: fallbackModel, cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
+  const latest = attempts[attempts.length - 1];
+  return { name: agent.name, state: agent.state, ...(agent.role ? { role: agent.role } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
 }
 
 export function matchSession(query: string, sessions: readonly SessionInfo[]): SessionInfo {
@@ -192,9 +240,9 @@ function detailLines(workflow: WorkflowReport): string[] {
   ];
   if (!workflow.agents.length) lines.push("(no agent run was persisted)");
   for (const agent of workflow.agents) {
-    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.name} [${agent.state}]`), `${agent.model} · ${money(agent.cost)}`);
+    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
     for (const attempt of agent.attempts) {
-      lines.push(`Attempt ${String(attempt.attempt)} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`);
+      lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`);
     }
   }
   return lines.filter((line, index) => line || index !== 2);
