@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
 type OwnershipNodes = Parameters<RunStore["saveOwnership"]>[0];
@@ -1063,6 +1064,36 @@ void test("rejects invalid role policy before persisting a run", async () => {
   assert.deepEqual(await listRunIds(cwd, "session", home), []);
   await assert.rejects(workflow.execute("id", { name: "invalid-schema", script: `return agent("inspect", { outputSchema: [] });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
   assert.deepEqual(await listRunIds(cwd, "session", home), []);
+});
+
+void test("production role policy rejects overrides before persistence and preserves effective policy", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-execution-"));
+  const cwd = join(home, "project");
+  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read]\n---\nReview role");
+  const inputs: SessionInput[] = [];
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    return { sessionId: `session-${String(inputs.length)}`, sessionFile: `/sessions/${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "agent", "workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  for (const [field, value] of [["model", "openai/gpt"], ["thinking", "low"], ["tools", ["read"]] ] as const) {
+    await assert.rejects(workflow.execute("id", { name: `static-${field}`, script: `return agent("inspect", { role: "reviewer", ${field}: ${JSON.stringify(value)} });`, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.deepEqual(await listRunIds(cwd, "session", home), []);
+  for (const [field, value] of [["model", "openai/gpt"], ["thinking", "low"], ["tools", ["read"]] ] as const) {
+    await assert.rejects(workflow.execute("id", { name: `dynamic-${field}`, script: `const options = { role: args.role }; options.${field} = args.value; return agent("inspect", options);`, args: { role: "reviewer", value }, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  const dynamicRuns = await listRunIds(cwd, "session", home);
+  assert.equal(dynamicRuns.length, 3);
+  for (const runId of dynamicRuns) assert.deepEqual((await new RunStore(cwd, "session", runId, home).load()).run.agents, []);
+  const result = await workflow.execute("id", { name: "role-only", script: "return agent(\"inspect\", { role: \"reviewer\", retries: 1, timeoutMs: 100 });", foreground: true }, new AbortController().signal, undefined, context) as { content: Array<{ text?: string }> };
+  assert.equal((JSON.parse(result.content[0]?.text ?? "null") as string), "done");
+  assert.deepEqual(inputs[0] && { model: inputs[0].model, thinking: inputs[0].model.thinking, tools: inputs[0].tools, systemPromptAppend: inputs[0].systemPromptAppend }, { model: { provider: "openai", model: "gpt", thinking: "high" }, thinking: "high", tools: ["read"], systemPromptAppend: "Review role" });
 });
 
 void test("interrupted resume path preserves workflow agent roles", () => {

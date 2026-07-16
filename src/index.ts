@@ -10,7 +10,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { copyToClipboard, parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress } from "./agent-execution.js";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type SessionFactory } from "./agent-execution.js";
 import { listRunIds, RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -1343,7 +1343,7 @@ function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
   }
 }
 
-export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard) {
+export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard, createSession: SessionFactory = createNativeAgentSession) {
   const registerEntryRenderer = (pi as unknown as Partial<Pick<ExtensionAPI, "registerEntryRenderer">>).registerEntryRenderer;
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
@@ -1397,7 +1397,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;
     } catch (error) {
@@ -1533,7 +1533,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, loaded.run.state);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), availableModels: new Set(loaded.snapshot.models), agentDefinitions: roleDefinitions, runStore: store, providerPause }), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool))), availableModels: new Set(loaded.snapshot.models), agentDefinitions: roleDefinitions, runStore: store, providerPause }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.settings.maxAgentLaunches, await store.loadOwnership());
     }
@@ -1601,7 +1601,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, "running");
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, agentDefinitions, runStore: store, providerPause });
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, agentDefinitions, runStore: store, providerPause }, createSession);
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, settings.maxAgentLaunches);

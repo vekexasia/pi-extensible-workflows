@@ -21,6 +21,7 @@ export interface AgentExecutionOptions {
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
   onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile">) => void | Promise<void>;
   tools?: readonly string[];
+  effectiveTools?: readonly string[];
   role?: string;
   schema?: JsonSchema;
   retries?: number;
@@ -59,7 +60,7 @@ export interface NativeSession {
   dispose(): void;
 }
 export interface SessionInput { cwd: string; model: ModelSpec; tools: readonly string[]; sessionLabel: string; agentDir?: string; customTools?: readonly ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string }
-type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
+export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel): ModelSpec {
   if (!value) return { ...fallback, ...(thinking ? { thinking } : {}) };
@@ -112,7 +113,7 @@ export class WorkflowAgentExecutor {
     const definition = role ? this.root.agentDefinitions?.[role] : undefined;
     if (role && !definition) throw new WorkflowError("UNKNOWN_AGENT_TYPE", `Unknown agent role: ${role}`);
     if (role && (options.model !== undefined || options.thinking !== undefined || options.tools !== undefined)) throw new WorkflowError("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
-    const requested = options.tools !== undefined ? options.tools : definition?.tools !== undefined ? definition.tools : inheritedTools !== undefined ? inheritedTools : [...this.root.tools];
+    const requested = options.tools !== undefined ? options.tools : definition?.tools !== undefined ? definition.tools : options.effectiveTools !== undefined ? options.effectiveTools : inheritedTools !== undefined ? inheritedTools : [...this.root.tools];
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
     const model = parseModel(options.model ?? definition?.model, this.root.model, options.thinking ?? definition?.thinking);
@@ -377,15 +378,16 @@ export class FairAgentScheduler {
   }
 
   /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
-  toolsFor(parentId: string, resolveTools?: (role: string | undefined, tools: readonly string[] | undefined, model: string | undefined, inheritedTools: readonly string[]) => readonly string[]): ToolDefinition[] {
+  toolsFor(parentId: string, resolveTools?: (role: string | undefined, tools: readonly string[] | undefined, model: string | undefined, inheritedTools: readonly string[], thinking: ThinkingLevel | undefined) => readonly string[]): ToolDefinition[] {
     const parent = this.#node(parentId);
     if (!parent.options.tools.includes("agent")) return [];
     const agentTool = {
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
-      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), role: Type.Optional(Type.String()), outputSchema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
-      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
-        const tools = (params.tools !== undefined || params.role !== undefined ? resolveTools?.(params.role, params.tools, params.model, parent.options.tools) : undefined) ?? params.tools ?? parent.options.tools;
-        const options = { label: params.label, cwd: parent.options.cwd, tools, ...(params.model ? { model: params.model } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
+      parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), thinking: Type.Optional(Type.String()), role: Type.Optional(Type.String()), outputSchema: Type.Optional(Type.Unsafe<JsonSchema>({})), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }),
+      execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; thinking?: ThinkingLevel; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
+        if (params.role !== undefined && (params.model !== undefined || params.thinking !== undefined || params.tools !== undefined)) throw new WorkflowError("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
+        const tools = (params.tools !== undefined || params.role !== undefined ? resolveTools?.(params.role, params.tools, params.model, parent.options.tools, params.thinking) : undefined) ?? params.tools ?? parent.options.tools;
+        const options = { label: params.label, cwd: parent.options.cwd, tools, ...(params.model ? { model: params.model } : {}), ...(params.thinking ? { thinking: params.thinking } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
         return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
       },

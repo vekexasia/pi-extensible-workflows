@@ -7,6 +7,7 @@ import { Type } from "@earendil-works/pi-ai";
 import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
+import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 
 void test("production session_start cold-restores ownership and /workflow stop cascades", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-workflows-acceptance-"));
@@ -31,6 +32,30 @@ void test("production session_start cold-restores ownership and /workflow stop c
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled", "cancelled"]);
   assert.deepEqual((await store.load()).run.agents.map(({ state }) => state), ["cancelled", "cancelled"]);
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
+});
+
+void test("cold resume runs a role-only agent with snapshotted policy", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-cold-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const role = { prompt: "Review role", model: "openai/gpt", thinking: "high" as const, tools: ["read"] };
+  await store.create({ id: "run-a", workflowName: "cold-role", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return agent(\"inspect\", { role: \"reviewer\" });", args: null, metadata: { name: "cold-role" }, settings: { concurrency: 1, maxAgentLaunches: 2 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: role }, extensions: {}, schemas: [] }));
+  await store.saveOwnership([{ id: "run-a:1", label: "reviewer", state: "running", options: { label: "reviewer", cwd, tools: ["read"], role: "reviewer" } }]);
+  const inputs: SessionInput[] = [];
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    return { sessionId: "native-role", sessionFile: "/sessions/native-role.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home, async () => {}, createSession);
+  assert.ok(start && command);
+  await start({}, ctx);
+  await command("resume run-a", ctx);
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal((await store.load()).run.state, "completed");
+  assert.deepEqual(inputs.map(({ model, tools, systemPromptAppend }) => ({ model, tools, systemPromptAppend })), [{ model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review role" }]);
 });
 
 void test("cold resume rejects obsolete identity snapshots", async () => {

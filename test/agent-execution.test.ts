@@ -31,7 +31,7 @@ void test("passes role prompt as system append, not task text", async () => {
   let input: unknown;
   let prompt = "";
   const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { input = sessionInput; return { sessionId: "role", sessionFile: "/sessions/role.jsonl", messages: [assistant("done")], prompt: async (text) => { prompt = text; }, dispose() {} }; });
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", role: "reviewer" });
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", role: "reviewer", effectiveTools: ["read", "grep"] });
   assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "Review carefully");
   assert.deepEqual((input as { tools?: readonly string[] }).tools, ["read"]);
   assert.doesNotMatch(prompt, /Review carefully/);
@@ -373,6 +373,23 @@ void test("scoped tools honor the root capability boundary and cancel orphan des
   await outsider.result;
 });
 
+void test("nested role policy conflicts fail before scheduler spawn", async () => {
+  const scheduler = new FairAgentScheduler(async ({ signal }) => {
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read"] });
+  const agentTool = scheduler.toolsFor(parent.id)[0];
+  assert.ok(agentTool);
+  for (const extra of [{ model: "openai/gpt" }, { thinking: "low" }, { tools: ["read"] }]) {
+    await assert.rejects(agentTool.execute("call", { prompt: "child", label: "child", role: "reviewer", ...extra }, undefined, undefined, {} as never), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.equal(scheduler.snapshot().length, 1);
+  scheduler.cancel(parent.id);
+  await parent.result;
+});
+
 void test("nested agent roles resolve tools before scheduler spawn", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
     await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
@@ -382,7 +399,7 @@ void test("nested agent roles resolve tools before scheduler spawn", async () =>
   const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read", "bash"] });
   const agentTool = scheduler.toolsFor(parent.id, (role, tools) => role === "reviewer" && tools === undefined ? ["read"] : tools ?? ["bash"])[0];
   assert.ok(agentTool);
-  await agentTool.execute("call", { prompt: "child", label: "child", role: "reviewer" }, undefined, undefined, {} as never);
+  await agentTool.execute("call", { prompt: "child", label: "child", role: "reviewer", retries: 1, timeoutMs: null }, undefined, undefined, {} as never);
   assert.deepEqual(scheduler.snapshot().find(({ options }) => options.label === "child")?.options.tools, ["read"]);
   scheduler.cancel(parent.id);
   await parent.result;
