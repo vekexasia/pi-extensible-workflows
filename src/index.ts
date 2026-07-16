@@ -1187,9 +1187,13 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   if (!run.agents.length) lines.push("  (none)");
   for (const agent of run.agents) {
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
+    const role = agent.role ? ` role=${agent.role}` : "";
+    const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
-    const policy = `role=${agent.role ?? "custom"} tools=${agent.tools.join(",") || "(none)"}`;
-    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))} ${policy}${accounting}`);
+    const role = agent.role ? ` role=${agent.role}` : "";
+    const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
+    const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
+    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
     for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
     for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
   }
@@ -1413,9 +1417,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const existing = new Map(current.agents.map((agent) => [agent.id, agent]));
       const agents = ownership.map((node) => {
         const previous = existing.get(node.id);
-        const requested = node.options.role ? { label: node.options.label, workflowName: run.metadata.name, role: node.options.role } : { label: node.options.label, workflowName: run.metadata.name, tools: node.options.tools, ...(node.options.model ? { model: node.options.model } : {}), ...(node.options.thinking ? { thinking: node.options.thinking } : {}) };
-        const resolved = run.executor.resolve(requested);
-        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.role ? { role: node.options.role } : {}), model: resolved.model, tools: resolved.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+        const effective = run.executor.resolve({ label: node.options.label, workflowName: run.metadata.name, ...(node.options.model ? { model: node.options.model } : {}), ...(node.options.thinking ? { thinking: node.options.thinking } : {}), ...(node.options.role ? { role: node.options.role } : {}), effectiveTools: node.options.tools });
+        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.role ? { role: node.options.role } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
       });
       return { ...current, agents };
     });

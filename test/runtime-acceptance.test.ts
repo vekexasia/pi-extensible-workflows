@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { RunStore } from "../src/persistence.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
@@ -34,28 +34,98 @@ void test("production session_start cold-restores ownership and /workflow stop c
   assert.deepEqual(notices, [`Stopped workflow ${runId}.`]);
 });
 
-void test("cold resume runs a role-only agent with snapshotted policy", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-cold-"));
+void test("cold resume persists effective role, fallback, nested, retry, and explicit policies", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-workflows-policy-reporting-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  const role = { prompt: "Review role", model: "openai/gpt", thinking: "high" as const, tools: ["read"] };
-  await store.create({ id: "run-a", workflowName: "cold-role", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return agent(\"inspect\", { role: \"reviewer\" });", args: null, metadata: { name: "cold-role" }, settings: { concurrency: 1, maxAgentLaunches: 2 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: role }, extensions: {}, schemas: [] }));
-  await store.saveOwnership([{ id: "run-a:1", label: "reviewer", state: "running", options: { label: "reviewer", cwd, tools: ["read"], role: "reviewer" } }]);
-  const inputs: SessionInput[] = [];
+  const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const parent = await agent(\"nested policies\"); return { role, parent };";
+  const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"] };
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2, maxAgentLaunches: 10 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, extensions: {}, schemas: [] });
+  await store.create({ id: "run-a", workflowName: "policy-reporting", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, snapshot);
+  await store.saveOwnership([]);
+  const inputs = new Map<string, SessionInput>();
+  let nextSession = 0;
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
-    inputs.push(input);
-    return { sessionId: "native-role", sessionFile: "/sessions/native-role.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+    const sessionId = `native-${String(++nextSession)}`;
+    inputs.set(sessionId, input);
+    const executeTool = async (name: string, params: Record<string, unknown>): Promise<unknown> => {
+      const tool = input.customTools?.find(({ name: candidate }) => candidate === name);
+      assert.ok(tool);
+      return tool.execute(sessionId, params, undefined, undefined, undefined as never);
+    };
+    const collectChild = async (options: Record<string, unknown>): Promise<void> => {
+      const spawned = await executeTool("agent", options) as { content?: Array<{ text?: string }> };
+      const childId = (JSON.parse(spawned.content?.[0]?.text ?? "{}") as { id?: string }).id;
+      assert.ok(childId);
+      await executeTool("get_subagent_result", { id: childId });
+    };
+    return {
+      sessionId,
+      sessionFile: `/sessions/${sessionId}.jsonl`,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      prompt: async () => {
+        if (input.sessionLabel.includes(":nested-role:attempt-1")) throw new Error("retry nested role");
+        if (input.sessionLabel.endsWith(":agent:attempt-1")) {
+          await collectChild({ prompt: "nested role", label: "nested-role", role: "reviewer", retries: 1 });
+          for (const options of [
+            { prompt: "model only", label: "model-only", model: "case-provider/model-only" },
+            { prompt: "thinking only", label: "thinking-only", thinking: "low" },
+            { prompt: "tools only", label: "tools-only", tools: ["read"] },
+            { prompt: "combined", label: "combined", model: "case-provider/model-and-thinking", thinking: "high", tools: ["read"] },
+          ]) await collectChild(options);
+        }
+      },
+      steer: async () => {},
+      dispose() {},
+    };
   };
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
-  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home, async () => {}, createSession);
+  const ctx = { cwd, hasUI: false, model: { provider: "root-provider", id: "root-model" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: typeof start) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["agent", "read", "workflow"] } as never, home, async () => {}, createSession);
   assert.ok(start && command);
   await start({}, ctx);
   await command("resume run-a", ctx);
-  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
-  assert.equal((await store.load()).run.state, "completed");
-  assert.deepEqual(inputs.map(({ model, tools, systemPromptAppend }) => ({ model, tools, systemPromptAppend })), [{ model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review role" }]);
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  const loaded = await store.load();
+  assert.equal(loaded.run.state, "completed");
+  const attempts = loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => ({ agent, attempt })));
+  assert.equal(inputs.size, 8);
+  assert.equal(attempts.length, inputs.size);
+  for (const { agent, attempt } of attempts) {
+    const input = inputs.get(attempt.sessionId);
+    assert.ok(input);
+    assert.deepEqual({ provider: input.model.provider, model: input.model.model, thinking: input.model.thinking, tools: input.tools }, { provider: agent.model.provider, model: agent.model.model, thinking: agent.model.thinking, tools: agent.tools });
+  }
+  const topRole = loaded.run.agents.find((agent) => agent.name === "reviewer" && !agent.parentId);
+  const nestedRole = loaded.run.agents.find((agent) => agent.name === "nested-role");
+  assert.ok(topRole && nestedRole);
+  assert.equal(topRole.role, "reviewer");
+  assert.equal(nestedRole.role, "reviewer");
+  assert.equal(nestedRole.parentId, loaded.run.agents.find((agent) => agent.name === "agent")?.id);
+  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "agent")?.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
+  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "agent")?.tools, ["agent", "read"]);
+  for (const policy of [
+    { name: "model-only", model: { provider: "case-provider", model: "model-only", thinking: "medium" }, tools: ["agent", "read"] },
+    { name: "thinking-only", model: { provider: "root-provider", model: "root-model", thinking: "low" }, tools: ["agent", "read"] },
+    { name: "tools-only", model: { provider: "root-provider", model: "root-model", thinking: "medium" }, tools: ["read"] },
+    { name: "combined", model: { provider: "case-provider", model: "model-and-thinking", thinking: "high" }, tools: ["read"] },
+  ]) {
+    const agent = loaded.run.agents.find((candidate) => candidate.name === policy.name);
+    assert.ok(agent);
+    assert.equal(agent.role, undefined);
+    assert.deepEqual(agent.model, policy.model);
+    assert.deepEqual(agent.tools, policy.tools);
+  }
+  const dashboard = formatNavigatorDashboard(loaded.run, [], []);
+  const detail = formatNavigatorRun(loaded, [], []);
+  assert.match(dashboard, /root-provider\/root-model:medium/);
+  assert.match(dashboard, /role=reviewer/);
+  assert.match(dashboard, /tools=agent,read/);
+  assert.match(dashboard, /agent > nested-role/);
+  assert.match(detail, /nested-role .*model=role-provider\/role-model:high role=reviewer tools=read/);
+  assert.match(detail, /model-only .*model=case-provider\/model-only:medium tools=agent,read/);
+  assert.match(detail, /combined .*model=case-provider\/model-and-thinking:high tools=read/);
 });
 
 void test("cold resume rejects obsolete identity snapshots", async () => {
