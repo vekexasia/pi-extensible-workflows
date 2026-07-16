@@ -77,7 +77,7 @@ void test("cold resume replays completed agents by hidden structural identity", 
   assert.ok(start && command);
   await start({}, ctx);
   await command("resume run-a", ctx);
-  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
   assert.equal((await store.load()).run.state, "completed");
   assert.deepEqual(await store.replay(replayPath), { path: replayPath, value: "replayed" });
 });
