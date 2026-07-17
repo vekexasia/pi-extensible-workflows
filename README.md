@@ -192,7 +192,7 @@ Agent, checkpoint, parallel, and pipeline calls now return bare values: use `res
 
 Agent calls no longer accept `name` or `continueFrom`. Interrupted runs created with the earlier named-agent identity contract must be relaunched; completed runs remain inspectable.
 
-If a top-level agent includes `agent` in its effective tools, it can create recursively nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Put one isolated coordinator in a worktree when agents must collaborate on shared files, and have that coordinator use nested children; do not remove per-agent worktree isolation. Parents release scheduler capacity while waiting; uncollected descendants are cancelled when the parent ends.
+If a top-level agent includes `agent` in its effective tools, it can create recursively nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Use `withWorktree(name, callback)` for a shared coordinator scope or separate named scopes, and have the coordinator use nested children; do not use deprecated per-agent worktree isolation for new workflows. Parents release scheduler capacity while waiting; uncollected descendants are cancelled when the parent ends.
 
 ## Parallel and pipeline
 
@@ -291,7 +291,7 @@ return { branch: DEFAULT_BRANCH, review };
 ```
 
 Registered workflow names are qualified, for example `{ "workflow": "git.releaseCheck" }`; calling `releaseCheck` without its namespace fails. Registration requires a JavaScript-safe namespace, semantic version, descriptions, valid one-object function schemas, valid variable schemas, and local workflow keys without dots. Global names cannot collide with built-in or sandbox-denied names or another extension.
-Whenever it is available, `workflow_catalog` returns deterministic, flat metadata for registered functions, variables, and workflows. It never exposes implementations, resolvers, resolved values, or workflow source. Call it once before creating the first workflow for a task. Function calls validate input/output, replay completed journal entries, and receive `agent`, `prompt`, `parallel`, `pipeline`, `withWorktree`, `checkpoint`, `phase`, `log`, and `run` through their context. Variables resolve in parallel before a run is persisted and are recomputed on cold resume.
+Whenever it is available, `workflow_catalog` returns deterministic, flat metadata for registered functions, variables, and workflows. It never exposes implementations, resolvers, resolved values, or workflow source. Call it once before creating the first workflow for a task, then reuse its exposed functions, variables, and workflows instead of recreating them in the script. Function calls validate input/output, replay completed journal entries, and receive `agent`, `prompt`, `parallel`, `pipeline`, `withWorktree`, `checkpoint`, `phase`, `log`, and `run` through their context. Variables resolve in parallel before a run is persisted and are recomputed on cold resume.
 
 ## Lifecycle and recovery
 
@@ -337,16 +337,21 @@ The run directory is created with mode `0700` and `system-prompts.json` with mod
 
 Identity checks use the exact resolved launch cwd and Pi session ID. Immutable snapshots include source, args, settings, models, tools, effective role definitions, and schemas. Native transcripts remain in Pi session storage and their paths are referenced by the run.
 
-Top-level agents may request `isolation: "worktree"`:
+`withWorktree(name, callback)` is the canonical worktree API. Use one named scope per parallel branch when branches must remain separate:
 
 ```js
-await agent("Implement the fix", { isolation: "worktree" });
+const results = await parallel("implementation", {
+  api: () => withWorktree("api", () => agent("Implement the API")),
+  ui: () => withWorktree("ui", () => agent("Implement the UI")),
+});
 ```
 
-The runtime creates a deterministic owned branch/worktree from all repository-wide tracked changes, deletions, and nonignored untracked files present at launch, not from clean `HEAD`. It preserves the launch cwd's relative subdirectory and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the worktree. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
-## Delivery
+The runtime creates each deterministic owned branch/worktree lazily from the launch tree. It preserves the launch cwd's relative subdirectory and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the enclosing scope. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
 
-Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed isolated branch/worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, cost, model, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, the ownership tree, agent states, and each agent's current activity or running tool call.
+For current-major compatibility only, `agent(..., { isolation: "worktree" })` remains supported but is deprecated. Use `withWorktree(name, callback)` for separate named or shared scopes; each use emits one warning through the workflow log. The shorthand will be removed in the next major version.
+
+## Delivery
+Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed scoped worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, cost, model, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, the ownership tree, agent states, and each agent's current activity or running tool call.
 
 Background runs also publish extension lifecycle events:
 

@@ -22,7 +22,7 @@ void test("loads workflow scripts, runtime prompts, models, and costs from stati
   const childPath = join(home, "child.jsonl");
   const sessionId = "019f65db-57e5-7df3-b3fb-91cbbcca948c";
   const runId = "run-a";
-  const script = `const report = await agent("Inspect code", { role: "scout" });\nreturn report;`;
+  const script = `const report = await withWorktree("audit", async () => agent("Inspect code", { role: "scout" }));\nreturn report;`;
   writeJsonl(childPath, [
     { type: "session", version: 3, id: "child-session", timestamp: "2026-01-01T00:00:00.000Z", cwd },
     { type: "model_change", id: "model-change", parentId: null, timestamp: "2026-01-01T00:00:00.500Z", provider: "openai-codex", modelId: "gpt-5.6-luna" },
@@ -49,7 +49,8 @@ void test("loads workflow scripts, runtime prompts, models, and costs from stati
   const audit = report.workflows[0];
   assert.ok(audit);
   assert.equal(audit.script, script);
-  const staticAgent = audit.calls[0];
+  const staticAgent = audit.calls.find(({ kind }) => kind === "agent");
+  assert.equal(audit.calls[0]?.kind, "withWorktree");
   assert.ok(staticAgent);
   assert.equal(staticAgent.prompt, "Inspect code");
   assert.equal(staticAgent.role, "scout");

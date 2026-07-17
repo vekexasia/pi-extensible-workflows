@@ -1,8 +1,9 @@
+/* eslint-disable @typescript-eslint/no-deprecated */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import { getAgentDir, parseFrontmatter, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -20,6 +21,7 @@ export interface AgentPolicyExpectation {
   callIndex: number;
   role?: string;
   model?: string;
+  /** @deprecated Compatibility expectation for the legacy agent isolation shorthand; prefer withWorktree scopes. */
   isolation?: "worktree";
   forbidOptions?: readonly ("role" | "model" | "thinking" | "tools" | "isolation" | "retries")[];
   tools?: { mode: "omitted" | "empty" | "exact"; values?: readonly string[] };

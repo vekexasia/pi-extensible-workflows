@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-deprecated */
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
@@ -15,6 +16,7 @@ export interface AgentExecutionOptions {
   workflowDescription?: string;
   phase?: string;
   parent?: string;
+  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
   parentIsolation?: "worktree";
   model?: string;
   thinking?: ThinkingLevel;
@@ -27,6 +29,7 @@ export interface AgentExecutionOptions {
   retries?: number;
   timeoutMs?: number | null;
   retryState?: string;
+  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
   isolation?: "worktree";
   worktreeOwner?: string;
   cwd?: string;
@@ -128,7 +131,7 @@ export class WorkflowAgentExecutor {
     const resolved = this.resolve(options);
     let cwd: string;
     if (options.parent) {
-      if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Only top-level agents may request worktree isolation");
+      if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Deprecated agent isolation is only supported for top-level agents; use withWorktree(name, callback)");
       if (!options.cwd) throw new WorkflowError("INVALID_METADATA", "Child agents require their parent cwd");
       if (options.parentIsolation) {
         if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree inheritance requires a persisted run");
@@ -258,6 +261,7 @@ export interface ScheduledAgentOptions {
   parentBreadcrumb?: string;
   cwd: string;
   tools: readonly string[];
+  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
   isolation?: "worktree";
   worktreeOwner?: string;
   model?: string;

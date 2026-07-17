@@ -62,7 +62,7 @@
         <h3>Development</h3>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"implement-feature"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"return await agent('Implement the requested feature', { isolation: 'worktree' });"</span>
+  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"return await withWorktree('implementation', async () =&gt; parallel('implementation', { code: () =&gt; agent('Implement the feature'), tests: () =&gt; agent('Add integration tests') }));"</span>
 <span class="tok-punctuation">}</span></code></pre>
         <h3>Review</h3>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> reports = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"review"</span>, <span class="tok-punctuation">{</span>
@@ -84,7 +84,7 @@
       <section id="selection">
         <h2>Role and model selection</h2>
         <p>An agent can select a <code>role</code>, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary.</p>
-        <p>Optional controls are <code>outputSchema</code>, non-negative integer <code>retries</code>, positive integer or <code>null</code> <code>timeoutMs</code>, and <code>isolation: "worktree"</code>. Retry only idempotent work or prompts that prevent duplicate side effects. The same worktree is reused across retries.</p>
+        <p>Optional controls are <code>outputSchema</code>, non-negative integer <code>retries</code>, positive integer or <code>null</code> <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. Use separate named scopes for independent branches and one enclosing scope for collaborators. The legacy <code>agent(..., { isolation: "worktree" })</code> shorthand is deprecated, warns through the workflow log, remains supported in this major version, and will be removed in the next major version.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the package API"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">,</span> <span class="tok-string">"find"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>

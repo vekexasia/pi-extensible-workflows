@@ -1347,6 +1347,7 @@ void test("preflight rejects every static boundary before run creation", () => {
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
+  assert.throws(() => preflight(`agent('a',{isolation:'typo'})`, capabilities), /deprecated.*withWorktree/i);
   assert.equal(preflight("phase('dynamic')", capabilities, [], { name: "minimal" }).metadata.name, "minimal");
   assert.throws(() => preflight("return 1", capabilities, [], { name: "" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight("return 1", capabilities, [{}]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
@@ -1401,7 +1402,7 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
+  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
@@ -1635,6 +1636,16 @@ void test("withWorktree validates calls, keeps empty scopes empty, and replays u
   assert.throws(() => preflight(`const alias = withWorktree; alias(() => 1);`, capabilities), /direct withWorktree.*aliases.*unsupported/i);
   await assert.rejects(runWorkflow(`const alias = withWorktree; return alias(() => 1);`).result, /direct withWorktree.*aliases.*unsupported/i);
   await assert.rejects(runWorkflow(`return withWorktree("shared", async () => agent("bad", { isolation: "worktree" }));`, null, { agent: async () => { throw new Error("must not launch"); } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
+void test("deprecated isolation shorthand remains compatible and logs one warning", async () => {
+  const logs: string[] = [];
+  const result = await runWorkflow(`return agent("legacy", { isolation: "worktree" });`, null, {
+    log(message) { logs.push(message); },
+    agent: async (_prompt, options) => ({ options }),
+  }).result;
+  assert.deepEqual(result, { options: { isolation: "worktree" } });
+  assert.equal(logs.length, 1);
+  assert.match(logs[0] ?? "", /isolation.*deprecated.*withWorktree.*next major version/i);
 });
 void test("parallel identities do not depend on completion order", async () => {
   const resolvers = new Map<string, () => void>();

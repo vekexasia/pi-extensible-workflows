@@ -4,6 +4,6 @@
 
 Update the development verification documentation to state that `npm test` makes no model calls.
 
-## Issue 102: Cover worktree isolation expectations
+## Issue 102: Cover canonical worktree scope expectations
 
-Add focused coverage proving that prompt-to-workflow evaluation policies can require `isolation: "worktree"`.
+Add focused coverage proving that prompt-to-workflow evaluation policies can require separate named `withWorktree` scopes.

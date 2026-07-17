@@ -195,6 +195,7 @@ export class RunLifecycle {
 
 export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, maxAgentLaunches: 1000 });
 
+const DEPRECATED_ISOLATION_WARNING = 'agent(..., { isolation: "worktree" }) is deprecated; use withWorktree(name, callback) for separate named or shared worktree scopes. It remains supported in this major version and will be removed in the next major version.';
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function positiveInteger(value: unknown): value is number { return Number.isInteger(value) && (value as number) > 0; }
@@ -542,7 +543,7 @@ function validateAgentOption(key: string, value: unknown): void {
       if (value !== null && !positiveInteger(value)) fail("INVALID_METADATA", "agent timeoutMs must be null or a positive integer");
       break;
     case "isolation":
-      if (value !== "worktree") fail("INVALID_METADATA", "agent isolation must be worktree");
+      if (value !== "worktree") fail("INVALID_METADATA", `${DEPRECATED_ISOLATION_WARNING} isolation must be "worktree"`);
       break;
   }
 }
@@ -1043,7 +1044,7 @@ const internalAgent = (...values) => {
   agentOccurrences.set(occurrenceKey, occurrence);
   const options = values.length < 2 || values[1] === undefined ? {} : values[1];
   const worktreeOwner = worktreeOwners.getStore();
-  if (worktreeOwner && options && typeof options === "object" && !Array.isArray(options) && Object.prototype.hasOwnProperty.call(options, "isolation")) throw workError("INVALID_METADATA", "agent isolation cannot be combined with withWorktree");
+  if (worktreeOwner && options && typeof options === "object" && !Array.isArray(options) && Object.prototype.hasOwnProperty.call(options, "isolation")) throw workError("INVALID_METADATA", 'agent(..., { isolation: "worktree" }) is deprecated; use withWorktree(name, callback) for separate named or shared worktree scopes. It remains supported in this major version and will be removed in the next major version. It cannot be combined with withWorktree.');
   const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}) };
   const result = rpc("agent", [values[0], options, identity]).then(unwrap);
   Object.defineProperties(result, {
@@ -1208,7 +1209,7 @@ function agentIdentityPath(identity: AgentIdentity): string {
 }
 function agentWorktree(options: Readonly<Record<string, JsonValue>>, identity: AgentIdentity, path: string): { isolation?: "worktree"; worktreeOwner?: string } {
   if (identity.worktreeOwner) {
-    if (Object.prototype.hasOwnProperty.call(options, "isolation")) fail("INVALID_METADATA", "agent isolation cannot be combined with withWorktree");
+    if (Object.prototype.hasOwnProperty.call(options, "isolation")) fail("INVALID_METADATA", `${DEPRECATED_ISOLATION_WARNING} It cannot be combined with withWorktree.`);
     return { isolation: "worktree", worktreeOwner: identity.worktreeOwner };
   }
   return options.isolation === "worktree" ? { isolation: "worktree", worktreeOwner: path } : {};
@@ -1274,6 +1275,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         const identity = readAgentIdentity(values[2]);
         const path = agentIdentityPath(identity);
         const label = typeof opts.label === "string" ? opts.label : typeof opts.role === "string" ? opts.role : "agent";
+        if (Object.prototype.hasOwnProperty.call(opts, "isolation")) await bridge.log?.(DEPRECATED_ISOLATION_WARNING);
         try {
           const result = await bridge.agent(values[0], opts, controller.signal, identity);
           value = branded({ name: label, ok: true, value: result ?? null });
@@ -1663,7 +1665,8 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
         const options = validateAgentOptions(args[1] === undefined ? {} : args[1]);
         const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
-        if (scopedWorktreeOwner && Object.prototype.hasOwnProperty.call(options, "isolation")) fail("INVALID_METADATA", "agent isolation cannot be combined with withWorktree");
+        if (scopedWorktreeOwner && Object.prototype.hasOwnProperty.call(options, "isolation")) fail("INVALID_METADATA", `${DEPRECATED_ISOLATION_WARNING} It cannot be combined with withWorktree.`);
+        if (Object.prototype.hasOwnProperty.call(options, "isolation")) sideEffects.push(Promise.resolve(bridge.log?.(DEPRECATED_ISOLATION_WARNING)));
         const structuralPath = inheritedHostAgentPath.getStore() ?? [];
         const key = `${path}\0${JSON.stringify(structuralPath)}`;
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
@@ -1770,6 +1773,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await persistActiveAgentAttempt(run.store, id, attempt);
         run.update?.(workflowToolUpdate((await run.store.load()).run));
       };
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
       const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.isolation ? { parentIsolation: "worktree" as const, worktreeOwner: options.worktreeOwner ?? options.label } : {}) } : options.isolation ? { isolation: options.isolation, worktreeOwner: options.worktreeOwner ?? options.label } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); });
       await persistAgentAttempts(run.store, id, result.attempts);
       return result.value;

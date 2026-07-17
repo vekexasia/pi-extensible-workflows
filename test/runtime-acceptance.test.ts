@@ -212,7 +212,7 @@ void test("cold resume rejects project roles after trust is revoked", async () =
 void test("cold resume replays completed agents by hidden structural identity", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-replay-"));
   const cwd = join(home, "project");
-  const script = `return agent("must replay");`;
+  const script = `return withWorktree("recovery", async () => agent("must replay"));`;
   let replayPath = "";
   assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; } }).result, "original");
   assert.ok(replayPath);
@@ -520,6 +520,27 @@ void test("shared worktree scopes persist one owner across production agents and
   assert.equal(completion.split(branch).length - 1, 1);
 });
 
+void test("production keeps deprecated isolation shorthand working and logs one warning", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-deprecated-isolation-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
+  const warnings: string[] = [];
+  const createSession = async (): Promise<NativeSession> => ({ sessionId: "deprecated-isolation", sessionFile: "/sessions/deprecated-isolation.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], appendEntry(_type: string, data: { message?: string }) { if (data.message) warnings.push(data.message); } } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "deprecated-isolation", script: `return agent("legacy", { isolation: "worktree" });`, foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.equal(result.details?.value, "done");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] ?? "", /isolation.*deprecated.*withWorktree.*next major version/i);
+});
 void test("production rejects explicit isolation inside a shared scope before launch", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-reject-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];

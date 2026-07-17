@@ -280,9 +280,10 @@ void test("replays outputSchema values and checks their shape", async () => {
   assert.equal(forbiddenResult.pass, true);
   const parallelStructure = staticExpectationResults([{ batch: 0, arguments: {}, script: 'parallel("p", { one: () => agent("api"), two: () => agent("ui") }); agent("after")' }], { requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{ promptIncludes: "api" }, { promptIncludes: "ui" }] }, { execution: "sequential", agents: [{ promptIncludes: "after" }] }] });
   assert.equal(parallelStructure.every(({ pass }) => pass), true);
-  const isolatedScript = 'const results = await parallel("fixes", { one: () => agent("one", { role: "developer", isolation: "worktree" }), two: () => agent("two", { role: "developer", isolation: "worktree" }) }); return agent(prompt("merge {results}", { results }), { role: "developer" });';
-  const isolatedExpectations = { agentPolicies: [{ callIndex: 0, isolation: "worktree" as const }, { callIndex: 1, isolation: "worktree" as const }, { callIndex: 2, forbidOptions: ["isolation" as const] }], requiredDataFlow: [{ binding: "results", toAgentIndex: 2 }] };
+  const isolatedScript = 'const results = await parallel("fixes", { one: () => withWorktree("one", () => agent("one", { role: "developer" })), two: () => withWorktree("two", () => agent("two", { role: "developer" })) }); return agent(prompt("merge {results}", { results }), { role: "developer" });';
+  const isolatedExpectations = { requiredOperations: ["withWorktree" as const], agentPolicies: [{ callIndex: 0, role: "developer" }, { callIndex: 1, role: "developer" }, { callIndex: 2, forbidOptions: ["isolation" as const] }], requiredDataFlow: [{ binding: "results", toAgentIndex: 2 }] };
   assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: isolatedScript }], isolatedExpectations).every(({ pass }) => pass), true);
+  assert.deepEqual(inspectWorkflowScript(isolatedScript).filter(({ kind }) => kind === "withWorktree").map(({ name }) => name), ["one", "two"]);
   const isolatedReplay = await replayWorkflowScript(isolatedScript);
   assert.deepEqual(replayExpectationErrors([{ batch: 0, arguments: {}, script: isolatedScript }], [{ script: isolatedScript, ...isolatedReplay }], isolatedExpectations), []);
   assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: 'agent("one", { role: "developer" })' }], { agentPolicies: [{ callIndex: 0, isolation: "worktree" }] })[0]?.pass, false);

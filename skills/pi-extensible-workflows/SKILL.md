@@ -37,7 +37,7 @@ To pass structured input from the main agent, include `args`:
 { "workflow": "namespace.workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. Reuse its exposed global functions, variables, and registered workflows instead of recreating their logic in the script.
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
 
@@ -52,9 +52,12 @@ interface AgentOptions {
   outputSchema?: JsonSchema;
   retries?: number; // non-negative; use for safe, repeatable work
   timeoutMs?: number | null; // positive milliseconds; null means unlimited
-  isolation?: "worktree"; // top-level file-changing agents
+  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
+  isolation?: "worktree";
 }
 ```
+
+`isolation: "worktree"` is a deprecated current-major compatibility shorthand. It remains supported with one workflow-log warning and will be removed in the next major version; use `withWorktree(name, callback)` for every separate named or shared scope.
 
 Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; aliases are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
@@ -69,7 +72,7 @@ const results = await withWorktree("implementation", async () => parallel("imple
 }));
 ```
 
-The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly. Do not also set `isolation: "worktree"` on an agent inside this scope.
+The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly. Do not set deprecated `isolation: "worktree"` on an agent inside this scope; that combination remains `INVALID_METADATA`.
 
 `parallel()` tasks may call any workflow function, not only `agent()`:
 
@@ -95,7 +98,7 @@ Registered extension functions receive `withWorktree` in their context, so they 
 
 - Do not create a workflow for one agent. Phases must have distinct work.
 - Use `log(messageString)` in the script to surface brief status messages to the operator.
-- A role owns its execution policy. When `role` is present, do not also set `model`, `thinking`, or `tools`; only task-specific options such as `outputSchema`, retries, timeout, or isolation may accompany it.
+- A role owns its execution policy. When `role` is present, do not also set `model`, `thinking`, or `tools`; only task-specific options such as `outputSchema`, retries, timeout, or a `withWorktree` scope may accompany it.
 - Use `parallel()` for independent tasks with different flows. Use `pipeline()` when each keyed item passes through the same ordered stages; do not duplicate identical stage chains inside `parallel()` branches.
 - Call shapes are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; object keys are stable task, item, and stage names.
 - Preserve item metadata in workflow code between pipeline stages instead of requiring agents to echo it through `outputSchema`.
