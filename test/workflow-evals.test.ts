@@ -269,24 +269,23 @@ void test("replays outputSchema values and checks their shape", async () => {
   assert.ok(replayExpectationErrors([{ batch: 0, arguments: {}, script: `return agent("read", { tools: ["read", "bash"] });` }], [{ script: "", result: "ok", trace: { ...replayed.trace, agentCalls: [{ ...firstAgent, options: { tools: ["read", "bash"] } }] } }], { agentPolicies: [{ callIndex: 0, tools: { mode: "exact", values: ["read"] } }] }).some((error) => error.includes("tools were")));
   assert.ok(replayExpectationErrors([{ batch: 0, arguments: { script: `return agent("count", { outputSchema: { type: "object" } });` }, script: `return agent("count", { outputSchema: { type: "object" } });` }], [{ script: "", result: {} }], { requireOutputSchema: { type: "object", requiredKeys: ["answer"] } }).some((error) => error.includes("no outputSchema matching")));
   const staticCalls = [{ batch: 0, arguments: {}, script: `const review = await agent("review", { role: "reviewer" }); return agent(prompt("Use {review}", { review }), { model: "p/m", tools: [] });` }];
-  const staticResults = staticExpectationResults(staticCalls, { requiredAgentOrder: [{ role: "reviewer" }, { model: "p/m" }], requiredDataFlow: [{ binding: "review", toAgentIndex: 1 }], agentPolicies: [{ callIndex: 1, tools: { mode: "empty" }, forbidOptions: ["isolation", "retries"] }], requiredAgentStructures: [{ execution: "sequential", agents: [{ role: "reviewer" }, { model: "p/m" }] }] });
+  const staticResults = staticExpectationResults(staticCalls, { requiredAgentOrder: [{ role: "reviewer" }, { model: "p/m" }], requiredDataFlow: [{ binding: "review", toAgentIndex: 1 }], agentPolicies: [{ callIndex: 1, tools: { mode: "empty" }, forbidOptions: ["retries"] }], requiredAgentStructures: [{ execution: "sequential", agents: [{ role: "reviewer" }, { model: "p/m" }] }] });
   assert.equal(staticResults.every(({ pass }) => pass), true);
-  const dynamicOptions = inspectWorkflowScript('agent("x", { tools: [], isolation: mode, outputSchema: schema })')[0];
+  const dynamicOptions = inspectWorkflowScript('agent("x", { tools: [], outputSchema: schema })')[0];
   assert.ok(dynamicOptions);
   assert.deepEqual(dynamicOptions.options?.tools, []);
-  assert.deepEqual(dynamicOptions.optionKeys, ["tools", "isolation", "outputSchema"]);
+  assert.deepEqual(dynamicOptions.optionKeys, ["tools", "outputSchema"]);
   const forbiddenResult = staticExpectationResults([{ batch: 0, arguments: {}, script: 'parallel("p", { one: () => agent("x") })' }], { forbiddenOperations: ["pipeline"] })[0];
   assert.ok(forbiddenResult);
   assert.equal(forbiddenResult.pass, true);
   const parallelStructure = staticExpectationResults([{ batch: 0, arguments: {}, script: 'parallel("p", { one: () => agent("api"), two: () => agent("ui") }); agent("after")' }], { requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{ promptIncludes: "api" }, { promptIncludes: "ui" }] }, { execution: "sequential", agents: [{ promptIncludes: "after" }] }] });
   assert.equal(parallelStructure.every(({ pass }) => pass), true);
   const isolatedScript = 'const results = await parallel("fixes", { one: () => withWorktree("one", () => agent("one", { role: "developer" })), two: () => withWorktree("two", () => agent("two", { role: "developer" })) }); return agent(prompt("merge {results}", { results }), { role: "developer" });';
-  const isolatedExpectations = { requiredOperations: ["withWorktree" as const], agentPolicies: [{ callIndex: 0, role: "developer" }, { callIndex: 1, role: "developer" }, { callIndex: 2, forbidOptions: ["isolation" as const] }], requiredDataFlow: [{ binding: "results", toAgentIndex: 2 }] };
+  const isolatedExpectations = { requiredOperations: ["withWorktree" as const], agentPolicies: [{ callIndex: 0, role: "developer" }, { callIndex: 1, role: "developer" }, { callIndex: 2, role: "developer" }], requiredDataFlow: [{ binding: "results", toAgentIndex: 2 }] };
   assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: isolatedScript }], isolatedExpectations).every(({ pass }) => pass), true);
   assert.deepEqual(inspectWorkflowScript(isolatedScript).filter(({ kind }) => kind === "withWorktree").map(({ name }) => name), ["one", "two"]);
   const isolatedReplay = await replayWorkflowScript(isolatedScript);
   assert.deepEqual(replayExpectationErrors([{ batch: 0, arguments: {}, script: isolatedScript }], [{ script: isolatedScript, ...isolatedReplay }], isolatedExpectations), []);
-  assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: 'agent("one", { role: "developer" })' }], { agentPolicies: [{ callIndex: 0, isolation: "worktree" }] })[0]?.pass, false);
   const setCalls = [
     { batch: 0, arguments: {}, script: 'agent("wrong", { role: "scout" })' },
     { batch: 1, arguments: {}, script: 'agent("review", { role: "reviewer" })' },

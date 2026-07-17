@@ -14,7 +14,6 @@ expectations:
       role: developer
     - callIndex: 2
       role: developer
-      forbidOptions: [isolation]
   requiredAgentOrder:
     - role: developer
       execution: parallel

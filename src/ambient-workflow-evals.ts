@@ -66,8 +66,7 @@ export interface AmbientManifest {
 
 export interface AmbientCaseResult {
   id: string;
-  status: "passed" | "failed" | "timed_out" | "budget_exceeded" | "skipped";
-  reason?: string;
+  status: "passed" | "failed" | "timed_out" | "budget_exceeded";
   workflows: readonly unknown[];
   accounting: AmbientManifest["tokenCost"];
   accountingTrustworthy: boolean;
@@ -91,7 +90,6 @@ export interface AmbientWorkflowEvalRunResult {
   artifactDir: string;
   cases: readonly AmbientCaseResult[];
   spent: number;
-  skipped: readonly string[];
   mode: string;
 }
 
@@ -408,7 +406,7 @@ export async function runAmbientWorkflowEvals(options: AmbientWorkflowEvalRunOpt
   const results: AmbientCaseResult[] = [];
   try {
     for (const candidate of candidates) results.push(await runAmbientCase(repository, candidate, artifactsDir, environment, provider, model, options.thinking, options.piCommand));
-    return { artifactDir: artifactsDir, cases: results, spent: results.reduce((sum, result) => sum + result.accounting.cost, 0), skipped: results.filter((result) => result.status === "skipped").map(({ id }) => id), mode: AMBIENT_INVOCATION_MODE };
+    return { artifactDir: artifactsDir, cases: results, spent: results.reduce((sum, result) => sum + result.accounting.cost, 0), mode: AMBIENT_INVOCATION_MODE };
   } finally {
     const fixtureRepoRemoved = removeAmbientFixtureRepository(repository);
     for (const [index, current] of results.entries()) {
@@ -422,7 +420,7 @@ export async function runAmbientWorkflowEvals(options: AmbientWorkflowEvalRunOpt
 
 export function formatAmbientSummary(result: AmbientWorkflowEvalRunResult): string {
   const rows = result.cases.map((item) => `${item.id}: ${item.status} (${item.accounting.cost.toFixed(4)} USD, ${String(item.accounting.totalTokens)} tok, ${String(item.manifest.workflowCallCount)} workflow calls)`);
-  return [`Ambient Tier D (${result.mode}): ${String(result.cases.length)} cases, ${result.spent.toFixed(4)} USD spent`, AMBIENT_CAPTURE_NOTE, ...rows, result.skipped.length ? `Skipped: ${result.skipped.join(", ")}` : "", `Artifacts: ${result.artifactDir}`].filter(Boolean).join("\n");
+  return [`Ambient Tier D (${result.mode}): ${String(result.cases.length)} cases, ${result.spent.toFixed(4)} USD spent`, AMBIENT_CAPTURE_NOTE, ...rows, `Artifacts: ${result.artifactDir}`].join("\n");
 }
 
 function option(args: readonly string[], name: string): string | undefined {

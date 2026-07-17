@@ -192,7 +192,7 @@ Agent, checkpoint, parallel, and pipeline calls now return bare values: use `res
 
 Agent calls no longer accept `name` or `continueFrom`. Interrupted runs created with the earlier named-agent identity contract must be relaunched; completed runs remain inspectable.
 
-If a top-level agent includes `agent` in its effective tools, it can create recursively nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Use `withWorktree(name, callback)` for a shared coordinator scope or separate named scopes, and have the coordinator use nested children; do not use deprecated per-agent worktree isolation for new workflows. Parents release scheduler capacity while waiting; uncollected descendants are cancelled when the parent ends.
+If a top-level agent includes `agent` in its effective tools, it can create recursively nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Use `withWorktree(name, callback)` for a shared coordinator scope or separate named scopes, and have the coordinator use nested children. Parents release scheduler capacity while waiting; uncollected descendants are cancelled when the parent ends.
 
 ## Parallel and pipeline
 
@@ -237,7 +237,7 @@ const decision = await checkpoint({
 if (decision !== "approved") return { approved: false };
 ```
 
-Direct `checkpoint()` returns `"approved"` or `"rejected"`. Prompt size is limited to 1 KB UTF-8 and serialized context to 4 KB. The run enters `awaiting_input`; answer it with Approve/Reject in `/workflow` or:
+Sandboxed workflow scripts receive `"approved"` or `"rejected"` from direct `checkpoint()`. Registered workflow functions receive a boolean from `WorkflowOrchestrationContext.checkpoint`. Prompt size is limited to 1 KB UTF-8 and serialized context to 4 KB. The run enters `awaiting_input`; answer it with Approve/Reject in `/workflow` or:
 
 ```json
 { "runId": "...", "name": "ship", "approved": true }
@@ -348,7 +348,6 @@ const results = await parallel("implementation", {
 
 The runtime creates each deterministic owned branch/worktree lazily from the launch tree. It preserves the launch cwd's relative subdirectory and snapshots launch and agent changes with fixed Git identity, message, dates, disabled hooks, and disabled signing. Children and retries reuse the enclosing scope. The caller branch is unchanged; no merge occurs. Worktrees and branches remain until confirmed run deletion. Creation or ownership failure is `WORKTREE_FAILED`; there is no shared-tree fallback.
 
-For current-major compatibility only, `agent(..., { isolation: "worktree" })` remains supported but is deprecated. Use `withWorktree(name, callback)` for separate named or shared scopes; each use emits one warning through the workflow log. The shorthand will be removed in the next major version.
 
 ## Delivery
 Background completion sends exactly one follow-up containing the workflow name and result. Messages are capped at 4 KB at a valid UTF-8 boundary and point to the persisted full result when truncated. Changed scoped worktree locations appear only when changes exist. Failure and provider-limit pause messages are minimal; token, cost, model, and agent-count telemetry stays in `/workflow`. Foreground calls keep their tool card live with an animated running indicator, the current phase, the ownership tree, agent states, and each agent's current activity or running tool call.
@@ -434,4 +433,4 @@ npm pack --dry-run --json
 git diff --check
 ```
 
-The acceptance suite covers worker isolation, structural replay, exact cwd/session isolation, nested ownership and permit handoff, retries and schema finalization, parallel and pipeline combinators, lifecycle recovery and checkpoints, deterministic worktrees and deletion, registered extension macros, strict preflight/settings, native Pi session integration, and minimal delivery.
+The acceptance suite covers worker worktree scopes, structural replay, exact cwd/session separation, nested ownership and permit handoff, retries and schema finalization, parallel and pipeline combinators, lifecycle recovery and checkpoints, deterministic worktrees and deletion, registered extension macros, strict preflight/settings, native Pi session integration, and minimal delivery.

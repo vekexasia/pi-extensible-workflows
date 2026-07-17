@@ -187,12 +187,16 @@ void test("cold resume rejects obsolete identity snapshots", async () => {
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  await store.saveOwnership([{ id: "run-a:1", label: "legacy", state: "running", options: { label: "legacy", cwd, tools: [], isolation: "worktree" } }] as never);
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
-  assert.ok(start && command);
-  await start({}, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } });
-  await assert.rejects(command("resume run-a", { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  const ctx = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; if (name === "session_shutdown") shutdown = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && shutdown && command);
+  await start({}, ctx);
+  await assert.rejects(command("resume run-a", ctx), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await shutdown();
 });
 
 void test("cold resume rejects project roles after trust is revoked", async () => {
@@ -289,11 +293,11 @@ void test("production Pi seam installs child tools and registers native steering
   let steer: ((message: string) => void | Promise<void>) | undefined;
   const received: string[] = [];
   const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => ({ sessionId: "s", sessionFile: "/s", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }], prompt: async () => {}, steer: async (message) => { received.push(message); }, dispose() {} }));
-  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "flow" }, undefined, [], (handler) => { steer = handler; });
+  await executor.execute("work", { label: "worker", workflowName: "flow" }, undefined, [], (handler) => { steer = handler; });
   assert.ok(steer); await steer("redirect"); assert.deepEqual(received, ["redirect"]);
 });
 
-void test("concurrency-1 cancellation and nested containment retain accounting and retry isolation", async () => {
+void test("concurrency-1 cancellation and nested containment retain accounting and retry separation", async () => {
   const started: string[] = [];
   let release!: () => void;
   let scheduler: FairAgentScheduler;
@@ -319,7 +323,7 @@ void test("concurrency-1 cancellation and nested containment retain accounting a
   let attempt = 0;
   let cleaned = 0;
   const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => { const current = ++attempt; return { sessionId: `s${String(current)}`, sessionFile: `/s${String(current)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } } }], prompt: async () => { if (current === 1) throw new Error("retry"); }, dispose() {} }; });
-  const retried = await executor.execute("retry", { label: "retry", workflowName: "flow", workflowDescription: "flow", retries: 1, timeoutMs: 100 }, undefined, [], undefined, () => { cleaned += 1; });
+  const retried = await executor.execute("retry", { label: "retry", workflowName: "flow", retries: 1, timeoutMs: 100 }, undefined, [], undefined, () => { cleaned += 1; });
   assert.equal(cleaned, 1); assert.equal(retried.attempts.length, 2); assert.deepEqual(retried.attempts.map(({ accounting }) => accounting.cost), [0.5, 0.5]);
 });
 
@@ -520,35 +524,6 @@ void test("shared worktree scopes persist one owner across production agents and
   assert.equal(completion.split(branch).length - 1, 1);
 });
 
-void test("production keeps deprecated isolation shorthand working and logs one warning", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-deprecated-isolation-"));
-  const cwd = join(home, "repo");
-  mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(cwd, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
-  const warnings: string[] = [];
-  const createSession = async (): Promise<NativeSession> => ({ sessionId: "deprecated-isolation", sessionFile: "/sessions/deprecated-isolation.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} });
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], appendEntry(_type: string, data: { message?: string }) { if (data.message) warnings.push(data.message); } } as never, home, async () => {}, createSession);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  const result = await workflow.execute("id", { name: "deprecated-isolation", script: `return agent("legacy", { isolation: "worktree" });`, foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  assert.equal(result.details?.value, "done");
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0] ?? "", /isolation.*deprecated.*withWorktree.*next major version/i);
-});
-void test("production rejects explicit isolation inside a shared scope before launch", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-reject-"));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "agent"] } as never, home);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  await assert.rejects(workflow.execute("id", { name: "shared-reject", script: `return withWorktree("shared", async () => agent("bad", { isolation: "worktree" }));`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
 void test("production variables resolve before persistence, freeze public bindings, and abort siblings", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-variable-acceptance-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];

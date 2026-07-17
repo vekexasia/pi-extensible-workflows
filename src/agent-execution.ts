@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-deprecated */
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
@@ -13,11 +12,8 @@ export interface AgentDefinition { prompt?: string; description?: string; model?
 export interface AgentExecutionOptions {
   label: string;
   workflowName: string;
-  workflowDescription?: string;
   phase?: string;
   parent?: string;
-  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
-  parentIsolation?: "worktree";
   model?: string;
   thinking?: ThinkingLevel;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
@@ -29,8 +25,6 @@ export interface AgentExecutionOptions {
   retries?: number;
   timeoutMs?: number | null;
   retryState?: string;
-  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
-  isolation?: "worktree";
   worktreeOwner?: string;
   cwd?: string;
 }
@@ -131,24 +125,22 @@ export class WorkflowAgentExecutor {
     const resolved = this.resolve(options);
     let cwd: string;
     if (options.parent) {
-      if (options.isolation) throw new WorkflowError("INVALID_METADATA", "Deprecated agent isolation is only supported for top-level agents; use withWorktree(name, callback)");
       if (!options.cwd) throw new WorkflowError("INVALID_METADATA", "Child agents require their parent cwd");
-      if (options.parentIsolation) {
+      if (options.worktreeOwner) {
         if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree inheritance requires a persisted run");
-        cwd = (await this.root.runStore.validateWorktree(options.worktreeOwner ?? options.parent, options.cwd)).cwd;
+        cwd = (await this.root.runStore.validateWorktree(options.worktreeOwner, options.cwd)).cwd;
       } else {
         if (options.cwd !== this.root.cwd) throw new WorkflowError("INVALID_METADATA", "Shared-tree children must inherit the root cwd");
         cwd = this.root.cwd;
       }
+    } else if (options.worktreeOwner) {
+      if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree scope requires a persisted run");
+      const worktree = await this.root.runStore.worktree(options.worktreeOwner);
+      if (options.cwd && resolvePath(options.cwd) !== resolvePath(worktree.cwd)) throw new WorkflowError("WORKTREE_FAILED", "Agent cwd does not match its owned worktree");
+      cwd = worktree.cwd;
     } else {
-      if (options.parentIsolation || (options.cwd && !options.isolation)) throw new WorkflowError("INVALID_METADATA", "Only isolated top-level agents or child agents may provide a cwd");
-      if (!options.isolation) cwd = this.root.cwd;
-      else {
-        if (!this.root.runStore) throw new WorkflowError("WORKTREE_FAILED", "Worktree isolation requires a persisted run");
-        const worktree = await this.root.runStore.worktree(options.worktreeOwner ?? options.label);
-        if (options.cwd && resolvePath(options.cwd) !== resolvePath(worktree.cwd)) throw new WorkflowError("WORKTREE_FAILED", "Isolated agent cwd does not match its owned worktree");
-        cwd = worktree.cwd;
-      }
+      if (options.cwd) throw new WorkflowError("INVALID_METADATA", "Only child agents or worktree scopes may provide a cwd");
+      cwd = this.root.cwd;
     }
     const attempts: AgentAttempt[] = [];
     const maxAttempts = (options.retries ?? 0) + 1;
@@ -216,7 +208,7 @@ export class WorkflowAgentExecutor {
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
         const value = options.schema ? schemaResult as JsonValue : text(session.messages);
-        if (options.isolation) await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label);
+        if (options.worktreeOwner) await this.root.runStore?.snapshotWorktree(options.worktreeOwner);
         report(true);
         await progress;
         await flushSystemPrompts();
@@ -236,7 +228,7 @@ export class WorkflowAgentExecutor {
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting });
           session.dispose();
         }
-        if (options.isolation && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label).catch(() => undefined);
+        if (options.worktreeOwner && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner).catch(() => undefined);
         if (attempt === maxAttempts || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
         beforeRetry?.();
       }
@@ -251,8 +243,6 @@ export interface ScheduledAgentOptions {
   parentBreadcrumb?: string;
   cwd: string;
   tools: readonly string[];
-  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
-  isolation?: "worktree";
   worktreeOwner?: string;
   model?: string;
   thinking?: ThinkingLevel;
@@ -439,14 +429,14 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "requestedLabel", "parentBreadcrumb", "cwd", "tools", "isolation", "worktreeOwner", "model", "thinking", "role", "schema", "retries", "timeoutMs"].includes(key));
+    const unknown = Object.keys(options).find((key) => !["label", "requestedLabel", "parentBreadcrumb", "cwd", "tools", "worktreeOwner", "model", "thinking", "role", "schema", "retries", "timeoutMs"].includes(key));
     if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });
     if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const forbidden = options.tools.find((tool) => !parent.options.tools.includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
-    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(parent.options.isolation ? { isolation: parent.options.isolation, worktreeOwner: parent.options.worktreeOwner } : {}) });
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
   }
   /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
 

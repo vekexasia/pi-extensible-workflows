@@ -181,16 +181,6 @@ export class TestHarness {
     return store;
   }
 
-  /**
-   * Add an interrupted run with a real workflow script. After `launch()`,
-   * session_start cold-recovers it. Use `/workflow resume <id>` to
-   * re-execute the script so checkpoints become live.
-   */
-  async addLiveRun(input: RunInput & { snapshot: { script: string } }): Promise<string> {
-    const store = await this.addRun({ ...input, state: "interrupted" });
-    return store.runId;
-  }
-
   // ── Pi lifecycle ───────────────────────────────────────────────────────
 
   /**
@@ -240,22 +230,10 @@ export class TestHarness {
     herdr("wait", "output", this.paneId, "--match", match, "--timeout", String(timeoutMs));
   }
 
-  /** Wait for a regex pattern. */
-  async waitForRegex(pattern: string, timeoutMs = 10_000): Promise<void> {
-    if (!this.paneId) throw new Error("Not launched");
-    herdr("wait", "output", this.paneId, "--match", pattern, "--regex", "--timeout", String(timeoutMs));
-  }
-
   /** Read recent pane content (plain text, soft-wraps joined). */
   readPane(lines = 80): string {
     if (!this.paneId) throw new Error("Not launched");
     return herdr("pane", "read", this.paneId, "--source", "recent-unwrapped", "--lines", String(lines));
-  }
-
-  /** Read ANSI-rendered pane content (for visual TUI checks). */
-  readPaneAnsi(lines = 80): string {
-    if (!this.paneId) throw new Error("Not launched");
-    return herdr("pane", "read", this.paneId, "--source", "recent", "--lines", String(lines), "--format", "ansi");
   }
 
   /** Send a keypress (e.g. "Enter", "Escape", "j", "k"). */

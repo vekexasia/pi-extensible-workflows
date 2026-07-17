@@ -12,30 +12,29 @@ function assistant(text: string) { return { role: "assistant", content: [{ type:
 
 void test("resolves explicit capabilities without widening least privilege", () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("unused"); });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "scout" }).tools, ["read", "grep"]);
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "google/gemini" }), { model: { provider: "google", model: "gemini", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPromptAppend: "" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "google/gemini", tools: [] }).tools, []);
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["read", "grep"] }).tools, ["read", "grep"]);
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", tools: ["read", "write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", model: "missing/model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", model: "google/gemini" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", thinking: "low" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "reviewer", tools: [] }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "reviewer" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "scout" }).tools, ["read", "grep"]);
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", model: "google/gemini" }), { model: { provider: "google", model: "gemini", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPromptAppend: "" });
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", model: "google/gemini", tools: [] }).tools, []);
+  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", tools: ["read", "grep"] }).tools, ["read", "grep"]);
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", tools: ["read", "write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", model: "missing/model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "reviewer", model: "google/gemini" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "reviewer", thinking: "low" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "reviewer", tools: [] }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   const broken = new WorkflowAgentExecutor({ ...root, agentDefinitions: { broken: { tools: ["write"] } } }, async () => { throw new Error("must not launch"); });
-  assert.throws(() => broken.resolve({ label: "a", workflowName: "w", workflowDescription: "d", role: "broken" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  assert.throws(() => broken.resolve({ label: "a", workflowName: "w", role: "broken" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
 });
 
 void test("passes role prompt as system append, not task text", async () => {
   let input: unknown;
   let prompt = "";
   const executor = new WorkflowAgentExecutor(root, async (sessionInput) => { input = sessionInput; return { sessionId: "role", sessionFile: "/sessions/role.jsonl", messages: [assistant("done")], prompt: async (text) => { prompt = text; }, dispose() {} }; });
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", role: "reviewer", effectiveTools: ["read", "grep"] });
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "reviewer", effectiveTools: ["read", "grep"] });
   assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "Review carefully");
   assert.deepEqual((input as { tools?: readonly string[] }).tools, ["read"]);
   assert.doesNotMatch(prompt, /Review carefully/);
-  assert.doesNotMatch(prompt, /Workflow: flow - desc/);
   assert.match(prompt, /Task:\nDo work/);
 });
 
@@ -71,7 +70,7 @@ void test("provider limits pause and retry the same native session", async () =>
   let prompts = 0;
   let pauses = 0;
   const executor = new WorkflowAgentExecutor({ ...root, providerPause: async () => { pauses += 1; } }, async () => ({ sessionId: "same", sessionFile: "/sessions/same.jsonl", messages: [assistant("continued")], prompt: async () => { prompts += 1; if (prompts === 1) throw Object.assign(new Error("limited"), { status: 429 }); }, dispose() {} }));
-  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc" })).value, "continued");
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow" })).value, "continued");
   assert.equal(prompts, 2);
   assert.equal(pauses, 1);
 });
@@ -79,7 +78,7 @@ void test("provider limits pause and retry the same native session", async () =>
 void test("returns final text and captures persisted native session accounting", async () => {
   const prompts: string[] = [];
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "s1", sessionFile: "/sessions/s1.jsonl", messages: [assistant("done")], prompt: async (prompt) => { prompts.push(prompt); }, dispose() {} }));
-  const result = await executor.execute("Do work", { label: "worker", workflowName: "flow", workflowDescription: "desc", phase: "build", parent: "root", cwd: root.cwd });
+  const result = await executor.execute("Do work", { label: "worker", workflowName: "flow", phase: "build", parent: "root", cwd: root.cwd });
   assert.equal(result.value, "done");
   assert.equal(prompts.length, 1);
   assert.match(prompts[0] ?? "", /Workflow: flow[\s\S]*Phase: build[\s\S]*Parent: root[\s\S]*Task:\nDo work/);
@@ -93,7 +92,7 @@ void test("exposes native attempt metadata before the prompt completes", async (
   let exposed!: (value: { attempt: number; sessionId: string; sessionFile: string }) => void;
   const exposure = new Promise<{ attempt: number; sessionId: string; sessionFile: string }>((resolve) => { exposed = resolve; });
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "active", sessionFile: "/sessions/active.jsonl", messages: [assistant("done")], prompt: () => new Promise<void>((resolve) => { finish = resolve; promptStarted(); }), dispose() {} }));
-  const running = executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onAttempt: (attempt) => { exposed(attempt); } });
+  const running = executor.execute("work", { label: "worker", workflowName: "flow", onAttempt: (attempt) => { exposed(attempt); } });
   assert.deepEqual(await exposure, { attempt: 1, sessionId: "active", sessionFile: "/sessions/active.jsonl" });
   await started;
   finish();
@@ -122,7 +121,7 @@ void test("streams non-content and tool-call progress", async () => {
     },
     dispose() {},
   }));
-  const result = await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onProgress: (update) => { updates.push(update); } });
+  const result = await executor.execute("work", { label: "worker", workflowName: "flow", onProgress: (update) => { updates.push(update); } });
   assert.equal(result.value, "done");
   assert.equal(updates.length, 6);
   assert.doesNotMatch(JSON.stringify(updates), /REASONING_ONE|REASONING_TWO|RESPONSE_ONE|RESPONSE_TWO/);
@@ -141,7 +140,7 @@ void test("keeps workflow_result present, delays acceptance, and allows one repa
       if (result !== undefined) { calls.push({ prompt, result }); await resultTool.execute("id", result, new AbortController().signal, () => {}, {} as never); }
     }, dispose() {} };
   });
-  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", workflowDescription: "desc", role: "reviewer", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
+  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", role: "reviewer", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
   assert.deepEqual(result.value, { answer: 9 });
   assert.equal(calls.length, 3);
   assert.match(calls[1]?.prompt ?? "", /Submit the final result/);
@@ -154,7 +153,7 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
     const attempt = ++created;
     return { sessionId: `s${String(attempt)}`, sessionFile: `/sessions/s${String(attempt)}.jsonl`, messages: [assistant(attempt === 2 ? "ok" : "bad")], async prompt() { if (attempt === 1) throw new Error("provider failed"); }, dispose() {} };
   });
-  const result = await executor.execute("retry", { label: "retry", workflowName: "flow", workflowDescription: "desc", retries: 1 });
+  const result = await executor.execute("retry", { label: "retry", workflowName: "flow", retries: 1 });
   assert.equal(result.value, "ok");
   assert.deepEqual(result.attempts.map(({ sessionId }) => sessionId), ["s1", "s2"]);
   assert.equal(result.attempts[0]?.error?.code, "AGENT_FAILED");
@@ -163,36 +162,35 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
 void test("top-level worktree cwd is inherited and reused by retries", async () => {
   const cwds: string[] = [];
   const snapshots: string[] = [];
-  const isolatedRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), validateWorktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), snapshotWorktree: async (owner: string) => { snapshots.push(owner); return "commit"; } } as unknown as RunStore };
+  const worktreeRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), validateWorktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), snapshotWorktree: async (owner: string) => { snapshots.push(owner); return "commit"; } } as unknown as RunStore };
   let attempt = 0;
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async (input) => {
+  const executor = new WorkflowAgentExecutor(worktreeRoot, async (input) => {
     cwds.push(input.cwd);
     const current = ++attempt;
     return { sessionId: `s${String(current)}`, sessionFile: `/sessions/s${String(current)}.jsonl`, messages: [assistant("ok")], async prompt() { if (current === 1) throw new Error("retry"); }, dispose() {} };
   });
-  const result = await executor.execute("isolated", { label: "worker", workflowName: "flow", workflowDescription: "desc", isolation: "worktree", retries: 1 });
+  const result = await executor.execute("worktree", { label: "worker", workflowName: "flow", worktreeOwner: "worker", retries: 1 });
   assert.deepEqual(cwds, ["/runs/worktree/subdir", "/runs/worktree/subdir"]);
   assert.deepEqual(snapshots, ["worker", "worker"]);
   assert.equal(result.cwd, "/runs/worktree/subdir");
-  await executor.execute("child", { label: "child", workflowName: "flow", workflowDescription: "desc", parent: "worker", parentIsolation: "worktree", cwd: result.cwd });
+  await executor.execute("child", { label: "child", workflowName: "flow", parent: "worker", worktreeOwner: "worker", cwd: result.cwd });
   assert.equal(cwds.at(-1), result.cwd);
-  await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", workflowDescription: "desc", parent: "worker", isolation: "worktree" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 
 
-void test("concurrent siblings keep their own cwd and non-isolated top-level calls use root cwd", async () => {
+void test("concurrent siblings keep their own cwd and plain top-level calls use root cwd", async () => {
   const cwds: Record<string, string> = {};
-  const isolatedRoot = { ...root, runStore: { worktree: async (owner: string) => ({ owner, path: `/runs/${owner}`, branch: `branch/${owner}`, cwd: `/runs/${owner}/repo` }), validateWorktree: async (owner: string, cwd: string) => ({ owner, path: `/runs/${owner}`, branch: `branch/${owner}`, cwd }), snapshotWorktree: async () => "commit" } as unknown as RunStore };
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async (input) => ({ sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`, messages: [assistant("ok")], async prompt() { cwds[input.sessionLabel] = input.cwd; await Promise.resolve(); }, dispose() {} }));
+  const worktreeRoot = { ...root, runStore: { worktree: async (owner: string) => ({ owner, path: `/runs/${owner}`, branch: `branch/${owner}`, cwd: `/runs/${owner}/repo` }), validateWorktree: async (owner: string, cwd: string) => ({ owner, path: `/runs/${owner}`, branch: `branch/${owner}`, cwd }), snapshotWorktree: async () => "commit" } as unknown as RunStore };
+  const executor = new WorkflowAgentExecutor(worktreeRoot, async (input) => ({ sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`, messages: [assistant("ok")], async prompt() { cwds[input.sessionLabel] = input.cwd; await Promise.resolve(); }, dispose() {} }));
   const [left, right] = await Promise.all([
-    executor.execute("left", { label: "left", workflowName: "flow", workflowDescription: "desc", isolation: "worktree" }),
-    executor.execute("right", { label: "right", workflowName: "flow", workflowDescription: "desc", isolation: "worktree" }),
+    executor.execute("left", { label: "left", workflowName: "flow", worktreeOwner: "left" }),
+    executor.execute("right", { label: "right", workflowName: "flow", worktreeOwner: "right" }),
   ]);
   await Promise.all([
-    executor.execute("left child", { label: "child-left", workflowName: "flow", workflowDescription: "desc", parent: "left", parentIsolation: "worktree", cwd: left.cwd }),
-    executor.execute("right child", { label: "child-right", workflowName: "flow", workflowDescription: "desc", parent: "right", parentIsolation: "worktree", cwd: right.cwd }),
+    executor.execute("left child", { label: "child-left", workflowName: "flow", parent: "left", worktreeOwner: "left", cwd: left.cwd }),
+    executor.execute("right child", { label: "child-right", workflowName: "flow", parent: "right", worktreeOwner: "right", cwd: right.cwd }),
   ]);
-  const plain = await executor.execute("plain", { label: "plain", workflowName: "flow", workflowDescription: "desc" });
+  const plain = await executor.execute("plain", { label: "plain", workflowName: "flow" });
   assert.equal(cwds["flow:left:attempt-1"], "/runs/left/repo");
   assert.equal(cwds["flow:right:attempt-1"], "/runs/right/repo");
   assert.equal(cwds["flow:child-left:attempt-1"], left.cwd);
@@ -202,37 +200,37 @@ void test("concurrent siblings keep their own cwd and non-isolated top-level cal
 
 void test("rejects arbitrary child cwd before launching a session", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("must not launch"); });
-  await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", workflowDescription: "desc", parent: "root", cwd: "/tmp/arbitrary" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", parent: "root", cwd: "/tmp/arbitrary" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 
-void test("stale isolated parent cwd fails before launching a session", async () => {
-  const isolatedRoot = { ...root, runStore: { validateWorktree: async () => { throw new WorkflowError("WORKTREE_FAILED", "stale"); } } as unknown as RunStore };
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async () => { throw new Error("must not launch"); });
-  await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", workflowDescription: "desc", parent: "worker", parentIsolation: "worktree", cwd: "/runs/stale" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+void test("stale worktree parent cwd fails before launching a session", async () => {
+  const worktreeRoot = { ...root, runStore: { validateWorktree: async () => { throw new WorkflowError("WORKTREE_FAILED", "stale"); } } as unknown as RunStore };
+  const executor = new WorkflowAgentExecutor(worktreeRoot, async () => { throw new Error("must not launch"); });
+  await assert.rejects(executor.execute("child", { label: "child", workflowName: "flow", parent: "worker", worktreeOwner: "worker", cwd: "/runs/stale" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
 });
 
-void test("worktree isolation without persisted ownership fails without launching a session", async () => {
+void test("worktree scope without persisted ownership fails without launching a session", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => { throw new Error("must not launch"); });
-  await assert.rejects(executor.execute("isolated", { label: "worker", workflowName: "flow", workflowDescription: "desc", isolation: "worktree" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  await assert.rejects(executor.execute("worktree", { label: "worker", workflowName: "flow", worktreeOwner: "worker" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
 });
 
 void test("snapshot failures stay WORKTREE_FAILED without a second snapshot", async () => {
   let snapshots = 0;
-  const isolatedRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worker", branch: "branch/worker", cwd: "/runs/worker/repo" }), snapshotWorktree: async () => { snapshots += 1; throw new WorkflowError("WORKTREE_FAILED", "snapshot failed"); } } as unknown as RunStore };
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async () => ({ sessionId: "s", sessionFile: "/sessions/s.jsonl", messages: [assistant("ok")], async prompt() {}, dispose() {} }));
-  await assert.rejects(executor.execute("isolated", { label: "worker", workflowName: "flow", workflowDescription: "desc", isolation: "worktree" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message === "snapshot failed");
+  const worktreeRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worker", branch: "branch/worker", cwd: "/runs/worker/repo" }), snapshotWorktree: async () => { snapshots += 1; throw new WorkflowError("WORKTREE_FAILED", "snapshot failed"); } } as unknown as RunStore };
+  const executor = new WorkflowAgentExecutor(worktreeRoot, async () => ({ sessionId: "s", sessionFile: "/sessions/s.jsonl", messages: [assistant("ok")], async prompt() {}, dispose() {} }));
+  await assert.rejects(executor.execute("worktree", { label: "worker", workflowName: "flow", worktreeOwner: "worker" }), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message === "snapshot failed");
   assert.equal(snapshots, 1);
 });
 
 void test("failed best-effort snapshots do not mask agent failures", async () => {
-  const isolatedRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worker", branch: "branch/worker", cwd: "/runs/worker/repo" }), snapshotWorktree: async () => { throw new WorkflowError("WORKTREE_FAILED", "snapshot failed"); } } as unknown as RunStore };
-  const executor = new WorkflowAgentExecutor(isolatedRoot, async () => ({ sessionId: "s", sessionFile: "/sessions/s.jsonl", messages: [assistant("bad")], async prompt() { throw new Error("agent failed"); }, dispose() {} }));
-  await assert.rejects(executor.execute("isolated", { label: "worker", workflowName: "flow", workflowDescription: "desc", isolation: "worktree" }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "agent failed");
+  const worktreeRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worker", branch: "branch/worker", cwd: "/runs/worker/repo" }), snapshotWorktree: async () => { throw new WorkflowError("WORKTREE_FAILED", "snapshot failed"); } } as unknown as RunStore };
+  const executor = new WorkflowAgentExecutor(worktreeRoot, async () => ({ sessionId: "s", sessionFile: "/sessions/s.jsonl", messages: [assistant("bad")], async prompt() { throw new Error("agent failed"); }, dispose() {} }));
+  await assert.rejects(executor.execute("worktree", { label: "worker", workflowName: "flow", worktreeOwner: "worker" }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "agent failed");
 });
 
 void test("per-attempt timeout is typed and terminal", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "slow", sessionFile: "/sessions/slow.jsonl", messages: [], prompt: () => new Promise(() => {}), dispose() {} }));
-  await assert.rejects(executor.execute("slow", { label: "slow", workflowName: "flow", workflowDescription: "desc", timeoutMs: 10 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && Array.isArray((error as WorkflowError & { attempts: unknown[] }).attempts));
+  await assert.rejects(executor.execute("slow", { label: "slow", workflowName: "flow", timeoutMs: 10 }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_TIMEOUT" && Array.isArray((error as WorkflowError & { attempts: unknown[] }).attempts));
 });
 
 void test("production native Pi session installs nested scheduler tools", async () => {
@@ -246,7 +244,7 @@ void test("executor registers the production native steering handler", async () 
   const steered: string[] = [];
   let registered: ((message: string) => void | Promise<void>) | undefined;
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "steer", sessionFile: "/sessions/steer.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => undefined, steer: async (message) => { steered.push(message); }, dispose() {} }));
-  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc" }, undefined, [], (handler) => { registered = handler; });
+  await executor.execute("work", { label: "worker", workflowName: "flow" }, undefined, [], (handler) => { registered = handler; });
   assert.ok(registered);
   await registered("redirect");
   assert.deepEqual(steered, ["redirect"]);
@@ -443,7 +441,7 @@ void test("nested agent roles resolve tools before scheduler spawn", async () =>
 
 void test("explicit null timeout remains unlimited", async () => {
   const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "unlimited", sessionFile: "/sessions/unlimited.jsonl", messages: [assistant("done")], prompt: async () => { await new Promise((resolve) => setTimeout(resolve, 20)); }, dispose() {} }));
-  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", timeoutMs: null })).value, "done");
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", timeoutMs: null })).value, "done");
 });
 
 void test("cancelRun waits for active agents to terminate", async () => {

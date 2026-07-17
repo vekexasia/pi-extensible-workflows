@@ -1349,11 +1349,10 @@ void test("preflight rejects every static boundary before run creation", () => {
     [`agent('a',{label:' '})`, "INVALID_METADATA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
     [`agent('a',{retries:-1})`, "INVALID_METADATA"],
-    [`agent('a',{isolation:'typo'})`, "INVALID_METADATA"],
+    [`agent('a',{unknown:1})`, "INVALID_METADATA"],
   ];
   for (const [script, code] of cases) assert.throws(() => { createRun(script); }, (error: unknown) => error instanceof WorkflowError && error.code === code);
   assert.equal(created, 0);
-  assert.throws(() => preflight(`agent('a',{isolation:'typo'})`, capabilities), /deprecated.*withWorktree/i);
   assert.equal(preflight("phase('dynamic')", capabilities, [], { name: "minimal" }).metadata.name, "minimal");
   assert.throws(() => preflight("return 1", capabilities, [], { name: "" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight("return 1", capabilities, [{}]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
@@ -1361,7 +1360,7 @@ void test("preflight rejects every static boundary before run creation", () => {
 
 void test("host rejects malformed dynamic agent options before launching", async () => {
   let launched = false;
-  for (const options of ["{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{isolation:'typo'}", "{role:'reviewer',model:'openai/gpt'}", "{role:'reviewer',thinking:'low'}", "{role:'reviewer',tools:[]}"]) {
+  for (const options of ["{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{unknown:1}", "{role:'reviewer',model:'openai/gpt'}", "{role:'reviewer',thinking:'low'}", "{role:'reviewer',tools:[]}"]) {
     await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
   assert.equal(launched, false);
@@ -1413,7 +1412,7 @@ void test("launch snapshots are detached and deeply immutable", () => {
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
   assert.deepEqual(snapshot.args, { nested: [1] });
-  assert.equal(snapshot.identityVersion, 1);
+  assert.equal(snapshot.identityVersion, 2);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
@@ -1641,17 +1640,6 @@ void test("withWorktree validates calls, keeps empty scopes empty, and replays u
   for (const source of [`withWorktree("", () => 1)`, `withWorktree("shared", 1)`, `withWorktree("shared", () => 1, 2)`]) assert.throws(() => preflight(source, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight(`const alias = withWorktree; alias(() => 1);`, capabilities), /direct withWorktree.*aliases.*unsupported/i);
   await assert.rejects(runWorkflow(`const alias = withWorktree; return alias(() => 1);`).result, /direct withWorktree.*aliases.*unsupported/i);
-  await assert.rejects(runWorkflow(`return withWorktree("shared", async () => agent("bad", { isolation: "worktree" }));`, null, { agent: async () => { throw new Error("must not launch"); } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
-void test("deprecated isolation shorthand remains compatible and logs one warning", async () => {
-  const logs: string[] = [];
-  const result = await runWorkflow(`return agent("legacy", { isolation: "worktree" });`, null, {
-    log(message) { logs.push(message); },
-    agent: async (_prompt, options) => ({ options }),
-  }).result;
-  assert.deepEqual(result, { options: { isolation: "worktree" } });
-  assert.equal(logs.length, 1);
-  assert.match(logs[0] ?? "", /isolation.*deprecated.*withWorktree.*next major version/i);
 });
 void test("parallel identities do not depend on completion order", async () => {
   const resolvers = new Map<string, () => void>();

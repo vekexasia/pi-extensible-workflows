@@ -37,7 +37,7 @@ To pass structured input from the main agent, include `args`:
 { "workflow": "namespace.workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task. Do not Try to reinvent already exposed functions.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task. Do not try to reinvent already exposed functions.
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
 
@@ -45,6 +45,7 @@ Pass downstream only needed results. Workflow JavaScript has no imports, filesys
 
 ```typescript
 interface AgentOptions {
+  label?: string; // optional non-empty display name
   model?: `${provider}/${model}` | `${provider}/${model}:${thinking}`;
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   role?: string; // one of the available workflow roles
@@ -68,7 +69,7 @@ const results = await withWorktree("implementation", async () => parallel("imple
 }));
 ```
 
-The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly. Do not set deprecated `isolation: "worktree"` on an agent inside this scope; that combination remains `INVALID_METADATA`.
+The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly.
 
 `parallel()` tasks may call any workflow function, not only `agent()`:
 
