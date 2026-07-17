@@ -331,6 +331,10 @@ Runs are stored under:
 ~/.pi/workflows/projects/<cwd-slug>-<cwd-hash>/sessions/<session-id>/runs/<run-id>/
 ```
 
+Each run also stores `system-prompts.json`. It records the full effective system prompt at every native Pi `agent_start`, after `before_agent_start` extensions have run, with the native `sessionId`, attempt, turn, and SHA-256 digest. This includes role bodies, project instructions, tool guidance, schema follow-up turns, retries, and any extension modifications. Native Pi JSONL transcripts intentionally do not contain system prompts.
+
+The run directory is created with mode `0700` and `system-prompts.json` with mode `0600`. Treat it as sensitive: it may contain private project instructions. Confirmed run deletion removes it with the other workflow artifacts, while native Pi transcripts remain in Pi session storage. Older runs without this file remain readable.
+
 Identity checks use the exact resolved launch cwd and Pi session ID. Immutable snapshots include source, args, settings, models, tools, effective role definitions, and schemas. Native transcripts remain in Pi session storage and their paths are referenced by the run.
 
 Top-level agents may request `isolation: "worktree"`:

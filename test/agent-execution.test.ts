@@ -39,6 +39,33 @@ void test("passes role prompt as system append, not task text", async () => {
   assert.match(prompt, /Task:\nDo work/);
 });
 
+void test("persists the effective role system prompt emitted for the native turn", async () => {
+  const saved: Array<{ sessionId: string; attempt: number; turn: number; prompt: string }> = [];
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const runStore = { recordSystemPrompt: async (entry: (typeof saved)[number]) => { saved.push(entry); } } as unknown as RunStore;
+  const executor = new WorkflowAgentExecutor({ ...root, runStore }, async (input) => ({
+    sessionId: "role", sessionFile: "/sessions/role.jsonl", messages: [assistant("done")],
+    systemPrompt: `BASE\n\n${input.systemPromptAppend ?? ""}`,
+    subscribe(candidate) { listener = candidate; return () => {}; },
+    async prompt() { listener?.({ type: "agent_start" }); },
+    dispose() {},
+  }));
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "reviewer" });
+  assert.deepEqual(saved, [{ sessionId: "role", attempt: 1, turn: 1, prompt: "BASE\n\nReview carefully" }]);
+});
+
+void test("does not mask agent failures when system prompt persistence also fails", async () => {
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  const runStore = { recordSystemPrompt: async () => { throw new Error("disk full"); } } as unknown as RunStore;
+  const executor = new WorkflowAgentExecutor({ ...root, runStore }, async () => ({
+    sessionId: "failed", sessionFile: "/sessions/failed.jsonl", messages: [], systemPrompt: "effective",
+    subscribe(candidate) { listener = candidate; return () => {}; },
+    async prompt() { listener?.({ type: "agent_start" }); throw new Error("provider failed"); },
+    dispose() {},
+  }));
+  await assert.rejects(executor.execute("Do work", { label: "worker", workflowName: "flow" }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "provider failed");
+});
+
 
 void test("provider limits pause and retry the same native session", async () => {
   let prompts = 0;

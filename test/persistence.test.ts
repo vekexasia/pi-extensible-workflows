@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -93,6 +93,17 @@ void test("stores exact cwd and Pi session snapshots atomically and rejects cros
   await assert.rejects(new RunStore(cwd, "session-b", "run-a", home).load());
   assert.notEqual(projectStorageKey(join(home, "a", "same-name")), projectStorageKey(join(home, "b", "same-name")));
   assert.deepEqual(readFileSync(join(store.directory, "state.json"), "utf8").trim().startsWith("{"), true);
+});
+void test("persists exact effective system prompts as private run artifacts", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-system-prompts-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const prompts = ["BASE\n\nROLE: α", "BASE\n\nROLE: β"];
+  await Promise.all(prompts.map((prompt, index) => store.recordSystemPrompt({ sessionId: "native-a", attempt: 1, turn: index + 1, prompt })));
+  const saved = await new RunStore(cwd, "session-a", "run-a", home).systemPrompts();
+  assert.deepEqual(saved, prompts.map((prompt, index) => ({ sessionId: "native-a", attempt: 1, turn: index + 1, sha256: createHash("sha256").update(prompt).digest("hex"), prompt })));
+  assert.equal(statSync(store.systemPromptPath()).mode & 0o777, 0o600);
 });
 void test("serializes concurrent state updates without losing fields", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-state-"));

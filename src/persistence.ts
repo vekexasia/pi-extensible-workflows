@@ -9,6 +9,7 @@ import type { OwnershipRecord } from "./agent-execution.js";
 import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
+export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
@@ -163,7 +164,8 @@ export class RunStore {
   private stateWrite: Promise<void> = Promise.resolve();
   private worktreeWrite: Promise<void> = Promise.resolve();
   private snapshotWrite: Promise<void> = Promise.resolve();
-
+  // ponytail: the session lease prevents concurrent RunStore writers for one run.
+  private systemPromptWrite: Promise<void> = Promise.resolve();
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
@@ -180,6 +182,7 @@ export class RunStore {
       await atomicJson(join(temporary, "ownership.json"), []);
       await atomicJson(join(temporary, "worktrees.json"), []);
       await atomicJson(join(temporary, "state.json"), run);
+      await atomicJson(join(temporary, "system-prompts.json"), { version: 1, entries: [] });
       await rename(temporary, this.directory);
     } catch (error) {
       await rm(temporary, { recursive: true, force: true });
@@ -228,6 +231,24 @@ export class RunStore {
 
   async loadOwnership(): Promise<readonly PersistedOwnershipNode[]> {
     return json<readonly PersistedOwnershipNode[]>(join(this.directory, "ownership.json"));
+  }
+
+  systemPromptPath(): string { return join(this.directory, "system-prompts.json"); }
+
+  async recordSystemPrompt(entry: Omit<EffectiveSystemPrompt, "sha256">): Promise<void> {
+    const write = this.systemPromptWrite.then(async () => {
+      const path = this.systemPromptPath();
+      const artifact = await json<{ version: 1; entries: EffectiveSystemPrompt[] }>(path).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1 as const, entries: [] as EffectiveSystemPrompt[] }; throw error; });
+      artifact.entries.push({ ...entry, sha256: createHash("sha256").update(entry.prompt).digest("hex") });
+      await atomicJson(path, artifact);
+    });
+    this.systemPromptWrite = write.catch(() => undefined);
+    await write;
+  }
+
+  async systemPrompts(): Promise<readonly EffectiveSystemPrompt[]> {
+    await this.systemPromptWrite;
+    return (await json<{ version: 1; entries: EffectiveSystemPrompt[] }>(this.systemPromptPath()).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1 as const, entries: [] }; throw error; })).entries;
   }
 
   private async updateJournal<T>(update: (journal: Journal) => T | Promise<T>): Promise<T> {

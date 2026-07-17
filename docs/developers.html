@@ -156,6 +156,8 @@ Focus on correctness and regressions.</code></pre>
         <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Direct <code>checkpoint()</code> returns <code>"approved"</code> or <code>"rejected"</code>. Responses are journaled and replay after cold recovery.</p>
         <p>Top-level agents can request <code>isolation: "worktree"</code>. The runtime creates a deterministic owned branch and worktree from the launch tree. The caller branch is unchanged; children and retries reuse the worktree. Use <code>withWorktree(name, callback)</code> when collaborating agents must share one worktree.</p>
         <p>Runs are stored under <code>~/.pi/workflows/projects/&lt;cwd-slug&gt;-&lt;cwd-hash&gt;/sessions/&lt;session-id&gt;/runs/&lt;run-id&gt;/</code>. Identity checks use the resolved launch cwd and Pi session ID.</p>
+        <p>Each run's private <code>system-prompts.json</code> records the full effective system prompt at every native Pi <code>agent_start</code>, after <code>before_agent_start</code> extensions have run. Entries include the native session ID, attempt, turn, SHA-256 digest, and prompt. Native Pi JSONL transcripts intentionally omit system prompts.</p>
+        <p>Run directories use mode <code>0700</code> and the prompt artifact uses <code>0600</code>. Treat it as sensitive because it can contain role bodies, project instructions, tool guidance, and extension modifications. Confirmed run deletion removes it; native Pi transcripts remain in Pi session storage.</p>
       </section>
       <section id="operations">
         <h2>Operations and debugging</h2>

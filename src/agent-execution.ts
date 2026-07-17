@@ -52,6 +52,7 @@ export interface NativeSession {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
   readonly messages: readonly AgentMessage[];
+  readonly systemPrompt?: string;
   readonly agent?: { state: { tools: readonly { name: string }[] } };
   subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string): Promise<void>;
@@ -171,6 +172,13 @@ export class WorkflowAgentExecutor {
       let lastActivityPersisted = 0;
       let progress = Promise.resolve();
       let unsubscribe: (() => void) | undefined;
+      let systemPromptTurn = 0;
+      let systemPromptWrite = Promise.resolve();
+      let systemPromptWriteError: unknown;
+      const flushSystemPrompts = async () => {
+        await systemPromptWrite;
+        if (systemPromptWriteError) throw new WorkflowError("INTERNAL_ERROR", `Failed to persist effective system prompt: ${systemPromptWriteError instanceof Error ? systemPromptWriteError.message : typeof systemPromptWriteError === "string" ? systemPromptWriteError : "unknown error"}`);
+      };
       const report = (persist: boolean) => {
         if (!session || !options.onProgress) return;
         const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
@@ -180,6 +188,11 @@ export class WorkflowAgentExecutor {
         session = await this.createSession({ cwd, model: resolved.model, tools: resolved.tools, sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(this.root.agentDir ? { agentDir: this.root.agentDir } : {}), ...(customTools.length ? { customTools } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPromptAppend ? { systemPromptAppend: resolved.systemPromptAppend } : {}) });
         await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile) });
         unsubscribe = session.subscribe?.((event) => {
+          if (event.type === "agent_start" && session?.systemPrompt !== undefined && this.root.runStore) {
+            systemPromptTurn += 1;
+            const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
+            systemPromptWrite = systemPromptWrite.then(() => this.root.runStore?.recordSystemPrompt(entry)).then(() => undefined).catch((error: unknown) => { systemPromptWriteError ??= error; });
+          }
           if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; }
           if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; }
           if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_start") reasoning = "";
@@ -213,6 +226,7 @@ export class WorkflowAgentExecutor {
         if (options.isolation) await this.root.runStore?.snapshotWorktree(options.worktreeOwner ?? options.label);
         report(true);
         await progress;
+        await flushSystemPrompts();
         unsubscribe?.();
         const attemptAccounting = accounting(session.messages);
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting });
@@ -223,6 +237,7 @@ export class WorkflowAgentExecutor {
         if (session) {
           report(true);
           await progress;
+          try { await flushSystemPrompts(); } catch { /* Preserve the agent failure that prompted this cleanup. */ }
           unsubscribe?.();
           const attemptAccounting = accounting(session.messages);
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting });
