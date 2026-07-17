@@ -127,7 +127,7 @@ void test("retries in fresh persisted sessions and reports terminal attempt hist
 void test("top-level worktree cwd is inherited and reused by retries", async () => {
   const cwds: string[] = [];
   const snapshots: string[] = [];
-  const isolatedRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-workflows/run/key", cwd: "/runs/worktree/subdir" }), validateWorktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-workflows/run/key", cwd: "/runs/worktree/subdir" }), snapshotWorktree: async (owner: string) => { snapshots.push(owner); return "commit"; } } as unknown as RunStore };
+  const isolatedRoot = { ...root, runStore: { worktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), validateWorktree: async () => ({ owner: "worker", path: "/runs/worktree", branch: "pi-extensible-workflows/run/key", cwd: "/runs/worktree/subdir" }), snapshotWorktree: async (owner: string) => { snapshots.push(owner); return "commit"; } } as unknown as RunStore };
   let attempt = 0;
   const executor = new WorkflowAgentExecutor(isolatedRoot, async (input) => {
     cwds.push(input.cwd);

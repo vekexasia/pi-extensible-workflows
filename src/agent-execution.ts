@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { AuthStorage, createAgentSession, DefaultResourceLoader, getAgentDir, ModelRegistry, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { JsonSchema, JsonValue, ModelSpec } from "./index.js";
@@ -91,15 +91,14 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
   const agentDir = input.agentDir ?? getAgentDir();
   const manager = input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd);
   manager.appendSessionInfo(input.sessionLabel);
-  const authStorage = AuthStorage.create(join(agentDir, "auth.json"));
-  const registry = ModelRegistry.create(authStorage, join(agentDir, "models.json"));
-  const model = registry.find(input.model.provider, input.model.model);
+  const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
+  const model = modelRuntime.getModel(input.model.provider, input.model.model);
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
   const resourceLoader = input.systemPromptAppend ? new DefaultResourceLoader({ cwd: input.cwd, agentDir, appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] }) : undefined;
   if (resourceLoader) await resourceLoader.reload();
-  const { session } = await createAgentSession({ cwd: input.cwd, agentDir, authStorage, modelRegistry: registry, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
+  const { session } = await createAgentSession({ cwd: input.cwd, agentDir, modelRuntime, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
   return session;
 }
 

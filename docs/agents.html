@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Agent documentation for invoking pi-extensible-workflows.">
+  <title>Agent docs | pi-extensible-workflows</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="index.html">pi-extensible-workflows</a>
+      <nav aria-label="Primary navigation">
+        <a href="developers.html">Developers</a>
+        <a class="active" href="agents.html">Agents</a>
+        <a href="https://github.com/vekexasia/pi-extensible-workflows">Repository</a>
+      </nav>
+    </div>
+  </header>
+  <main class="container docs-layout">
+    <aside class="toc" aria-label="On this page">
+      <p class="toc-title">Agents</p>
+      <a href="#quick-start">Quick start</a>
+      <a href="#script-contract">Script and args</a>
+      <a href="#patterns">Workflow patterns</a>
+      <a href="#selection">Roles and models</a>
+      <a href="#checkpoints">Checkpoints</a>
+      <a href="#recovery">Failure and recovery</a>
+    </aside>
+    <article class="prose">
+      <p class="eyebrow">Agent path</p>
+      <h1>Invoke workflows safely</h1>
+      <p class="lead">Use the workflow tools when a task benefits from explicit orchestration, parallel work, durable checkpoints, or isolated agent changes.</p>
+      <section id="quick-start">
+        <h2>Quick start</h2>
+        <p>Call <code>workflow</code> with either an inline script or a registered workflow. Use <code>workflow_respond</code> only to answer a pending checkpoint.</p>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"release-check"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"phase('inspect'); return await agent('Inspect the package');"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"target"</span><span class="tok-punctuation">:</span> <span class="tok-string">"dist"</span> <span class="tok-punctuation">}</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Inline scripts require <code>name</code>. A registered workflow uses <code>workflow: "namespace.name"</code> instead of <code>script</code>:</p>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"git.releaseCheck"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call.</p>
+      </section>
+      <section id="script-contract">
+        <h2>Script and argument contract</h2>
+        <p>The script is immutable, sandboxed JavaScript. It can use <code>args</code>, <code>agent</code>, <code>prompt</code>, <code>parallel</code>, <code>pipeline</code>, <code>phase</code>, <code>log</code>, <code>checkpoint</code>, <code>withWorktree</code>, and registered globals. It cannot import modules or access the filesystem, network, process, clocks, timers, or dynamic code.</p>
+        <p>Arguments must be JSON-compatible. If omitted, <code>args</code> is <code>null</code>. Await agent results before passing them to <code>prompt()</code> or serialization. Values returned by agents and combinators are bare values, not <code>{ value, ok }</code> wrappers.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> result = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the target"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">result</span> <span class="tok-punctuation">}</span>;</code></pre>
+        <p>Direct calls from the same source location must be sequential unless they are structurally inside <code>parallel</code> or <code>pipeline</code>. Keep operation names and object keys stable so replay can match them.</p>
+      </section>
+      <section id="patterns">
+        <h2>Minimal workflow patterns</h2>
+        <h3>Development</h3>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"implement-feature"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"return await agent('Implement the requested feature', { isolation: 'worktree' });"</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <h3>Review</h3>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> reports = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"review"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">correctness</span><span class="tok-punctuation">:</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review correctness and regressions"</span>),
+  <span class="tok-property">security</span><span class="tok-punctuation">:</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review trust and security boundaries"</span>),
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">return</span> reports;</code></pre>
+        <h3>Planning</h3>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> plan = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Create a concise implementation plan"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">role</span><span class="tok-punctuation">:</span> <span class="tok-string">"planner"</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">return</span> plan;</code></pre>
+        <h3>Scouting</h3>
+        <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Scout the repository and report only relevant files"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">role</span><span class="tok-punctuation">:</span> <span class="tok-string">"scout"</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);</code></pre>
+        <p>Use roles only when the Pi installation provides those role files. Otherwise choose an explicit available model and the smallest required tool list.</p>
+      </section>
+      <section id="selection">
+        <h2>Role and model selection</h2>
+        <p>An agent can select a <code>role</code>, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary.</p>
+        <p>Optional controls are <code>outputSchema</code>, non-negative integer <code>retries</code>, positive integer or <code>null</code> <code>timeoutMs</code>, and <code>isolation: "worktree"</code>. Retry only idempotent work or prompts that prevent duplicate side effects. The same worktree is reused across retries.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the package API"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">,</span> <span class="tok-string">"find"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">timeoutMs</span><span class="tok-punctuation">:</span> <span class="tok-number">120000</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);</code></pre>
+      </section>
+      <section id="checkpoints">
+        <h2>Checkpoints and <code>workflow_respond</code></h2>
+        <p>Use <code>checkpoint({ name, prompt, context })</code> when execution must wait for a decision. The name must be a stable non-empty string. The prompt is limited to 1 KB UTF-8 bytes and context to 4 KB serialized JSON.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> approved = <span class="tok-keyword">await</span> <span class="tok-function">checkpoint</span>(<span class="tok-punctuation">{</span>
+  <span class="tok-property">name</span><span class="tok-punctuation">:</span> <span class="tok-string">"ship"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">prompt</span><span class="tok-punctuation">:</span> <span class="tok-string">"Ship this build?"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">context</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">commit</span><span class="tok-punctuation">:</span> args.commit <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">if</span> (approved !== <span class="tok-string">"approved"</span>) <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">cancelled</span><span class="tok-punctuation">:</span> <span class="tok-boolean">true</span> <span class="tok-punctuation">}</span>;</code></pre>
+        <p>For a background run, the tool asks for <code>workflow_respond</code>:</p>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span> <span class="tok-property">"runId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"..."</span><span class="tok-punctuation">,</span> <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"ship"</span><span class="tok-punctuation">,</span> <span class="tok-property">"approved"</span><span class="tok-punctuation">:</span> <span class="tok-boolean">true</span> <span class="tok-punctuation">}</span></code></pre>
+        <p>The first valid response wins. Foreground checkpoints require a Pi UI with an interactive <code>select</code>; <code>workflow_respond</code> alone cannot satisfy that requirement.</p>
+      </section>
+      <section id="recovery">
+        <h2>Failure, retry, resume, and cancellation</h2>
+        <ul>
+          <li><strong>Failure:</strong> catch workflow-source failures as ordinary <code>Error</code> values and inspect <code>code</code> and <code>message</code>. Host tool calls reject with <code>WorkflowError</code>.</li>
+          <li><strong>Retry:</strong> set <code>retries</code> only for safe, repeatable agent work. Each retry gets a fresh Pi session but preserves filesystem changes.</li>
+          <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. Completed, failed, and stopped runs are terminal.</li>
+          <li><strong>Cancellation:</strong> stopping a run is immediate, cascades to owned agents, and cannot be undone. A cancelled workflow reports <code>CANCELLED</code> or a stopped run state.</li>
+        </ul>
+        <p>Use <code>/workflow</code> to inspect state, pause, resume, stop, approve, reject, or delete a run. The run ID returned by a background invocation is the handle for these actions.</p>
+      </section>
+      <section class="callout">
+        <h2>Need the implementation details?</h2>
+        <p>See the <a href="developers.html#operations">developer operations guide</a> for storage, doctor, inspector, and evaluation commands.</p>
+      </section>
+      <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>pi-extensible-workflows</span>
+      <a href="https://github.com/vekexasia/pi-extensible-workflows">GitHub repository</a>
+    </div>
+  </footer>
+</body>
+</html>

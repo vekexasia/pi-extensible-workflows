@@ -5,7 +5,7 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   {
-    ignores: ["dist/**", "eslint.config.js"],
+    ignores: ["dist/**", "eslint.config.js", "scripts/check-docs.mjs"],
   },
   {
     languageOptions: {

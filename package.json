@@ -1,14 +1,16 @@
 {
-  "name": "pi-workflows",
+  "name": "pi-extensible-workflows",
   "version": "0.3.0",
   "description": "Deterministic multi-agent workflow orchestration for Pi",
+  "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
+  "repository": { "type": "git", "url": "git+https://github.com/vekexasia/pi-extensible-workflows.git" },
   "type": "module",
   "keywords": [
     "pi-package"
   ],
   "exports": "./dist/src/index.js",
   "bin": {
-    "pi-workflows": "./dist/src/cli.js"
+    "pi-extensible-workflows": "./dist/src/cli.js"
   },
   "files": [
     "dist/src",
@@ -21,7 +23,8 @@
     "lint": "eslint .",
     "test": "npm run build && node --test 'dist/test/*.test.js'",
     "acceptance": "npm run build && node --test dist/test/runtime-acceptance.test.js",
-    "check": "npm run lint && npm test",
+    "docs:check": "node scripts/check-docs.mjs",
+    "check": "npm run lint && npm test && npm run docs:check",
     "test:deterministic": "npm test",
     "evals": "npm run build && node dist/src/workflow-evals.js",
     "evals:ambient": "node -e \"if (process.env.PI_WORKFLOW_EVAL_AMBIENT !== '1') { console.error('Ambient Tier D evals are opt-in. Set PI_WORKFLOW_EVAL_AMBIENT=1 to run them.'); process.exit(1); }\" && npm run build && node dist/src/ambient-workflow-evals.js",
@@ -38,8 +41,8 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.80.6",
-    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.9",
+    "@earendil-works/pi-coding-agent": "0.80.9",
     "@eslint/js": "10.0.1",
     "@types/node": "24.12.4",
     "eslint": "10.0.3",

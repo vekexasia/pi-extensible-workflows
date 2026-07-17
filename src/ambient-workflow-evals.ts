@@ -155,7 +155,7 @@ test("summarizes scores", () => {
 `,
 });
 
-const FIXED_GIT_NAME = "pi-workflows ambient fixture";
+const FIXED_GIT_NAME = "pi-extensible-workflows ambient fixture";
 const FIXED_GIT_EMAIL = "ambient-fixture@example.invalid";
 
 function git(cwd: string, args: readonly string[]): string {

@@ -16,7 +16,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
     try { await (options.inspect ?? runSessionInspector)(args[1]); return 0; }
     catch (error) { write(`Error: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
   }
-  write("Usage: pi-workflows doctor | inspect [session-id]\n");
+  write("Usage: pi-extensible-workflows doctor | inspect [session-id]\n");
   return 1;
 }
 

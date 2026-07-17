@@ -1,8 +1,9 @@
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import { InMemoryCredentialStore, type Credential } from "@earendil-works/pi-ai";
 import {
-  AuthStorage,
+  ModelRuntime,
   createAgentSessionFromServices,
   createAgentSessionServices,
   getAgentDir,
@@ -16,7 +17,7 @@ import {
   parseModelReference,
   parseRoleMarkdown,
   preflight,
-  workflowDslRegistry,
+  registeredWorkflowDefinitions,
   WorkflowError,
   type WorkflowScriptDefinition,
   type WorkflowSettings,
@@ -35,7 +36,6 @@ export interface DoctorPiState {
   availableModels: readonly string[];
   extensionErrors: readonly { path?: string; message: string }[];
   workflows: Readonly<Record<string, WorkflowScriptDefinition>>;
-  extensionVersions: Readonly<Record<string, string>>;
 }
 export interface DoctorReport {
   cwd: string;
@@ -63,15 +63,16 @@ function canonical(path: string): string {
   try { return realpathSync(absolute); } catch { return absolute; }
 }
 
-function readAuthStorage(agentDir: string): AuthStorage {
+async function readCredentials(agentDir: string): Promise<InMemoryCredentialStore> {
+  const credentials = new InMemoryCredentialStore();
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(agentDir, "auth.json"), "utf8"));
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("Pi auth.json must be an object");
-    return AuthStorage.inMemory(parsed as NonNullable<Parameters<typeof AuthStorage.inMemory>[0]>);
+    await Promise.all(Object.entries(parsed).map(([provider, credential]) => credentials.modify(provider, async () => credential as Credential)));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return AuthStorage.inMemory();
-    throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  return credentials;
 }
 
 function savedTrust(cwd: string, agentDir: string): boolean | undefined {
@@ -99,21 +100,21 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
   const previousOffline = process.env.PI_OFFLINE;
   process.env.PI_OFFLINE = "1";
   try {
+    const modelRuntime = await ModelRuntime.create({ credentials: await readCredentials(agentDir), modelsPath: join(agentDir, "models.json") });
     const services = await createAgentSessionServices({
       cwd,
       agentDir,
       settingsManager,
-      authStorage: readAuthStorage(agentDir),
+      modelRuntime,
       resourceLoaderOptions: { noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true },
       resourceLoaderReloadOptions: { resolveProjectTrust: async () => trusted },
     });
-    const allModels = services.modelRegistry.getAll();
-    const availableModels = services.modelRegistry.getAvailable();
+    const allModels = services.modelRuntime.getModels();
+    const availableModels = await services.modelRuntime.getAvailable();
     const model = availableModels[0] ?? allModels[0];
     if (!model) throw new Error("Pi has no models registered");
     const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory(), model });
-    const activeTools = session.agent.state.tools.map(({ name }) => name).filter((name) => name !== "workflow" && name !== "workflow_respond");
-    session.dispose();
+    const activeTools = session.agent.state.tools.map(({ name }) => name).filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_catalog");
     const extensions = services.resourceLoader.getExtensions();
     return {
       trust: { required, trusted, source },
@@ -124,8 +125,7 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
         ...extensions.errors.map(({ path, error }) => ({ path, message: error })),
         ...services.diagnostics.filter(({ type }) => type === "error").map(({ message }) => ({ message })),
       ],
-      workflows: workflowDslRegistry.workflows(),
-      extensionVersions: workflowDslRegistry.versions(),
+      workflows: registeredWorkflowDefinitions(),
     };
   } finally {
     if (previousOffline === undefined) delete process.env.PI_OFFLINE;
@@ -136,6 +136,11 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
 function roleFiles(dir: string): string[] {
   try { return readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isFile() && extname(entry.name) === ".md").map((entry) => join(dir, entry.name)).sort(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+}
+
+function roleFilesFrom(dirs: readonly string[]): string[] {
+  const paths = dirs.flatMap((dir) => roleFiles(dir));
+  return [...new Map(paths.map((path) => [basename(path, ".md"), path])).values()].sort();
 }
 
 function diagnostic(severity: DoctorSeverity, code: string, message: string, source?: string, hint?: string): DoctorDiagnostic {
@@ -185,9 +190,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   try { pi = await (options.discoverPi ?? discoverPi)(cwd, agentDir); }
   catch (error) {
     diagnostics.push(diagnostic("error", "PI_DISCOVERY", `Pi headless discovery failed: ${(error as Error).message}`, undefined, "Open and trust the project in Pi, fix extension errors, then rerun doctor."));
-    pi = { trust: { required: false, trusted: false, source: "discovery failed" }, activeTools: [], knownModels: [], availableModels: [], extensionErrors: [], workflows: {}, extensionVersions: {} };
+    pi = { trust: { required: false, trusted: false, source: "discovery failed" }, activeTools: [], knownModels: [], availableModels: [], extensionErrors: [], workflows: {} };
   }
-  if (options.activeTools) pi = { ...pi, activeTools: options.activeTools };
+  if (options.activeTools) pi = { ...pi, activeTools: options.activeTools.filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_catalog") };
   if (pi.trust.required && !pi.trust.trusted) diagnostics.push(diagnostic("warning", "PROJECT_UNTRUSTED", "Pi project resources are inactive because the project is not trusted", cwd, "Open this project in Pi, choose Trust, then rerun doctor."));
   for (const error of pi.extensionErrors) diagnostics.push(diagnostic("error", "EXTENSION_LOAD", error.message, error.path, "Fix or disable the failing Pi extension."));
 
@@ -197,15 +202,15 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const roles: DoctorRole[] = [];
   const definitions = new Map<string, AgentDefinition>();
   const globalPaths = new Map<string, string>();
-  const globalRoleDir = join(dirname(agentDir), "piworkflows", "roles");
-  for (const path of roleFiles(globalRoleDir)) {
+  const globalRoleDirs = [join(dirname(agentDir), "piworkflows", "roles"), join(dirname(agentDir), "pi-extensible-workflows", "roles")];
+  for (const path of roleFilesFrom(globalRoleDirs)) {
     const name = basename(path, ".md");
     roles.push({ name, path, scope: "global", active: true });
     globalPaths.set(name, path);
     const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics);
     if (definition) definitions.set(name, definition);
   }
-  for (const path of roleFiles(join(cwd, ".pi", "piworkflows", "roles"))) {
+  for (const path of roleFilesFrom([join(cwd, ".pi", "piworkflows", "roles"), join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
     const name = basename(path, ".md");
     const globalPath = globalPaths.get(name);
     const active = pi.trust.trusted;
@@ -227,8 +232,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
         models: new DoctorModelSet(pi.knownModels),
         tools: activeTools,
         agentTypes: new Set(definitions.keys()),
-        extensions: pi.extensionVersions,
-      }, [], { name, description: workflow.description, ...(workflow.extensions ? { extensions: workflow.extensions } : {}) });
+      }, [], { name, description: workflow.description });
       for (const model of checked.referenced.models) if (!knownModels.has(model) || !availableModels.has(model)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${model}`, name));
     } catch (error) {
       valid = false;
@@ -250,7 +254,7 @@ export function doctorExitCode(report: DoctorReport): 0 | 1 { return count(repor
 
 export function formatDoctorReport(report: DoctorReport): string {
   const lines = [
-    "# pi-workflows doctor",
+    "# pi-extensible-workflows doctor",
     "",
     "## Environment",
     `- CWD: \`${report.cwd}\``,

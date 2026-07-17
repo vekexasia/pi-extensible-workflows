@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Developer and agent documentation for pi-extensible-workflows.">
+  <title>pi-extensible-workflows documentation</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="index.html">pi-extensible-workflows</a>
+      <nav aria-label="Primary navigation">
+        <a href="developers.html">Developers</a>
+        <a href="agents.html">Agents</a>
+        <a href="https://github.com/vekexasia/pi-extensible-workflows">Repository</a>
+      </nav>
+    </div>
+  </header>
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">Pi extension documentation</p>
+      <h1>Deterministic workflows for Pi</h1>
+      <p class="lead">pi-extensible-workflows orchestrates resumable work across Pi agents with a small JavaScript DSL, explicit checkpoints, and durable run state.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="developers.html">Read developer docs</a>
+        <a class="button" href="agents.html">Read agent docs</a>
+      </div>
+    </section>
+    <section class="grid two-up" aria-label="Documentation paths">
+      <article class="card">
+        <p class="card-kicker">For developers</p>
+        <h2><a href="developers.html">Build and integrate</a></h2>
+        <p>Install the extension, understand its trust boundary, write workflow scripts, register reusable primitives, and operate runs in Pi.</p>
+        <a class="text-link" href="developers.html#dsl">Explore the DSL <span aria-hidden="true">→</span></a>
+      </article>
+      <article class="card">
+        <p class="card-kicker">For agents</p>
+        <h2><a href="agents.html">Invoke and recover</a></h2>
+        <p>Choose between <code>workflow</code> and <code>workflow_respond</code>, pass the right script and arguments, and handle checkpoints, retries, and failure.</p>
+        <a class="text-link" href="agents.html#quick-start">Start with an invocation <span aria-hidden="true">→</span></a>
+      </article>
+    </section>
+    <section class="section split" id="quick-start">
+      <div>
+        <p class="eyebrow">Quick start</p>
+        <h2>Install, then ask Pi to run a workflow</h2>
+        <p>Use Node.js 22.19 or newer and a trusted Pi project. The package registers the <code>workflow</code> tool, the checkpoint response tool, and the <code>/workflow</code> command.</p>
+      </div>
+      <pre><code class="language-shell"><span class="tok-command">npm</span> ci
+<span class="tok-command">pi</span> install /absolute/path/to/pi-extensible-workflows</code></pre>
+    </section>
+    <section class="section" id="choose-a-path">
+      <p class="eyebrow">Choose a path</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Need</th><th>Go to</th></tr></thead>
+          <tbody>
+            <tr><td>Install, extend, or debug the package</td><td><a href="developers.html#installation">Developer installation</a></td></tr>
+            <tr><td>Write a workflow tool call</td><td><a href="agents.html#script-contract">Agent script contract</a></td></tr>
+            <tr><td>Ask for approval before continuing</td><td><a href="agents.html#checkpoints">Checkpoint handling</a></td></tr>
+            <tr><td>Inspect a run or recover it</td><td><a href="developers.html#operations">Operations and recovery</a></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section callout">
+      <h2>Documentation is versioned with the package</h2>
+      <p>Examples and contracts in this site are maintained beside the implementation. See the <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/README.md">repository README</a> for the package overview and <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/skills/pi-extensible-workflows/SKILL.md">bundled agent skill</a> for workflow selection guidance.</p>
+    </section>
+  </main>
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>pi-extensible-workflows</span>
+      <a href="https://github.com/vekexasia/pi-extensible-workflows">GitHub repository</a>
+    </div>
+  </footer>
+</body>
+</html>

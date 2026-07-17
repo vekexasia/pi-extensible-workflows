@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPreview, formatWorkflowProgress, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowDslExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowDslRegistry, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, validateCheckpoint, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -19,8 +20,9 @@ RunStore.prototype.saveOwnership = async function (nodes: OwnershipNodes) {
   await nativeSaveOwnership.call(this, nodes);
 };
 const capabilities = {
-  models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]), extensions: { git: "1.2.3" },
+  models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]),
 };
+const reuseExtension = { namespace: "reuseTest", version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", functions: { inspect: { description: "Inspect", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: () => "ok" } }, variables: { branch: { description: "Branch", schema: { type: "string" }, resolve: () => "main" } }, workflows: { hello: { description: "Say hello", script: `return args.name;` } } };
 const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt", tools: ["read"] });`;
 
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
@@ -51,26 +53,65 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.equal(tool.promptGuidelines, undefined);
   assert.ok(discover);
   assert.ok(discover()?.skillPaths?.some((path) => existsSync(path)));
+  const skillPath = discover()?.skillPaths?.find((path) => existsSync(path));
+  assert.ok(skillPath);
+  assert.match(readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8"), /If `workflow_catalog` is available, call it once before creating the first workflow for a task/);
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+void test("registers workflow_catalog only for active non-empty registries", async () => {
+  const empty = new WorkflowRegistry();
+  assert.deepEqual(empty.catalog(), { functions: [], variables: [], workflows: [] });
+  const inactiveHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-inactive-"));
+  const inactiveTools: Array<{ name: string }> = [];
+  let inactiveStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let inactiveShutdown: (() => Promise<void>) | undefined;
+  workflowExtension({ registerTool(tool: { name: string }) { inactiveTools.push(tool); }, registerCommand() {}, getActiveTools: () => ["read"], on(name: string, handler: unknown) { if (name === "session_start") inactiveStart = handler as typeof inactiveStart; if (name === "session_shutdown") inactiveShutdown = handler as typeof inactiveShutdown; } } as never, inactiveHome);
+  assert.ok(inactiveStart && inactiveShutdown);
+  await inactiveStart({}, { cwd: inactiveHome, sessionManager: { getSessionId: () => "inactive" } });
+  assert.equal(inactiveTools.some(({ name }) => name === "workflow_catalog"), false);
+  await inactiveShutdown();
+  const activeHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-active-"));
+  const activeTools: Array<{ name: string; execute?: (...args: never[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  let activeStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let activeShutdown: (() => Promise<void>) | undefined;
+  workflowExtension({ registerTool(tool: (typeof activeTools)[number]) { activeTools.push(tool); }, registerCommand() {}, getActiveTools: () => ["workflow"], on(name: string, handler: unknown) { if (name === "session_start") activeStart = handler as typeof activeStart; if (name === "session_shutdown") activeShutdown = handler as typeof activeShutdown; } } as never, activeHome);
+  registerWorkflowExtension(reuseExtension);
+  assert.ok(activeStart && activeShutdown);
+  assert.equal(activeTools.filter(({ name }) => name === "workflow_catalog").length, 0);
+  const activeContext = { cwd: activeHome, sessionManager: { getSessionId: () => "active" } };
+  await activeStart({}, activeContext);
+  await activeStart({}, activeContext);
+  assert.equal(activeTools.filter(({ name }) => name === "workflow_catalog").length, 1);
+  assert.throws(() => { registerWorkflowExtension({ namespace: "lateCatalog", version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
+  const catalogTool = activeTools.find(({ name }) => name === "workflow_catalog");
+  assert.ok(catalogTool?.execute);
+  const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { functions: Array<Record<string, unknown>>; variables: Array<Record<string, unknown>>; workflows: Array<Record<string, unknown>> };
+  assert.deepEqual(catalog.functions.map(({ name, namespace }) => ({ name, namespace })), [{ name: "inspect", namespace: "reuseTest" }]);
+  assert.deepEqual(catalog.variables.map(({ name, namespace }) => ({ name, namespace })), [{ name: "branch", namespace: "reuseTest" }]);
+  assert.deepEqual(catalog.workflows.map(({ name, namespace }) => ({ name, namespace })), [{ name: "reuseTest.hello", namespace: "reuseTest" }]);
+  assert.deepEqual(Object.keys(catalog.functions[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "input", "name", "namespace", "output", "version"]);
+  assert.deepEqual(Object.keys(catalog.variables[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "name", "namespace", "schema", "version"]);
+  assert.doesNotMatch(JSON.stringify(catalog), /"script"|"run"|"resolve"|"source"|"main"|"ok"/);
+  await activeShutdown();
 });
 
 void test("advertises only described effective roles in the system prompt while workflow is active", () => {
   type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
   let handler: StartHandler | undefined;
   const activeTools = ["workflow"];
-  const cwd = mkdtempSync(join(tmpdir(), "pi-workflows-role-guidance-"));
-  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-guidance-"));
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
   workflowExtension({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: StartHandler) { if (name === "before_agent_start") handler = candidate; } } as never);
   assert.ok(handler);
   const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
   const guidance = result?.systemPrompt ?? "";
   assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
   assert.match(guidance, /`reviewer`: Reviews correctness/);
-  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool/);
+  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|reuseTest|workflow_catalog/);
   assert.equal(handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false }), undefined);
 });
 
@@ -79,7 +120,7 @@ void test("background workflows emit compatible lifecycle events", async () => {
   const events: Array<{ channel: string; data: Record<string, unknown> }> = [];
   let completed!: () => void;
   const done = new Promise<void>((resolve) => { completed = resolve; });
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-events-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-events-"));
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data: data as Record<string, unknown> }); if (channel === WORKFLOW_ASYNC_COMPLETE_EVENT) completed(); } } } as never, home);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
@@ -87,6 +128,8 @@ void test("background workflows emit compatible lifecycle events", async () => {
   await done;
   const runId = (JSON.parse(result.content[0]?.text ?? "{}") as { runId?: string }).runId;
   assert.ok(runId);
+  const stored = new RunStore(home, "session", runId, home);
+  assert.equal(JSON.parse(readFileSync(join(stored.directory, "result.json"), "utf8")), true);
   assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT]);
 });
 
@@ -94,31 +137,28 @@ void test("/workflow doctor formats the shared doctor report with active session
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"], on() {} } as never);
   let output = "";
-  await commands[0]?.handler("doctor", { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-slash-doctor-")), ui: { notify(text: string) { output = text; } } } as never);
-  assert.match(output, /^# pi-workflows doctor/m);
+  await commands[0]?.handler("doctor", { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-slash-doctor-")), ui: { notify(text: string) { output = text; } } } as never);
+  assert.match(output, /^# pi-extensible-workflows doctor/m);
   assert.match(output, /## Active tools\n- `read`/);
   assert.doesNotMatch(output, /- `workflow`/);
 });
 
 void test("registered extension workflows can run by name", async () => {
-  registerWorkflowDslExtension({
-    name: "reuseTest", version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", methods: {},
-    workflows: { hello: { description: "Say hello", script: `return args.name;` } },
-  });
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never);
+  registerWorkflowExtension(reuseExtension);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
-  const result = await execute("id", { workflow: "reuseTest.hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const result = await execute("id", { workflow: "reuseTest.hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(result.content[0]?.text, '"Andrea"');
 });
 void test("inline workflow args cross the production tool boundary and omitted args become null", async () => {
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-inline-home-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-inline-home-"));
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never, home);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
-  const context = { cwd: mkdtempSync(join(tmpdir(), "pi-workflows-inline-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const context = { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-inline-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   const withArgs = await execute("id", { name: "with-args", script: "return args.answer;", args: { answer: 42 }, foreground: true }, new AbortController().signal, undefined, context);
   assert.equal(withArgs.content[0]?.text, "42");
   const omitted = await execute("id", { name: "without-args", script: "return args;", foreground: true }, new AbortController().signal, undefined, context);
@@ -136,7 +176,7 @@ void test("navigator renders effective agent policy separately from launch metad
 void test("streams foreground workflow progress into its tool card", async () => {
   type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string } } };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-progress-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-progress-"));
   workflowExtension({
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
     registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {},
@@ -167,9 +207,9 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create({ id: "run-a", workflowName: "nav", cwd, sessionId: "session-a", state: "completed", phase: "review", agents: [{ id: "run-a:1", name: "reviewer", path: "run-a:1", state: "failed", role: "reviewer", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read"], attempts: 2, attemptDetails: [{ attempt: 2, sessionId: "native-a", sessionFile: "/pi/native-a.jsonl", error: { code: "AGENT_FAILED", message: "boom" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], nativeSessions: [{ sessionId: "native-a", sessionFile: "/pi/native-a.jsonl" }] }, snapshot);
   const same = new RunStore(cwd, "session-a", "run-c", home);
@@ -177,11 +217,11 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   await same.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
   const other = new RunStore(cwd, "session-b", "run-b", home);
   await other.create({ id: "run-b", workflowName: "other", cwd, sessionId: "session-b", state: "completed", agents: [], nativeSessions: [] }, snapshot);
-  const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "reviewer", branch: "pi-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
+  const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "reviewer", branch: "pi-extensible-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
   assert.match(rendered, /Phase: review/);
   assert.match(rendered, /parent=root model=openai\/gpt:medium role=reviewer tools=read attempts=2 retries=1/);
   assert.match(rendered, /error=AGENT_FAILED: boom/);
-  assert.match(rendered, /branch=pi-workflows\/run-a\/tree path=\/worktree/);
+  assert.match(rendered, /branch=pi-extensible-workflows\/run-a\/tree path=\/worktree/);
   assert.match(rendered, /native-a: \/pi\/native-a\.jsonl/);
 
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
@@ -215,7 +255,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.equal(existsSync(store.directory), false);
 });
 void test("TUI navigator copies full run artifacts and stays open on clipboard failure", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-copy-artifacts-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-copy-artifacts-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -228,7 +268,7 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
   const transcriptA = join(home, `transcript-${"a".repeat(80)}.jsonl`);
   const transcriptB = join(home, `transcript-${"b".repeat(80)}.jsonl`);
   const store = new RunStore(repo, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'copy',description:'copy'}", args: null, metadata: { name: "copy", description: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'copy',description:'copy'}", args: null, metadata: { name: "copy", description: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({
     id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "native-a", sessionFile: transcriptA, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [{ sessionId: "native-a", sessionFile: transcriptA }, { sessionId: "native-b", sessionFile: transcriptB }],
   }, snapshot);
@@ -277,10 +317,10 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
 });
 
 void test("navigator stop asks for confirmation before cancelling", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stop-confirm-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-confirm-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -325,15 +365,15 @@ void test("navigator stop asks for confirmation before cancelling", async () => 
   closeNavigator();
   await pending;
   assert.equal(customCalls, 1);
-  assert.equal((await store.load()).run.state, "running");
+  assert.equal((await store.load()).run.state, "interrupted");
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["running"]);
 });
 
 void test("navigator stop stays visible through cleanup and ignores repeated input", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stop-progress-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-progress-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   let releaseCleanup = () => {};
@@ -401,10 +441,10 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
   assert.ok(notices.some((notice) => notice.includes("Stopped workflow run.")));
 });
 void test("non-TUI navigator Stop confirms before cancelling", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stop-select-confirm-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-select-confirm-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "select-stop" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "select-stop" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "select-stop", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -419,8 +459,9 @@ void test("non-TUI navigator Stop confirms before cancelling", async () => {
       confirm: async () => { confirmations += 1; return true; },
       select: async (_prompt: string, options: string[]) => {
         selectCalls += 1;
-        if (selectCalls === 1) return options.find((option) => option.includes("select-stop")) ?? "Close";
-        if (selectCalls === 2) return options.find((option) => option === "Stop") ?? "Close";
+        if (selectCalls === 1) return "Skip";
+        if (selectCalls === 2) return options.find((option) => option.includes("select-stop")) ?? "Close";
+        if (selectCalls === 3) return options.find((option) => option === "Stop") ?? "Close";
         return "Close";
       },
     },
@@ -434,10 +475,10 @@ void test("non-TUI navigator Stop confirms before cancelling", async () => {
 });
 
 void test("navigator dashboard auto-refreshes the selected run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-refresh-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-refresh-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", phase: "before", agents: [], nativeSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
@@ -482,17 +523,16 @@ void test("navigator dashboard auto-refreshes the selected run", async () => {
   };
   await commands[0]?.handler("", ctx as never);
 });
-void test("navigator keeps the run dashboard open for consecutive lifecycle actions", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-actions-"));
+void test("navigator exposes recovered runs without making them inert", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-actions-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "actions" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "actions" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "actions", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
   const notices: string[] = [];
-  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   const sessionContext = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notices.push(message); } } };
   assert.ok(start);
   await start({}, sessionContext);
@@ -506,45 +546,30 @@ void test("navigator keeps the run dashboard open for consecutive lifecycle acti
       let result: string | undefined;
       const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
       const dashboard = component.render(200).join("\n");
-      if (customCalls === 1) {
-        assert.match(dashboard, /running/);
-        assert.match(dashboard, /Pause/);
-        component.handleInput?.("tui.select.confirm");
-      } else if (customCalls === 2) {
-        assert.match(dashboard, /paused/);
-        assert.match(dashboard, /Resume/);
-        component.handleInput?.("tui.select.confirm");
-      } else if (customCalls === 3) {
-        assert.match(dashboard, /running/);
-        await shutdown?.();
-        component.handleInput?.("tui.select.confirm");
-      } else {
-        assert.match(dashboard, /interrupted/);
-        component.handleInput?.("tui.select.cancel");
-      }
+      assert.match(dashboard, /interrupted/);
+      assert.match(dashboard, /Resume/);
+      component.handleInput?.("tui.select.cancel");
       component.dispose?.();
       return result;
     },
   } };
   await commands[0]?.handler("", ctx as never);
   assert.equal(pickerCalls, 1);
-  assert.equal(customCalls, 4);
+  assert.equal(customCalls, 1);
   assert.equal((await store.load()).run.state, "interrupted");
-  assert.deepEqual(notices.slice(0, 2), [`Paused workflow run.`, `Resumed workflow run.`]);
-  assert.ok(notices.some((message) => message.includes("Cannot pause") && message.includes("interrupted")));
 });
 void test("navigator keeps consecutive checkpoint decisions in the same dashboard", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-actions-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-actions-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "checkpoints" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "checkpoints" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "checkpoints", cwd, sessionId: "session", state: "awaiting_input", agents: [], nativeSessions: [] }, snapshot);
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
   await store.awaitCheckpoint({ path: "checkpoint/deploy", name: "deploy", prompt: "Deploy?", context: null });
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], sendMessage() {} } as never, home);
-  const sessionContext = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: { handler: (args: string, ctx: never) => Promise<void> }) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], sendMessage() {} } as never, home);
+  const sessionContext = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async () => "Skip" } };
   assert.ok(start);
   await start({}, sessionContext);
   let customCalls = 0;
@@ -558,6 +583,7 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
       if (customCalls === 1) {
         assert.match(dashboard, /Review ship/);
         component.handleInput?.("tui.select.down");
+        component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
       } else if (customCalls === 2) {
         assert.match(dashboard, /Name: ship/);
@@ -565,13 +591,14 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
       } else if (customCalls === 3) {
         assert.match(dashboard, /Review deploy/);
         component.handleInput?.("tui.select.down");
+        component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
       } else if (customCalls === 4) {
         assert.match(dashboard, /Name: deploy/);
         component.handleInput?.("tui.select.down");
         component.handleInput?.("tui.select.confirm");
       } else {
-        assert.match(dashboard, /running/);
+        assert.match(dashboard, /interrupted/);
         component.handleInput?.("tui.select.cancel");
       }
       component.dispose?.();
@@ -584,9 +611,9 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
   assert.deepEqual(await store.replay("checkpoint/deploy"), { path: "checkpoint/deploy", value: false });
 });
 void test("navigator returns to the picker after deleting a run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-delete-actions-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delete-actions-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "delete", }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "delete", }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   const oldStore = new RunStore(cwd, "session", "old", home);
   const keepStore = new RunStore(cwd, "session", "keep", home);
   await oldStore.create({ id: "old", workflowName: "old", cwd, sessionId: "session", state: "completed", agents: [], nativeSessions: [] }, snapshot);
@@ -615,11 +642,11 @@ void test("navigator returns to the picker after deleting a run", async () => {
   assert.equal(existsSync(keepStore.directory), true);
 });
 void test("navigator opens the complete workflow script in a scrollable TUI pane", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-script-viewer-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-script-viewer-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
   const script = ["// SCRIPT_START", ...Array.from({ length: 20 }, (_, index) => `const line${String(index)} = ${String(index)};`), "// SCRIPT_END"].join("\n");
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "running", phase: "view", agents: [], nativeSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
@@ -658,9 +685,9 @@ void test("navigator opens the complete workflow script in a scrollable TUI pane
 
 
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-navigator-v2-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-v2-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'build',description:'b'}", args: null, metadata: { name: "build", description: "b" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'build',description:'b'}", args: null, metadata: { name: "build", description: "b" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
   const storeA = new RunStore(cwd, "s", "aaaa-1111-2222-3333", home);
   await storeA.create({ id: "aaaa-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "completed", agents: [{ id: "a:1", name: "scout", path: "a:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: ["read"], attempts: 1, accounting: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01 } }], nativeSessions: [] }, snapshot);
   const storeB = new RunStore(cwd, "s", "bbbb-1111-2222-3333", home);
@@ -722,10 +749,10 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
 });
 
 void test("navigator reviews each pending checkpoint before answering", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-review-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-review-"));
   const cwd = join(home, "project");
   const runId = "checkpoint-review";
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'review',description:'review'}", args: null, metadata: { name: "review", description: "review" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'review',description:'review'}", args: null, metadata: { name: "review", description: "review" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   const store = new RunStore(cwd, "session", runId, home);
   await store.create({ id: runId, workflowName: "review", cwd, sessionId: "session", state: "awaiting_input", agents: [], nativeSessions: [] }, snapshot);
   await store.awaitCheckpoint({ path: "checkpoint/first", name: "first", prompt: "Review the first artifact?", context: { artifact: "object", entries: Array.from({ length: 80 }, (_, index) => `entry-${String(index)}`), marker: "OBJECT_CONTEXT_END" } });
@@ -753,7 +780,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
     cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
     ui: {
       notify(message: string) { notices.push(message); },
-      select: async (_prompt: string, options: string[]) => { selectCalls += 1; return options[0]; },
+      select: async (_prompt: string, options: string[]) => { selectCalls += 1; return _prompt.includes("interrupted") ? "Skip" : options[0]; },
       custom: async (factory: Factory) => {
         customCalls += 1;
         let result: string | undefined;
@@ -764,6 +791,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
           assert.match(dashboard, /Review first/);
           assert.match(dashboard, /Review second/);
           assert.doesNotMatch(dashboard, /Approve first/);
+          component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 2) {
@@ -794,6 +822,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
           assert.doesNotMatch(dashboard, /Review first/);
           assert.match(dashboard, /Review second/);
           component.handleInput?.("tui.select.down");
+          component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 4) {
           const review = component.render(80).join("\n");
@@ -803,6 +832,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
           component.handleInput?.("tui.select.cancel");
           pendingAfterCancel = (await store.awaitingCheckpoints()).length;
         } else if (customCalls === 5) {
+          component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 6) {
@@ -820,7 +850,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
   await start({}, ctx);
   await command("", ctx);
 
-  assert.equal(selectCalls, 1);
+  assert.equal(selectCalls, 2);
   assert.equal(customCalls, 7);
   assert.equal(pendingAfterCancel, 1);
   assert.deepEqual(await store.replay("checkpoint/first"), { path: "checkpoint/first", value: true });
@@ -839,7 +869,7 @@ void test("checkpoint contract is boolean-only and enforces UTF-8 limits", async
 });
 
 void test("production checkpoints resolve in foreground navigator and background tool paths", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-runtime-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-runtime-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
@@ -880,7 +910,7 @@ void test("production checkpoints resolve in foreground navigator and background
 });
 
 void test("two concurrent checkpoints keep the run awaiting until both are answered", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-concurrent-checkpoints-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-concurrent-checkpoints-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const pi = { registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], sendMessage() {} };
   workflowExtension(pi as never, home);
@@ -901,7 +931,7 @@ void test("two concurrent checkpoints keep the run awaiting until both are answe
 });
 
 void test("a checkpoint answer persisted before resolver registration cannot hang", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-race-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-race-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   let completed!: () => void;
   const completion = new Promise<void>((resolve) => { completed = resolve; });
@@ -941,7 +971,7 @@ void test("a checkpoint answer persisted before resolver registration cannot han
 });
 
 void test("background delivery is minimal and capped while foreground stays inline", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-delivery-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delivery-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId: string } }> }> = [];
   const messages: Array<{ message: { content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
   let markDelivered!: () => void;
@@ -971,7 +1001,7 @@ void test("background delivery is minimal and capped while foreground stays inli
 
 void test("workflow log appends capped TUI-only transcript entries", async () => {
   type LogData = { workflowName: string; message: string };
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-log-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-log-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const entries: Array<{ type: string; data: LogData }> = [];
   let renderer: ((entry: { data?: LogData }, options: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
@@ -1041,20 +1071,23 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
 });
 
 void test("loads markdown agent roles with frontmatter from global and project directories", () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-roles-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-roles-"));
   const cwd = join(home, "project");
+  mkdirSync(join(home, "pi-extensible-workflows", "roles"), { recursive: true });
   mkdirSync(join(home, "piworkflows", "roles"), { recursive: true });
-  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-  writeFileSync(join(home, "piworkflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
-  writeFileSync(join(home, "piworkflows", "roles", "shadowed.md"), "---\ndescription: Hidden global\n---\nGlobal shadowed role");
-  writeFileSync(join(home, "piworkflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "Review role");
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "shadowed.md"), "Project shadowed role");
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(home, "pi-extensible-workflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
+  writeFileSync(join(home, "pi-extensible-workflows", "roles", "shadowed.md"), "---\ndescription: Hidden global\n---\nGlobal shadowed role");
+  writeFileSync(join(home, "pi-extensible-workflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Review role");
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), "Project shadowed role");
+  writeFileSync(join(home, "piworkflows", "roles", "legacy.md"), "Legacy role");
   const roles = loadAgentDefinitions(cwd, home);
   assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
   assert.equal(roles.reviewer?.prompt, "Review role");
   assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
   assert.deepEqual(roles.multiline, { prompt: "Multiline role", tools: ["read", "grep"] });
+  assert.deepEqual(roles.legacy, { prompt: "Legacy role" });
   const untrusted = loadAgentDefinitions(cwd, home, false);
   assert.equal(untrusted.reviewer, undefined);
   assert.deepEqual(untrusted.shadowed, { prompt: "Global shadowed role", description: "Hidden global" });
@@ -1071,10 +1104,10 @@ void test("strict role frontmatter rejects malformed metadata", () => {
 });
 
 void test("rejects invalid role policy before persisting a run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-policy-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-policy-"));
   const cwd = join(home, "project");
-  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "broken.md"), "---\ntools: [missing]\n---\nBroken role");
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "broken.md"), "---\ntools: [missing]\n---\nBroken role");
   const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
@@ -1086,10 +1119,10 @@ void test("rejects invalid role policy before persisting a run", async () => {
 });
 
 void test("production role policy rejects overrides before persistence and preserves effective policy", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-role-execution-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-execution-"));
   const cwd = join(home, "project");
-  mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read]\n---\nReview role");
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read]\n---\nReview role");
   const inputs: SessionInput[] = [];
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     inputs.push(input);
@@ -1130,7 +1163,7 @@ void test("interrupted lifecycle can cold-resume while completed and failed cann
 });
 
 void test("strict settings use defaults and reject unknown or unsafe values", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-workflows-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-"));
   assert.equal(loadSettings(join(dir, "missing.json")), DEFAULT_SETTINGS);
   const path = join(dir, "settings.json");
   writeFileSync(path, JSON.stringify({ concurrency: 4, maxAgentLaunches: 20 }));
@@ -1144,7 +1177,7 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
 });
 
 void test("preflight accepts the complete static contract", () => {
-  const metadata = { name: "review", description: "Review code", extensions: [{ name: "git", version: "^1.0.0" }] };
+  const metadata = { name: "review", description: "Review code" };
   const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);
   assert.equal(result.metadata.name, "review");
   assert.equal(result.dynamicAgentRoles, false);
@@ -1192,7 +1225,6 @@ void test("host rejects malformed dynamic agent options before launching", async
 void test("preflight enforces object-key combinators without agent names", () => {
   const base = "return 1;";
   assert.throws(() => preflight(base, capabilities, [{ type: "object", properties: { bad: () => true } }]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
-  assert.throws(() => preflight("return 1", { ...capabilities, extensions: { git: "1.0.0" } }, [], { name: "x", extensions: [{ name: "git", version: "^1.2.3" }] }), (error: unknown) => error instanceof WorkflowError && error.code === "INCOMPATIBLE_EXTENSION");
   assert.throws(() => preflight(`${base} parallel([{name:'task',run:()=>1}], {name:'batch'})`, capabilities), /operation name string and tasks record/);
   assert.throws(() => preflight(`${base} pipeline([{name:'item',value:1}], {name:'stage',run:value=>value}, {name:'pipe'})`, capabilities), /operation name string, items record, and stages record/);
   assert.doesNotThrow(() => preflight(`${base} agent('top-level')`, capabilities));
@@ -1226,7 +1258,7 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], extensions: { git: "1.2.3" }, schemas: [{ type: "object" }] };
+  const input = { script: valid, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
@@ -1355,16 +1387,12 @@ void test("agent Promises reject serialization and string coercion but retain aw
   assert.deepEqual(JSON.parse(result.awaited), ["first", "second"]);
 });
 
-void test("agent, checkpoint, and extension calls expose bare values and typed failures", async () => {
+void test("agent and checkpoint calls expose bare values and typed failures", async () => {
   assert.equal(await runWorkflow(`return agent('direct');`, null, { agent: async () => "value" }).result, "value");
   for (const [code, message] of [["AGENT_FAILED", "failed"], ["AGENT_TIMEOUT", "timed out"], ["RESULT_INVALID", "invalid"]] as const) {
     await assert.rejects(runWorkflow(`return agent('direct');`, null, { agent: async () => { throw new WorkflowError(code, message); } }).result,
       (error: unknown) => error instanceof WorkflowError && error.code === code && error.message === message);
   }
-  assert.deepEqual(await runWorkflow(`return extensions.demo.run({});`, null, {
-    extensions: { demo: ["run"] },
-    extension: async () => ({ answer: 42 }),
-  }).result, { answer: 42 });
 });
 
 void test("parallel and pipeline return keyed bare values in input order", async () => {
@@ -1435,6 +1463,36 @@ void test("direct workflow agents use call-site and occurrence identity", async 
   assert.notEqual(firstIdentity.callSite, thirdIdentity.callSite);
 });
 
+void test("withWorktree returns bare values and propagates one owner through parallel and pipeline", async () => {
+  const identities: Array<{ prompt: string; worktreeOwner?: string }> = [];
+  const result = await runWorkflow(`const shared = await withWorktree("shared", async () => ({
+    parallel: await parallel("batch", { first: () => agent("first"), second: () => agent("second") }),
+    pipeline: await pipeline("pipe", { one: 1, two: 2 }, { review: value => agent(String(value)) }),
+  })); return { shared, outside: await agent("outside") };`, null, { agent: async (prompt, _options, _signal, identity) => { identities.push({ prompt, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) }); return prompt; } }).result;
+  assert.deepEqual(result, { shared: { parallel: { first: "first", second: "second" }, pipeline: { one: "1", two: "2" } }, outside: "outside" });
+  const scoped = identities.filter(({ prompt }) => prompt !== "outside");
+  assert.equal(new Set(scoped.map(({ worktreeOwner }) => worktreeOwner)).size, 1);
+  assert.ok(scoped[0]?.worktreeOwner);
+  assert.equal(identities.find(({ prompt }) => prompt === "outside")?.worktreeOwner, undefined);
+});
+
+void test("withWorktree validates calls, keeps empty scopes empty, and replays unnamed identity", async () => {
+  const emptyOwners: string[] = [];
+  assert.deepEqual(await runWorkflow(`return await withWorktree("empty", async () => ({ ok: true }));`, null, { agent: async (_prompt, _options, _signal, identity) => { emptyOwners.push(identity.worktreeOwner ?? ""); return null; } }).result, { ok: true });
+  assert.deepEqual(emptyOwners, []);
+  const namedOwners: string[] = [];
+  await runWorkflow(`return await Promise.all([withWorktree("same", async () => agent("one")), withWorktree("same", async () => agent("two")), withWorktree("other", async () => agent("three"))]);`, null, { agent: async (_prompt, _options, _signal, identity) => { namedOwners.push(identity.worktreeOwner ?? ""); return "done"; } }).result;
+  assert.equal(namedOwners[0], namedOwners[1]);
+  assert.notEqual(namedOwners[0], namedOwners[2]);
+  const script = `return await withWorktree(async () => agent("same"));`;
+  const owner = async () => { let value = ""; await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { value = identity.worktreeOwner ?? ""; return "done"; } }).result; return value; };
+  assert.equal(await owner(), await owner());
+  assert.deepEqual(inspectWorkflowScript(`withWorktree("shared", async () => agent("x"));`).map(({ kind, name }) => ({ kind, name })), [{ kind: "withWorktree", name: "shared" }, { kind: "agent", name: null }]);
+  for (const source of [`withWorktree("", () => 1)`, `withWorktree("shared", 1)`, `withWorktree("shared", () => 1, 2)`]) assert.throws(() => preflight(source, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => preflight(`const alias = withWorktree; alias(() => 1);`, capabilities), /direct withWorktree.*aliases.*unsupported/i);
+  await assert.rejects(runWorkflow(`const alias = withWorktree; return alias(() => 1);`).result, /direct withWorktree.*aliases.*unsupported/i);
+  await assert.rejects(runWorkflow(`return withWorktree("shared", async () => agent("bad", { isolation: "worktree" }));`, null, { agent: async () => { throw new Error("must not launch"); } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
 void test("parallel identities do not depend on completion order", async () => {
   const resolvers = new Map<string, () => void>();
   const identities: Array<{ structuralPath: string[]; callSite: string; occurrence: number }> = [];
@@ -1457,9 +1515,9 @@ void test("aliases, reserved internals, and removed options are rejected before 
   let launched = false;
   await assert.rejects(runWorkflow(`const alias=agent; return alias("no");`, null, { agent: async () => { launched = true; return null; } }).result, /direct agent.*aliases.*unsupported/i);
   assert.equal(launched, false);
-  assert.throws(() => preflight(`__pi_workflows_agent("x", {}, "0:1")`, capabilities), /reserved for workflow agent instrumentation/);
-  assert.throws(() => runWorkflow(`return __pi_workflows_agent("x", {}, "0:1")`, null, { agent: async () => { launched = true; return null; } }), /reserved for workflow agent instrumentation/);
-  await assert.rejects(runWorkflow(`const internal=globalThis["__pi_workflows"+"_agent"]; return internal("x", {}, "0:1");`, null, { agent: async () => { launched = true; return null; } }).result, /not a function/);
+  assert.throws(() => preflight(`__pi_extensible_workflows_agent("x", {}, "0:1")`, capabilities), /reserved for workflow agent instrumentation/);
+  assert.throws(() => runWorkflow(`return __pi_extensible_workflows_agent("x", {}, "0:1")`, null, { agent: async () => { launched = true; return null; } }), /reserved for workflow agent instrumentation/);
+  await assert.rejects(runWorkflow(`const internal=globalThis["__pi_extensible_workflows"+"_agent"]; return internal("x", {}, "0:1");`, null, { agent: async () => { launched = true; return null; } }).result, /not a function/);
   assert.equal(launched, false);
   assert.throws(() => preflight(`agent("x",{name:"old"})`, capabilities), /Unknown agent option: name/);
   assert.throws(() => preflight(`agent("x",{continueFrom:"old"})`, capabilities), /Unknown agent option: continueFrom/);
@@ -1530,13 +1588,13 @@ void test("worker enforces 10 MB boundaries on individual and final JSON values"
   assert.equal(called, false);
 });
 
-void test("registers namespaced DSL extensions and replays each call as one validated macro", async () => {
-  const registry = new WorkflowDslRegistry();
+void test("registers global functions and replays each call as one validated operation", async () => {
+  const registry = new WorkflowRegistry();
   let calls = 0;
   let receivedContext: unknown;
   registry.register({
-    name: "git", version: "1.2.3", headline: "Git operations", description: "Orchestrate Git work",
-    methods: {
+    namespace: "git", version: "1.2.3", headline: "Git operations", description: "Orchestrate Git work",
+    functions: {
       status: {
         description: "Read status",
         input: { type: "object", properties: { short: { type: "boolean" } }, required: ["short"], additionalProperties: false },
@@ -1547,20 +1605,55 @@ void test("registers namespaced DSL extensions and replays each call as one vali
   });
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
-  const context = { agent: async () => null, parallel: async () => null, pipeline: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {}, privateScheduler: true };
-  assert.deepEqual(registry.versions(), { git: "1.2.3" });
-  assert.deepEqual(Object.keys(registry.namespaces().git ?? {}), ["status"]);
-  assert.deepEqual(await registry.invoke("git", "status", { short: true }, context, "root/git.status", journal), { clean: true });
-  assert.deepEqual(await registry.invoke("git", "status", { short: false }, context, "root/git.status", journal), { clean: true });
+  const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
+  const context = { run, agent: async () => null, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  assert.deepEqual(await registry.invokeFunction("git", "status", { short: true }, context, "function/git/status/1", journal), { clean: true });
+  assert.deepEqual(await registry.invokeFunction("git", "status", { short: false }, context, "function/git/status/1", journal), { clean: true });
   assert.equal(calls, 1);
-  assert.deepEqual(Object.keys(receivedContext as object), ["agent", "parallel", "pipeline", "checkpoint", "phase", "log"]);
+  assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "log", "parallel", "phase", "pipeline", "run", "withWorktree"]);
+  assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
+});
+void test("freezes registries and produces a deterministic flat catalog", () => {
+  const registry = new WorkflowRegistry();
+  const second = new WorkflowRegistry();
+  assert.equal(registry.frozen, false);
+  registry.register({
+    namespace: "catalog", version: "1.0.0", headline: "Catalog", description: "Catalog test",
+    functions: { inspect: { description: "Inspect", input: { type: "object" }, output: { type: "string" }, run: () => "ok" } },
+    variables: { branch: { description: "Branch", schema: { type: "string" }, resolve: () => "main" } },
+    workflows: { release: { description: "Release", script: "return branch;" } },
+  });
+  second.register({ namespace: "catalog", version: "1.0.0", headline: "Catalog", description: "Catalog test", workflows: { release: { description: "Release", script: "return 1;" } } });
+  assert.deepEqual(registry.catalog().functions.map(({ name, namespace }) => ({ name, namespace })), [{ name: "inspect", namespace: "catalog" }]);
+  assert.deepEqual(registry.catalog().variables.map(({ name, namespace }) => ({ name, namespace })), [{ name: "branch", namespace: "catalog" }]);
+  assert.deepEqual(registry.catalog().workflows.map(({ name }) => name), ["catalog.release"]);
+  registry.freeze();
+  assert.equal(registry.frozen, true);
+  assert.throws(() => { registry.register({ namespace: "late", version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
+  assert.throws(() => registry.workflow("release"), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
+});
+void test("shares the registry between package imports and Pi's jiti loader", () => {
+  const script = `
+import { createRequire } from "node:module";
+import { join } from "node:path";
+const require = createRequire(import.meta.url);
+const { createJiti } = require(${JSON.stringify(join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/node_modules/jiti"))});
+const native = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/src/index.js")).href)});
+const jiti = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
+const source = await jiti.import(${JSON.stringify(join(process.cwd(), "src/index.ts"))});
+native.registerWorkflowExtension({ namespace: "loaderBoundary", version: "1.0.0", headline: "Loader", description: "Loader boundary", workflows: { verify: { description: "Verify", script: "return 1;" } } });
+const catalog = source.workflowCatalog();
+if (catalog.workflows.length !== 1 || catalog.workflows[0]?.name !== "loaderBoundary.verify") throw new Error(JSON.stringify(catalog));
+`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
 });
 
 void test("navigator stop reports cleanup failures without closing unexpectedly", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stop-failure-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-failure-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'broken',description:'broken'}", args: null, metadata: { name: "broken", description: "broken" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'broken',description:'broken'}", args: null, metadata: { name: "broken", description: "broken" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "broken", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   failedOwnership.add(store.directory);
@@ -1611,15 +1704,91 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
   assert.ok(notices.some((notice) => notice.includes("scheduler cleanup failed")));
 });
 
-void test("rejects extension collisions, invalid metadata, schemas, input, and output", async () => {
-  const registry = new WorkflowDslRegistry();
-  const extension = { name: "demo", version: "1.0.0", headline: "Demo", description: "Demo methods", methods: { run: { description: "Run", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, output: { type: "string" }, run: () => 1 } } };
+void test("rejects global collisions, invalid metadata, schemas, input, and output", async () => {
+  const registry = new WorkflowRegistry();
+  const extension = { namespace: "demo", version: "1.0.0", headline: "Demo", description: "Demo functions", functions: { run: { description: "Run", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, output: { type: "string" }, run: () => 1 } } };
   registry.register(extension);
   assert.throws(() => { registry.register(extension); }, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
-  assert.throws(() => { new WorkflowDslRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => { new WorkflowDslRegistry().register({ ...extension, methods: { run: { ...extension.methods.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
+  assert.throws(() => { registry.register({ ...extension, namespace: "other" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION" && /demo\.run.*other\.run/.test(error.message));
+  const crossType = new WorkflowRegistry();
+  crossType.register(extension);
+  const variableExtension = { namespace: "variables", version: "1.0.0", headline: "Variables", description: "Variable globals", variables: { run: { description: "Run", schema: { type: "string" }, resolve: () => "ok" } } };
+  assert.throws(() => { crossType.register(variableExtension); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION" && /demo\.run.*variables\.run/.test(error.message));
+  for (const name of ["agent", "Date", "process", "extensions"]) {
+    assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { [name]: extension.functions.run } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
+  }
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { __pi_extensible_workflows_internal: extension.functions.run } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, namespace: undefined as never }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: undefined as never }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, workflows: { "release.check": { description: "Release", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, namespace: "bad-name" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
-  const context = { agent: async () => null, parallel: async () => null, pipeline: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
-  await assert.rejects(registry.invoke("demo", "run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
-  await assert.rejects(registry.invoke("demo", "run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), agent: async () => null, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  await assert.rejects(registry.invokeFunction("demo", "run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(registry.invokeFunction("demo", "run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+});
+void test("presents every workflow error code as factual prose", () => {
+  for (const code of ERROR_CODES) {
+    const prose = formatWorkflowFailure(new WorkflowError(code, `${code}: model-or-role detail 123e4567-e89b-12d3-a456-426614174000\n    at internal-callsite-id`));
+    assert.match(prose, /model-or-role detail/);
+    assert.doesNotMatch(prose, new RegExp(`\\b${code}\\b`));
+    assert.doesNotMatch(prose, /123e4567-e89b-12d3-a456-426614174000|internal-callsite-id/);
+  }
+  assert.equal(formatWorkflowFailure(new Error("The release was rejected by the approval gate.")), "The release was rejected by the approval gate.");
+  assert.equal(formatWorkflowFailure("plain thrown value"), "The workflow failed with value plain thrown value.");
+  const owned = formatWorkflowFailure(new WorkflowError("RUN_OWNED", "Pi session session-a is already owned by process 42"));
+  assert.doesNotMatch(owned, /session-a|process 42/);
+  const composed = formatWorkflowFailure(new WorkflowError("INTERNAL_ERROR", "Nested UNKNOWN_MODEL: missing/provider"));
+  assert.match(composed, /missing\/provider/);
+  assert.doesNotMatch(composed, /UNKNOWN_MODEL/);
+  assert.equal(formatWorkflowFailure(new WorkflowError("RUN_LIMIT_EXCEEDED", "Run 123e4567-e89b-12d3-a456-426614174000 exceeded maxAgentLaunches")), "The workflow exceeded its agent launch limit: maxAgentLaunches.");
+});
+void test("foreground workflow failures preserve codes while returning main-agent prose", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> };
+  const tools: Tool[] = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-foreground-failure-"));
+  workflowExtension({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  const tool = tools.find(({ name }) => name === "workflow");
+  assert.ok(tool);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(tool.execute("id", { name: "custom", script: "throw new Error('The release was rejected by the approval gate.');", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The release was rejected by the approval gate.");
+  await assert.rejects(tool.execute("id", { name: "value", script: "throw 'plain thrown value';", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The workflow encountered an internal error: plain thrown value.");
+});
+void test("background failures and workflow responses deliver prose to the main agent", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
+  const tools: Tool[] = [];
+  const delivered: string[] = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-background-failure-"));
+  workflowExtension({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { delivered.push(message.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"] } as never, home);
+  const tool = tools.find(({ name }) => name === "workflow");
+  assert.ok(tool);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await tool.execute("id", { name: "custom-background", script: "throw Object.assign(new Error('The approval gate rejected the release.'), {code:'ENOSPC'});" }, new AbortController().signal, undefined, context);
+  await tool.execute("id", { name: "value-background", script: "throw 'background value';" }, new AbortController().signal, undefined, context);
+  for (let attempt = 0; attempt < 100 && delivered.filter((message) => message.includes("failed:")).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(delivered.some((message) => message.includes("The approval gate rejected the release.")));
+  assert.ok(delivered.some((message) => message.includes("background value")));
+  assert.ok(delivered.filter((message) => message.includes("failed:")).every((message) => !ERROR_CODES.some((code) => message.includes(code))));
+});
+void test("workflow_respond keeps asynchronous failures on the prose delivery path", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
+  const tools: Tool[] = [];
+  const delivered: string[] = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-respond-failure-"));
+  workflowExtension({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { delivered.push(message.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"] } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(workflow && respond);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const started = await workflow.execute("id", { name: "respond-failure", script: "const approved = await checkpoint({name:'ship', prompt:'Ship?', context:null}); if (approved) throw new Error('The release was rejected after approval.'); return approved;" }, new AbortController().signal, undefined, context);
+  const runId = (JSON.parse(started.content[0]?.text ?? "{}") as { runId?: string }).runId;
+  assert.ok(runId);
+  for (let attempt = 0; attempt < 100 && !delivered.some((message) => message.includes("Ship?")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  const response = await respond.execute("id", { runId, name: "ship", approved: true }, undefined, undefined, context);
+  assert.equal(response.details?.accepted, true);
+  for (let attempt = 0; attempt < 100 && !delivered.some((message) => message.includes("The release was rejected after approval.")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.ok(delivered.some((message) => message.includes("The release was rejected after approval.")));
+  assert.ok(delivered.every((message) => !message.includes("INTERNAL_ERROR")));
 });

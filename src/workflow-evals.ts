@@ -8,7 +8,7 @@ import { Value } from "typebox/value";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { CAPTURE_ERROR_PREFIX, CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 export { resolveWorkflowSkillPath } from "./eval-capture-extension.js";
-import { ERROR_CODES, inspectWorkflowScript, loadAgentDefinitions, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type WorkflowErrorCode } from "./index.js";
+import { ERROR_CODES, inspectWorkflowScript, loadAgentDefinitions, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "./index.js";
 
 export type SignificantAction = { kind: "tool"; name: string } | { kind: "text" } | { kind: "thinking" };
 export type SequenceExpectation = readonly string[] | { equals?: readonly string[]; startsWith?: readonly string[] };
@@ -23,7 +23,8 @@ export interface AgentPolicyExpectation {
   forbidOptions?: readonly ("role" | "model" | "thinking" | "tools" | "isolation" | "retries")[];
   tools?: { mode: "omitted" | "empty" | "exact"; values?: readonly string[] };
 }
-export interface AgentOrderExpectation { role?: string; model?: string; promptIncludes?: string }
+export interface AgentStructureExpectation { execution: StaticWorkflowExecution; operation?: "parallel" | "pipeline"; agents: readonly AgentOrderExpectation[] }
+export interface AgentOrderExpectation { role?: string; model?: string; promptIncludes?: string; execution?: StaticWorkflowExecution }
 export interface DataFlowExpectation { binding: string; toAgentIndex: number }
 export interface ParentAssistantBatch { index: number; parts: readonly JsonValue[]; tools: readonly string[]; usage?: ParentUsage }
 export interface ParentToolResult { toolCallId?: string; details?: JsonValue; isError?: boolean; text?: string }
@@ -45,6 +46,7 @@ export interface EvalExpectations {
   expectedResults?: readonly ExpectedReplayResult[];
   agentPolicies?: readonly AgentPolicyExpectation[];
   requiredAgentOrder?: readonly AgentOrderExpectation[];
+  requiredAgentStructures?: readonly AgentStructureExpectation[];
   requiredDataFlow?: readonly DataFlowExpectation[];
 }
 export interface SemanticCriterion { id: string; description: string }
@@ -100,9 +102,9 @@ export const INITIAL_WORKFLOW_EVAL_CASES: readonly WorkflowEvalCase[] = Object.f
   { id: "required-role", prompt: "Have a reviewer assess the change and return a short review.", maxCost: 0.1, expectations: naturalExpectations({ requiredRoles: ["reviewer"], agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }] }), semanticCriteria: semantic("A reviewer-role agent assesses the change and its result is returned.") },
   { id: "custom-model-read", prompt: `Have one subagent using the model ${EVAL_MODEL_TOKEN} read README.md with a minimal toolset and report in one sentence what this package does.`, maxCost: 0.1, expectations: naturalExpectations({ agentPolicies: [{ callIndex: 0, model: EVAL_MODEL_TOKEN, tools: { mode: "exact", values: ["read"] } }] }), semanticCriteria: semantic("The script configures one agent with the requested model and only the read tool, instructs it to inspect README.md, and returns its one-sentence package description.") },
   { id: "role-model-mixed", prompt: `Obtain a reviewer-role assessment first, then use a separate subagent with the explicit model ${EVAL_MODEL_TOKEN} and no tools to synthesize the final text.`, maxCost: 0.1, expectations: naturalExpectations({ minimumAgentCalls: 2, agentPolicies: [{ callIndex: 0, role: "reviewer", forbidOptions: ["model", "thinking", "tools"] }, { callIndex: 1, model: EVAL_MODEL_TOKEN, tools: { mode: "empty" } }] }), semanticCriteria: semantic("The reviewer assessment is produced first and passed to a separate no-tools synthesis agent.") },
-  { id: "parallel", prompt: "Run the independent API and UI checks at the same time, then report both outcomes together.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel"], minimumAgentCalls: 2 }), semanticCriteria: semantic("Independent API and UI checks run in parallel and both outcomes are combined.") },
+  { id: "parallel", prompt: "Run the independent API and UI checks at the same time, then report both outcomes together.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel"], minimumAgentCalls: 2, requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{}, {}] }] }), semanticCriteria: semantic("Independent API and UI checks run in parallel and both outcomes are combined.") },
   { id: "pipeline", prompt: "Process the API and UI artifacts through the same ordered normalization and finalization stages, preserving each item's result.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["pipeline"] }), semanticCriteria: semantic("API and UI items pass through the same ordered normalization and finalization stages.") },
-  { id: "mixed-parallel-pipeline", prompt: "Gather API and UI evidence independently at the same time, then process each gathered result through the same ordered analysis and summary stages.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2 }), semanticCriteria: semantic("The script gathers API and UI evidence in parallel, then passes each result through ordered analysis and summary stages.") },
+  { id: "mixed-parallel-pipeline", prompt: "Gather API and UI evidence independently at the same time, then process each gathered result through the same ordered analysis and summary stages.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2, requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{}, {}] }, { execution: "sequential", operation: "pipeline", agents: [{}, {}] }] }), semanticCriteria: semantic("The script gathers API and UI evidence in parallel, then passes each result through ordered analysis and summary stages.") },
   { id: "output-schema", prompt: "Use one scout subagent for a structured report containing a numeric count and a text summary.", maxCost: 0.1, expectations: naturalExpectations({ requiredRoles: ["scout"], agentPolicies: [{ callIndex: 0, role: "scout", forbidOptions: ["model", "thinking", "tools"] }], requireOutputSchema: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"], count: 1 } }), semanticCriteria: semantic("The script configures one scout agent with an output schema requiring a numeric count and text summary.") },
 ]);
 
@@ -309,7 +311,43 @@ function staticCallRows(calls: readonly CapturedWorkflowCall[]): Array<{ call: S
     catch { return []; }
   });
 }
-
+function matchesAgentExpectation(call: StaticWorkflowCall | undefined, expected: AgentOrderExpectation): boolean {
+  if (!call) return false;
+  return (expected.role === undefined || call.role === expected.role) && (expected.model === undefined || call.model === expected.model) && (expected.promptIncludes === undefined || call.prompt?.includes(expected.promptIncludes) === true) && (expected.execution === undefined || (call.execution ?? "sequential") === expected.execution);
+}
+function structureGroupKey(call: StaticWorkflowCall, kind: "parallel" | "pipeline"): string | undefined {
+  const scopes = (call.structure ?? []).filter((scope) => scope.kind === kind);
+  return scopes.length ? JSON.stringify(scopes.map(({ kind: scopeKind, name }) => [scopeKind, name])) : undefined;
+}
+function distinctAgentMatches(rows: readonly StaticWorkflowCall[], expected: readonly AgentOrderExpectation[]): boolean {
+  const used = new Set<number>();
+  return expected.every((selector) => {
+    const index = rows.findIndex((call, candidateIndex) => !used.has(candidateIndex) && matchesAgentExpectation(call, selector));
+    if (index < 0) return false;
+    used.add(index);
+    return true;
+  });
+}
+function agentStructureMatches(rows: readonly { call: StaticWorkflowCall; source: string }[], expected: AgentStructureExpectation): boolean {
+  const agents = rows.filter(({ call }) => call.kind === "agent").map(({ call }) => call);
+  if (expected.execution === "parallel") {
+    const groups = new Map<string, StaticWorkflowCall[]>();
+    for (const call of agents) {
+      if ((call.execution ?? "sequential") !== "parallel" || expected.operation && !(call.structure ?? []).some((scope) => scope.kind === expected.operation)) continue;
+      const key = structureGroupKey(call, "parallel");
+      if (key) groups.set(key, [...(groups.get(key) ?? []), call]);
+    }
+    return [...groups.values()].some((group) => distinctAgentMatches(group, expected.agents));
+  }
+  const candidates = agents.filter((call) => (call.execution ?? "sequential") === "sequential" && (!expected.operation || (call.structure ?? []).some((scope) => scope.kind === expected.operation)));
+  let start = 0;
+  return expected.agents.every((selector) => {
+    const index = candidates.findIndex((call, candidateIndex) => candidateIndex >= start && matchesAgentExpectation(call, selector));
+    if (index < 0) return false;
+    start = index + 1;
+    return true;
+  });
+}
 export function staticExpectationResults(calls: readonly CapturedWorkflowCall[], expectations: EvalExpectations): CriterionResult[] {
   const rows = staticCallRows(calls);
   const staticCalls = rows.map(({ call }) => call);
@@ -348,8 +386,12 @@ export function staticExpectationResults(calls: readonly CapturedWorkflowCall[],
   }
   if (expectations.requiredAgentOrder) {
     const order = expectations.requiredAgentOrder;
-    const pass = order.every((expected, index) => { const call = agentCalls[index]; return Boolean(call) && (expected.role === undefined || call?.role === expected.role) && (expected.model === undefined || call?.model === expected.model) && (expected.promptIncludes === undefined || call?.prompt?.includes(expected.promptIncludes)); });
+    const pass = order.every((expected, index) => matchesAgentExpectation(agentCalls[index], expected));
     add("agent-order", pass, `Checked ${String(order.length)} ordered agent selectors.`);
+  }
+  for (const [index, structure] of (expectations.requiredAgentStructures ?? []).entries()) {
+    const pass = agentStructureMatches(rows, structure);
+    add(`agent-structure:${String(index)}`, pass, `Required ${structure.execution} agent structure${structure.operation ? ` in ${structure.operation}` : ""}.`);
   }
   for (const flow of expectations.requiredDataFlow ?? []) {
     const source = agentRows[flow.toAgentIndex]?.source ?? "";
@@ -541,17 +583,19 @@ function seedEvalProject(cwd: string, home: string, model: string): void {
     if (excluded.has(entry)) continue;
     cpSync(join(source, entry), join(cwd, entry), { recursive: true, filter: (path) => !excluded.has(basename(path)) });
   }
-  const roles = join(source, ".pi", "piworkflows", "roles");
-  const roleTargets = [join(home, ".pi", "piworkflows", "roles"), join(cwd, ".pi", "piworkflows", "roles")];
-  if (!existsSync(roles)) return;
-  cpSync(roles, roleTargets[0] as string, { recursive: true });
-  for (const target of roleTargets) {
-    if (!existsSync(target)) continue;
-    for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
-      const path = join(target, name);
-      const content = readFileSync(path, "utf8");
-      const frontmatterEnd = content.startsWith("---\n") ? content.indexOf("\n---", 4) : -1;
-      if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
+  for (const directory of ["piworkflows", "pi-extensible-workflows"]) {
+    const roles = join(source, ".pi", directory, "roles");
+    const roleTargets = [join(home, ".pi", directory, "roles"), join(cwd, ".pi", directory, "roles")];
+    if (!existsSync(roles)) continue;
+    cpSync(roles, roleTargets[0] as string, { recursive: true });
+    for (const target of roleTargets) {
+      if (!existsSync(target)) continue;
+      for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
+        const path = join(target, name);
+        const content = readFileSync(path, "utf8");
+        const frontmatterEnd = content.startsWith("---\n") ? content.indexOf("\n---", 4) : -1;
+        if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
+      }
     }
   }
 }

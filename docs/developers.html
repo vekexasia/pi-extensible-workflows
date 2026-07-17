@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Developer documentation for pi-extensible-workflows.">
+  <title>Developer docs | pi-extensible-workflows</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="index.html">pi-extensible-workflows</a>
+      <nav aria-label="Primary navigation">
+        <a class="active" href="developers.html">Developers</a>
+        <a href="agents.html">Agents</a>
+        <a href="https://github.com/vekexasia/pi-extensible-workflows">Repository</a>
+      </nav>
+    </div>
+  </header>
+  <main class="container docs-layout">
+    <aside class="toc" aria-label="On this page">
+      <p class="toc-title">Developers</p>
+      <a href="#installation">Installation</a>
+      <a href="#tool-api">Tool API</a>
+      <a href="#dsl">Workflow DSL</a>
+      <a href="#extensions">Extensions and roles</a>
+      <a href="#lifecycle">Lifecycle</a>
+      <a href="#operations">Operations</a>
+      <a href="#evaluation">Evaluation</a>
+    </aside>
+    <article class="prose">
+      <p class="eyebrow">Developer path</p>
+      <h1>Build and operate workflows</h1>
+      <p class="lead">This page describes the package contract from the host tool boundary through the sandboxed workflow worker and its durable run store.</p>
+      <section id="installation">
+        <h2>Installation and trust</h2>
+        <p>Use Node.js 22.19 or newer. pi-extensible-workflows is a trusted Pi extension: installing it gives the extension the same filesystem and process access as Pi. Only install it from a source you trust, and open and trust the project in Pi before running <code>doctor</code>.</p>
+        <pre><code class="language-shell"><span class="tok-command">npm</span> ci
+<span class="tok-command">npm</span> run check
+<span class="tok-command">pi</span> install /absolute/path/to/pi-extensible-workflows</code></pre>
+        <p>For a one-session trial without changing Pi settings:</p>
+        <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension /absolute/path/to/pi-extensible-workflows/src/index.ts</code></pre>
+        <p>The package declares Pi AI, Pi coding agent, and TypeBox as peer dependencies. The repository development setup currently pins the Pi packages to 0.80.9.</p>
+      </section>
+      <section id="tool-api">
+        <h2>Tool API</h2>
+        <p>The extension registers two tools and one command:</p>
+        <ul>
+          <li><code>workflow</code> runs an inline or registered deterministic JavaScript workflow.</li>
+          <li><code>workflow_respond</code> approves or rejects a pending checkpoint.</li>
+          <li><code>/workflow</code> lists and controls runs in the current Pi session.</li>
+        </ul>
+        <h3><code>workflow</code> parameters</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Field</th><th>Type</th><th>Contract</th></tr></thead>
+          <tbody>
+            <tr><td><code>name</code></td><td>string</td><td>Required for an inline script; registered workflows use their registered name.</td></tr>
+            <tr><td><code>description</code></td><td>string</td><td>Optional human-readable metadata.</td></tr>
+            <tr><td><code>script</code></td><td>string</td><td>Immutable workflow source. Mutually exclusive with <code>workflow</code>.</td></tr>
+            <tr><td><code>workflow</code></td><td>string</td><td>Registered reusable workflow as <code>namespace.name</code>.</td></tr>
+            <tr><td><code>args</code></td><td>JSON value</td><td>Available inside the script as <code>args</code>; defaults to <code>null</code>.</td></tr>
+            <tr><td><code>foreground</code></td><td>boolean</td><td>Wait for the final value instead of returning a run ID.</td></tr>
+            <tr><td><code>concurrency</code></td><td>integer 1-16</td><td>Per-run active-agent limit.</td></tr>
+            <tr><td><code>maxAgentLaunches</code></td><td>positive integer</td><td>Total logical agent launches, including nested children.</td></tr>
+          </tbody>
+        </table></div>
+        <h3><code>workflow_respond</code> parameters</h3>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"runId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"..."</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"ship"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"approved"</span><span class="tok-punctuation">:</span> <span class="tok-boolean">true</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Background workflow calls return a run ID immediately. Completion or failure is delivered as one follow-up. Foreground calls return the workflow value inline.</p>
+      </section>
+      <section id="dsl">
+        <h2>Workflow DSL</h2>
+        <p>Workflow source is plain sandboxed JavaScript. It has no imports, filesystem, network, process, timer, or dynamic-code globals. The deterministic primitives are:</p>
+        <div class="table-wrap"><table>
+          <thead><tr><th>Primitive</th><th>Use</th></tr></thead>
+          <tbody>
+            <tr><td><code>agent(prompt, options)</code></td><td>Run one Pi agent and return its bare text or JSON value.</td></tr>
+            <tr><td><code>prompt(template, values)</code></td><td>Safely interpolate JSON-compatible values into a prompt.</td></tr>
+            <tr><td><code>parallel(name, tasks)</code></td><td>Run keyed independent tasks concurrently.</td></tr>
+            <tr><td><code>pipeline(name, items, stages)</code></td><td>Apply ordered stages to keyed items.</td></tr>
+            <tr><td><code>phase(name)</code></td><td>Record progress telemetry.</td></tr>
+            <tr><td><code>log(message)</code></td><td>Add a TUI-only transcript entry, capped at 4 KB.</td></tr>
+            <tr><td><code>checkpoint(input)</code></td><td>Wait for an approval or rejection.</td></tr>
+            <tr><td><code>withWorktree(callback)</code></td><td>Create one shared worktree lazily for a collaborating scope.</td></tr>
+          </tbody>
+        </table></div>
+        <h3>Agent options</h3>
+        <p>Use <code>model</code> as <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and <code>isolation: "worktree"</code>. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> report = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review the implementation"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);</code></pre>
+        <p>Results are bare values. With <code>outputSchema</code>, the native agent submits the schema through <code>workflow_result</code>; prose is not parsed as structured output. The serialized result and every worker RPC value must fit within 10 MB.</p>
+        <h3>Composition</h3>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> reports = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"review"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">api</span><span class="tok-punctuation">:</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the API"</span>),
+  <span class="tok-property">ui</span><span class="tok-punctuation">:</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the UI"</span>),
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">return</span> <span class="tok-function">agent</span>(<span class="tok-function">prompt</span>(<span class="tok-string">"Combine these reports:\n{reports}"</span>, <span class="tok-punctuation">{</span> reports <span class="tok-punctuation">}</span>));</code></pre>
+        <p>Calls from one source location must not race outside <code>parallel</code> or <code>pipeline</code>. Their structural keys make replay deterministic. Ordinary branch failures wait for sibling work to settle; cancellation is immediate.</p>
+      </section>
+      <section id="extensions">
+        <h2>Extensions, reusable workflows, and roles</h2>
+        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Registration validates the namespace, semantic version, descriptions, schemas, and workflow source.</p>
+        <pre><code class="language-typescript"><span class="tok-keyword">import</span> <span class="tok-punctuation">{</span> registerWorkflowExtension <span class="tok-punctuation">}</span> <span class="tok-keyword">from</span> <span class="tok-string">"pi-extensible-workflows"</span>;
+registerWorkflowExtension(<span class="tok-punctuation">{</span>
+  <span class="tok-property">namespace</span><span class="tok-punctuation">:</span> <span class="tok-string">"review"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review helpers"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Reusable review primitives"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">functions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+    <span class="tok-property">review</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+      <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review one focus"</span><span class="tok-punctuation">,</span>
+      <span class="tok-property">input</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"object"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+      <span class="tok-property">output</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"string"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+      <span class="tok-function">async run</span>(input<span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> agent <span class="tok-punctuation">}</span>) <span class="tok-punctuation">{</span>
+        <span class="tok-keyword">return</span> agent(<span class="tok-string">`Review ${String(input.focus)}`</span>);
+      <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+    <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+  <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">workflows</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+    <span class="tok-property">release</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+      <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review release readiness"</span><span class="tok-punctuation">,</span>
+      <span class="tok-property">script</span><span class="tok-punctuation">:</span> <span class="tok-string">`return review({ focus: "release readiness" });`</span><span class="tok-punctuation">,</span>
+    <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+  <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);</code></pre>
+        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source.</p>
+        <h3>Role files</h3>
+        <p>Global roles live under <code>~/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. The legacy <code>~/.pi/piworkflows/roles/</code> and <code>&lt;cwd&gt;/.pi/piworkflows/roles/</code> paths remain readable for compatibility, with the new paths taking precedence when both define a role.</p>
+        <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
+<span class="tok-property">description</span><span class="tok-punctuation">:</span> Reviews code for correctness
+<span class="tok-property">model</span><span class="tok-punctuation">:</span> anthropic/claude-fable-5
+<span class="tok-property">thinking</span><span class="tok-punctuation">:</span> high
+<span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>read<span class="tok-punctuation">,</span> grep<span class="tok-punctuation">]</span>
+<span class="tok-punctuation">---</span>
+Focus on correctness and regressions.</code></pre>
+        <p>When <code>role</code> is present, omit <code>model</code>, <code>thinking</code>, and <code>tools</code> from the agent call. The role body is appended to the native Pi system prompt.</p>
+      </section>
+      <section id="lifecycle">
+        <h2>Lifecycle, checkpoints, and isolation</h2>
+        <p>Run states are <code>queued</code>, <code>running</code>, <code>pausing</code>, <code>paused</code>, <code>awaiting_input</code>, <code>completed</code>, <code>failed</code>, <code>stopped</code>, and <code>interrupted</code>. Agent states include <code>queued</code>, <code>running</code>, <code>waiting_for_child</code>, <code>paused</code>, <code>retrying</code>, <code>completed</code>, <code>failed</code>, and <code>cancelled</code>.</p>
+        <p>Use a checkpoint when an agent must wait for a human or parent decision:</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> decision = <span class="tok-keyword">await</span> <span class="tok-function">checkpoint</span>(<span class="tok-punctuation">{</span>
+  <span class="tok-property">name</span><span class="tok-punctuation">:</span> <span class="tok-string">"ship"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">prompt</span><span class="tok-punctuation">:</span> <span class="tok-string">"Ship this build?"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">context</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">commit</span><span class="tok-punctuation">:</span> args.commit <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">if</span> (decision !== <span class="tok-string">"approved"</span>) <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">approved</span><span class="tok-punctuation">:</span> <span class="tok-boolean">false</span> <span class="tok-punctuation">}</span>;</code></pre>
+        <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Direct <code>checkpoint()</code> returns <code>"approved"</code> or <code>"rejected"</code>. Responses are journaled and replay after cold recovery.</p>
+        <p>Top-level agents can request <code>isolation: "worktree"</code>. The runtime creates a deterministic owned branch and worktree from the launch tree. The caller branch is unchanged; children and retries reuse the worktree. Use <code>withWorktree(name, callback)</code> when collaborating agents must share one worktree.</p>
+        <p>Runs are stored under <code>~/.pi/workflows/projects/&lt;cwd-slug&gt;-&lt;cwd-hash&gt;/sessions/&lt;session-id&gt;/runs/&lt;run-id&gt;/</code>. Identity checks use the resolved launch cwd and Pi session ID.</p>
+      </section>
+      <section id="operations">
+        <h2>Operations and debugging</h2>
+        <h3>Doctor and inspector</h3>
+        <pre><code class="language-shell"><span class="tok-command">npx</span> pi-extensible-workflows doctor
+<span class="tok-command">npx</span> pi-extensible-workflows inspect [session-id]
+<span class="tok-command">npm</span> run inspect -- [session-id]</code></pre>
+        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered workflows. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script.</p>
+        <h3><code>/workflow</code> controls</h3>
+        <pre><code class="language-text">/workflow doctor
+/workflow pause &lt;run-id&gt;
+/workflow resume &lt;run-id&gt;
+/workflow stop &lt;run-id&gt;
+/workflow approve &lt;run-id&gt; &lt;checkpoint&gt;
+/workflow reject &lt;run-id&gt; &lt;checkpoint&gt;
+/workflow delete &lt;run-id&gt;</code></pre>
+        <p>The navigator discovers only runs from the exact current cwd and Pi session. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
+        <h3>Settings and errors</h3>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"maxAgentLaunches"</span><span class="tok-punctuation">:</span> <span class="tok-number">1000</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Optional strict settings live at <code>~/.pi/workflows/settings.json</code>. Invocation options override the defaults. The session-wide active-agent ceiling is 16.</p>
+        <p>Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, or script issue before retrying.</p>
+      </section>
+      <section id="evaluation">
+        <h2>Evaluation and package checks</h2>
+        <p>Deterministic evaluation helpers use a fake bridge and make zero model calls during normal tests. Model-backed evaluations are opt-in and require an explicit provider and model.</p>
+        <pre><code class="language-shell"><span class="tok-command">npm</span> run check
+<span class="tok-command">npm</span> run acceptance
+<span class="tok-command">npm</span> run evals -- --provider <span class="tok-variable">"$PROVIDER"</span> --model <span class="tok-variable">"$MODEL"</span> --case direct-answer,parallel
+PI_WORKFLOW_EVAL_AMBIENT=1 <span class="tok-command">npm</span> run evals:ambient -- --provider <span class="tok-variable">"$PROVIDER"</span> --model <span class="tok-variable">"$MODEL"</span></code></pre>
+        <p>The ambient tier is separately opt-in. Do not enable it in ordinary CI unless its external model cost and cleanup are intentional.</p>
+      </section>
+      <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>pi-extensible-workflows</span>
+      <a href="https://github.com/vekexasia/pi-extensible-workflows">GitHub repository</a>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,21 +1,88 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
-import { projectStorageKey, RunStore, structuralPath } from "../src/persistence.js";
+import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
+import { listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
 
-const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',description:'x'}", args: { answer: 42 }, metadata: { name: "x", description: "x" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], extensions: {}, schemas: [] });
+const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',description:'x'}", args: { answer: 42 }, metadata: { name: "x", description: "x" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
 
 function run(cwd: string, sessionId = "session-a") {
   return { id: "run-a", workflowName: "x", cwd, sessionId, state: "running" as const, agents: [], nativeSessions: [{ sessionId: "native-a", sessionFile: "/pi/sessions/native-a.jsonl" }] };
 }
 
+void test("session leases reject live owners and reclaim dead owners", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lease-"));
+  const cwd = join(home, "project");
+  const lease = await acquireSessionLease(cwd, "session-a", home);
+  await assert.rejects(acquireSessionLease(cwd, "session-a", home), (error: unknown) => error instanceof WorkflowError && error.code === "RUN_OWNED");
+  await lease.release();
+  writeFileSync(join(runsDirectory(cwd, "session-a", home), "owner.json"), JSON.stringify({ pid: 2147483647, token: "dead", startedAt: 0 }));
+  const reclaimed = await acquireSessionLease(cwd, "session-a", home);
+  await reclaimed.release();
+  if (process.platform === "linux") {
+    writeFileSync(join(runsDirectory(cwd, "session-a", home), "owner.json"), JSON.stringify({ pid: process.pid, token: "reused", startedAt: 0 }));
+    const pidReused = await acquireSessionLease(cwd, "session-a", home);
+    await pidReused.release();
+  }
+  writeFileSync(join(runsDirectory(cwd, "session-a", home), "owner.json"), "{");
+  utimesSync(join(runsDirectory(cwd, "session-a", home), "owner.json"), new Date(0), new Date(0));
+  const invalidReclaimed = await acquireSessionLease(cwd, "session-a", home);
+  await invalidReclaimed.release();
+});
+void test("cleans orphaned run creation directories without listing them as runs", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-run-temp-"));
+  const cwd = join(home, "project");
+  const directory = runsDirectory(cwd, "session-a", home);
+  mkdirSync(directory, { recursive: true });
+  const orphan = join(directory, ".run-a.2147483647.00000000-0000-0000-0000-000000000000.tmp");
+  mkdirSync(orphan);
+  assert.deepEqual(await listRunIds(cwd, "session-a", home), []);
+  assert.equal(existsSync(orphan), false);
+});
+
+void test("partial run directories do not block sibling loading or deletion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-partial-"));
+  const cwd = join(home, "project");
+  const partial = new RunStore(cwd, "session-a", "partial", home);
+  mkdirSync(partial.directory, { recursive: true });
+  writeFileSync(join(partial.directory, "state.json"), "{}\n");
+  const sibling = new RunStore(cwd, "session-a", "sibling", home);
+  await sibling.create({ id: "sibling", workflowName: "x", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, snapshot);
+  assert.deepEqual((await listRunIds(cwd, "session-a", home)).sort(), ["partial", "sibling"]);
+  assert.equal((await sibling.load()).run.id, "sibling");
+  await partial.delete(true);
+  assert.equal(existsSync(partial.directory), false);
+});
+
+void test("reclaims an orphaned worktree transaction before retrying", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-recovery-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
+  const path = join(store.directory, "worktrees", key);
+  const branch = `pi-extensible-workflows/run-a/${key}`;
+  const base = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  execFileSync("git", ["-C", repo, "branch", branch, base]);
+  writeFileSync(join(store.directory, `worktree-${key}.creating`), JSON.stringify({ owner: "agent", path, branch, base }));
+  const worktree = await store.worktree("agent");
+  assert.equal(worktree.path, path);
+  const records = JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")) as Array<{ owner: string }>;
+  assert.equal(records[0]?.owner, "agent");
+});
 void test("stores exact cwd and Pi session snapshots atomically and rejects cross-session loading", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-store-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-store-"));
   const cwd = join(home, "same-name");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -28,7 +95,7 @@ void test("stores exact cwd and Pi session snapshots atomically and rejects cros
   assert.deepEqual(readFileSync(join(store.directory, "state.json"), "utf8").trim().startsWith("{"), true);
 });
 void test("serializes concurrent state updates without losing fields", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-state-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-state-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -42,7 +109,7 @@ void test("serializes concurrent state updates without losing fields", async () 
 });
 
 void test("cold reload restores persisted ownership for cascading cancellation", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-ownership-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-ownership-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -62,7 +129,7 @@ void test("cold reload restores persisted ownership for cascading cancellation",
 });
 
 void test("journals stable structural paths and replays only completed operations", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-journal-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-journal-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -76,7 +143,7 @@ void test("journals stable structural paths and replays only completed operation
 });
 
 void test("persists awaiting checkpoints and atomically accepts only the first answer", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -91,7 +158,7 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
 });
 
 void test("creates deterministic snapshot worktrees, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-"));
   const repo = join(home, "repo");
   const cwd = join(repo, "packages", "app");
   mkdirSync(cwd, { recursive: true });
@@ -115,13 +182,13 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   assert.equal(readFileSync(join(first.cwd, "untracked.txt"), "utf8"), "new");
   assert.equal(existsSync(join(first.cwd, "deleted.txt")), false);
   assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
-  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%s"], { encoding: "utf8" }).trim(), "pi-workflows|pi-workflows@localhost|pi-workflows runtime snapshot");
+  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%s"], { encoding: "utf8" }).trim(), "pi-extensible-workflows|pi-extensible-workflows@localhost|pi-extensible-workflows runtime snapshot");
   assert.deepEqual(await store.changedWorktrees(), []);
   writeFileSync(join(first.cwd, "agent.txt"), "post-creation");
   await store.snapshotWorktree("agent/path");
   assert.deepEqual(await store.changedWorktrees(), [first]);
   assert.equal(execFileSync("git", ["-C", first.path, "show", "HEAD:packages/app/agent.txt"], { encoding: "utf8" }), "post-creation");
-  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI|%s"], { encoding: "utf8" }).trim(), "pi-workflows|pi-workflows@localhost|pi-workflows|pi-workflows@localhost|2000-01-01T00:00:00+00:00|2000-01-01T00:00:00+00:00|pi-workflows runtime snapshot");
+  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI|%s"], { encoding: "utf8" }).trim(), "pi-extensible-workflows|pi-extensible-workflows@localhost|pi-extensible-workflows|pi-extensible-workflows@localhost|2000-01-01T00:00:00+00:00|2000-01-01T00:00:00+00:00|pi-extensible-workflows runtime snapshot");
   assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
   await assert.rejects(store.delete(false), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   assert.equal(existsSync(first.path), true);
@@ -131,7 +198,7 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
 });
 
 void test("preserves a pre-existing deterministic branch when creation fails", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-branch-collision-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-branch-collision-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -143,7 +210,7 @@ void test("preserves a pre-existing deterministic branch when creation fails", a
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
-  const branch = `pi-workflows/run-a/${key}`;
+  const branch = `pi-extensible-workflows/run-a/${key}`;
   execFileSync("git", ["-C", repo, "branch", branch]);
   const commit = execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim();
   await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
@@ -152,7 +219,7 @@ void test("preserves a pre-existing deterministic branch when creation fails", a
 });
 
 void test("cleans a created branch when worktree add fails before cwd exists", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-add-fail-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-add-fail-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -165,7 +232,7 @@ void test("cleans a created branch when worktree add fails before cwd exists", a
   await store.create(run(repo), snapshot);
   const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
   const path = join(store.directory, "worktrees", key);
-  const branch = `pi-workflows/run-a/${key}`;
+  const branch = `pi-extensible-workflows/run-a/${key}`;
   mkdirSync(path, { recursive: true });
   writeFileSync(join(path, "block"), "worktree add");
   await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
@@ -174,7 +241,7 @@ void test("cleans a created branch when worktree add fails before cwd exists", a
 });
 
 void test("worktree creation failures are typed and never fall back", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-worktree-fail-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-fail-"));
   const cwd = join(home, "not-a-repo");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -182,7 +249,7 @@ void test("worktree creation failures are typed and never fall back", async () =
 });
 
 void test("stale persisted worktree records fail as WORKTREE_FAILED", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-stale-worktree-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stale-worktree-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -199,7 +266,7 @@ void test("stale persisted worktree records fail as WORKTREE_FAILED", async () =
 });
 
 void test("malicious worktree metadata cannot trigger deletion", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-malicious-worktree-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-malicious-worktree-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -220,7 +287,7 @@ void test("malicious worktree metadata cannot trigger deletion", async () => {
 });
 
 void test("snapshot git failures are typed as WORKTREE_FAILED", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-snapshot-fail-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-snapshot-fail-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -237,7 +304,7 @@ void test("snapshot git failures are typed as WORKTREE_FAILED", async () => {
 });
 
 void test("deletion requires confirmation, verifies ownership, and removes only the run directory", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-delete-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delete-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
@@ -18,7 +18,7 @@ export interface WorktreeReference { owner: string; path: string; branch: string
 
 const execute = promisify(execFile);
 const gitIdentity = {
-  GIT_AUTHOR_NAME: "pi-workflows", GIT_AUTHOR_EMAIL: "pi-workflows@localhost", GIT_COMMITTER_NAME: "pi-workflows", GIT_COMMITTER_EMAIL: "pi-workflows@localhost",
+  GIT_AUTHOR_NAME: "pi-extensible-workflows", GIT_AUTHOR_EMAIL: "pi-extensible-workflows@localhost", GIT_COMMITTER_NAME: "pi-extensible-workflows", GIT_COMMITTER_EMAIL: "pi-extensible-workflows@localhost",
   GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z", GIT_COMMITTER_DATE: "2000-01-01T00:00:00Z",
 };
 
@@ -34,8 +34,112 @@ export function runsDirectory(cwd: string, sessionId: string, home = homedir()):
   return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions", safePart(sessionId), "runs");
 }
 
+const SESSION_OWNER_FILE = "owner.json";
+const SESSION_OWNER_WRITE_GRACE_MS = 30_000;
+const RUN_CREATE_TEMP = /^\.([a-zA-Z0-9._-]+)\.(\d+)\.[0-9a-f-]+\.tmp$/;
+type SessionOwner = { pid: number; token: string; startedAt: number };
+
+async function processAlive(pid: number, startedAt?: number): Promise<boolean> {
+  try { process.kill(pid, 0); } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+  if (startedAt !== undefined && process.platform === "linux") {
+    try { if ((await stat(`/proc/${String(pid)}`)).ctimeMs > startedAt) return false; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; }
+  }
+  return true;
+}
+
+function sameOwner(left: unknown, right: unknown): boolean {
+  if (!left || typeof left !== "object" || !right || typeof right !== "object") return false;
+  const first = left as Partial<SessionOwner>;
+  const second = right as Partial<SessionOwner>;
+  return first.pid === second.pid && first.token === second.token;
+}
+
+async function restoreLease(path: string, stale: string): Promise<void> {
+  try { await link(stale, path); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EEXIST" && code !== "ENOENT") throw error;
+  }
+  await rm(stale, { force: true });
+}
+
+async function cleanupRunTemps(directory: string, entries: readonly { name: string; isDirectory(): boolean }[]): Promise<void> {
+  await Promise.all(entries.map(async (entry) => {
+    const match = entry.isDirectory() ? RUN_CREATE_TEMP.exec(entry.name) : undefined;
+    const pid = match?.[2] ? Number(match[2]) : undefined;
+    if (pid && !await processAlive(pid)) await rm(join(directory, entry.name), { recursive: true, force: true });
+  }));
+}
+
+export class SessionLease {
+  #released = false;
+  constructor(readonly path: string, readonly token: string) {}
+  get active(): boolean { return !this.#released; }
+  async release(): Promise<void> {
+    if (this.#released) return;
+    this.#released = true;
+    try {
+      const owner = JSON.parse(await readFile(this.path, "utf8")) as Partial<SessionOwner>;
+      if (owner.token === this.token) await rm(this.path, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
+export async function acquireSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<SessionLease> {
+  const directory = runsDirectory(cwd, sessionId, home);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const path = join(directory, SESSION_OWNER_FILE);
+  for (;;) {
+    const token = randomUUID();
+    const owner: SessionOwner = { pid: process.pid, token, startedAt: Date.now() };
+    try {
+      const handle = await open(path, "wx", 0o600);
+      try { await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8"); } finally { await handle.close(); }
+      return new SessionLease(path, token);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      let existing: Partial<SessionOwner>;
+      let existingText = "";
+      try {
+        existingText = await readFile(path, "utf8");
+        existing = JSON.parse(existingText) as Partial<SessionOwner>;
+        if (typeof existing.pid === "number" && existing.pid > 0 && await processAlive(existing.pid, existing.startedAt)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} is already owned by process ${String(existing.pid)}`);
+      } catch (readError) {
+        if (readError instanceof WorkflowError) throw readError;
+        if ((readError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        const age = await stat(path).then((value) => Date.now() - value.mtimeMs).catch(() => 0);
+        if (age < SESSION_OWNER_WRITE_GRACE_MS) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an active ownership lease`);
+        existing = {};
+      }
+      const stale = `${path}.${randomUUID()}.stale`;
+      try {
+        await rename(path, stale);
+        const movedText = await readFile(stale, "utf8");
+        let moved: unknown;
+        try { moved = JSON.parse(movedText); }
+        catch {
+          if (movedText === existingText) await rm(stale, { force: true });
+          else await restoreLease(path, stale);
+          continue;
+        }
+        if (!sameOwner(existing, moved)) { await restoreLease(path, stale); continue; }
+        await rm(stale, { force: true });
+      }
+      catch (reclaimError) { if ((reclaimError as NodeJS.ErrnoException).code === "ENOENT") continue; throw reclaimError; }
+    }
+  }
+}
+
 export async function listRunIds(cwd: string, sessionId: string, home = homedir()): Promise<string[]> {
-  try { return (await readdir(runsDirectory(cwd, sessionId, home), { withFileTypes: true })).filter((entry) => entry.isDirectory()).map(({ name }) => name); }
+  const directory = runsDirectory(cwd, sessionId, home);
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    await cleanupRunTemps(directory, entries);
+    return entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map(({ name }) => name);
+  }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
 }
 
@@ -58,6 +162,7 @@ export class RunStore {
   // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
   private stateWrite: Promise<void> = Promise.resolve();
   private worktreeWrite: Promise<void> = Promise.resolve();
+  private snapshotWrite: Promise<void> = Promise.resolve();
 
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
     this.cwd = resolve(cwd);
@@ -66,12 +171,25 @@ export class RunStore {
 
   async create(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError("INTERNAL_ERROR", "Run identity does not match its session-scoped store");
+    const temporary = join(dirname(this.directory), `.${safePart(this.runId)}.${String(process.pid)}.${randomUUID()}.tmp`);
     await mkdir(dirname(this.directory), { recursive: true, mode: 0o700 });
-    await mkdir(this.directory, { mode: 0o700 });
-    await atomicJson(join(this.directory, "snapshot.json"), snapshot);
-    await atomicJson(join(this.directory, "journal.json"), { completed: {}, awaiting: {} });
-    await atomicJson(join(this.directory, "ownership.json"), []);
-    await atomicJson(join(this.directory, "state.json"), run);
+    await mkdir(temporary, { mode: 0o700 });
+    try {
+      await atomicJson(join(temporary, "snapshot.json"), snapshot);
+      await atomicJson(join(temporary, "journal.json"), { completed: {}, awaiting: {} });
+      await atomicJson(join(temporary, "ownership.json"), []);
+      await atomicJson(join(temporary, "worktrees.json"), []);
+      await atomicJson(join(temporary, "state.json"), run);
+      await rename(temporary, this.directory);
+    } catch (error) {
+      await rm(temporary, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async isComplete(): Promise<boolean> {
+    try { await Promise.all([access(join(this.directory, "snapshot.json")), access(join(this.directory, "journal.json")), access(join(this.directory, "ownership.json")), access(join(this.directory, "state.json"))]); return true; }
+    catch { return false; }
   }
 
   async load(): Promise<{ run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }> {
@@ -165,7 +283,12 @@ export class RunStore {
 
   private expectedWorktree(owner: string): Pick<WorktreeReference, "path" | "branch"> {
     const key = createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16);
-    return { path: join(this.directory, "worktrees", key), branch: `pi-workflows/${safePart(this.runId)}/${key}` };
+    return { path: join(this.directory, "worktrees", key), branch: `pi-extensible-workflows/${safePart(this.runId)}/${key}` };
+  }
+
+  private markerPath(owner: string): string {
+    const key = createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16);
+    return join(this.directory, `worktree-${key}.creating`);
   }
 
   private structuralWorktree(owner: string, record: unknown): WorktreeReference {
@@ -176,6 +299,27 @@ export class RunStore {
     const relativeCwd = typeof candidate.path === "string" && typeof candidate.cwd === "string" ? relative(candidate.path, candidate.cwd) : "..";
     if (candidate.owner !== owner || typeof candidate.path !== "string" || typeof candidate.branch !== "string" || typeof candidate.cwd !== "string" || typeof candidate.base !== "string" || resolve(candidate.path) !== expected.path || candidate.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
     return candidate as WorktreeReference;
+  }
+
+  private async cleanupMarker(markerPath: string): Promise<void> {
+    let marker: Partial<{ owner: string; path: string; branch: string; base: string }>;
+    try { marker = await json(markerPath); } catch { return; }
+    if (typeof marker.owner !== "string" || typeof marker.base !== "string") return;
+    const expected = this.expectedWorktree(marker.owner);
+    if (marker.path !== expected.path || marker.branch !== expected.branch) return;
+    const root = await git(this.cwd, ["rev-parse", "--show-toplevel"]).then((value) => value.trim()).catch(() => "");
+    if (!root) return;
+    const branchBase = await git(root, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).then((value) => value.trim()).catch(() => "");
+    if (branchBase !== marker.base) return;
+    await git(root, ["worktree", "remove", "--force", expected.path]).catch(() => undefined);
+    await git(root, ["branch", "-D", expected.branch]).catch(() => undefined);
+    await rm(expected.path, { recursive: true, force: true });
+    await rm(markerPath, { force: true });
+  }
+
+  private async cleanupOrphanWorktrees(): Promise<void> {
+    const entries = await readdir(this.directory).catch(() => [] as string[]);
+    for (const entry of entries.filter((name) => name.endsWith(".creating"))) await this.cleanupMarker(join(this.directory, entry));
   }
 
   async validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
@@ -202,37 +346,39 @@ export class RunStore {
       if (existing) return this.validateWorktree(owner);
       const { path, branch } = this.expectedWorktree(owner);
       const index = join(this.directory, `index-${basename(path)}`);
+      const markerPath = this.markerPath(owner);
       let branchCreated = false;
       let worktreeCreated = false;
       try {
         const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
         const launchRelative = relative(root, this.cwd);
         if (launchRelative.startsWith("..")) throw new Error("launch cwd is outside the repository");
+        await this.cleanupMarker(markerPath);
         await mkdir(dirname(path), { recursive: true, mode: 0o700 });
         await git(root, ["read-tree", "HEAD"], { GIT_INDEX_FILE: index });
         await git(root, ["add", "-A"], { GIT_INDEX_FILE: index });
         const tree = (await git(root, ["write-tree"], { GIT_INDEX_FILE: index })).trim();
-        const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
+        const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-extensible-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
         const record = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
-        await atomicJson(recordsPath, [...records, record]);
+        await atomicJson(markerPath, { owner, path, branch, base: commit });
         await git(root, ["branch", branch, commit]);
         branchCreated = true;
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
         await rm(index, { force: true });
+        await atomicJson(recordsPath, [...records, record]);
+        await rm(markerPath, { force: true });
         return record;
       } catch (error) {
+        await rm(index, { force: true });
+        if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
+        if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
+        await rm(markerPath, { force: true });
         try {
           const persisted = await json<unknown[]>(recordsPath);
           const matches = persisted.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
-          if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`, { cause: error });
-          this.structuralWorktree(owner, matches[0]);
-          await rm(index, { force: true });
-          if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
-          if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
-          records = persisted.filter((candidate) => candidate !== matches[0]) as WorktreeReference[];
-          await atomicJson(recordsPath, records);
+          if (matches.length === 1) { this.structuralWorktree(owner, matches[0]); records = persisted.filter((candidate) => candidate !== matches[0]) as WorktreeReference[]; await atomicJson(recordsPath, records); }
         } catch { /* Ownership changed or disappeared: do not delete anything. */ }
         throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
       }
@@ -243,13 +389,13 @@ export class RunStore {
 
   async snapshotWorktree(owner: string): Promise<string> {
     try {
-      const record = await this.worktree(owner);
-      const write = this.worktreeWrite.then(async () => {
+      const write = this.snapshotWrite.then(async () => {
+        const record = await this.worktree(owner);
         await git(record.path, ["add", "-A"]);
-        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-workflows runtime snapshot"], gitIdentity);
+        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
         return (await git(record.path, ["rev-parse", "HEAD"])).trim();
       });
-      this.worktreeWrite = write.then(() => undefined, () => undefined);
+      this.snapshotWrite = write.then(() => undefined, () => undefined);
       return await write;
     } catch (error) {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
@@ -258,7 +404,8 @@ export class RunStore {
 
   async worktrees(): Promise<readonly WorktreeReference[]> {
     const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
-    return Promise.all(records.map((record) => this.validateWorktree(record.owner)));
+    const validated = await Promise.all(records.map(async (record) => { try { return await this.validateWorktree(record.owner); } catch { return undefined; } }));
+    return validated.filter((record): record is WorktreeReference => record !== undefined);
   }
 
   async changedWorktrees(): Promise<readonly WorktreeReference[]> {
@@ -278,14 +425,21 @@ export class RunStore {
 
   async delete(confirmed: boolean): Promise<void> {
     if (!confirmed) throw new WorkflowError("CANCELLED", "Run deletion requires confirmation");
-    await this.load();
-    const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
-    const validated = await Promise.all(records.map((record) => this.validateWorktree(record.owner)));
+    const records = await json<unknown[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+    const validated = records.map((record) => {
+      try {
+        if (!record || typeof record !== "object" || typeof (record as Partial<WorktreeReference>).owner !== "string") throw new Error("Invalid worktree record");
+        return this.structuralWorktree((record as Partial<WorktreeReference>).owner as string, record);
+      } catch (error) {
+        throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+      }
+    });
+    await this.cleanupOrphanWorktrees();
     for (const record of validated) {
-      await git(this.cwd, ["worktree", "remove", "--force", record.path]);
-      await git(this.cwd, ["branch", "-D", record.branch]);
+      await git(this.cwd, ["worktree", "remove", "--force", record.path]).catch(() => undefined);
+      await git(this.cwd, ["branch", "-D", record.branch]).catch(() => undefined);
     }
-    await rm(this.directory, { recursive: true, force: false });
+    await rm(this.directory, { recursive: true, force: true });
   }
 }
 

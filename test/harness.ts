@@ -1,5 +1,5 @@
 /**
- * Test fixture harness for pi-workflows.
+ * Test fixture harness for pi-extensible-workflows.
  *
  * Creates a temp project directory, writes persisted run fixtures with a
  * predetermined session ID, then launches a real Pi session in a herdr pane
@@ -149,7 +149,6 @@ export class TestHarness {
       models: si.models ?? ["openai/gpt"],
       tools: si.tools ?? ["read"],
       agentTypes: [],
-      extensions: {},
       schemas: [],
     });
 

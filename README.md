@@ -1,6 +1,8 @@
-# pi-workflows
+# pi-extensible-workflows
 
 Deterministic, resumable multi-agent workflow orchestration for Pi.
+
+Documentation: [developers and agents](https://vekexasia.github.io/pi-extensible-workflows/)
 
 Requires Node.js 22.19 or newer. Verified against Pi 0.80.6. This is a trusted Pi extension: installing it grants it the same filesystem and process access as Pi.
 
@@ -9,7 +11,7 @@ Requires Node.js 22.19 or newer. Verified against Pi 0.80.6. This is a trusted P
 From the private Git repository:
 
 ```sh
-pi install git:git@github.com:vekexasia/pi-workflows.git
+pi install git:git@github.com:vekexasia/pi-extensible-workflows.git
 ```
 
 From a local checkout:
@@ -17,13 +19,13 @@ From a local checkout:
 ```sh
 npm ci
 npm run check
-pi install /absolute/path/to/pi-workflows
+pi install /absolute/path/to/pi-extensible-workflows
 ```
 
 For a one-session trial without changing Pi settings:
 
 ```sh
-pi --no-extensions --extension /absolute/path/to/pi-workflows/src/index.ts
+pi --no-extensions --extension /absolute/path/to/pi-extensible-workflows/src/index.ts
 ```
 
 The package registers two tools, `workflow` and the narrow checkpoint response tool `workflow_respond`, plus one singular `/workflow` command.
@@ -33,7 +35,7 @@ The package registers two tools, `workflow` and the narrow checkpoint response t
 Open the read-only terminal inspector with a session ID, or omit it to be prompted:
 
 ```sh
-npx pi-workflows inspect [session-id]
+npx pi-extensible-workflows inspect [session-id]
 # From this checkout after npm run build:
 npm run inspect -- [session-id]
 ```
@@ -45,7 +47,7 @@ Use the arrow keys and Enter to select a workflow. The detail view shows cost, m
 Run the read-only, non-interactive health check after opening and trusting the project in Pi:
 
 ```sh
-npx pi-workflows doctor
+npx pi-extensible-workflows doctor
 ```
 
 From an active Pi session, `/workflow doctor` runs the same checks using that session's active tools.
@@ -72,7 +74,6 @@ Invocation options:
 | --- | --- | --- |
 | `name` | string | Required for inline scripts; registered workflows use their registered name |
 | `description` | string | Optional human-readable description |
-| `extensions` | object[] | Optional `{ name, version }` extension requirements |
 | `script` | string | Immutable workflow source; mutually exclusive with `workflow` |
 | `workflow` | string | Registered reusable workflow name as `namespace.name`; mutually exclusive with `script` |
 | `args` | JSON value | Available to the script as `args`; defaults to `null` |
@@ -89,13 +90,10 @@ Workflow source is plain sandboxed JavaScript. Inline workflows receive their na
 {
   "name": "release-check",
   "script": "phase('inspect'); return await agent('Inspect the package');",
-  "extensions": [{ "name": "git", "version": "^1.0.0" }]
 }
 ```
-
-`description` and `extensions` are optional tool-call metadata. `extensions` declares required registered DSL extension versions. `phase(name)` is optional progress telemetry and accepts dynamic names.
-
-Preflight is synchronous and runs before a run directory is created. It rejects statically discoverable syntax errors, malformed schemas and agent options, unavailable models/tools/agent types, and missing or incompatible DSL extensions. Dynamic values are validated again at the host boundary before execution. Direct `agent(...)` calls receive hidden source call-site identities; aliases are rejected. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
+`description` is optional tool-call metadata. `phase(name)` is optional progress telemetry and accepts dynamic names.
+Preflight is synchronous and runs before a run directory is created. It rejects statically discoverable syntax errors, malformed schemas and agent options, and unavailable models/tools/agent types. Dynamic values are validated again at the host boundary before execution. Direct `agent(...)` calls receive hidden source call-site identities; aliases are rejected. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
 The worker exposes only deterministic data operations plus:
 
@@ -107,7 +105,19 @@ The worker exposes only deterministic data operations plus:
 - `phase(name)`
 - `log(message)`
 - `checkpoint({ name, prompt, context })`
-- `extensions.<namespace>.<method>(input)`
+- `withWorktree(callback)` or `withWorktree(name, callback)`
+- registered global functions and variables
+
+Use a shared scope when top-level agents must collaborate in one worktree:
+
+```js
+const results = await withWorktree("implementation", async () => parallel("implementation", {
+  api: () => agent("Implement the API"),
+  tests: () => agent("Add integration tests"),
+}));
+```
+
+`withWorktree()` returns the callback result and creates its worktree lazily; an empty scope creates none. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly.
 
 `log(message)` appends a TUI-only entry to the main transcript, capped at 4 KB. It does not enter LLM context or trigger a turn. Calls replayed during recovery may appear again.
 
@@ -156,7 +166,7 @@ tools: [read, grep, find]
 
 When the `workflow` tool is active, the main agent sees only the names and descriptions of effective described roles. Project roles replace same-named global roles completely. Role bodies, paths, models, thinking, and tools remain private to role loading and spawned-agent execution.
 
-`role` references markdown roles from `~/.pi/piworkflows/roles/<name>.md` and `<cwd>/.pi/piworkflows/roles/<name>.md`; project roles override same-named global roles only in a Pi-trusted project. The role body is appended to that agent session's system prompt. Omitted model, thinking, and tools use the launch snapshot or role policy; omitted timeout is unlimited. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
+`role` references markdown roles from `~/.pi/pi-extensible-workflows/roles/<name>.md` and `<cwd>/.pi/pi-extensible-workflows/roles/<name>.md`; the legacy `~/.pi/piworkflows/roles/` and `<cwd>/.pi/piworkflows/roles/` paths remain readable for compatibility, with the new paths taking precedence when both define a role. Project roles override same-named global roles only in a Pi-trusted project. The role body is appended to that agent session's system prompt. Omitted model, thinking, and tools use the launch snapshot or role policy; omitted timeout is unlimited. Overrides cannot exceed the launching Pi session's model/tool boundary. Workflows intentionally do not provide small/medium/big model tiers or phase routing; role policy belongs in Pi custom agent-role markdowns so prompts, tools, model, and thinking stay in one place. `timeoutMs` is opt-in for intentionally bounded work. Use `retries` only for idempotent/read-only work or prompts that prevent duplicate side effects; each retry gets a fresh persisted Pi session but keeps filesystem changes and counts as one logical agent.
 
 Agents return their bare final text or schema-valid JSON value. Workflow source failures are ordinary `Error` instances with stable `code` and `message`; host-facing tool calls reject with `WorkflowError`. Without `outputSchema`, an agent returns its final text. With a plain JSON Schema:
 
@@ -232,45 +242,53 @@ Direct `checkpoint()` returns `"approved"` or `"rejected"`. Prompt size is limit
 
 through `workflow_respond`. The first valid response wins. Responses and completed checkpoints are journaled and replay after cold recovery. Foreground checkpoints require a Pi UI that provides `select` (interactive picker); without it the checkpoint fails with `RESUME_INCOMPATIBLE`, and `workflow_respond` alone does not satisfy that requirement.
 
-## DSL extensions
+## Global workflow primitives
 
-Trusted Pi extensions can register validated orchestration macros during extension load:
+Trusted Pi extensions can register discoverable global functions, run-scoped variables, and reusable workflows during extension loading:
 
 ```ts
-import { registerWorkflowDslExtension } from "pi-workflows";
+import { registerWorkflowExtension } from "pi-extensible-workflows";
 
-registerWorkflowDslExtension({
-  name: "git",
-  version: "1.0.0",
+registerWorkflowExtension({
+  namespace: "git",
+  version: "1.1.0",
   headline: "Git operations",
-  description: "Reusable Git workflow macros",
-  methods: {
-    status: {
-      description: "Read repository status",
-      input: { type: "object", properties: {}, additionalProperties: false },
-      output: {
-        type: "object",
-        properties: { clean: { type: "boolean" } },
-        required: ["clean"],
-        additionalProperties: false,
+  description: "Reusable Git workflow primitives",
+  functions: {
+    reviewRepository: {
+      description: "Review the current repository",
+      input: { type: "object", properties: { focus: { type: "string" } }, required: ["focus"], additionalProperties: false },
+      output: { type: "string" },
+      async run(input, { run, agent }) {
+        return agent(`Review ${run.cwd}, focusing on ${input.focus}`);
       },
-      async run(_input, { agent }) {
-        const text = await agent("Inspect git status");
-        return { clean: String(text).trim() === "clean" };
-      },
+    },
+  },
+  variables: {
+    DEFAULT_BRANCH: {
+      description: "Repository default branch",
+      schema: { type: "string" },
+      async resolve(run) { return readDefaultBranch(run.cwd, run.signal); },
     },
   },
   workflows: {
     releaseCheck: {
-      description: "Reusable release check workflow",
-      extensions: [{ name: "git", version: "^1.0.0" }],
-      script: `return agent('Check a release', {role:'reviewer'});`,
+      description: "Run the repository release checks",
+      script: `return reviewRepository({ focus: "release readiness" });`,
     },
   },
 });
 ```
 
-A workflow can call `extensions.git.status({})` when the `git` extension is registered. A caller can run the registered script directly with `{ "workflow": "git.releaseCheck" }`. Registration requires a unique JavaScript-safe namespace, exact semantic version, headline, descriptions, one-object input schema, output schema, and valid plain JavaScript workflow scripts. Input/output are validated, implementations receive only public orchestration functions, and completed calls replay as one journaled macro. In extension method context, `checkpoint()` returns a boolean rather than the workflow sandbox's `"approved"` or `"rejected"` string. Duplicate namespaces fail extension load.
+Workflow scripts call functions and read variables directly:
+
+```js
+const review = await reviewRepository({ focus: "security" });
+return { branch: DEFAULT_BRANCH, review };
+```
+
+Registered workflow names are qualified, for example `{ "workflow": "git.releaseCheck" }`; calling `releaseCheck` without its namespace fails. Registration requires a JavaScript-safe namespace, semantic version, descriptions, valid one-object function schemas, valid variable schemas, and local workflow keys without dots. Global names cannot collide with built-in or sandbox-denied names or another extension.
+Whenever it is available, `workflow_catalog` returns deterministic, flat metadata for registered functions, variables, and workflows. It never exposes implementations, resolvers, resolved values, or workflow source. Call it once before creating the first workflow for a task. Function calls validate input/output, replay completed journal entries, and expose only the public orchestration functions. Variables resolve in parallel before a run is persisted and are recomputed on cold resume.
 
 ## Lifecycle and recovery
 
@@ -281,7 +299,7 @@ Run states are `queued`, `running`, `pausing`, `paused`, `awaiting_input`, `comp
 - Stop is immediate, cascading, irreversible, and waits for owned agents to terminate.
 - Pi shutdown marks active work `interrupted`; no daemon remains and nothing auto-resumes.
 - Reopening the original Pi session can explicitly cold-resume an interrupted run.
-- Cold resume revalidates snapshotted capabilities/extensions, replays completed structural operations, and reruns interrupted parents.
+- Cold resume trusts the currently loaded workflow primitives, recomputes variables, replays completed structural operations, and reruns interrupted parents.
 - Completed, failed, and stopped runs are terminal.
 
 ## `/workflow`
@@ -310,7 +328,7 @@ Runs are stored under:
 ~/.pi/workflows/projects/<cwd-slug>-<cwd-hash>/sessions/<session-id>/runs/<run-id>/
 ```
 
-Identity checks use the exact resolved launch cwd and Pi session ID. Immutable snapshots include source, args, settings, models, tools, effective role definitions, schemas, and extension versions. Native transcripts remain in Pi session storage and their paths are referenced by the run.
+Identity checks use the exact resolved launch cwd and Pi session ID. Immutable snapshots include source, args, settings, models, tools, effective role definitions, and schemas. Native transcripts remain in Pi session storage and their paths are referenced by the run.
 
 Top-level agents may request `isolation: "worktree"`:
 
@@ -349,8 +367,7 @@ Host-facing failures use `WorkflowError` with a stable `code` and message. Workf
 
 ```text
 INVALID_SETTINGS INVALID_SYNTAX INVALID_METADATA DUPLICATE_NAME
-INVALID_SCHEMA MISSING_EXTENSION INCOMPATIBLE_EXTENSION UNKNOWN_MODEL UNKNOWN_TOOL
-UNKNOWN_AGENT_TYPE RUN_LIMIT_EXCEEDED RPC_LIMIT_EXCEEDED AGENT_TIMEOUT AGENT_FAILED
+INVALID_SCHEMA REGISTRY_FROZEN GLOBAL_COLLISION MISSING_WORKFLOW UNKNOWN_MODEL UNKNOWN_TOOL UNKNOWN_AGENT_TYPE RUN_LIMIT_EXCEEDED RPC_LIMIT_EXCEEDED AGENT_TIMEOUT AGENT_FAILED
 RESULT_INVALID CANCELLED WORKER_UNRESPONSIVE WORKTREE_FAILED RESUME_INCOMPATIBLE
 INTERNAL_ERROR
 ```

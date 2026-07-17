@@ -1,22 +1,64 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowDslExtension, runWorkflow, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowExtension, runWorkflow, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue, type WorkflowExtension } from "../src/index.js";
 import { createNativeAgentSession } from "../src/agent-execution.js";
-import { RunStore } from "../src/persistence.js";
+import { listRunIds, RunStore } from "../src/persistence.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
+let acceptanceFunctionCalls = 0;
+let acceptanceVariableCalls = 0;
+let variableSiblingAborted = false;
+let variableContext: unknown;
+let markStopVariableStarted: (() => void) | undefined;
+let stopVariableAborted = false;
+let coldVariableCalls = 0;
+const acceptanceExtension: WorkflowExtension = {
+  namespace: "issue48Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance globals",
+  functions: {
+    echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { acceptanceFunctionCalls += 1; return { value: input.value as string }; } },
+    orchestrate: {
+      description: "Exercise host combinators", input: { type: "object", additionalProperties: false }, output: { type: "object" },
+      async run(_input, context) {
+        const parallel = await context.parallel("host-parallel", { first: () => 1, second: () => 2 });
+        const pipeline = await context.pipeline("host-pipeline", { first: 1, second: 2 }, { double: (value: number) => value * 2 });
+        let parallelWaited = false;
+        let parallelFailure!: WorkflowError;
+        try { await context.parallel("host-failure", { first: () => { throw new WorkflowError("AGENT_FAILED", "host parallel failed"); }, second: async () => { await Promise.resolve(); parallelWaited = true; return 2; } }); }
+        catch (error) { parallelFailure = error as WorkflowError; }
+        let pipelineWaited = false;
+        try { await context.pipeline("host-pipeline-failure", { first: 1, second: 2 }, { fail: (value: number) => { if (value === 1) throw new WorkflowError("RESULT_INVALID", "host pipeline failed"); return value; }, finish: async (value: number) => { await Promise.resolve(); pipelineWaited = true; return value; } }); }
+        catch (error) { return { parallel, pipeline, parallelWaited, parallelCode: parallelFailure.code, pipelineWaited, pipelineCode: (error as WorkflowError).code }; }
+        throw new Error("expected host pipeline failure");
+      },
+    },
+  },
+  variables: {
+    resolvedValue: { description: "Resolved value", schema: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, resolve(run) { acceptanceVariableCalls += 1; return { value: run.workflow.name }; } },
+    contextValue: { description: "Context probe", schema: { type: "string" }, resolve(run) { if (run.workflow.name === "variable-context") variableContext = run; return "ok"; } },
+    bindingValue: { description: "Immutable binding", schema: { type: "object", properties: { nested: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false } }, required: ["nested"], additionalProperties: false }, resolve: () => ({ nested: { value: "original" } }) },
+    failureVariable: { description: "Primary failure", schema: { type: "string" }, resolve(run) { if (run.workflow.name === "variable-failure") throw new Error("primary variable failure"); return "ok"; } },
+    siblingVariable: { description: "Sibling failure", schema: { type: "string" }, resolve(run) { if (run.workflow.name !== "variable-failure") return "ok"; return new Promise<string>((resolve) => { if (run.signal.aborted) { variableSiblingAborted = true; resolve("aborted"); return; } run.signal.addEventListener("abort", () => { variableSiblingAborted = true; resolve("aborted"); }, { once: true }); }); } },
+    invalidVariable: { description: "Invalid output", schema: { type: "string" }, resolve(run) { return run.workflow.name === "invalid-variable" ? 3 : "ok"; } },
+    nonJsonVariable: { description: "Non JSON output", schema: { type: "string" }, resolve(run) { return run.workflow.name === "non-json-variable" ? undefined as unknown as JsonValue : "ok"; } },
+    coldVariable: { description: "Cold value", schema: { type: "string" }, resolve(run) { return run.workflow.name === "cold-variable" ? `cold-${String(++coldVariableCalls)}` : "unused"; } },
+    resumeFailureVariable: { description: "Resume failure", schema: { type: "string" }, resolve(run) { if (run.workflow.name === "resume-variable-failure") throw new Error("resume variable failure"); return "ok"; } },
+    stopVariable: { description: "Stop race", schema: { type: "string" }, resolve(run) { if (run.workflow.name !== "cold-stop") return "ok"; markStopVariableStarted?.(); return new Promise<string>((resolve) => { if (run.signal.aborted) { stopVariableAborted = true; resolve("aborted"); return; } run.signal.addEventListener("abort", () => { stopVariableAborted = true; resolve("aborted"); }, { once: true }); }); } },
+  }
+};
+function registerAcceptanceExtension(): void { registerWorkflowExtension(acceptanceExtension); }
 
 void test("production session_start cold-restores ownership and /workflow stop cascades", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-acceptance-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-acceptance-"));
   const cwd = join(home, "project");
   const sessionId = "session-a";
   const runId = "run-a";
   const store = new RunStore(cwd, sessionId, runId, home);
   const settings = { concurrency: 1, maxAgentLaunches: 2 };
-  await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: runId, workflowName: "cold", cwd, sessionId, state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'cold',description:'cold'}", args: null, metadata: { name: "cold", description: "cold" }, settings, models: ["openai-codex/gpt-5.6-sol"], tools: ["agent"], agentTypes: [], roles: {}, schemas: [] }));
   const parentOptions = { label: "parent", cwd, tools: ["agent"], model: "runtime/runtime-model" };
   await store.saveOwnership([{ id: `${runId}:1`, label: "parent", state: "waiting_for_child", options: parentOptions }, { id: `${runId}:2`, parentId: `${runId}:1`, label: "child", state: "running", options: { label: "child", cwd, tools: [], model: "runtime/runtime-model" } }]);
 
@@ -36,12 +78,12 @@ void test("production session_start cold-restores ownership and /workflow stop c
 });
 
 void test("cold resume persists effective role, fallback, nested, retry, and explicit policies", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-policy-reporting-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-policy-reporting-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const parent = await agent(\"nested policies\"); return { role, parent };";
   const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"] };
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2, maxAgentLaunches: 10 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, extensions: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2, maxAgentLaunches: 10 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, schemas: [] });
   await store.create({ id: "run-a", workflowName: "policy-reporting", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([]);
   const inputs = new Map<string, SessionInput>();
@@ -132,10 +174,10 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
 });
 
 void test("cold resume rejects obsolete identity snapshots", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-old-snapshot-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-old-snapshot-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
@@ -145,10 +187,10 @@ void test("cold resume rejects obsolete identity snapshots", async () => {
 });
 
 void test("cold resume rejects project roles after trust is revoked", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-untrusted-resume-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-untrusted-resume-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "untrusted", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return agent("review", {role:"reviewer"});`, args: null, metadata: { name: "untrusted" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "project role" } }, projectRoles: ["reviewer"], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "untrusted", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return agent("review", {role:"reviewer"});`, args: null, metadata: { name: "untrusted" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "project role" } }, projectRoles: ["reviewer"], schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const ctx = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, isProjectTrusted: () => false };
@@ -159,14 +201,14 @@ void test("cold resume rejects project roles after trust is revoked", async () =
 });
 
 void test("cold resume replays completed agents by hidden structural identity", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-agent-replay-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-replay-"));
   const cwd = join(home, "project");
   const script = `return agent("must replay");`;
   let replayPath = "";
   assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; } }).result, "original");
   assert.ok(replayPath);
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.complete(replayPath, "replayed");
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -181,11 +223,11 @@ void test("cold resume replays completed agents by hidden structural identity", 
 });
 
 void test("cold recovery delivers a persisted checkpoint only once before replay", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-checkpoint-recovery-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-recovery-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = `export const meta={name:'cold-gate',description:'cold gate'}; return checkpoint({name:'ship',prompt:'Ship?',context:{sha:'abc'}});`;
-  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "cold-gate", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [], error: { code: "CANCELLED", message: "interrupted" } }, createLaunchSnapshot({ script, args: null, metadata: { name: "cold-gate", description: "cold gate" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: { sha: "abc" } });
   const tools: Array<{ name: string; execute: (...args: never[]) => Promise<{ details: { accepted: boolean } }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -209,11 +251,11 @@ void test("cold recovery delivers a persisted checkpoint only once before replay
 });
 
 
-void test("production lifecycle commands persist pause, resume, and Pi-close interruption", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-lifecycle-"));
+void test("production restart recovery and graceful shutdown persist durable completion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lifecycle-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "life", cwd, sessionId: "session-a", state: "running", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'life',description:'life'}", args: null, metadata: { name: "life", description: "life" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai-codex/gpt-5.6-sol"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
@@ -221,15 +263,13 @@ void test("production lifecycle commands persist pause, resume, and Pi-close int
   workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; if (name === "session_shutdown") shutdown = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && shutdown && command);
   await start({}, ctx);
-  await command("pause run-a", ctx);
-  assert.equal((await store.load()).run.state, "paused");
-  await command("resume run-a", ctx);
-  assert.equal((await store.load()).run.state, "running");
+  assert.equal((await store.load()).run.state, "interrupted");
   await shutdown();
   assert.equal((await store.load()).run.state, "interrupted");
   await command("resume run-a", ctx);
-  for (let attempt = 0; attempt < 20 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal((await store.load()).run.state, "completed");
+  assert.equal(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), null);
 });
 
 void test("production Pi seam installs child tools and registers native steering", async () => {
@@ -289,7 +329,7 @@ void test("production worker returns bare combinator values and waits before typ
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false);
   releaseParallel();
-  await assert.rejects(parallelRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "branch failed");
+  await assert.rejects(parallelRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === "branch failed" && (error as WorkflowError & { failedAt?: string }).failedAt === "batch/failure");
 
   let releasePipeline!: () => void;
   const pipelineWait = new Promise<JsonValue>((resolve) => { releasePipeline = () => { resolve(2); }; });
@@ -303,7 +343,7 @@ void test("production worker returns bare combinator values and waits before typ
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, false);
   releasePipeline();
-  await assert.rejects(pipelineRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID" && error.message === "invalid first");
+  await assert.rejects(pipelineRun.result, (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID" && error.message === "invalid first" && (error as WorkflowError & { failedAt?: string }).failedAt?.startsWith("pipe%2Ffirst%2Frun/agent%2F"));
 
   const controller = new AbortController();
   let markStarted!: () => void;
@@ -317,10 +357,10 @@ void test("production worker returns bare combinator values and waits before typ
 });
 
 void test("terminal failed attempts remain persisted", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-attempts-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-attempts-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], extensions: {}, schemas: [] }));
+  await store.create({ id: "run-a", workflowName: "failed", cwd, sessionId: "session-a", state: "running", agents: [{ id: "run-a:1", name: "agent", path: "run-a:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 0 }], nativeSessions: [] }, createLaunchSnapshot({ script: "export const meta={name:'failed',description:'failed'}", args: null, metadata: { name: "failed" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
   await persistActiveAgentAttempt(store, "run-a:1", { attempt: 1, sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" });
   const active = (await store.load()).run;
   assert.equal(active.agents[0]?.attemptDetails?.[0]?.sessionFile, "/sessions/failed.jsonl");
@@ -331,40 +371,232 @@ void test("terminal failed attempts remain persisted", async () => {
   assert.deepEqual(persisted.nativeSessions, [{ sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" }]);
 });
 
-void test("production workflow exposes registered extension macros and replays them structurally", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-workflows-extension-acceptance-"));
-  let calls = 0;
-  registerWorkflowDslExtension({
-    name: "issue16Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance macro",
-    methods: {
-      echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { calls += 1; return { value: input.value as string }; } },
-      orchestrate: {
-        description: "Exercise host combinators", input: { type: "object", additionalProperties: false }, output: { type: "object" },
-        async run(_input, context) {
-          const parallel = await context.parallel("host-parallel", { first: () => 1, second: () => 2 });
-          const pipeline = await context.pipeline("host-pipeline", { first: 1, second: 2 }, { double: (value: number) => value * 2 });
-          let parallelWaited = false;
-          let parallelFailure!: WorkflowError;
-          try { await context.parallel("host-failure", { first: () => { throw new WorkflowError("AGENT_FAILED", "host parallel failed"); }, second: async () => { await Promise.resolve(); parallelWaited = true; return 2; } }); }
-          catch (error) { parallelFailure = error as WorkflowError; }
-          let pipelineWaited = false;
-          try { await context.pipeline("host-pipeline-failure", { first: 1, second: 2 }, { fail: (value: number) => { if (value === 1) throw new WorkflowError("RESULT_INVALID", "host pipeline failed"); return value; }, finish: async (value: number) => { await Promise.resolve(); pipelineWaited = true; return value; } }); }
-          catch (error) { return { parallel, pipeline, parallelWaited, parallelCode: parallelFailure.code, pipelineWaited, pipelineCode: (error as WorkflowError).code }; }
-          throw new Error("expected host pipeline failure");
-        },
-      },
-    },
-  });
+void test("production workflow exposes registered global functions and replays them structurally", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-global-acceptance-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId: string; value: unknown } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog"] } as never, home);
+  registerAcceptanceExtension();
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const script = `phase('verify'); const resolved=resolvedValue.value; const first=await echo({value:'first'}); const replayed=await echo({value:'second'}); const parallelResults=await parallel('global-parallel',{first:()=>echo({value:'parallel-first'}),second:()=>echo({value:'parallel-second'})}); const pipelineResults=await pipeline('global-pipeline',{first:'pipeline-value'},{echo:value=>echo({value})}); const orchestrated=await orchestrate({}); return {resolved,first,replayed,parallelResults,pipelineResults,orchestrated};`;
+  const result = await workflow.execute("id", { name: "global-e2e", script, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(result.details.value, { resolved: "global-e2e", first: { value: "first" }, replayed: { value: "second" }, parallelResults: { first: { value: "parallel-first" }, second: { value: "parallel-second" } }, pipelineResults: { first: { value: "pipeline-value" } }, orchestrated: { parallel: { first: 1, second: 2 }, pipeline: { first: 2, second: 4 }, parallelWaited: true, parallelCode: "AGENT_FAILED", pipelineWaited: true, pipelineCode: "RESULT_INVALID" } });
+  assert.equal(acceptanceFunctionCalls, 5);
+  assert.ok(acceptanceVariableCalls >= 1);
+  const store = new RunStore(home, "session", result.details.runId, home);
+  assert.equal((await store.load()).run.phase, "verify");
+  assert.equal((await store.load()).snapshot.tools.includes("workflow_catalog"), false);
+  assert.deepEqual(await store.replay("function/issue48Acceptance/echo/1"), { path: "function/issue48Acceptance/echo/1", value: { value: "first" } });
+  assert.deepEqual(await store.replay("function/issue48Acceptance/echo/2"), { path: "function/issue48Acceptance/echo/2", value: { value: "second" } });
+  assert.deepEqual(await store.replay("function/global-parallel/first/issue48Acceptance/echo/1"), { path: "function/global-parallel/first/issue48Acceptance/echo/1", value: { value: "parallel-first" } });
+  assert.deepEqual(await store.replay("function/global-parallel/second/issue48Acceptance/echo/1"), { path: "function/global-parallel/second/issue48Acceptance/echo/1", value: { value: "parallel-second" } });
+  assert.deepEqual(await store.replay("function/global-pipeline/first/echo/issue48Acceptance/echo/1"), { path: "function/global-pipeline/first/echo/issue48Acceptance/echo/1", value: { value: "pipeline-value" } });
+});
+
+void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const extension: WorkflowExtension = {
+    namespace: "issue53Acceptance", version: "1.0.0", headline: "Shared worktree", description: "Shared worktree acceptance",
+    functions: {
+      inherited: { description: "Use the inherited scope", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.parallel("function-agents", { left: () => context.agent("function-left"), right: () => context.agent("function-right") }); } },
+      scoped: { description: "Use a named scope", input: { type: "object" }, output: { type: "string" }, async run(_input, context) { return context.withWorktree("shared", async () => context.agent("function-scoped")); } },
+    },
+  };
+  const inputs: SessionInput[] = [];
+  let nextSession = 0;
+  let failFirst = true;
+  let spawnedChild = false;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    const sessionId = `shared-worktree-${String(++nextSession)}`;
+    inputs.push(input);
+    return {
+      sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      prompt: async () => {
+        writeFileSync(join(input.cwd, `${sessionId}.txt`), sessionId);
+        if (failFirst) { failFirst = false; throw new Error("retry once"); }
+        const childTool = input.customTools?.find(({ name }) => name === "agent");
+        const resultTool = input.customTools?.find(({ name }) => name === "get_subagent_result");
+        if (!spawnedChild && childTool && resultTool) {
+          spawnedChild = true;
+          const launched = await childTool.execute(sessionId, { prompt: "nested", label: "nested" }, undefined, undefined, undefined as never) as { content?: Array<{ text?: string }> };
+          const parsed = JSON.parse(launched.content?.[0]?.text ?? "{}") as { id?: unknown };
+          if (typeof parsed.id !== "string") throw new Error("Missing nested agent id");
+          await resultTool.execute(sessionId, { id: parsed.id }, undefined, undefined, undefined as never);
+        }
+      },
+      steer: async () => {}, dispose() {},
+    };
+  };
+  const messages: string[] = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId: string } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "agent"], sendMessage(message: { content: string }) { messages.push(message.content); } } as never, home, async () => {}, createSession);
+  registerWorkflowExtension(extension);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const script = `const values = await withWorktree("shared", async () => parallel("top", { retry: () => agent("retry", { retries: 1 }), direct: () => agent("direct"), inherited: () => inherited({}), scoped: () => scoped({}) })); return { values, outside: await agent("outside") };`;
+  const started = await workflow.execute("id", { name: "shared-worktree", script, maxAgentLaunches: 10 }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const runId = started.details.runId;
+  const store = new RunStore(cwd, "session", runId, home);
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  const loaded = await store.load();
+  assert.equal(loaded.run.state, "completed", JSON.stringify(loaded.run.error));
+  const worktrees = await store.worktrees();
+  assert.equal(worktrees.length, 1);
+  assert.equal(loaded.run.agents.filter((agent) => agent.state === "completed").length, 7);
+  assert.equal(loaded.run.agents.find((agent) => agent.attempts === 2)?.attempts, 2);
+  const owners = (await store.loadOwnership()).map(({ options }) => options.worktreeOwner).filter((owner): owner is string => typeof owner === "string");
+  assert.equal(new Set(owners).size, 1);
+  assert.equal(owners.length, 6);
+  const sharedCwds = new Set(inputs.slice(0, -1).map(({ cwd: inputCwd }) => inputCwd));
+  assert.equal(sharedCwds.size, 1);
+  assert.equal(inputs.at(-1)?.cwd, cwd);
+  const detail = formatNavigatorRun(loaded, [], worktrees);
+  assert.equal((detail.match(/branch=/g) ?? []).length, 1);
+  for (let attempt = 0; attempt < 100 && !messages.length; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  const branch = worktrees[0]?.branch;
+  const completion = messages.find((message) => message.includes("Changes:"));
+  assert.ok(branch && completion, JSON.stringify(messages));
+  assert.equal(completion.split(branch).length - 1, 1);
+});
+
+void test("production rejects explicit isolation inside a shared scope before launch", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-reject-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "agent"] } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  await assert.rejects(workflow.execute("id", { name: "shared-reject", script: `return withWorktree("shared", async () => agent("bad", { isolation: "worktree" }));`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
+void test("production variables resolve before persistence, freeze public bindings, and abort siblings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-variable-acceptance-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const script = `phase('verify'); const first=await extensions.issue16Acceptance.echo({value:'first'}); const replayed=await extensions.issue16Acceptance.echo({value:'second'}); const orchestrated=await extensions.issue16Acceptance.orchestrate({}); return {first,replayed,orchestrated};`;
-  const result = await workflow.execute("id", { name: "extension-e2e", script, extensions: [{ name: "issue16Acceptance", version: "^1.0.0" }], foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  assert.deepEqual(result.details.value, { first: { value: "first" }, replayed: { value: "second" }, orchestrated: { parallel: { first: 1, second: 2 }, pipeline: { first: 2, second: 4 }, parallelWaited: true, parallelCode: "AGENT_FAILED", pipelineWaited: true, pipelineCode: "RESULT_INVALID" } });
-  assert.equal(calls, 2);
-  const store = new RunStore(home, "session", result.details.runId, home);
-  assert.equal((await store.load()).run.phase, "verify");
-  assert.deepEqual(await store.replay("extension/issue16Acceptance/echo"), { path: "extension/issue16Acceptance/echo", value: { value: "first" } });
-  assert.deepEqual(await store.replay("extension/issue16Acceptance/echo/2"), { path: "extension/issue16Acceptance/echo/2", value: { value: "second" } });
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const contextResult = await workflow.execute("id", { name: "variable-context", args: { nested: { value: 1 } }, script: "return true;", foreground: true }, new AbortController().signal, undefined, context);
+  assert.equal(contextResult.details?.value, true);
+  const run = variableContext as { cwd: string; sessionId: string; runId: string; workflow: object; args: object; signal: AbortSignal };
+  assert.ok(run);
+  assert.deepEqual(Object.keys(run).sort(), ["args", "cwd", "runId", "sessionId", "signal", "workflow"]);
+  assert.ok(Object.isFrozen(run));
+  assert.ok(Object.isFrozen(run.workflow));
+  assert.ok(Object.isFrozen(run.args));
+  const bindings = await workflow.execute("id", { name: "variable-bindings", script: "const descriptor=Object.getOwnPropertyDescriptor(globalThis,'bindingValue'); let rejected=false; try { bindingValue={nested:{value:'changed'}}; } catch { rejected=true; } try { bindingValue.nested.value='changed'; } catch {} return { writable: descriptor?.writable, configurable: descriptor?.configurable, rejected, value: bindingValue.nested.value, frozen: Object.isFrozen(bindingValue), nestedFrozen: Object.isFrozen(bindingValue.nested) };", foreground: true }, new AbortController().signal, undefined, context);
+  assert.deepEqual(bindings.details?.value, { writable: false, configurable: false, rejected: false, value: "original", frozen: true, nestedFrozen: true });
+  const beforeFailure = await listRunIds(home, "session", home);
+  variableSiblingAborted = false;
+  await assert.rejects(workflow.execute("id", { name: "variable-failure", script: "return 'worker started';", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
+  assert.equal(variableSiblingAborted, true);
+  assert.deepEqual(await listRunIds(home, "session", home), beforeFailure);
+  for (const name of ["invalid-variable", "non-json-variable"]) {
+    const isolatedHome = mkdtempSync(join(tmpdir(), `pi-extensible-workflows-${name}-`));
+    const isolatedTools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+    workflowExtension({ registerTool(tool: (typeof isolatedTools)[number]) { isolatedTools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, isolatedHome);
+    const isolatedWorkflow = isolatedTools.find(({ name: toolName }) => toolName === "workflow");
+    assert.ok(isolatedWorkflow);
+    await assert.rejects(isolatedWorkflow.execute("id", { name, script: "return 'worker started';", foreground: true }, new AbortController().signal, undefined, { ...context, cwd: isolatedHome, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+    assert.deepEqual(await listRunIds(isolatedHome, "session", isolatedHome), []);
+  }
+});
+void test("workflow_catalog is excluded from child tools", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-child-"));
+  const inputs: SessionInput[] = [];
+  let nextSession = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    return { sessionId: `catalog-child-${String(++nextSession)}`, sessionFile: "/tmp/catalog-child.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog", "read"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  await workflow.execute("id", { name: "catalog-child", script: "return await agent('child');", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.equal(inputs[0]?.tools.includes("workflow_catalog"), false);
+});
+void test("cold resume recomputes variables and marks resolver failures", { timeout: 5000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-variable-resume-"));
+  const cwd = join(home, "project");
+  const cold = new RunStore(cwd, "session", "cold-run", home);
+  const failed = new RunStore(cwd, "session", "failed-run", home);
+  const snapshot = (name: string, script: string) => createLaunchSnapshot({ script, args: null, metadata: { name }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: ["workflow_catalog"], agentTypes: [], roles: {}, schemas: [] });
+  await cold.create({ id: "cold-run", workflowName: "cold-variable", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("cold-variable", "return coldVariable;"));
+  await failed.create({ id: "failed-run", workflowName: "resume-variable-failure", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("resume-variable-failure", "return true;"));
+  const stopped = new RunStore(cwd, "session", "stop-run", home);
+  await stopped.create({ id: "stop-run", workflowName: "cold-stop", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("cold-stop", "return true;"));
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, context);
+  await command("resume cold-run", context);
+  for (let attempt = 0; attempt < 1000 && (await cold.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(JSON.parse(readFileSync(join(cold.directory, "result.json"), "utf8")), "cold-1");
+  assert.equal(coldVariableCalls, 1);
+  await assert.rejects(command("resume failed-run", context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
+  assert.deepEqual((await failed.load()).run.error, { code: "INTERNAL_ERROR", message: "issue48Acceptance.resumeFailureVariable: resume variable failure" });
+  assert.equal((await failed.load()).run.state, "failed");
+  const started = new Promise<void>((resolve) => { markStopVariableStarted = resolve; });
+  stopVariableAborted = false;
+  const resuming = command("resume stop-run", context).catch(() => undefined);
+  await started;
+  await command("stop stop-run", context);
+  await resuming;
+  assert.equal(stopVariableAborted, true);
+  assert.equal((await stopped.load()).run.state, "stopped");
+});
+void test("restart recovers every persisted nonterminal run state", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-recovery-states-"));
+  const cwd = join(home, "project");
+  const states = ["running", "pausing", "paused", "awaiting_input"] as const;
+  const stores = states.map((state, index) => new RunStore(cwd, "session-a", `run-${String(index)}`, home));
+  for (const [index, state] of states.entries()) {
+    const id = `run-${String(index)}`;
+    await stores[index]?.create({ id, workflowName: id, cwd, sessionId: "session-a", state, agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `return '${id}';`, args: null, metadata: { name: id }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  }
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  for (const [index, store] of stores.entries()) {
+    assert.equal((await store.load()).run.state, "interrupted");
+    await command(`resume run-${String(index)}`, ctx);
+  }
+  for (const [index, store] of stores.entries()) {
+    for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await store.load()).run.state, "completed");
+    assert.equal(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), `run-${String(index)}`);
+  }
+});
+void test("cold-resumed failures deliver custom errors as prose while persistence keeps codes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-recovery-failure-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const message = "The restored approval gate rejected the release.";
+  await store.create({ id: "run-a", workflowName: "restored-failure", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: `throw new Error(${JSON.stringify(message)});`, args: null, metadata: { name: "restored-failure" }, settings: { concurrency: 1, maxAgentLaunches: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const messages: string[] = [];
+  const ctx = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {} } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, sendMessage(value: { content: string }) { messages.push(value.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  await command("resume run-a", ctx);
+  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "failed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  const loaded = await store.load();
+  assert.equal(loaded.run.state, "failed");
+  assert.deepEqual(loaded.run.error, { code: "INTERNAL_ERROR", message });
+  assert.ok(messages.some((value) => value.includes(message)));
+  assert.ok(messages.every((value) => !value.includes("INTERNAL_ERROR")));
 });

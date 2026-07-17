@@ -35,19 +35,20 @@ void test("navigator shows attention-ordered runs in the real TUI", { skip: !pro
     });
 
     await h.launch();
+    if (h.readPane(40).includes("interrupted workflow")) { h.sendKey("ctrl+c"); await new Promise((resolve) => setTimeout(resolve, 500)); }
     h.send("/workflow");
-    await h.waitForRegex("build|deploy|test-suite", 10_000);
+    await h.waitFor("Close", 10_000);
 
     const screen = h.readPane(40);
 
-    const buildLine = screen.split("\n").findIndex((l) => l.includes("build") && l.includes("running"));
+    const buildLine = screen.split("\n").findIndex((l) => l.includes("build") && l.includes("interrupted"));
     const testLine = screen.split("\n").findIndex((l) => l.includes("test-suite") && l.includes("failed"));
     const deployLine = screen.split("\n").findIndex((l) => l.includes("deploy") && l.includes("completed"));
 
-    assert.ok(buildLine >= 0, `Expected 'build running' in screen:\n${screen}`);
+    assert.ok(buildLine >= 0, `Expected 'build interrupted' in screen:\n${screen}`);
     assert.ok(testLine >= 0, `Expected 'test-suite failed' in screen:\n${screen}`);
     assert.ok(deployLine >= 0, `Expected 'deploy completed' in screen:\n${screen}`);
-    assert.ok(buildLine < testLine, `running should appear before failed`);
+    assert.ok(buildLine < testLine, `interrupted should appear before failed`);
     assert.ok(testLine < deployLine, `failed should appear before completed`);
     assert.ok(screen.includes("Close"), `Expected 'Close' option`);
   } finally {

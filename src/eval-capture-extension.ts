@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { validateWorkflowLaunch, WorkflowError, WORKFLOW_TOOL_DESCRIPTION, WORKFLOW_TOOL_LABEL, WORKFLOW_TOOL_PARAMETERS, WORKFLOW_TOOL_PROMPT_SNIPPET, type WorkflowValidationParameters } from "./index.js";
 
-export const CAPTURE_IDENTITY = "pi-workflows-eval-capture-v1";
+export const CAPTURE_IDENTITY = "pi-extensible-workflows-eval-capture-v1";
 export const CAPTURE_ERROR_PREFIX = `${CAPTURE_IDENTITY}:`;
 
 interface CaptureContext {
@@ -17,13 +17,13 @@ interface CaptureContext {
 export function resolveWorkflowSkillPath(): string {
   let directory = dirname(fileURLToPath(import.meta.url));
   for (let depth = 0; depth < 6; depth += 1) {
-    const candidate = join(directory, "skills", "pi-workflows", "SKILL.md");
+    const candidate = join(directory, "skills", "pi-extensible-workflows", "SKILL.md");
     if (existsSync(candidate)) return candidate;
     const parent = dirname(directory);
     if (parent === directory) break;
     directory = parent;
   }
-  throw new Error("Could not resolve skills/pi-workflows/SKILL.md from the eval extension");
+  throw new Error("Could not resolve skills/pi-extensible-workflows/SKILL.md from the eval extension");
 }
 
 export default function evalCaptureExtension(pi: ExtensionAPI): void {
@@ -39,7 +39,7 @@ export default function evalCaptureExtension(pi: ExtensionAPI): void {
         const rootModel = `${ctx.model.provider}/${ctx.model.id}`;
         const availableModels = new Set((ctx.modelRegistry?.getAvailable() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
         availableModels.add(rootModel);
-        const rootTools = new Set(pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond"));
+        const rootTools = new Set(pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_catalog"));
         const validated = validateWorkflowLaunch(params, { cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted?.() ?? true, availableModels, rootTools });
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ captured: true, validated: true, launchBudget: 0, name: validated.checked.metadata.name }) }],

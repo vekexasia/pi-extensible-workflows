@@ -1,9 +1,9 @@
 ---
-name: pi-workflows
+name: pi-extensible-workflows
 description: Use when the task is complex enough to require multiple subagents or when the user explicitly asks for a workflow.
 ---
 
-# pi-workflows
+# pi-extensible-workflows
 
 Use `workflow` exclusively for genuinely multi-agent orchestration. For one agent, use ordinary tools or `Agent` directly. Do not wrap a single agent in a workflow; define distinct responsibilities and keep the result flow explicit.
 
@@ -32,6 +32,13 @@ return agent(
 );
 ```
 
+To pass structured input from the main agent, include `args`:
+```json
+{ "workflow": "namespace.workflowName", "args": { "issue": 42 } }
+```
+Inside the workflow, read `args.issue`; omitted `args` is `null`.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task.
+
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
 
 ## `agent()` options
@@ -50,6 +57,19 @@ interface AgentOptions {
 ```
 
 Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; aliases are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
+
+## Shared worktree scope
+
+Use `withWorktree(callback)` or `withWorktree(name, callback)` when top-level agents should collaborate in one worktree:
+
+```js
+const results = await withWorktree("implementation", async () => parallel("implementation", {
+  api: () => agent("Implement the API"),
+  tests: () => agent("Add integration tests"),
+}));
+```
+
+The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly.
 
 ## Rules
 
