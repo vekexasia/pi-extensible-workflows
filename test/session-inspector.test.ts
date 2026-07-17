@@ -3,10 +3,10 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { SessionInfo } from "@earendil-works/pi-coding-agent";
+import type { SessionEntry, SessionInfo } from "@earendil-works/pi-coding-agent";
 import { createLaunchSnapshot, inspectWorkflowScript } from "../src/index.js";
 import { RunStore } from "../src/persistence.js";
-import { loadSessionReport, matchSession, renderInspector, resolveSession, type InspectorViewState } from "../src/session-inspector.js";
+import { loadSessionReport, matchSession, renderInspector, resolveSession, transcriptLines, type InspectorViewState } from "../src/session-inspector.js";
 
 const usage = (cost: number) => ({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost } });
 
@@ -202,4 +202,16 @@ void test("session inspector uses labels and omits missing roles consistently", 
   const rendered = renderInspector(report, { view: "detail", selected: 0, scroll: 0 }).join("\n");
   assert.match(rendered, /explicit label[\s\S]*provider\/worker/);
   assert.doesNotMatch(rendered, /role=/);
+});
+
+void test("renders active transcript entries with message roles and content", () => {
+  const entries = [
+    { type: "message", message: { role: "user", content: "Inspect the API", timestamp: 1 } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/api.ts" } }, { type: "text", text: "I found it.", }], api: "openai-responses", provider: "openai", model: "gpt", usage: usage(0), stopReason: "toolUse", timestamp: 2 } },
+    { type: "message", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "API source" }], isError: false, timestamp: 3 } },
+  ] as unknown as SessionEntry[];
+  const rendered = transcriptLines(entries).join("\n");
+  assert.match(rendered, /\[user\][\s\S]*Inspect the API/);
+  assert.match(rendered, /\[assistant\][\s\S]*Tool call: read[\s\S]*src\/api\.ts/);
+  assert.match(rendered, /\[toolResult: read\][\s\S]*API source/);
 });

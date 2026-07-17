@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
-import { highlightCode, initTheme, SessionManager, truncateToVisualLines, type SessionInfo } from "@earendil-works/pi-coding-agent";
+import { highlightCode, initTheme, SessionManager, truncateToVisualLines, type SessionEntry, type SessionInfo } from "@earendil-works/pi-coding-agent";
 import { inspectWorkflowScript, type ModelSpec, type StaticWorkflowCall } from "./index.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 
@@ -24,6 +24,33 @@ function text(content: unknown): string {
   if (!Array.isArray(content)) return "";
   const parts: unknown[] = content;
   return parts.flatMap((part) => typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string" ? [part.text] : []).join("");
+}
+
+function transcriptPartLines(part: unknown): string[] {
+  if (typeof part !== "object" || part === null || !("type" in part)) return [];
+  const value = part as Record<string, unknown>;
+  if (value.type === "text" && typeof value.text === "string") return value.text.split("\n");
+  if (value.type === "thinking" && typeof value.thinking === "string") return ["Thinking:", ...value.thinking.split("\n")];
+  if (value.type === "toolCall" && typeof value.name === "string") return [`Tool call: ${value.name}`, JSON.stringify(value.arguments, null, 2)];
+  if (value.type === "image") return ["[image]"];
+  return [];
+}
+
+function transcriptMessageLines(message: unknown): string[] {
+  if (typeof message !== "object" || message === null) return ["(invalid message)"];
+  const value = message as Record<string, unknown>;
+  const role = typeof value.role === "string" ? value.role : "message";
+  const label = role === "toolResult" && typeof value.toolName === "string" ? `${role}: ${value.toolName}` : role === "custom" && typeof value.customType === "string" ? `${role}: ${value.customType}` : role;
+  const content = Array.isArray(value.content) ? value.content.flatMap(transcriptPartLines) : typeof value.content === "string" ? value.content.split("\n") : [];
+  return [`[${label}]`, ...(content.length ? content : ["(empty)"])];
+}
+
+export function transcriptLines(entries: readonly SessionEntry[]): string[] {
+  if (!entries.length) return ["(no active transcript entries)"];
+  return entries.flatMap((entry, index) => {
+    const lines = entry.type === "message" ? transcriptMessageLines(entry.message) : entry.type === "model_change" ? [`[model] ${entry.provider}/${entry.modelId}`] : entry.type === "thinking_level_change" ? [`[thinking] ${entry.thinkingLevel}`] : entry.type === "compaction" ? ["[compaction]", ...entry.summary.split("\n")] : entry.type === "branch_summary" ? ["[branch summary]", ...entry.summary.split("\n")] : entry.type === "custom_message" ? [`[custom_message: ${entry.customType}]`, ...(typeof entry.content === "string" ? entry.content.split("\n") : entry.content.flatMap(transcriptPartLines))] : entry.type === "custom" ? [`[custom: ${entry.customType}]`] : entry.type === "label" ? [`[label] ${entry.label ?? ""}`] : [`[session info] ${entry.name ?? ""}`];
+    return index ? ["", ...lines] : lines;
+  });
 }
 
 function mergedModels(groups: readonly (readonly ModelUsage[])[]): ModelUsage[] {

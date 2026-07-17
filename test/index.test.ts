@@ -701,6 +701,62 @@ void test("navigator opens the complete workflow script in a scrollable TUI pane
   assert.equal(customCalls, 3);
 });
 
+void test("navigator opens a selected native transcript in a scrollable TUI overlay", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-transcript-viewer-"));
+  const cwd = join(home, "project");
+  const transcriptPath = join(home, "native.jsonl");
+  const session = { type: "session", version: 3, id: "native", timestamp: "2026-01-01T00:00:00.000Z", cwd };
+  const entries = [
+    { type: "message", id: "user", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "FIRST_USER", timestamp: 1 } },
+    { type: "message", id: "assistant", parentId: "user", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/index.ts" } }], api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 2 } },
+    { type: "message", id: "tool", parentId: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "TOOL_OUTPUT" }], isError: false, timestamp: 3 } },
+    ...Array.from({ length: 12 }, (_, index) => ({ type: "message", id: `message-${String(index)}`, parentId: index === 0 ? "tool" : `message-${String(index - 1)}`, timestamp: `2026-01-01T00:00:${String(index + 4).padStart(2, "0")}.000Z`, message: { role: index % 2 ? "assistant" : "user", content: `TRANSCRIPT_LINE_${String(index)}`, ...(index % 2 ? { api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop" } : {}), timestamp: index + 4 } })),
+    { type: "message", id: "end", parentId: "message-11", timestamp: "2026-01-01T00:00:20.000Z", message: { role: "assistant", content: [{ type: "text", text: "TRANSCRIPT_END" }], api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 20 } },
+  ];
+  writeFileSync(transcriptPath, `${[session, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  const store = new RunStore(cwd, "session", "run", home);
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "completed", agents: [], nativeSessions: [{ sessionId: "native", sessionFile: transcriptPath }] }, snapshot);
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  let customCalls = 0;
+  const ctx = {
+    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
+    ui: {
+      notify() {}, confirm: async () => false,
+      select: async (prompt: string, options: string[]) => { if (prompt === "Workflows\n") return options[0] ?? "Close"; assert.equal(prompt, "Native Pi transcripts"); assert.ok(options.includes(transcriptPath)); return transcriptPath; },
+      custom: async (factory: (tui: { terminal: { rows: number }; requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
+        customCalls += 1;
+        let result: string | undefined;
+        const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
+        if (customCalls === 1) {
+          const dashboard = component.render(80).join("\n");
+          assert.match(dashboard, /View transcript/);
+          component.handleInput?.("tui.select.down");
+          component.handleInput?.("tui.select.confirm");
+        } else if (customCalls === 2) {
+          const initial = component.render(80).join("\n");
+          assert.match(initial, /\[user\]/);
+          assert.match(initial, /\[assistant\]/);
+          assert.match(initial, /Tool call: read/);
+          assert.match(initial, /FIRST_USER/);
+          for (let index = 0; index < 20; index += 1) component.handleInput?.("tui.select.pageDown");
+          assert.match(component.render(80).join("\n"), /TRANSCRIPT_END/);
+          component.handleInput?.("tui.select.cancel");
+        } else {
+          assert.match(component.render(80).join("\n"), /View transcript/);
+          component.handleInput?.("tui.select.cancel");
+        }
+        component.dispose?.();
+        return result;
+      },
+    },
+  };
+  await commands[0]?.handler("", ctx as never);
+  assert.equal(customCalls, 3);
+  await store.delete(true);
+});
+
 
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-v2-"));
