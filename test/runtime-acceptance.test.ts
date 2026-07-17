@@ -402,6 +402,50 @@ void test("production workflow exposes registered global functions and replays t
   assert.deepEqual(await store.replay("function/global-pipeline/first/echo/issue48Acceptance/echo/1"), { path: "function/global-pipeline/first/echo/issue48Acceptance/echo/1", value: { value: "pipeline-value" } });
 });
 
+void test("parent registry survives nested agent session lifecycle", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-registry-session-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: { value?: unknown } }> }> = [];
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let nestedLifecycleRan = false;
+  const createSession = async (): Promise<NativeSession> => ({
+    sessionId: "nested", sessionFile: "/sessions/nested.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    prompt: async () => {
+      const nestedHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-nested-registry-"));
+      let nestedStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+      let nestedShutdown: (() => Promise<void>) | undefined;
+      workflowExtension({ registerTool() {}, registerCommand() {}, getActiveTools: () => ["workflow"], on(name: string, handler: unknown) { if (name === "session_start") nestedStart = handler as typeof nestedStart; if (name === "session_shutdown") nestedShutdown = handler as typeof nestedShutdown; } } as never, nestedHome);
+      assert.ok(nestedStart && nestedShutdown);
+      await nestedStart({}, { cwd: nestedHome, sessionManager: { getSessionId: () => "nested" } });
+      await nestedShutdown();
+      nestedLifecycleRan = true;
+    },
+    steer: async () => {}, dispose() {},
+  });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog"], on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; } } as never, home, async () => {}, createSession);
+  registerWorkflowExtension({
+    namespace: "registrySessionAcceptance", version: "1.0.0", headline: "Registry session", description: "Registry session acceptance",
+    functions: {
+      afterNested: {
+        description: "Run after a nested session",
+        input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+        output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+        run: (input) => ({ value: input.value as string }),
+      },
+    },
+  });
+  assert.ok(start);
+  await start({}, { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "parent" } });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const catalog = tools.find(({ name }) => name === "workflow_catalog");
+  assert.ok(workflow && catalog);
+  const result = await workflow.execute("id", { name: "registry-session", script: "await agent('nested'); return afterNested({value:'after'});", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "parent" } });
+  assert.equal(nestedLifecycleRan, true);
+  assert.deepEqual(result.details.value, { value: "after" });
+  const listed = JSON.parse((await catalog.execute()).content[0]?.text ?? "null") as { functions: Array<{ name: string }> };
+  assert.equal(listed.functions.some(({ name }) => name === "afterNested"), true);
+  registerAcceptanceExtension();
+});
+
 void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-"));
   const cwd = join(home, "repo");

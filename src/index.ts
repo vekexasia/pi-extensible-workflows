@@ -887,8 +887,11 @@ export interface ValidatedWorkflowLaunch {
 }
 
 export function validateWorkflowLaunch(params: WorkflowValidationParameters, context: WorkflowValidationContext): ValidatedWorkflowLaunch {
+  return validateWorkflowLaunchWithRegistry(params, context, loadingRegistry());
+}
+function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters, context: WorkflowValidationContext, registry: WorkflowRegistryApi): ValidatedWorkflowLaunch {
   if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
-  const definition = typeof params.workflow === "string" ? loadingRegistry().workflow(params.workflow) : undefined;
+  const definition = typeof params.workflow === "string" ? registry.workflow(params.workflow) : undefined;
   const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
   if (!script) fail("INVALID_SYNTAX", "Provide script or registered workflow");
   const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
@@ -1565,9 +1568,9 @@ function workflowRunContext(cwd: string, sessionId: string, runId: string, workf
   return Object.freeze({ cwd, sessionId, runId, workflow: deepFreeze(structuredClone(workflow)), args: deepFreeze(structuredClone(args)), signal });
 }
 
-async function resolveWorkflowVariables(run: Readonly<WorkflowRunContext>, controller: AbortController): Promise<Readonly<Record<string, JsonValue>>> {
+async function resolveWorkflowVariables(run: Readonly<WorkflowRunContext>, controller: AbortController, registry: WorkflowRegistryApi): Promise<Readonly<Record<string, JsonValue>>> {
   let first: WorkflowError | undefined;
-  const tasks = loadingRegistry().variables().map(async ({ namespace, name, variable }) => {
+  const tasks = registry.variables().map(async ({ namespace, name, variable }) => {
     try {
       const result: unknown = await variable.resolve(run);
       if (!jsonValue(result) || !Value.Check(variable.schema, result)) fail("RESULT_INVALID", `Invalid output from ${namespace}.${name}`);
@@ -1641,10 +1644,10 @@ function nextNamedOccurrence(counters: Map<string, number>, label: string): stri
 }
 
 
-function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>): WorkflowBridge {
+function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>, registry: WorkflowRegistryApi): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionWorktreeOccurrences = new Map<string, number>();
-  return { ...bridge, functions: loadingRegistry().globals(), variables, function: async (namespace, name, input, path, signal, worktreeOwner) => {
+  return { ...bridge, functions: registry.globals(), variables, function: async (namespace, name, input, path, signal, worktreeOwner) => {
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
     const sideEffects: Promise<void>[] = [];
@@ -1672,7 +1675,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
       log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
     };
-    const result = await loadingRegistry().invokeFunction(namespace, name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } });
+    const result = await registry.invokeFunction(namespace, name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } });
     await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
@@ -1693,6 +1696,7 @@ function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
 
 export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard, createSession: SessionFactory = createNativeAgentSession) {
   beginWorkflowExtensionLoading();
+  const registry = loadingRegistry();
   const registerEntryRenderer = (pi as unknown as Partial<Pick<ExtensionAPI, "registerEntryRenderer">>).registerEntryRenderer;
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
@@ -1855,14 +1859,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   let sessionStarted = false;
   const registerCatalog = () => {
     if (catalogRegistered || !pi.getActiveTools().includes("workflow")) return;
-    const catalog = loadingRegistry().catalog();
+    const catalog = registry.catalog();
     if (!catalog.functions.length && !catalog.variables.length && !catalog.workflows.length) return;
     pi.registerTool({
       name: "workflow_catalog",
       label: "Workflow Catalog",
       description: "List global workflow functions, variables, and reusable workflows",
       parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() { return { content: [{ type: "text" as const, text: JSON.stringify(loadingRegistry().catalog()) }], details: {} }; }
+      async execute() { return { content: [{ type: "text" as const, text: JSON.stringify(registry.catalog()) }], details: {} }; }
     });
     catalogRegistered = true;
   };
@@ -1881,7 +1885,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     run.abortController = controller;
     const runContext = workflowRunContext(run.store.cwd, run.store.sessionId, run.store.runId, loaded.snapshot.metadata, loaded.snapshot.args, controller.signal);
     let variables: Readonly<Record<string, JsonValue>>;
-    try { variables = await resolveWorkflowVariables(runContext, controller); }
+    try { variables = await resolveWorkflowVariables(runContext, controller, registry); }
     catch (error) {
       const typed = asWorkflowError(error);
       if (!["completed", "failed", "stopped"].includes(run.lifecycle.state)) { await run.lifecycle.terminal("failed").catch(() => undefined); await run.store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); }
@@ -1913,7 +1917,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await run.store.complete(path, outcome.value);
         return outcome.value;
       } finally { await run.lifecycle.leave(); }
-    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { await run.store.updateState((current) => ({ ...current, phase })); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables), controller.signal);
+    }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { await run.store.updateState((current) => ({ ...current, phase })); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
     run.execution = execution;
     emitAsyncStarted(run.store, run.metadata);
     const completion = execution.result.then(async (value) => { await scheduler.flush(); const resultPath = await run.store.saveResult(value); await run.lifecycle.terminal("completed"); emitAsyncComplete(run.store, "complete"); return { value, resultPath }; }, async (error: unknown) => { await scheduler.flush(); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") await run.lifecycle.terminal("failed"); const typed = error instanceof WorkflowError ? error : new WorkflowError(errorCode(error) ?? "INTERNAL_ERROR", errorText(error)); await run.store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); emitAsyncComplete(run.store, run.lifecycle.state === "stopped" ? "stopped" : "failed", typed); if (run.lifecycle.state !== "stopped" && run.lifecycle.state !== "interrupted") deliverFailure(pi, run.metadata.name, error); });
@@ -1923,7 +1927,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   pi.on("session_start", async (_event, ctx) => {
     if (sessionStarted) return;
     sessionStarted = true;
-    loadingRegistry().freeze();
+    registry.freeze();
     registerCatalog();
     await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
     try {
@@ -1988,7 +1992,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       availableModels.add(rootModelName);
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_catalog");
       const trustedProject = projectTrusted(ctx);
-      const validated = validateWorkflowLaunch(params, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools) });
+      const validated = validateWorkflowLaunchWithRegistry(params, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools) }, registry);
       const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames } = validated;
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
       const runId = randomUUID();
@@ -1997,7 +2001,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const runController = new AbortController();
       if (signal?.aborted) runController.abort(); else signal?.addEventListener("abort", () => { runController.abort(); }, { once: true });
       const runContext = workflowRunContext(ctx.cwd, ctx.sessionManager.getSessionId(), runId, checked.metadata, args, runController.signal);
-      const variables = await resolveWorkflowVariables(runContext, runController);
+      const variables = await resolveWorkflowVariables(runContext, runController, registry);
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;
       const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
@@ -2042,7 +2046,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const run = await store.updateState((current) => ({ ...current, phase }));
           runs.get(runId)?.update?.(workflowToolUpdate(run));
         } finally { await lifecycle.leave(); }
-      }, log: logBridge(lifecycle, checked.metadata.name) }, store, runContext, variables), runController.signal);
+      }, log: logBridge(lifecycle, checked.metadata.name) }, store, runContext, variables, registry), runController.signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       if (background) emitAsyncStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => { await scheduler.flush(); const resultPath = await store.saveResult(value); await lifecycle.terminal("completed"); return { value, resultPath }; }, async (error: unknown) => { await scheduler.flush(); const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error)); if (lifecycle.state !== "stopped" && lifecycle.state !== "interrupted") await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : "failed"); await store.updateState((current) => ({ ...current, error: { code: typed.code, message: typed.message } })); throw typed; });
