@@ -147,8 +147,10 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   assert.equal(topRole.role, "reviewer");
   assert.equal(nestedRole.role, "reviewer");
   assert.equal(named.role, undefined);
+  assert.equal(named.label, "API inspection");
   assert.deepEqual(named.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
   assert.deepEqual(named.tools, ["agent", "read"]);
+  assert.equal(loaded.run.agents.find((agent) => agent.name === "root-model")?.label, undefined);
   assert.equal(nestedRole.parentId, loaded.run.agents.find((agent) => agent.name === "root-model")?.id);
   assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "root-model")?.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
   assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "root-model")?.tools, ["agent", "read"]);

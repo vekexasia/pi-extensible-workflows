@@ -172,6 +172,20 @@ void test("navigator renders effective agent policy separately from launch metad
   assert.match(dashboard, /role=reviewer/);
   assert.doesNotMatch(dashboard, /Launch models/);
 });
+void test("navigator uses persisted labels and model fallbacks across views", () => {
+  const run = { id: "run", workflowName: "labels", cwd: "/repo", sessionId: "session", state: "running", agents: [
+    { id: "run:1", name: "stale-name", label: "explicit label", path: "run:1", state: "running", model: { provider: "provider", model: "worker" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "worker", path: "run:2", state: "completed", parentId: "run:1", model: { provider: "provider", model: "worker" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const dashboard = formatNavigatorDashboard(run, [], []);
+  const progress = formatWorkflowProgress(run);
+  const detail = formatNavigatorRun({ run, snapshot: createLaunchSnapshot({ script: "return 1;", args: null, metadata: { name: "labels" }, settings: DEFAULT_SETTINGS, models: ["provider/worker"], tools: [], agentTypes: [], schemas: [] }) }, [], []);
+  assert.match(dashboard, /explicit label > worker/);
+  assert.match(progress, /explicit label/);
+  assert.match(detail, /explicit label .*model=provider\/worker/);
+  assert.match(detail, /worker .*model=provider\/worker/);
+  assert.doesNotMatch(`${dashboard}\n${detail}`, /role=custom/);
+});
 
 void test("streams foreground workflow progress into its tool card", async () => {
   type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string } } };
