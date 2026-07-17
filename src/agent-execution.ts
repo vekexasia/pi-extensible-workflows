@@ -254,6 +254,7 @@ export class WorkflowAgentExecutor {
 
 export interface ScheduledAgentOptions {
   label: string;
+  requestedLabel?: string;
   cwd: string;
   tools: readonly string[];
   isolation?: "worktree";
@@ -401,7 +402,7 @@ export class FairAgentScheduler {
       execute: async (_id: string, params: { prompt: string; label: string; tools?: string[]; model?: string; thinking?: ThinkingLevel; role?: string; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null }) => {
         if (params.role !== undefined && (params.model !== undefined || params.thinking !== undefined || params.tools !== undefined)) throw new WorkflowError("INVALID_METADATA", "Role agents must not specify model, thinking, or tools");
         const tools = (params.tools !== undefined || params.role !== undefined ? resolveTools?.(params.role, params.tools, params.model, parent.options.tools, params.thinking) : undefined) ?? params.tools ?? parent.options.tools;
-        const options = { label: params.label, cwd: parent.options.cwd, tools, ...(params.model ? { model: params.model } : {}), ...(params.thinking ? { thinking: params.thinking } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
+        const options = { label: params.label, requestedLabel: params.label, cwd: parent.options.cwd, tools, ...(params.model ? { model: params.model } : {}), ...(params.thinking ? { thinking: params.thinking } : {}), ...(params.role ? { role: params.role } : {}), ...(params.outputSchema ? { schema: params.outputSchema } : {}), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
         return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
       },
@@ -443,7 +444,7 @@ export class FairAgentScheduler {
   async flush(): Promise<void> { await this.#persistence; }
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
-    const unknown = Object.keys(options).find((key) => !["label", "cwd", "tools", "isolation", "worktreeOwner", "model", "thinking", "role", "schema", "retries", "timeoutMs"].includes(key));
+    const unknown = Object.keys(options).find((key) => !["label", "requestedLabel", "cwd", "tools", "isolation", "worktreeOwner", "model", "thinking", "role", "schema", "retries", "timeoutMs"].includes(key));
     if (unknown) throw new WorkflowError("INVALID_METADATA", `Unsupported child agent option: ${unknown}`);
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]) });

@@ -9,7 +9,7 @@ import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 
 export interface ModelUsage { model: string; cost: number }
 export interface AttemptReport { attempt: number; prompt: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; models: readonly ModelUsage[]; error?: string }
-export interface AgentReport { name: string; state: string; role?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
+export interface AgentReport { name: string; label?: string; state: string; role?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[] }
 export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[] }
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
@@ -155,7 +155,7 @@ async function agentReport(agent: PersistedRun["agents"][number]): Promise<Agent
     attempts.push({ attempt: 1, prompt: "(transcript unavailable)", model: fallbackModel, ...(fallbackThinking !== undefined ? { thinking: fallbackThinking } : {}), cost, models: [{ model: fallbackModel, cost }] });
   }
   const latest = attempts[attempts.length - 1];
-  return { name: agent.name, state: agent.state, ...(agent.role ? { role: agent.role } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
+  return { name: agent.name, ...(agent.label ? { label: agent.label } : {}), state: agent.state, ...(agent.role ? { role: agent.role } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts };
 }
 
 export function matchSession(query: string, sessions: readonly SessionInfo[]): SessionInfo {
@@ -232,7 +232,7 @@ function detailLines(workflow: WorkflowReport): string[] {
     "",
     style(ansi.bold, "Static workflow calls"),
     ...(workflow.parseError ? [style(ansi.red, `Parse error: ${workflow.parseError}`)] : workflow.calls.length ? workflow.calls.map((call, index) => {
-      const fields = [call.name ? `name=${JSON.stringify(call.name)}` : "", call.prompt ? `prompt=${JSON.stringify(call.prompt)}` : call.kind === "agent" || call.kind === "checkpoint" ? "prompt=<dynamic>" : "", call.role ? `role=${call.role}` : "", call.model ? `model=${call.model}` : ""].filter(Boolean);
+      const fields = [call.name ? `name=${JSON.stringify(call.name)}` : "", call.prompt ? `prompt=${JSON.stringify(call.prompt)}` : call.kind === "agent" || call.kind === "checkpoint" ? "prompt=<dynamic>" : "", call.label ? `label=${call.label}` : "", call.role ? `role=${call.role}` : "", call.model ? `model=${call.model}` : ""].filter(Boolean);
       return `${String(index + 1)}. ${call.kind}${fields.length ? ` · ${fields.join(" · ")}` : ""}`;
     }) : ["(none)"]),
     "",
@@ -240,7 +240,7 @@ function detailLines(workflow: WorkflowReport): string[] {
   ];
   if (!workflow.agents.length) lines.push("(no agent run was persisted)");
   for (const agent of workflow.agents) {
-    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
+    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
     for (const attempt of agent.attempts) {
       lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`);
     }

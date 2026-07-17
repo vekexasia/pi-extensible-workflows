@@ -36,7 +36,7 @@ export interface ModelSpec { provider: string; model: string; thinking?: "off" |
 export interface WorkflowMetadata { name: string; description?: string }
 export interface WorkflowSettings { concurrency: number; maxAgentLaunches: number }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number } }
-export interface AgentRecord { id: string; name: string; path: string; state: AgentState; parentId?: string; role?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
+export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; role?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape }
 const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 1;
 export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
@@ -589,6 +589,7 @@ export interface StaticWorkflowCall {
   name: string | null;
   prompt: string | null;
   model: string | null;
+  label?: string | null;
   role: string | null;
   retries?: number | null;
   outputSchema?: JsonSchema | null;
@@ -623,7 +624,7 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
         return key ? [key] : [];
       }) : [];
       const knownOptions = Object.fromEntries(optionKeys.flatMap((key) => { const value = staticValue(propertyNode(options, key)); return value.known && jsonValue(value.value) ? [[key, value.value]] : []; })) as Record<string, JsonValue>;
-      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), role: staticString(propertyNode(options, "role")) };
+      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticString(propertyNode(options, "role")) };
       return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(outputSchema.known && object(outputSchema.value) ? { outputSchema: outputSchema.value as JsonSchema } : {}), ...(optionKeys.length ? { options: knownOptions, optionKeys } : {}) };
     }
     if (kind === "checkpoint") return { ...placement, kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
@@ -1356,7 +1357,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): stri
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat(depth + 1);
     const activity = formatAgentActivity(agent, spinner);
-    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.name} [${agent.state}]${activity ? ` ${activity}` : ""}`);
+    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.label ?? agent.name} [${agent.state}]${activity ? ` ${activity}` : ""}`);
   }
   return lines.join("\n");
 }
@@ -1406,16 +1407,17 @@ function navigatorRunLabels(entries: readonly { store: RunStore; loaded: { run: 
 }
 
 function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): string {
-  const parts: string[] = [agent.name];
+  const name = agent.label ?? agent.name;
+  const parts: string[] = [name];
   const seen = new Set<string>([agent.id]);
   for (let parentId = agent.parentId; parentId; parentId = byId.get(parentId)?.parentId) {
     if (seen.has(parentId)) break; // ponytail: cycle guard for corrupt data
     seen.add(parentId);
     const parent = byId.get(parentId);
-    if (parent) parts.unshift(parent.name);
+    if (parent) parts.unshift(parent.label ?? parent.name);
     else break;
   }
-  return parts.length > 1 ? parts.join(" > ") : agent.name;
+  return parts.length > 1 ? parts.join(" > ") : name;
 }
 
 function formatAgentActivity(agent: AgentRecord, spinner: string): string {
@@ -1486,7 +1488,7 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
     const role = agent.role ? ` role=${agent.role}` : "";
     const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
-    lines.push(`  ${agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
+    lines.push(`  ${agent.label ?? agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
     for (const attempt of agent.attemptDetails ?? []) lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
     for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
   }
@@ -1776,7 +1778,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         let effective: { model: ModelSpec; tools: readonly string[] };
         try { effective = run.executor.resolve(requested); }
         catch { effective = previous ? { model: previous.model, tools: previous.tools } : { model: node.options.model ? modelSpec(node.options.model, run.model) : { ...run.model, ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, tools: node.options.tools }; }
-        return { id: node.id, name: node.label, path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.role ? { role: node.options.role } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+        return { id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.role ? { role: node.options.role } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
       });
       return { ...current, agents };
     });
@@ -1896,11 +1898,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const role = typeof options.role === "string" ? options.role : undefined;
         const model = typeof options.model === "string" ? options.model : undefined;
         const thinking = parseThinking(options.thinking);
-        const resolved = run.executor.resolve({ label: typeof options.label === "string" ? options.label : role ?? "agent", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
-        const label = typeof options.label === "string" ? options.label : role ?? resolved.model.model;
+        const requestedLabel = typeof options.label === "string" ? options.label : undefined;
+        const resolved = run.executor.resolve({ label: requestedLabel ?? role ?? "agent", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
+        const label = displayAgentName(requestedLabel, role, resolved.model);
         const tools = resolved.tools;
         const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
@@ -2018,11 +2021,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const role = typeof options.role === "string" ? options.role : undefined;
           const model = typeof options.model === "string" ? options.model : undefined;
           const thinking = parseThinking(options.thinking);
-          const resolved = executor.resolve({ label: typeof options.label === "string" ? options.label : role ?? "agent", workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
-          const label = typeof options.label === "string" ? options.label : role ?? resolved.model.model;
+          const requestedLabel = typeof options.label === "string" ? options.label : undefined;
+          const resolved = executor.resolve({ label: requestedLabel ?? role ?? "agent", workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
+          const label = displayAgentName(requestedLabel, role, resolved.model);
           const tools = resolved.tools;
           const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
@@ -2444,6 +2448,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       resetWorkflowRegistry();
     }
   });
+}
+
+function displayAgentName(label: string | undefined, role: string | undefined, model: ModelSpec): string {
+  return label ?? role ?? model.model;
 }
 
 function modelSpec(value: string, fallback: ModelSpec): ModelSpec {

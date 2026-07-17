@@ -69,7 +69,27 @@ const results = await withWorktree("implementation", async () => parallel("imple
 }));
 ```
 
-The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly.
+The callback result is returned unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so give them non-conflicting work or coordinate explicitly. Do not also set `isolation: "worktree"` on an agent inside this scope.
+
+`parallel()` tasks may call any workflow function, not only `agent()`:
+
+```js
+const results = await parallel("checks", {
+  security: () => reviewRepository({ focus: "security" }),
+  release: () => reviewRepository({ focus: "release readiness" }),
+});
+```
+
+Use separate named scopes when each parallel branch needs its own worktree:
+
+```js
+const results = await parallel("implementation", {
+  api: () => withWorktree("api", () => agent("Implement the API")),
+  ui: () => withWorktree("ui", () => agent("Implement the UI")),
+});
+```
+
+Registered extension functions receive `withWorktree` in their context, so they may create a shared scope internally. Their public inputs and outputs must remain JSON; callbacks cannot cross the extension-function boundary.
 
 ## Rules
 
@@ -86,8 +106,4 @@ The callback result is returned unchanged and the worktree is created only when 
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
 - Use `outputSchema` only when another phase must compare, aggregate, or validate the result. Never add it to a final agent whose prose is returned directly. Keep only fields the consumer needs, and avoid repeating the same evidence in multiple schemas.
 - With `outputSchema`, agents must call `workflow_result`; one repair prompt is built in. Omit `retries` unless an additional retry is justified and the work is idempotent.
-- Put `isolation: "worktree"` on top-level file-changing agents.
 - Do not add "persona" specs to the prompt for agents. Just define the task.
-
-
-If a top-level agent includes `agent` in its effective tools, it can create nested children through the separate child-agent `label` API. Children inherit the parent cwd/worktree and cannot escalate tools. Put one isolated coordinator in a worktree when agents must collaborate on shared files, and have that coordinator use nested children; per-agent worktree isolation remains enabled.

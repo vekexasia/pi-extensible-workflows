@@ -119,6 +119,7 @@ void test("static workflow inspection exposes roles, retries, schemas, and execu
     { kind: "agent", name: null, role: null, retries: null, hasSchema: false, execution: "sequential", structure: [{ kind: "pipeline", name: "pipe", key: "check" }] },
     { kind: "agent", name: null, role: null, retries: null, hasSchema: false, execution: "sequential", structure: [] },
   ]);
+  assert.equal(inspectWorkflowScript(`agent("label", { label: "named" })`)[0]?.label, "named");
   assert.deepEqual(inspectWorkflowScript(`agent("read", { tools: [] })`)[0]?.options, { tools: [] });
   assertEvalScriptSafe(`agent("safe", { retries: 0 });`);
   assert.throws(() => { assertEvalScriptSafe(`agent("unsafe", { retries: 1 });`); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");

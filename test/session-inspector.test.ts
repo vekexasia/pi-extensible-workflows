@@ -194,3 +194,12 @@ void test("renders interactive workflow, detail, and syntax-highlighted script v
   assert.match(renderInspector(report, { ...list, view: "detail" }).join("\n"), /agent[\s\S]*role=scout[\s\S]*openai\/worker:high[\s\S]*Attempt 1 · openai\/worker:high[\s\S]*Prompt: Inspect code/);
   assert.match(renderInspector(report, { ...list, view: "script" }, 80, 24, (script) => [`highlight:${script}`]).join("\n"), /highlight:return 1;/);
 });
+void test("session inspector uses labels and omits missing roles consistently", () => {
+  const report = {
+    id: "session", cwd: "/repo", path: "/session.jsonl", cost: 0, models: [], totalCost: 0, totalModels: [],
+    workflows: [{ name: "labels", status: "completed", cost: 0, models: [], calls: [], agents: [{ name: "stale-name", label: "explicit label", state: "completed", model: "provider/worker", cost: 0, attempts: [{ attempt: 1, prompt: "Inspect", model: "provider/worker", cost: 0, models: [] }] }] }],
+  } as Parameters<typeof renderInspector>[0];
+  const rendered = renderInspector(report, { view: "detail", selected: 0, scroll: 0 }).join("\n");
+  assert.match(rendered, /explicit label[\s\S]*provider\/worker/);
+  assert.doesNotMatch(rendered, /role=/);
+});
