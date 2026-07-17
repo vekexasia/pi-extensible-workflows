@@ -52,12 +52,8 @@ interface AgentOptions {
   outputSchema?: JsonSchema;
   retries?: number; // non-negative; use for safe, repeatable work
   timeoutMs?: number | null; // positive milliseconds; null means unlimited
-  /** @deprecated Use withWorktree(name, callback) for separate named or shared scopes; removed in the next major version. */
-  isolation?: "worktree";
 }
 ```
-
-`isolation: "worktree"` is a deprecated current-major compatibility shorthand. It remains supported with one workflow-log warning and will be removed in the next major version; use `withWorktree(name, callback)` for every separate named or shared scope.
 
 Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; aliases are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
