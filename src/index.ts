@@ -2208,6 +2208,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             if (transcripts.length) actions.set("Transcript paths", "transcripts");
             if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
             if (ctx.mode === "tui") {
+              addCopy("Copy run path", store.directory, "run path");
               addCopy("Copy run ID", store.runId, "run ID");
               for (const worktree of worktrees) {
                 addCopy(`Copy branch (${worktree.owner})`, worktree.branch, "branch");

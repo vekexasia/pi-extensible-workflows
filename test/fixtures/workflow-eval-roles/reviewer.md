@@ -1,7 +1,7 @@
 ---
 model: anthropic/claude-fable-5
 thinking: medium
-tools: [read, grep, find, ls, bash, view_image]
+tools: [read, grep, find, bash]
 description: Reviewer. Use when we need to review decisions or code changes
 ---
 

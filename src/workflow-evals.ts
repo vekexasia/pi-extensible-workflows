@@ -20,6 +20,7 @@ export interface AgentPolicyExpectation {
   callIndex: number;
   role?: string;
   model?: string;
+  isolation?: "worktree";
   forbidOptions?: readonly ("role" | "model" | "thinking" | "tools" | "isolation" | "retries")[];
   tools?: { mode: "omitted" | "empty" | "exact"; values?: readonly string[] };
 }
@@ -106,6 +107,7 @@ export const INITIAL_WORKFLOW_EVAL_CASES: readonly WorkflowEvalCase[] = Object.f
   { id: "pipeline", prompt: "Process the API and UI artifacts through the same ordered normalization and finalization stages, preserving each item's result.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["pipeline"] }), semanticCriteria: semantic("API and UI items pass through the same ordered normalization and finalization stages.") },
   { id: "mixed-parallel-pipeline", prompt: "Gather API and UI evidence independently at the same time, then process each gathered result through the same ordered analysis and summary stages.", maxCost: 0.1, expectations: naturalExpectations({ requiredOperations: ["parallel", "pipeline"], minimumAgentCalls: 2, requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{}, {}] }, { execution: "sequential", operation: "pipeline", agents: [{}, {}] }] }), semanticCriteria: semantic("The script gathers API and UI evidence in parallel, then passes each result through ordered analysis and summary stages.") },
   { id: "output-schema", prompt: "Use one scout subagent for a structured report containing a numeric count and a text summary.", maxCost: 0.1, expectations: naturalExpectations({ requiredRoles: ["scout"], agentPolicies: [{ callIndex: 0, role: "scout", forbidOptions: ["model", "thinking", "tools"] }], requireOutputSchema: { type: "object", requiredKeys: ["count", "summary"], propertyTypes: { count: "number", summary: "string" }, forbiddenProperties: ["extra"], count: 1 } }), semanticCriteria: semantic("The script configures one scout agent with an output schema requiring a numeric count and text summary.") },
+  { id: "ready-for-agent-parallel-merge", prompt: "Fix every ready-for-agent issue. GitHub access is unavailable, so read the two issue descriptions in test/fixtures/ready-for-agent-tasks.md. Do the issues in parallel, each in its own worktree. After all work is done, merge their branches into main and leave main clean.", maxCost: 10, expectations: naturalExpectations({ forbiddenOperations: ["withWorktree"], minimumAgentCalls: 3, requiredRoles: ["developer"], agentPolicies: [{ callIndex: 0, role: "developer", isolation: "worktree" }, { callIndex: 1, role: "developer", isolation: "worktree" }, { callIndex: 2, role: "developer", forbidOptions: ["isolation"] }], requiredAgentOrder: [{ role: "developer", execution: "parallel" }, { role: "developer", execution: "parallel" }, { role: "developer", execution: "sequential" }], requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{ role: "developer" }, { role: "developer" }] }] }), semanticCriteria: semantic("Two developer agents fix the local issue tasks concurrently in separate isolated worktrees, then a final developer agent receives both results, merges both branches into main, verifies the merged work, and leaves main clean.") },
 ]);
 
 
@@ -273,6 +275,7 @@ export function replayExpectationErrors(calls: readonly CapturedWorkflowCall[], 
     if (!call) { errors.push(`agent policy ${String(policy.callIndex)} had no matching call`); continue; }
     if (policy.role !== undefined && call.options.role !== policy.role) errors.push(`agent ${String(policy.callIndex)} role was ${JSON.stringify(call.options.role)}`);
     if (policy.model !== undefined && call.options.model !== policy.model) errors.push(`agent ${String(policy.callIndex)} model was ${JSON.stringify(call.options.model)}`);
+    if (policy.isolation !== undefined && call.options.isolation !== policy.isolation) errors.push(`agent ${String(policy.callIndex)} isolation was ${JSON.stringify(call.options.isolation)}`);
     for (const option of policy.forbidOptions ?? []) if (Object.prototype.hasOwnProperty.call(call.options, option)) errors.push(`agent ${String(policy.callIndex)} unexpectedly specified ${option}`);
     if (policy.tools) {
       const present = Object.prototype.hasOwnProperty.call(call.options, "tools");
@@ -368,6 +371,7 @@ export function staticExpectationResults(calls: readonly CapturedWorkflowCall[],
     if (!call) failures.push("missing call");
     if (call && policy.role !== undefined && call.role !== policy.role) failures.push(`role ${JSON.stringify(call.role)}`);
     if (call && policy.model !== undefined && call.model !== policy.model) failures.push(`model ${JSON.stringify(call.model)}`);
+    if (call && policy.isolation !== undefined && options.isolation !== policy.isolation) failures.push(`isolation ${JSON.stringify(options.isolation)}`);
     for (const option of policy.forbidOptions ?? []) if (optionKeys.has(option)) failures.push(`specified ${option}`);
     if (policy.tools) {
       const present = optionKeys.has("tools");
@@ -484,6 +488,7 @@ export async function replayCapturedWorkflows(calls: readonly CapturedWorkflowCa
 
 export interface CaptureCaseInput { case: WorkflowEvalCase; model: string; provider?: string; thinking?: string; piCommand?: string; maxCost: number }
 interface PiRunResult { exitCode: number | null; timedOut: boolean; budgetExceeded: boolean; processGroupTerminated: boolean; stderr: string; error?: string }
+const reportProgress = (message: string): void => { if (process.env.PI_WORKFLOW_EVAL_PROGRESS === "1") process.stderr.write(`[eval] ${message}\n`); };
 
 
 function terminateProcess(child: ChildProcess, signal: NodeJS.Signals): boolean {
@@ -506,7 +511,17 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
   const child = spawn(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, { cwd, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), PI_CODING_AGENT_SESSION_DIR: sessionDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], signal: controller.signal });
   const requestKill = (): Promise<boolean> => { killPromise ??= killProcessGroup(child); return killPromise; };
   const inspectLine = (line: string) => {
-    try { const event = JSON.parse(line) as unknown; if (!isObject(event) || event.type !== "message_end" || !isObject(event.message)) return; const usage = usageFrom(event.message); if (!usage) return; streamCost += usage.cost; if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); } } catch { /* The JSON stream may contain a diagnostic line. */ }
+    try {
+      const event = JSON.parse(line) as unknown;
+      if (!isObject(event) || event.type !== "message_end" || !isObject(event.message)) return;
+      const tools = Array.isArray(event.message.content) ? event.message.content.flatMap((part) => isObject(part) && part.type === "toolCall" && typeof part.name === "string" ? [part.name] : []) : [];
+      if (tools.length) reportProgress(`${input.case.id}: parent tools: ${tools.join(", ")}`);
+      const usage = usageFrom(event.message);
+      if (!usage) return;
+      streamCost += usage.cost;
+      reportProgress(`${input.case.id}: parent turn complete, ${String(usage.totalTokens)} tokens, $${streamCost.toFixed(4)} total`);
+      if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+    } catch { /* The JSON stream may contain a diagnostic line. */ }
   };
   child.stdout.on("data", (chunk: Buffer) => { lineBuffer += chunk.toString(); const lines = lineBuffer.split("\n"); lineBuffer = lines.pop() ?? ""; for (const line of lines) if (line) inspectLine(line); });
   child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
@@ -583,20 +598,15 @@ function seedEvalProject(cwd: string, home: string, model: string): void {
     if (excluded.has(entry)) continue;
     cpSync(join(source, entry), join(cwd, entry), { recursive: true, filter: (path) => !excluded.has(basename(path)) });
   }
-  for (const directory of ["piworkflows", "pi-extensible-workflows"]) {
-    const roles = join(source, ".pi", directory, "roles");
-    const roleTargets = [join(home, ".pi", directory, "roles"), join(cwd, ".pi", directory, "roles")];
-    if (!existsSync(roles)) continue;
-    cpSync(roles, roleTargets[0] as string, { recursive: true });
-    for (const target of roleTargets) {
-      if (!existsSync(target)) continue;
-      for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
-        const path = join(target, name);
-        const content = readFileSync(path, "utf8");
-        const frontmatterEnd = content.startsWith("---\n") ? content.indexOf("\n---", 4) : -1;
-        if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
-      }
-    }
+  const roles = join(source, "test", "fixtures", "workflow-eval-roles");
+  const target = join(home, ".pi", "pi-extensible-workflows", "roles");
+  if (!existsSync(roles)) return;
+  cpSync(roles, target, { recursive: true });
+  for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
+    const path = join(target, name);
+    const content = readFileSync(path, "utf8");
+    const frontmatterEnd = content.startsWith("---\n") ? content.indexOf("\n---", 4) : -1;
+    if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
   }
 }
 
@@ -658,7 +668,9 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
   const cwd = join(root, "project"); const home = join(root, "home"); const sessionDir = join(root, "sessions"); const sessionId = randomUUID();
   try {
     mkdirSync(cwd, { recursive: true }); mkdirSync(home, { recursive: true }); mkdirSync(sessionDir, { recursive: true }); seedPiIdentity(home); seedEvalProject(cwd, home, input.model.includes("/") ? input.model : input.provider ? `${input.provider}/${input.model}` : input.model);
+    reportProgress(`${input.case.id}: parent model starting`);
     const pi = await runPiCapture(input, cwd, home, sessionDir, sessionId);
+    reportProgress(`${input.case.id}: parent model finished`);
     const diagnostics = [pi.stderr, pi.error ? `Pi process error: ${pi.error}` : ""].filter(Boolean);
     const sessionFile = await findParentSession(cwd, sessionDir, sessionId);
     if (!sessionFile) {
@@ -678,7 +690,9 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
     if (selection.callIndices.length > 0) {
       const criteria = input.case.semanticCriteria ?? semantic("The workflow design is semantically appropriate for the original request.");
       const judgeCase = { ...input.case, semanticCriteria: criteria };
+      reportProgress(`${input.case.id}: semantic judge starting`);
       judgeProcess = await runSemanticJudge({ ...input, case: judgeCase }, selection.callIndices.map((index) => workflows[index] as CapturedWorkflowCall), cwd, home, sessionDir, Math.max(0, input.maxCost - oracle.usage.cost));
+      reportProgress(`${input.case.id}: semantic judge finished`);
       diagnostics.push(judgeProcess.stderr, judgeProcess.error ? `Judge process error: ${judgeProcess.error}` : "");
       if (judgeProcess.exitCode !== 0 || judgeProcess.error) errors.push("Semantic judge process failed.");
       else {
@@ -717,7 +731,7 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
   }
 }
 
-export interface IsolatedProcessOptions { childPath: string; timeoutMs?: number; env?: NodeJS.ProcessEnv }
+export interface IsolatedProcessOptions { childPath: string; timeoutMs?: number; env?: NodeJS.ProcessEnv; onStderr?: (chunk: string) => void }
 export interface IsolatedProcessResult<T> { value?: T; timedOut: boolean; exitCode: number | null; processGroupTerminated: boolean; stderr: string; error?: string }
 export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedProcessOptions): Promise<IsolatedProcessResult<T>> {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-case-")); const inputPath = join(root, "input.json"); const outputPath = join(root, "output.json");
@@ -726,7 +740,7 @@ export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedP
     const controller = new AbortController();
     const child = spawn(process.execPath, [options.childPath, inputPath], { cwd: root, env: { ...process.env, ...options.env, HOME: join(root, "home"), PI_CODING_AGENT_DIR: join(root, "home", ".pi", "agent"), PI_CODING_AGENT_SESSION_DIR: join(root, "sessions"), PI_WORKFLOW_EVAL_CASE_ROOT: root }, detached: process.platform !== "win32", stdio: ["ignore", "ignore", "pipe"], signal: controller.signal });
     let timedOut = false; let processGroupTerminated = false; let stderr = ""; let processError: string | undefined; let killPromise: Promise<boolean> | undefined;
-    child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
+    child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); stderr = `${stderr}${text}`.slice(-64_000); options.onStderr?.(text); });
     child.once("error", (error: Error) => { processError = error.message; });
     const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
     const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); killPromise ??= killProcessGroup(child); void killPromise.then((terminated) => { processGroupTerminated ||= terminated; }); }, options.timeoutMs);
@@ -744,7 +758,7 @@ export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedP
   }
 }
 
-export interface WorkflowEvalRunOptions { cases?: readonly WorkflowEvalCase[]; caseIds?: readonly string[]; model?: string; provider?: string; thinking?: string; piCommand?: string; timeoutMs?: number; spendCeiling?: number; artifactsDir?: string }
+export interface WorkflowEvalRunOptions { cases?: readonly WorkflowEvalCase[]; caseIds?: readonly string[]; model?: string; provider?: string; thinking?: string; piCommand?: string; timeoutMs?: number; spendCeiling?: number; artifactsDir?: string; onProgress?: (message: string) => void }
 
 function materializeCase(candidate: WorkflowEvalCase, model: string): WorkflowEvalCase {
   return JSON.parse(JSON.stringify(candidate).replaceAll(EVAL_MODEL_TOKEN, model)) as WorkflowEvalCase;
@@ -770,21 +784,38 @@ export async function runWorkflowEvals(options: WorkflowEvalRunOptions = {}): Pr
       continue;
     }
     const input: CaptureCaseInput = { case: { ...candidate, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }) }, model, ...(options.provider ? { provider: options.provider } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.piCommand ? { piCommand: options.piCommand } : {}), maxCost: Math.min(candidate.maxCost, remaining) };
-    const isolated = await runIsolatedProcess<EvalCaseResult>(input, { childPath: fileURLToPath(new URL("./workflow-evals-child.js", import.meta.url)), ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs * 2 + CASE_PROCESS_GRACE_MS }), env: { PI_WORKFLOW_EVAL_SOURCE_AGENT_DIR: sourceAgentDir, PI_WORKFLOW_EVAL_SOURCE_PROJECT_DIR: process.cwd() } });
-    const diagnostics = [isolated.stderr, isolated.error ? `Case process error: ${isolated.error}` : ""].filter(Boolean);
+    const started = Date.now();
+    options.onProgress?.(`[eval] ${candidate.id}: starting, budget $${input.maxCost.toFixed(2)}, timeout ${input.case.timeoutMs === undefined ? "off" : `${String(input.case.timeoutMs)}ms`}`);
+    const isolated = await runIsolatedProcess<EvalCaseResult>(input, { childPath: fileURLToPath(new URL("./workflow-evals-child.js", import.meta.url)), ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs * 2 + CASE_PROCESS_GRACE_MS }), env: { PI_WORKFLOW_EVAL_SOURCE_AGENT_DIR: sourceAgentDir, PI_WORKFLOW_EVAL_SOURCE_PROJECT_DIR: process.cwd(), PI_WORKFLOW_EVAL_PROGRESS: options.onProgress ? "1" : "0" }, ...(options.onProgress ? { onStderr: (chunk: string) => { for (const line of chunk.trimEnd().split("\n")) if (line) options.onProgress?.(line); } } : {}) });
+    const childStderr = isolated.stderr.split("\n").filter((line) => !line.startsWith("[eval] ")).join("\n").trim();
+    const diagnostics = [childStderr, isolated.error ? `Case process error: ${isolated.error}` : ""].filter(Boolean);
     const trustworthy = Boolean(isolated.value) && !isolated.timedOut && isolated.exitCode === 0 && !isolated.error && Boolean(isolated.value?.accountingTrustworthy);
     const untrustedStatus: EvalCaseResult["status"] = isolated.timedOut ? "timed_out" : isolated.value?.status === "timed_out" || isolated.value?.status === "budget_exceeded" ? isolated.value.status : "failed";
     const base = isolated.value ?? resultFromFailure(input, untrustedStatus, [isolated.timedOut ? "Case process timed out." : isolated.error ? isolated.error : "Case process returned no artifact.", ...diagnostics], isolated.exitCode !== null, isolated.processGroupTerminated, diagnostics, input.maxCost);
     const result: EvalCaseResult = { ...base, ...(trustworthy ? {} : { status: untrustedStatus, accounting: { ...base.accounting, cost: input.maxCost }, accountingTrustworthy: false }), diagnostics: [...base.diagnostics, ...diagnostics] };
     spent += result.accounting.cost;
+    options.onProgress?.(`[eval] ${candidate.id}: ${result.status} after ${((Date.now() - started) / 1000).toFixed(1)}s, $${result.accounting.cost.toFixed(4)}, ${String(result.accounting.totalTokens)} tokens`);
     results.push(result); writeFileSync(join(artifactDir, `${candidate.id}.json`), `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
   }
   return { artifactDir, cases: results, spent, skipped };
 }
 
 export function formatEvalSummary(result: WorkflowEvalRunResult): string {
-  const rows = result.cases.map((item) => `${item.id}: ${item.status} (${item.accounting.cost.toFixed(4)} USD, ${String(item.accounting.totalTokens)} tok, ${String(item.workflows.length)} workflow calls)`);
-  return [`Workflow evals: ${String(result.cases.length)} cases, ${result.spent.toFixed(4)} USD spent`, ...rows, result.skipped.length ? `Skipped: ${result.skipped.join(", ")}` : ""].filter(Boolean).join("\n");
+  const rows = result.cases.flatMap((item) => {
+    const invalid = item.productionValidation.filter(({ valid }) => !valid);
+    const staticCriteria = item.metrics.staticCandidates.flatMap(({ criteria }) => criteria).filter(({ pass }) => !pass);
+    const semantic = item.metrics.semanticCriteria.map(({ id, pass, evidence }) => `  judge ${pass ? "PASS" : "FAIL"} ${id}: ${evidence}`);
+    return [
+      `${item.id}: ${item.status}`,
+      `  usage: $${item.accounting.cost.toFixed(4)}, ${String(item.accounting.totalTokens)} tokens (${String(item.accounting.input)} input, ${String(item.accounting.output)} output, ${String(item.accounting.cacheRead)} cache read)`,
+      `  workflows: ${String(item.workflows.length)} captured, ${String(item.productionValidation.filter(({ valid }) => valid).length)} production-valid`,
+      ...invalid.map(({ callIndex, errorCode, message }) => `  validation FAIL call ${String(callIndex)}${errorCode ? ` ${errorCode}` : ""}: ${message ?? "unknown error"}`),
+      ...staticCriteria.map(({ id, evidence }) => `  static FAIL ${id}: ${evidence}`),
+      ...semantic,
+      ...item.errors.map((error) => `  error: ${error}`),
+    ];
+  });
+  return [`Workflow evals: ${String(result.cases.length)} cases, $${result.spent.toFixed(4)} spent`, ...rows, result.skipped.length ? `Skipped: ${result.skipped.join(", ")}` : "", `Artifacts: ${result.artifactDir}`].filter(Boolean).join("\n");
 }
 
 async function main(): Promise<void> {
@@ -796,7 +827,7 @@ async function main(): Promise<void> {
   const piCommand = value("--pi");
   const artifactsDir = value("--artifacts");
   const timeoutValue = Number(value("--timeout-ms") ?? "0");
-  const result = await runWorkflowEvals({ ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(thinking ? { thinking } : {}), ...(piCommand ? { piCommand } : {}), ...(artifactsDir ? { artifactsDir } : {}), spendCeiling: Number(value("--spend-ceiling") ?? process.env.PI_WORKFLOW_EVAL_SPEND_CEILING ?? "1"), ...(timeoutValue ? { timeoutMs: timeoutValue } : {}), ...(caseIds?.length ? { caseIds } : {}) });
+  const result = await runWorkflowEvals({ ...(model ? { model } : {}), ...(provider ? { provider } : {}), ...(thinking ? { thinking } : {}), ...(piCommand ? { piCommand } : {}), ...(artifactsDir ? { artifactsDir } : {}), spendCeiling: Number(value("--spend-ceiling") ?? process.env.PI_WORKFLOW_EVAL_SPEND_CEILING ?? "1"), ...(timeoutValue ? { timeoutMs: timeoutValue } : {}), ...(caseIds?.length ? { caseIds } : {}), onProgress: (message) => { process.stderr.write(`${message}\n`); } });
   process.stdout.write(`${formatEvalSummary(result)}\n`);
   if (result.cases.some((item) => item.status !== "passed")) process.exitCode = 1;
 }

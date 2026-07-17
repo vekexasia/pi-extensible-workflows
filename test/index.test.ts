@@ -103,16 +103,17 @@ void test("advertises only described effective roles in the system prompt while 
   const activeTools = ["workflow"];
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-guidance-"));
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "project-reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
   writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
   workflowExtension({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: StartHandler) { if (name === "before_agent_start") handler = candidate; } } as never);
   assert.ok(handler);
   const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
   const guidance = result?.systemPrompt ?? "";
   assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
-  assert.match(guidance, /`reviewer`: Reviews correctness/);
+  assert.match(guidance, /`project-reviewer`: Reviews correctness/);
   assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|reuseTest|workflow_catalog/);
-  assert.equal(handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false }), undefined);
+  const untrustedGuidance = handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false })?.systemPrompt ?? "";
+  assert.doesNotMatch(untrustedGuidance, /project-reviewer|Reviews correctness/);
 });
 
 void test("background workflows emit compatible lifecycle events", async () => {
@@ -262,7 +263,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.match(dashActions, /Delete|Stop|Approve|Reject/);
   assert.match(dashActions, /Transcript paths/);
   assert.doesNotMatch(dashActions, /View script/);
-  assert.doesNotMatch(dashActions, /Copy run ID|Copy branch|Copy worktree path/);
+  assert.doesNotMatch(dashActions, /Copy run path|Copy run ID|Copy branch|Copy worktree path/);
   assert.ok(selections.some((options) => options.includes("/pi/native-a.jsonl")));
   assert.deepEqual(copied, []);
   assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
@@ -296,7 +297,7 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] };
   workflowExtension(pi as never, home, async (value) => { if (value === worktree.branch) throw new Error("clipboard unavailable"); copied.push(value); });
-  const dashboardChoices = ["Copy run ID", "Transcript paths", "Transcript paths", `Copy branch (${worktree.owner})`, `Copy worktree path (${worktree.owner})`, "Close"];
+  const dashboardChoices = ["Copy run path", "Copy run ID", "Transcript paths", "Transcript paths", `Copy branch (${worktree.owner})`, `Copy worktree path (${worktree.owner})`, "Close"];
   let transcriptChoice = 0;
   let customCalls = 0;
   const ctx = {
@@ -325,7 +326,8 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
-  assert.deepEqual(copied, [runId, transcriptA, transcriptB, worktree.path]);
+  assert.deepEqual(copied, [store.directory, runId, transcriptA, transcriptB, worktree.path]);
+  assert.ok(notifications.some(({ message, type }) => message === "Copied run path." && type === "info"));
   assert.ok(notifications.some(({ message, type }) => message === "Copied run ID." && type === "info"));
   assert.ok(notifications.some(({ message, type }) => message === "Copied transcript path." && type === "info"));
   assert.ok(notifications.some(({ message, type }) => message === "Copied worktree path." && type === "info"));
@@ -1197,6 +1199,9 @@ void test("production role policy rejects overrides before persistence and prese
   const cwd = join(home, "project");
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
   writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt\nthinking: high\ntools: [read]\n---\nReview role");
+  for (const role of Object.keys(loadAgentDefinitions(cwd, undefined, false))) {
+    if (role !== "reviewer") writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", `${role}.md`), "---\nmodel: openai/gpt\ntools: [read]\n---\nTest role");
+  }
   const inputs: SessionInput[] = [];
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     inputs.push(input);

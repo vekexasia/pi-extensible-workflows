@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectWorkflowScript, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
-import { assertEvalScriptSafe, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, INITIAL_WORKFLOW_EVAL_CASES, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
+import { assertEvalScriptSafe, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
 
 const schema = { type: "object", properties: { answer: { type: "number" }, label: { type: "string" } }, required: ["answer", "label"], additionalProperties: false };
 void test("defines the cheap initial evaluation matrix", () => {
-  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["direct-answer", "two-agents", "required-role", "custom-model-read", "role-model-mixed", "parallel", "pipeline", "mixed-parallel-pipeline", "output-schema"]);
+  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["direct-answer", "two-agents", "required-role", "custom-model-read", "role-model-mixed", "parallel", "pipeline", "mixed-parallel-pipeline", "output-schema", "ready-for-agent-parallel-merge"]);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.every(({ timeoutMs, maxCost }) => timeoutMs === undefined && maxCost > 0), true);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.slice(1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
   assert.match(resolveWorkflowSkillPath(), /skills\/pi-extensible-workflows\/SKILL\.md$/);
@@ -181,6 +181,12 @@ void test("replays outputSchema values and checks their shape", async () => {
   assert.equal(forbiddenResult.pass, true);
   const parallelStructure = staticExpectationResults([{ batch: 0, arguments: {}, script: 'parallel("p", { one: () => agent("api"), two: () => agent("ui") }); agent("after")' }], { requiredAgentStructures: [{ execution: "parallel", operation: "parallel", agents: [{ promptIncludes: "api" }, { promptIncludes: "ui" }] }, { execution: "sequential", agents: [{ promptIncludes: "after" }] }] });
   assert.equal(parallelStructure.every(({ pass }) => pass), true);
+  const isolatedScript = 'const results = await parallel("fixes", { one: () => agent("one", { role: "developer", isolation: "worktree" }), two: () => agent("two", { role: "developer", isolation: "worktree" }) }); return agent(prompt("merge {results}", { results }), { role: "developer" });';
+  const isolatedExpectations = { agentPolicies: [{ callIndex: 0, isolation: "worktree" as const }, { callIndex: 1, isolation: "worktree" as const }, { callIndex: 2, forbidOptions: ["isolation" as const] }], requiredDataFlow: [{ binding: "results", toAgentIndex: 2 }] };
+  assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: isolatedScript }], isolatedExpectations).every(({ pass }) => pass), true);
+  const isolatedReplay = await replayWorkflowScript(isolatedScript);
+  assert.deepEqual(replayExpectationErrors([{ batch: 0, arguments: {}, script: isolatedScript }], [{ script: isolatedScript, ...isolatedReplay }], isolatedExpectations), []);
+  assert.equal(staticExpectationResults([{ batch: 0, arguments: {}, script: 'agent("one", { role: "developer" })' }], { agentPolicies: [{ callIndex: 0, isolation: "worktree" }] })[0]?.pass, false);
   const setCalls = [
     { batch: 0, arguments: {}, script: 'agent("wrong", { role: "scout" })' },
     { batch: 1, arguments: {}, script: 'agent("review", { role: "reviewer" })' },
@@ -229,9 +235,11 @@ void test("parent oracle accounting ignores child-style entries", () => {
 void test("uses the effective remaining spend ceiling for untrusted case fallbacks", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-budget-"));
   const fakePi = join(root, "fake-pi.mjs");
-  writeFileSync(fakePi, "#!/usr/bin/env node\nprocess.exit(7);\n");
+  const seededRole = join(root, "seeded-role");
+  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const globalRole = join(process.env.HOME, ".pi", "pi-extensible-workflows", "roles", "developer.md"); const projectRole = join(process.cwd(), ".pi", "pi-extensible-workflows", "roles", "developer.md"); if (!existsSync(globalRole) || existsSync(projectRole)) process.exit(8); const content = readFileSync(globalRole, "utf8"); if (!content.includes("model: fake/model") || !content.includes("tools: [read, grep, find, bash]")) process.exit(9); writeFileSync(${JSON.stringify(join(root, "seeded-role"))}, "ok"); process.exit(7);\n`);
   chmodSync(fakePi, 0o755);
   try {
+    const progress: string[] = [];
     const result = await runWorkflowEvals({
       cases: [
         { id: "first", prompt: "ignored", timeoutMs: 2_000, maxCost: 0.1, expectations: {} },
@@ -241,9 +249,13 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
       piCommand: fakePi,
       artifactsDir: join(root, "artifacts"),
       spendCeiling: 0.15,
+      onProgress: (message) => { progress.push(message); },
     });
     assert.deepEqual(result.cases.map(({ accounting, limits }) => [accounting.cost.toFixed(2), limits.maxCost.toFixed(2)]), [["0.10", "0.10"], ["0.05", "0.05"]]);
     assert.equal(result.spent.toFixed(2), "0.15");
+    assert.equal(existsSync(seededRole), true);
+    assert.match(progress.join("\n"), /first: starting[\s\S]*first: failed/);
+    assert.match(formatEvalSummary(result), /first: failed[\s\S]*error:[\s\S]*Artifacts:/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
