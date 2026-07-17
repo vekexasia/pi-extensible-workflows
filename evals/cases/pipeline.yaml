@@ -1,0 +1,10 @@
+id: pipeline
+prompt: "Process the API and UI artifacts through the same ordered normalization and finalization stages, preserving each item's result."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  requiredOperations: [pipeline]
+semanticCriteria:
+  - id: intent
+    description: "API and UI items pass through the same ordered normalization and finalization stages."

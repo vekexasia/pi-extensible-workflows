@@ -1,17 +1,78 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectWorkflowScript, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
-import { assertEvalScriptSafe, captureEvalCase, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
+import { assertEvalScriptSafe, captureEvalCase, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, loadWorkflowEvalCases, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
 
 const schema = { type: "object", properties: { answer: { type: "number" }, label: { type: "string" } }, required: ["answer", "label"], additionalProperties: false };
 void test("defines the cheap initial evaluation matrix", () => {
-  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["direct-answer", "two-agents", "required-role", "custom-model-read", "role-model-mixed", "parallel", "pipeline", "mixed-parallel-pipeline", "output-schema", "ready-for-agent-parallel-merge"]);
+  assert.deepEqual(INITIAL_WORKFLOW_EVAL_CASES.map(({ id }) => id), ["custom-model-read", "direct-answer", "mixed-parallel-pipeline", "output-schema", "parallel", "pipeline", "ready-for-agent-parallel-merge", "required-role", "role-model-mixed", "two-agents"]);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.every(({ timeoutMs, maxCost }) => timeoutMs === undefined && maxCost > 0), true);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.slice(1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
   assert.match(resolveWorkflowSkillPath(), /skills\/pi-extensible-workflows\/SKILL\.md$/);
+});
+void test("loads YAML cases in deterministic filename order and preserves model tokens", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-cases-"));
+  try {
+    writeFileSync(join(root, "z.yaml"), "id: z\nprompt: z\nmaxCost: 1\nexpectations: {}\n");
+    writeFileSync(join(root, "a.yaml"), "id: a\nprompt: a\nmaxCost: 1\nexpectations: {}\n");
+    const cases = loadWorkflowEvalCases(root);
+    assert.deepEqual(cases.map(({ id }) => id), ["a", "z"]);
+    assert.equal(INITIAL_WORKFLOW_EVAL_CASES.find(({ id }) => id === "custom-model-read")?.prompt.includes("$EVAL_MODEL"), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("reports YAML paths and field paths for case validation failures", () => {
+  const failures = [
+    ["unknown.yaml", "id: bad\nprompt: bad\nmaxCost: 1\nexpectations:\n  nope: true\n", "expectations.nope"],
+    ["type.yaml", "id: bad\nprompt: bad\nmaxCost: bad\nexpectations: {}\n", "maxCost"],
+    ["value.yaml", "id: bad\nprompt: bad\nmaxCost: 1\nexpectations:\n  requiredOperations: [invalid]\n", "expectations.requiredOperations[0]"],
+    ["malformed.yaml", "id: [\n", "<document>"],
+  ] as const;
+  for (const [name, content, field] of failures) {
+    const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-invalid-"));
+    try {
+      writeFileSync(join(root, name), content);
+      assert.throws(() => loadWorkflowEvalCases(root), (error: unknown) => error instanceof Error && error.message.includes(name) && error.message.includes(`field ${field}`));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-duplicate-"));
+  try {
+    const content = "id: same\nprompt: same\nmaxCost: 1\nexpectations: {}\n";
+    writeFileSync(join(root, "a.yaml"), content);
+    writeFileSync(join(root, "b.yaml"), content);
+    assert.throws(() => loadWorkflowEvalCases(root), (error: unknown) => error instanceof Error && error.message.includes("b.yaml") && error.message.includes("field id"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("validates programmatic case overrides before starting Pi", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-override-"));
+  const marker = join(root, "called");
+  const piPath = join(root, "fake-pi.mjs");
+  writeFileSync(piPath, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "called");\n`);
+  chmodSync(piPath, 0o755);
+  try {
+    const invalid = { id: "invalid", prompt: "ignored", maxCost: 1, expectations: { unknown: true } };
+    await assert.rejects(() => runWorkflowEvals({ model: "fake/model", piCommand: piPath, cases: [invalid] as never }), /options\.cases\[0\].*expectations\.unknown/);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("publishes eval cases and referenced fixtures", () => {
+  const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: process.cwd(), encoding: "utf8" });
+  const reports = JSON.parse(output) as Array<{ files?: Array<{ path: string }> }>;
+  const files = reports[0]?.files?.map(({ path }) => path) ?? [];
+  assert.equal(files.includes("evals/cases/parallel.yaml"), true);
+  assert.equal(files.includes("test/fixtures/ready-for-agent-tasks.md"), true);
+  assert.equal(files.includes("test/fixtures/workflow-eval-roles/developer.md"), true);
 });
 
 

@@ -15,7 +15,9 @@
   "files": [
     "dist/src",
     "src",
-    "skills"
+    "skills",
+    "evals",
+    "test/fixtures"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/src/cli.js",

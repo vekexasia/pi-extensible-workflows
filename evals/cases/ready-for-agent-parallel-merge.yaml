@@ -1,0 +1,35 @@
+id: ready-for-agent-parallel-merge
+prompt: "Fix every ready-for-agent issue. GitHub access is unavailable, so read the two issue descriptions in test/fixtures/ready-for-agent-tasks.md. Do the issues in parallel, each in its own worktree. After all work is done, merge their branches into main and leave main clean."
+maxCost: 10
+expectations:
+  workflowCallCount:
+    min: 1
+  forbiddenOperations: [withWorktree]
+  minimumAgentCalls: 3
+  requiredRoles: [developer]
+  agentPolicies:
+    - callIndex: 0
+      role: developer
+      isolation: worktree
+    - callIndex: 1
+      role: developer
+      isolation: worktree
+    - callIndex: 2
+      role: developer
+      forbidOptions: [isolation]
+  requiredAgentOrder:
+    - role: developer
+      execution: parallel
+    - role: developer
+      execution: parallel
+    - role: developer
+      execution: sequential
+  requiredAgentStructures:
+    - execution: parallel
+      operation: parallel
+      agents:
+        - role: developer
+        - role: developer
+semanticCriteria:
+  - id: intent
+    description: "Two developer agents fix the local issue tasks concurrently in separate isolated worktrees, then a final developer agent receives both results, merges both branches into main, verifies the merged work, and leaves main clean."

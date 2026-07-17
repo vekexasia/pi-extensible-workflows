@@ -1,0 +1,14 @@
+id: required-role
+prompt: "Have a reviewer assess the change and return a short review."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  requiredRoles: [reviewer]
+  agentPolicies:
+    - callIndex: 0
+      role: reviewer
+      forbidOptions: [model, thinking, tools]
+semanticCriteria:
+  - id: intent
+    description: "A reviewer-role agent assesses the change and its result is returned."

@@ -1,0 +1,22 @@
+id: output-schema
+prompt: "Use one scout subagent for a structured report containing a numeric count and a text summary."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  requiredRoles: [scout]
+  agentPolicies:
+    - callIndex: 0
+      role: scout
+      forbidOptions: [model, thinking, tools]
+  requireOutputSchema:
+    type: object
+    requiredKeys: [count, summary]
+    propertyTypes:
+      count: number
+      summary: string
+    forbiddenProperties: [extra]
+    count: 1
+semanticCriteria:
+  - id: intent
+    description: "The script configures one scout agent with an output schema requiring a numeric count and text summary."

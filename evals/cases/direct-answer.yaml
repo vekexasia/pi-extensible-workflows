@@ -1,0 +1,6 @@
+id: direct-answer
+prompt: "How many lines are in README.md?"
+maxCost: 0.1
+expectations:
+  workflowCallCount: 0
+expectedWorkflowCalls: 0

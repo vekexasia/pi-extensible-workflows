@@ -405,6 +405,10 @@ npm run evals -- --provider "$PROVIDER" --model "$MODEL" --spend-ceiling 0.50
 
 The runner exposes the repository's exact workflow skill through Pi's normal skill mechanism and gives the parent `read`, `grep`, `find`, and `bash` inside the disposable project. Skill reads, tools used before workflow, and workflow position are recorded as telemetry rather than forced ordering. Existing Pi auth/model files and workflow roles are copied into the private temporary home and deleted with it. Thinking defaults to `off`; `--model`, `--provider`, `--thinking`, `--case`, `--artifacts`, and `--pi` are supported, with optional `--timeout-ms` when a bounded run is desired.
 
+### Add an eval case
+
+Add one `<id>.yaml` file under `evals/cases` using the existing case files as templates. The top-level fields are `id`, `prompt`, `timeoutMs`, `maxCost`, `expectations`, `expectedWorkflowCalls`, and `semanticCriteria`; nested expectation fields are validated strictly, and files load in filename order. Use `$EVAL_MODEL` in prompts or agent model expectations when the case should use the selected model. Case IDs are passed to `--case` as a comma-separated list, for example `--case parallel`. Keep fixtures referenced by prompts under `test/fixtures`; both case YAML and fixtures are included in the npm package.
+
 ### Ambient Tier D
 
 The ambient harness is separately opt-in and prepares execution against the launching user's normal Pi home and discovered resources. It creates one temporary committed fixture repository and a disposable git worktree per case; fixtures contain harmless `test` and `lint` scripts, source, tests, config, and a deliberate bug. Artifacts are JSON and cleanup is recorded:

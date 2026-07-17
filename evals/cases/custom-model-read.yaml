@@ -1,0 +1,15 @@
+id: custom-model-read
+prompt: "Have one subagent using the model $EVAL_MODEL read README.md with a minimal toolset and report in one sentence what this package does."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  agentPolicies:
+    - callIndex: 0
+      model: "$EVAL_MODEL"
+      tools:
+        mode: exact
+        values: [read]
+semanticCriteria:
+  - id: intent
+    description: "The script configures one agent with the requested model and only the read tool, instructs it to inspect README.md, and returns its one-sentence package description."

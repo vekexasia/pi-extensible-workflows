@@ -1,0 +1,18 @@
+id: mixed-parallel-pipeline
+prompt: "Gather API and UI evidence independently at the same time, then process each gathered result through the same ordered analysis and summary stages."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  requiredOperations: [parallel, pipeline]
+  minimumAgentCalls: 2
+  requiredAgentStructures:
+    - execution: parallel
+      operation: parallel
+      agents: [{}, {}]
+    - execution: sequential
+      operation: pipeline
+      agents: [{}, {}]
+semanticCriteria:
+  - id: intent
+    description: "The script gathers API and UI evidence in parallel, then passes each result through ordered analysis and summary stages."

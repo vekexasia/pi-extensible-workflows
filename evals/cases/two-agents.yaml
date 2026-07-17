@@ -1,0 +1,10 @@
+id: two-agents
+prompt: "Investigate this repository from two independent angles: inspect the API surface and inspect the user-facing behavior. Combine both findings into one concise plain-text comparison."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  minimumAgentCalls: 2
+semanticCriteria:
+  - id: intent
+    description: "The workflow independently inspects API and user-facing behavior, then combines both findings into one concise comparison."

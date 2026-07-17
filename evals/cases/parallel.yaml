@@ -1,0 +1,15 @@
+id: parallel
+prompt: "Run the independent API and UI checks at the same time, then report both outcomes together."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  requiredOperations: [parallel]
+  minimumAgentCalls: 2
+  requiredAgentStructures:
+    - execution: parallel
+      operation: parallel
+      agents: [{}, {}]
+semanticCriteria:
+  - id: intent
+    description: "Independent API and UI checks run in parallel and both outcomes are combined."

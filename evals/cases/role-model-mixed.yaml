@@ -1,0 +1,18 @@
+id: role-model-mixed
+prompt: "Obtain a reviewer-role assessment first, then use a separate subagent with the explicit model $EVAL_MODEL and no tools to synthesize the final text."
+maxCost: 0.1
+expectations:
+  workflowCallCount:
+    min: 1
+  minimumAgentCalls: 2
+  agentPolicies:
+    - callIndex: 0
+      role: reviewer
+      forbidOptions: [model, thinking, tools]
+    - callIndex: 1
+      model: "$EVAL_MODEL"
+      tools:
+        mode: empty
+semanticCriteria:
+  - id: intent
+    description: "The reviewer assessment is produced first and passed to a separate no-tools synthesis agent."
