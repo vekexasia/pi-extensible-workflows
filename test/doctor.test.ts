@@ -25,13 +25,20 @@ function fixture(): { root: string; cwd: string; agentDir: string; settingsPath:
   const agentDir = join(root, "agent");
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
   mkdirSync(join(agentDir, "agents"), { recursive: true });
-  mkdirSync(join(root, "pi-extensible-workflows", "roles"), { recursive: true });
+  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
   return { root, cwd, agentDir, settingsPath: join(root, "missing-settings.json") };
+}
+
+async function withHome<T>(home: string, action: () => Promise<T>): Promise<T> {
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  try { return await action(); }
+  finally { if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous; }
 }
 
 void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.root, "pi-extensible-workflows", "roles", "override.md"), "Global role");
+  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "override.md"), "Global role");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"), "Project role");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "tool-typo.md"), "---\ntools: [read, cat]\n---\nCheck tools");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "thinking.md"), "---\nthinking: hihg\n---\nThink");
@@ -41,7 +48,7 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "placeholder.md"), "Use {{tools}} here");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-frontmatter.md"), "---\n---\nBody");
 
-  const report = await doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) });
+  const report = await withHome(paths.root, () => doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) }));
   const codes = report.diagnostics.map(({ code }) => code);
   assert.ok(codes.includes("ROLE_TOOL_INACTIVE"));
   assert.ok(codes.includes("ROLE_FRONTMATTER"));
@@ -55,7 +62,7 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   const global = report.roles.find((role) => role.name === "override" && role.scope === "global");
   assert.ok(project);
   assert.ok(global);
-  assert.equal(project.overrides, join(paths.root, "pi-extensible-workflows", "roles", "override.md"));
+  assert.equal(project.overrides, join(paths.agentDir, "pi-extensible-workflows", "roles", "override.md"));
   assert.equal(global.overriddenBy, join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"));
   assert.equal(global.active, false);
   assert.equal(doctorExitCode(report), 1);
@@ -66,20 +73,20 @@ void test("doctor rejects invalid role descriptions", async () => {
   const paths = fixture();
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-description.md"), "---\ndescription: ''\n---\nRole");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "long-description.md"), `---\ndescription: ${"x".repeat(1025)}\n---\nRole`);
-  const report = await doctor({ ...paths, discoverPi: async () => pi() });
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi() }));
   const sources = report.diagnostics.filter(({ code }) => code === "ROLE_FRONTMATTER").map(({ source }) => source);
   assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-description.md")));
   assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "long-description.md")));
 });
 void test("doctor preflights every registered workflow", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.root, "pi-extensible-workflows", "roles", "reviewer.md"), "Review");
+  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Review");
   const workflows = {
     "test.missing-role": { description: "missing role", script: `agent("x",{role:"missing"});` },
     "test.missing-tool": { description: "missing tool", script: `agent("x",{tools:["cat"]});` },
     "test.bad-meta": { description: "bad meta", script: `const x = ;` },
   };
-  const report = await doctor({ ...paths, discoverPi: async () => pi({ workflows }) });
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ workflows }) }));
   assert.deepEqual(report.workflows.map(({ name, valid }) => [name, valid]), [
     ["test.bad-meta", false],
     ["test.missing-role", false],
@@ -92,10 +99,10 @@ void test("doctor preflights every registered workflow", async () => {
 
 void test("doctor respects untrusted projects and does not mutate fixtures", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.root, "pi-extensible-workflows", "roles", "same.md"), "Global");
+  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "same.md"), "Global");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "same.md"), "---\ntools: [cat]\n---\nProject");
   const before = readdirSync(paths.root, { recursive: true }).map(String).sort();
-  const report = await doctor({ ...paths, discoverPi: async () => pi({ trust: { required: true, trusted: false, source: "saved Pi trust decision" } }) });
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ trust: { required: true, trusted: false, source: "saved Pi trust decision" } }) }));
   const after = readdirSync(paths.root, { recursive: true }).map(String).sort();
   assert.deepEqual(after, before);
   assert.ok(report.diagnostics.some(({ code }) => code === "PROJECT_UNTRUSTED"));
@@ -105,7 +112,7 @@ void test("doctor respects untrusted projects and does not mutate fixtures", asy
 });
 void test("doctor excludes workflow_catalog from active capabilities and output", async () => {
   const paths = fixture();
-  const report = await doctor({ ...paths, activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"], discoverPi: async () => pi({ activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"] }) });
+  const report = await withHome(paths.root, () => doctor({ ...paths, activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"], discoverPi: async () => pi({ activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"] }) }));
   assert.deepEqual(report.activeTools, ["read"]);
   assert.doesNotMatch(formatDoctorReport(report), /workflow_catalog/);
 });
@@ -114,7 +121,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(pkg.bin?.["pi-extensible-workflows"], "./dist/src/cli.js");
   const paths = fixture();
   let output = "";
-  const exit = await runCli(["doctor"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; });
+  const exit = await withHome(paths.root, () => runCli(["doctor"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; }));
   assert.equal(exit, 0);
   for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Reusable workflows", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
   let inspected: string | undefined;

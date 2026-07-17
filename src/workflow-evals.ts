@@ -1,11 +1,11 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, SessionManager } from "@earendil-works/pi-coding-agent";
 import { CAPTURE_ERROR_PREFIX, CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 export { resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 import { ERROR_CODES, inspectWorkflowScript, loadAgentDefinitions, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "./index.js";
@@ -583,7 +583,7 @@ export function parseSemanticJudge(raw: string, criteria: readonly SemanticCrite
 interface JudgeProcessResult extends PiRunResult { raw: string; usage: ParentUsage }
 
 function semanticJudgePrompt(evalCase: WorkflowEvalCase, calls: readonly CapturedWorkflowCall[], cwd: string, home: string): string {
-  const roles = loadAgentDefinitions(cwd, join(home, ".pi"));
+  const roles = loadAgentDefinitions(cwd, join(home, ".pi", "agent"));
   const usedRoles = new Set(calls.flatMap(({ script }) => { try { return script ? inspectWorkflowScript(script).flatMap((call) => call.kind === "agent" && call.role ? [call.role] : []) : []; } catch { return []; } }));
   const roleText = [...usedRoles].map((role) => `${role}: ${roles[role]?.description ?? "no description"}`).join("\n") || "none";
   const docs = "agent(prompt, options) delegates; parallel(name, tasks) runs independent tasks concurrently; pipeline(name, items, stages) applies ordered stages; prompt(template, data) carries values into prompts. A role owns model/thinking/tools policy.";
@@ -626,8 +626,9 @@ function seedEvalProject(cwd: string, home: string, model: string): void {
     cpSync(join(source, entry), join(cwd, entry), { recursive: true, filter: (path) => !excluded.has(basename(path)) });
   }
   const roles = join(source, "test", "fixtures", "workflow-eval-roles");
-  const target = join(home, ".pi", "pi-extensible-workflows", "roles");
+  const target = join(home, ".pi", "agent", "pi-extensible-workflows", "roles");
   if (!existsSync(roles)) return;
+  mkdirSync(target, { recursive: true, mode: 0o700 });
   cpSync(roles, target, { recursive: true });
   for (const name of readdirSync(target).filter((entry) => entry.endsWith(".md"))) {
     const path = join(target, name);
@@ -800,7 +801,7 @@ export async function runWorkflowEvals(options: WorkflowEvalRunOptions = {}): Pr
   if (!model) throw new Error("Set --model or PI_WORKFLOW_EVAL_MODEL before running model evals.");
   const explicitModel = model.includes("/") ? model : options.provider ? `${options.provider}/${model}` : model;
   const cases = (options.cases ?? INITIAL_WORKFLOW_EVAL_CASES).filter((candidate) => !options.caseIds?.length || options.caseIds.includes(candidate.id)).map((candidate) => materializeCase(candidate, explicitModel));
-  const sourceAgentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const sourceAgentDir = getAgentDir();
   const ceiling = options.spendCeiling ?? Number(process.env.PI_WORKFLOW_EVAL_SPEND_CEILING ?? "1");
   if (!Number.isFinite(ceiling) || ceiling <= 0) throw new Error("spend ceiling must be positive");
   const artifactDir = options.artifactsDir ?? join(process.cwd(), ".tmp", "workflow-evals", new Date().toISOString().replace(/[:.]/g, "-"));

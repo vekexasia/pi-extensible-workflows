@@ -274,7 +274,7 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-budget-"));
   const fakePi = join(root, "fake-pi.mjs");
   const seededRole = join(root, "seeded-role");
-  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const globalRole = join(process.env.HOME, ".pi", "pi-extensible-workflows", "roles", "developer.md"); const projectRole = join(process.cwd(), ".pi", "pi-extensible-workflows", "roles", "developer.md"); if (!existsSync(globalRole) || existsSync(projectRole)) process.exit(8); const content = readFileSync(globalRole, "utf8"); if (!content.includes("model: fake/model") || !content.includes("tools: [read, grep, find, bash]")) process.exit(9); writeFileSync(${JSON.stringify(join(root, "seeded-role"))}, "ok"); process.exit(7);\n`);
+  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const globalRole = join(process.env.HOME, ".pi", "agent", "pi-extensible-workflows", "roles", "developer.md"); const projectRole = join(process.cwd(), ".pi", "pi-extensible-workflows", "roles", "developer.md"); if (!existsSync(globalRole) || existsSync(projectRole)) process.exit(8); const content = readFileSync(globalRole, "utf8"); if (!content.includes("model: fake/model") || !content.includes("tools: [read, grep, find, bash]")) process.exit(9); writeFileSync(${JSON.stringify(join(root, "seeded-role"))}, "ok"); process.exit(7);\n`);
   chmodSync(fakePi, 0o755);
   try {
     const progress: string[] = [];

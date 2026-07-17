@@ -9,7 +9,7 @@ import * as acorn from "acorn";
 import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { copyToClipboard, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type SessionFactory } from "./agent-execution.js";
 import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
@@ -219,7 +219,8 @@ export function validateCheckpoint(value: unknown): CheckpointInput {
   return { name: value.name, prompt: value.prompt, context: value.context };
 }
 
-export function loadSettings(path = join(homedir(), ".pi", "workflows", "settings.json")): Readonly<WorkflowSettings> {
+export function workflowSettingsPath(agentDir = getAgentDir()): string { return join(agentDir, ROLE_DIRECTORY, "settings.json"); }
+export function loadSettings(path = workflowSettingsPath()): Readonly<WorkflowSettings> {
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(path, "utf8")); }
   catch (error) {
@@ -274,7 +275,12 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
 const ROLE_DIRECTORY = "pi-extensible-workflows";
 const LEGACY_ROLE_DIRECTORY = "piworkflows";
 
-function roleDirectories(root: string): readonly string[] {
+export function workflowRoleDirectories(agentDir = getAgentDir()): readonly string[] {
+  const migrationRoot = join(homedir(), ".pi");
+  return [join(migrationRoot, LEGACY_ROLE_DIRECTORY, "roles"), join(migrationRoot, ROLE_DIRECTORY, "roles"), join(agentDir, ROLE_DIRECTORY, "roles")];
+}
+
+function projectRoleDirectories(root: string): readonly string[] {
   return [join(root, LEGACY_ROLE_DIRECTORY, "roles"), join(root, ROLE_DIRECTORY, "roles")];
 }
 
@@ -289,12 +295,12 @@ function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
   }
 }
 
-function readRoleDefinitions(root: string): Record<string, AgentDefinition> {
-  return Object.fromEntries(roleDirectories(root).flatMap((dir) => Object.entries(readAgentDefinitions(dir))));
+function readRoleDefinitions(dirs: readonly string[]): Record<string, AgentDefinition> {
+  return Object.fromEntries(dirs.flatMap((dir) => Object.entries(readAgentDefinitions(dir))));
 }
 
-export function loadAgentDefinitions(cwd: string, piHome = join(homedir(), ".pi"), projectTrusted = true): Readonly<Record<string, AgentDefinition>> {
-  return deepFreeze({ ...readRoleDefinitions(piHome), ...(projectTrusted ? readRoleDefinitions(join(cwd, ".pi")) : {}) });
+export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), projectTrusted = true): Readonly<Record<string, AgentDefinition>> {
+  return deepFreeze({ ...readRoleDefinitions(workflowRoleDirectories(agentDir)), ...(projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))) : {}) });
 }
 function validateRolePolicies(definitions: Readonly<Record<string, AgentDefinition>>, roles: readonly string[], availableModels: ReadonlySet<string>, rootTools: ReadonlySet<string>): void {
   for (const role of roles) {
@@ -898,7 +904,7 @@ function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters
   if (!workflowName) fail("INVALID_METADATA", "Inline workflows require name");
   const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}) });
   const globalAgentDefinitions = loadAgentDefinitions(context.cwd, undefined, false);
-  const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(join(context.cwd, ".pi")) : {};
+  const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};
   const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
   const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)) }, [], metadata);
   const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;

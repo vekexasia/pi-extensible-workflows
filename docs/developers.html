@@ -133,7 +133,7 @@ registerWorkflowExtension(<span class="tok-punctuation">{</span>
 <span class="tok-punctuation">}</span>);</code></pre>
         <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. Registered functions receive <code>agent</code>, <code>prompt</code>, the combinators, lifecycle helpers, and run metadata through their context. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source.</p>
         <h3>Role files</h3>
-        <p>Global roles live under <code>~/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. The legacy <code>~/.pi/piworkflows/roles/</code> and <code>&lt;cwd&gt;/.pi/piworkflows/roles/</code> paths remain readable for compatibility, with the new paths taking precedence when both define a role.</p>
+        <p>Global roles live under <code>&lt;agentDir&gt;/pi-extensible-workflows/roles/&lt;name&gt;.md</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/roles/&lt;name&gt;.md</code>; set <code>PI_CODING_AGENT_DIR</code> to change it. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. The migration paths <code>~/.pi/pi-extensible-workflows/roles/</code>, <code>~/.pi/piworkflows/roles/</code>, and <code>&lt;cwd&gt;/.pi/piworkflows/roles/</code> remain readable, with canonical paths taking precedence.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
 <span class="tok-property">description</span><span class="tok-punctuation">:</span> Reviews code for correctness
 <span class="tok-property">model</span><span class="tok-punctuation">:</span> anthropic/claude-fable-5
@@ -180,7 +180,7 @@ Focus on correctness and regressions.</code></pre>
   <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"maxAgentLaunches"</span><span class="tok-punctuation">:</span> <span class="tok-number">1000</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Optional strict settings live at <code>~/.pi/workflows/settings.json</code>. Invocation options override the defaults. The session-wide active-agent ceiling is 16.</p>
+        <p>Optional strict settings live at <code>&lt;agentDir&gt;/pi-extensible-workflows/settings.json</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/settings.json</code>. Invocation options override the defaults. The session-wide active-agent ceiling is 16.</p>
         <p>Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, or script issue before retrying.</p>
       </section>
       <section id="evaluation">

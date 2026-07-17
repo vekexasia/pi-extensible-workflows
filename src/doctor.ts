@@ -1,5 +1,4 @@
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { InMemoryCredentialStore, type Credential } from "@earendil-works/pi-ai";
 import {
@@ -18,6 +17,8 @@ import {
   parseRoleMarkdown,
   preflight,
   registeredWorkflowDefinitions,
+  workflowRoleDirectories,
+  workflowSettingsPath,
   WorkflowError,
   type WorkflowScriptDefinition,
   type WorkflowSettings,
@@ -180,7 +181,7 @@ class DoctorModelSet extends Set<string> {
 export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const cwd = canonical(options.cwd ?? process.cwd());
   const agentDir = canonical(options.agentDir ?? getAgentDir());
-  const settingsPath = canonical(options.settingsPath ?? join(homedir(), ".pi", "workflows", "settings.json"));
+  const settingsPath = canonical(options.settingsPath ?? workflowSettingsPath(agentDir));
   const diagnostics: DoctorDiagnostic[] = [];
   let settings = DEFAULT_SETTINGS;
   try { settings = loadSettings(settingsPath); }
@@ -202,7 +203,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const roles: DoctorRole[] = [];
   const definitions = new Map<string, AgentDefinition>();
   const globalPaths = new Map<string, string>();
-  const globalRoleDirs = [join(dirname(agentDir), "piworkflows", "roles"), join(dirname(agentDir), "pi-extensible-workflows", "roles")];
+  const globalRoleDirs = workflowRoleDirectories(agentDir);
   for (const path of roleFilesFrom(globalRoleDirs)) {
     const name = basename(path, ".md");
     roles.push({ name, path, scope: "global", active: true });

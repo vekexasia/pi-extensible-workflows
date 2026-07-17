@@ -1157,27 +1157,51 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
   assert.deepEqual(states, ["awaiting_input", "running"]);
 });
 
-void test("loads markdown agent roles with frontmatter from global and project directories", () => {
+void test("loads markdown agent roles from the effective agent directory with migration fallback and precedence", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-roles-"));
   const cwd = join(home, "project");
-  mkdirSync(join(home, "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(join(home, "piworkflows", "roles"), { recursive: true });
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(home, "pi-extensible-workflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
-  writeFileSync(join(home, "pi-extensible-workflows", "roles", "shadowed.md"), "---\ndescription: Hidden global\n---\nGlobal shadowed role");
-  writeFileSync(join(home, "pi-extensible-workflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Review role");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), "Project shadowed role");
-  writeFileSync(join(home, "piworkflows", "roles", "legacy.md"), "Legacy role");
-  const roles = loadAgentDefinitions(cwd, home);
-  assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
-  assert.equal(roles.reviewer?.prompt, "Review role");
-  assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
-  assert.deepEqual(roles.multiline, { prompt: "Multiline role", tools: ["read", "grep"] });
-  assert.deepEqual(roles.legacy, { prompt: "Legacy role" });
-  const untrusted = loadAgentDefinitions(cwd, home, false);
-  assert.equal(untrusted.reviewer, undefined);
-  assert.deepEqual(untrusted.shadowed, { prompt: "Global shadowed role", description: "Hidden global" });
+  const defaultAgentDir = join(home, ".pi", "agent");
+  const customAgentDir = join(home, "custom-agent");
+  const previousHome = process.env.HOME;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.HOME = home;
+  delete process.env.PI_CODING_AGENT_DIR;
+  try {
+    mkdirSync(join(defaultAgentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    mkdirSync(join(home, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+    mkdirSync(join(home, ".pi", "piworkflows", "roles"), { recursive: true });
+    mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
+    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "collision.md"), "Canonical collision");
+    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
+    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "fallback.md"), "Migration role");
+    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "collision.md"), "Migration collision");
+    writeFileSync(join(home, ".pi", "piworkflows", "roles", "legacy.md"), "Legacy role");
+    writeFileSync(join(home, ".pi", "piworkflows", "roles", "collision.md"), "Legacy collision");
+    writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Review role");
+    writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), "Project shadowed role");
+    const roles = loadAgentDefinitions(cwd);
+    assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
+    assert.equal(roles.reviewer?.prompt, "Review role");
+    assert.deepEqual(roles.collision, { prompt: "Canonical collision" });
+    assert.deepEqual(roles.fallback, { prompt: "Migration role" });
+    assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
+    assert.deepEqual(roles.multiline, { prompt: "Multiline role", tools: ["read", "grep"] });
+    assert.deepEqual(roles.legacy, { prompt: "Legacy role" });
+    const untrusted = loadAgentDefinitions(cwd, undefined, false);
+    assert.equal(untrusted.reviewer, undefined);
+    assert.deepEqual(untrusted.collision, { prompt: "Canonical collision" });
+    process.env.PI_CODING_AGENT_DIR = customAgentDir;
+    mkdirSync(join(customAgentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "roles", "custom.md"), "Custom role");
+    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "roles", "collision.md"), "Custom collision");
+    const customRoles = loadAgentDefinitions(cwd);
+    assert.deepEqual(customRoles.custom, { prompt: "Custom role" });
+    assert.deepEqual(customRoles.collision, { prompt: "Custom collision" });
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
 });
 
 void test("strict role frontmatter rejects malformed metadata", () => {
@@ -1250,6 +1274,28 @@ void test("interrupted lifecycle can cold-resume while completed and failed cann
   await interrupted.resume();
   assert.equal(interrupted.state, "running");
   for (const state of ["completed", "failed"] as const) await assert.rejects(new RunLifecycle(state).resume(), /Cannot resume/);
+});
+
+void test("default settings follow the effective agent directory", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-settings-"));
+  const agentDir = join(home, ".pi", "agent");
+  const customAgentDir = join(home, "custom-agent");
+  const previousHome = process.env.HOME;
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.HOME = home;
+  delete process.env.PI_CODING_AGENT_DIR;
+  try {
+    mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+    writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 4 }));
+    assert.deepEqual(loadSettings(), { concurrency: 4, maxAgentLaunches: 1000 });
+    process.env.PI_CODING_AGENT_DIR = customAgentDir;
+    mkdirSync(join(customAgentDir, "pi-extensible-workflows"), { recursive: true });
+    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ maxAgentLaunches: 20 }));
+    assert.deepEqual(loadSettings(), { concurrency: 8, maxAgentLaunches: 20 });
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
 });
 
 void test("strict settings use defaults and reject unknown or unsafe values", () => {
