@@ -170,9 +170,6 @@ export class WorkflowAgentExecutor {
       let session: NativeSession | undefined;
       const toolCalls = new Map<string, AgentToolCallProgress>();
       let activity: AgentActivity | undefined;
-      let reasoning = "";
-      let output = "";
-      let lastActivityPersisted = 0;
       let progress = Promise.resolve();
       let unsubscribe: (() => void) | undefined;
       let systemPromptTurn = 0;
@@ -196,17 +193,10 @@ export class WorkflowAgentExecutor {
             const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
             systemPromptWrite = systemPromptWrite.then(() => this.root.runStore?.recordSystemPrompt(entry)).then(() => undefined).catch((error: unknown) => { systemPromptWriteError ??= error; });
           }
-          if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; }
-          if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; }
-          if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_start") reasoning = "";
-          if (event.type === "message_update" && event.assistantMessageEvent.type === "thinking_delta") { reasoning += event.assistantMessageEvent.delta; activity = { kind: "reasoning", text: oneLine(reasoning) }; }
-          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_start") output = "";
-          if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") { output += event.assistantMessageEvent.delta; activity = { kind: "text", text: oneLine(output) }; }
-          if (["message_update", "message_end", "tool_execution_start", "tool_execution_end"].includes(event.type)) {
-            const persist = event.type !== "message_update" || Date.now() - lastActivityPersisted >= 500;
-            if (persist) lastActivityPersisted = Date.now();
-            report(persist);
-          }
+          if (event.type === "message_start" && event.message.role === "assistant") { activity = { kind: "text", text: "responding" }; report(false); }
+          if (event.type === "message_end") { activity = undefined; if (event.message.role === "assistant") report(true); }
+          if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; report(false); }
+          if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; report(false); }
         });
         report(false);
         if (setSteer) {
@@ -513,7 +503,6 @@ export class FairAgentScheduler {
   }
 }
 
-function oneLine(value: string): string { return value.replace(/\s+/g, " ").trim().slice(-120); }
 function resolvePath(path: string): string { return path.replace(/[\\/]+$/, ""); }
 
 function requiredFile(file: string | undefined): string {

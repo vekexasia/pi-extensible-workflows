@@ -38,6 +38,8 @@ async function withHome<T>(home: string, action: () => Promise<T>): Promise<T> {
 
 void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
   const paths = fixture();
+  mkdirSync(join(paths.cwd, ".pi", "piworkflows", "roles"), { recursive: true });
+  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "old-project.md"), "Ignored old project role");
   writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "override.md"), "Global role");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"), "Project role");
   writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "tool-typo.md"), "---\ntools: [read, cat]\n---\nCheck tools");
@@ -58,6 +60,7 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   assert.ok(codes.includes("ROLE_PLACEHOLDER"));
   assert.ok(codes.includes("EXTENSION_LOAD"));
   assert.ok(!report.diagnostics.some(({ source }) => source?.endsWith("empty-frontmatter.md")));
+  assert.ok(!report.roles.some(({ name }) => name === "old-project"));
   const project = report.roles.find((role) => role.name === "override" && role.scope === "project");
   const global = report.roles.find((role) => role.name === "override" && role.scope === "global");
   assert.ok(project);

@@ -211,7 +211,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics);
     if (definition) definitions.set(name, definition);
   }
-  for (const path of roleFilesFrom([join(cwd, ".pi", "piworkflows", "roles"), join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
+  for (const path of roleFilesFrom([join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
     const name = basename(path, ".md");
     const globalPath = globalPaths.get(name);
     const active = pi.trust.trusted;

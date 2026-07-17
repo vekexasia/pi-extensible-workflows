@@ -100,7 +100,7 @@ void test("exposes native attempt metadata before the prompt completes", async (
   await running;
 });
 
-void test("streams live token and tool-call progress", async () => {
+void test("streams non-content and tool-call progress", async () => {
   let listener: ((event: AgentSessionEvent) => void) | undefined;
   const messages = [assistant("")];
   const updates: AgentProgress[] = [];
@@ -108,18 +108,27 @@ void test("streams live token and tool-call progress", async () => {
     sessionId: "progress", sessionFile: "/sessions/progress.jsonl", messages,
     subscribe(next) { listener = next; return () => { listener = undefined; }; },
     async prompt() {
-      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "Checking state", partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_start", message: messages[0] } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "REASONING_ONE", partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "REASONING_TWO", partial: messages[0] } } as AgentSessionEvent);
       listener?.({ type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: {} });
       messages[0] = assistant("done");
-      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "done", partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_start", contentIndex: 0, partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "RESPONSE_ONE", partial: messages[0] } } as AgentSessionEvent);
+      listener?.({ type: "message_update", message: messages[0], assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "RESPONSE_TWO", partial: messages[0] } } as AgentSessionEvent);
       listener?.({ type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false });
+      listener?.({ type: "message_end", message: messages[0] } as AgentSessionEvent);
     },
     dispose() {},
   }));
-  await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onProgress: (update) => { updates.push(update); } });
-  assert.ok(updates.some(({ activity }) => activity?.kind === "reasoning" && activity.text === "Checking state"));
+  const result = await executor.execute("work", { label: "worker", workflowName: "flow", workflowDescription: "desc", onProgress: (update) => { updates.push(update); } });
+  assert.equal(result.value, "done");
+  assert.equal(updates.length, 6);
+  assert.doesNotMatch(JSON.stringify(updates), /REASONING_ONE|REASONING_TWO|RESPONSE_ONE|RESPONSE_TWO/);
+  assert.ok(updates.some(({ activity }) => activity?.kind === "text" && activity.text === "responding"));
   assert.ok(updates.some(({ toolCalls, activity }) => activity?.kind === "tool" && toolCalls.some(({ name, state }) => name === "read" && state === "running")));
-  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], activity: { kind: "text", text: "done" }, persist: true });
+  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], persist: true });
 });
 
 void test("keeps workflow_result present, delays acceptance, and allows one repair", async () => {

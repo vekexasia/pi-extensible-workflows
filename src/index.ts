@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as acorn from "acorn";
@@ -274,15 +274,13 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
 }
 
 const ROLE_DIRECTORY = "pi-extensible-workflows";
-const LEGACY_ROLE_DIRECTORY = "piworkflows";
 
 export function workflowRoleDirectories(agentDir = getAgentDir()): readonly string[] {
-  const migrationRoot = join(homedir(), ".pi");
-  return [join(migrationRoot, LEGACY_ROLE_DIRECTORY, "roles"), join(migrationRoot, ROLE_DIRECTORY, "roles"), join(agentDir, ROLE_DIRECTORY, "roles")];
+  return [join(agentDir, ROLE_DIRECTORY, "roles")];
 }
 
 function projectRoleDirectories(root: string): readonly string[] {
-  return [join(root, LEGACY_ROLE_DIRECTORY, "roles"), join(root, ROLE_DIRECTORY, "roles")];
+  return [join(root, ROLE_DIRECTORY, "roles")];
 }
 
 function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
@@ -1369,7 +1367,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): stri
     for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat(depth + 1);
-    const activity = formatAgentActivity(agent, spinner);
+    const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner);
     lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.parentBreadcrumb ? `${agent.parentBreadcrumb} > ` : ""}${agent.label ?? agent.name} [${agent.state}]${activity ? ` ${activity}` : ""}`);
   }
   return lines.join("\n");
@@ -1434,8 +1432,8 @@ function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): st
 }
 
 function formatAgentActivity(agent: AgentRecord, spinner: string): string {
-  if (agent.activity?.kind === "reasoning") return `… reasoning: ${agent.activity.text}`;
-  if (agent.activity?.kind === "text") return `> ${agent.activity.text}`;
+  if (agent.activity?.kind === "reasoning") return `${spinner} reasoning`;
+  if (agent.activity?.kind === "text") return `${spinner} responding`;
   if (agent.activity?.kind === "tool") return `${spinner} ${agent.activity.text}`;
   const tool = [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running");
   return tool ? `${spinner} ${tool.name}` : "";

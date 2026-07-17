@@ -215,10 +215,14 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review \[running\] ⠙ read/);
   const agent = run.agents[0];
   assert.ok(agent);
-  const reasoning = { ...run, agents: [{ ...agent, activity: { kind: "reasoning" as const, text: "checking cache" } }] };
-  assert.match(formatWorkflowProgress(reasoning), /reasoning: checking cache/);
-  const text = { ...run, agents: [{ ...agent, activity: { kind: "text" as const, text: "streaming answer" } }] };
-  assert.match(formatWorkflowProgress(text), /> streaming answer/);
+  const reasoning = { ...run, agents: [{ ...agent, activity: { kind: "reasoning" as const, text: "checking cache" } }] } as Parameters<typeof formatWorkflowProgress>[0];
+  assert.match(formatWorkflowProgress(reasoning), /reasoning/);
+  assert.doesNotMatch(formatWorkflowProgress(reasoning), /checking cache/);
+  const text = { ...run, agents: [{ ...agent, activity: { kind: "text" as const, text: "streaming answer" } }] } as Parameters<typeof formatWorkflowProgress>[0];
+  assert.match(formatWorkflowProgress(text), /responding/);
+  assert.doesNotMatch(formatWorkflowProgress(text), /streaming answer/);
+  const settled = { ...run, agents: [{ ...agent, state: "completed" as const, activity: { kind: "text" as const, text: "stale output" } }] } as Parameters<typeof formatWorkflowProgress>[0];
+  assert.doesNotMatch(formatWorkflowProgress(settled), /stale output|◇ read/);
 });
 void test("workflow progress shows extension-function agent breadcrumbs", () => {
   const run = { id: "run", workflowName: "review", cwd: "/repo", sessionId: "session", state: "running", agents: [{ id: "run:1", name: "agent-label", parentBreadcrumb: "git.reviewRepository", path: "run:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
@@ -788,7 +792,8 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /phase: review/);
   assert.match(dashB, /1\/2 agents/);
   assert.match(dashB, /37 tok/);
-  assert.match(dashB, /reasoning: checking source/);
+  assert.match(dashB, /reasoning/);
+  assert.doesNotMatch(dashB, /checking source/);
   assert.match(dashB, /model=openai\/gpt:high/);
   assert.match(dashB, /role=reviewer/);
   assert.match(dashB, /tools=read/);
@@ -1157,7 +1162,7 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
   assert.deepEqual(states, ["awaiting_input", "running"]);
 });
 
-void test("loads markdown agent roles from the effective agent directory with migration fallback and precedence", () => {
+void test("loads markdown agent roles only from canonical global and project directories", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-roles-"));
   const cwd = join(home, "project");
   const defaultAgentDir = join(home, ".pi", "agent");
@@ -1171,23 +1176,24 @@ void test("loads markdown agent roles from the effective agent directory with mi
     mkdirSync(join(home, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
     mkdirSync(join(home, ".pi", "piworkflows", "roles"), { recursive: true });
     mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+    mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
     writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt\nthinking: high\ntools: [read, grep]\n---\nGlobal role");
     writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "collision.md"), "Canonical collision");
     writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
-    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "fallback.md"), "Migration role");
-    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "collision.md"), "Migration collision");
-    writeFileSync(join(home, ".pi", "piworkflows", "roles", "legacy.md"), "Legacy role");
-    writeFileSync(join(home, ".pi", "piworkflows", "roles", "collision.md"), "Legacy collision");
+    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "old-global.md"), "Ignored old global role");
+    writeFileSync(join(home, ".pi", "piworkflows", "roles", "old-legacy.md"), "Ignored legacy role");
+    writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "old-project.md"), "Ignored old project role");
     writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Review role");
     writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), "Project shadowed role");
     const roles = loadAgentDefinitions(cwd);
     assert.deepEqual(roles.global, { prompt: "Global role", description: "Global review", model: "openai/gpt", thinking: "high", tools: ["read", "grep"] });
     assert.equal(roles.reviewer?.prompt, "Review role");
     assert.deepEqual(roles.collision, { prompt: "Canonical collision" });
-    assert.deepEqual(roles.fallback, { prompt: "Migration role" });
     assert.deepEqual(roles.shadowed, { prompt: "Project shadowed role" });
     assert.deepEqual(roles.multiline, { prompt: "Multiline role", tools: ["read", "grep"] });
-    assert.deepEqual(roles.legacy, { prompt: "Legacy role" });
+    assert.equal(roles["old-global"], undefined);
+    assert.equal(roles["old-legacy"], undefined);
+    assert.equal(roles["old-project"], undefined);
     const untrusted = loadAgentDefinitions(cwd, undefined, false);
     assert.equal(untrusted.reviewer, undefined);
     assert.deepEqual(untrusted.collision, { prompt: "Canonical collision" });
