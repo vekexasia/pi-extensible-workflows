@@ -487,7 +487,7 @@ export async function replayCapturedWorkflows(calls: readonly CapturedWorkflowCa
 }
 
 export interface CaptureCaseInput { case: WorkflowEvalCase; model: string; provider?: string; thinking?: string; piCommand?: string; maxCost: number }
-interface PiRunResult { exitCode: number | null; timedOut: boolean; budgetExceeded: boolean; processGroupTerminated: boolean; stderr: string; error?: string }
+interface PiRunResult { exitCode: number | null; timedOut: boolean; budgetExceeded: boolean; processGroupTerminated: boolean; stoppedIntentionally: boolean; stderr: string; error?: string }
 const reportProgress = (message: string): void => { if (process.env.PI_WORKFLOW_EVAL_PROGRESS === "1") process.stderr.write(`[eval] ${message}\n`); };
 
 
@@ -507,20 +507,47 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
   args.push("--thinking", input.thinking ?? "off");
   args.push("--print", input.case.prompt);
   const controller = new AbortController();
-  let timedOut = false; let budgetExceeded = false; let processGroupTerminated = false; let streamCost = 0; let lineBuffer = ""; let stderr = ""; let spawnError: string | undefined; let killPromise: Promise<boolean> | undefined;
+  let timedOut = false; let budgetExceeded = false; let processGroupTerminated = false; let stoppedIntentionally = false; let workflowCallSeen = false; let streamCost = 0; let lineBuffer = ""; let stderr = ""; let spawnError: string | undefined; let killPromise: Promise<boolean> | undefined;
   const child = spawn(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, { cwd, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), PI_CODING_AGENT_SESSION_DIR: sessionDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], signal: controller.signal });
   const requestKill = (): Promise<boolean> => { killPromise ??= killProcessGroup(child); return killPromise; };
+  const stopIntentionally = (): void => { if (stoppedIntentionally) return; stoppedIntentionally = true; void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); };
+  const isValidatedCapture = (value: unknown): boolean => {
+    if (!isObject(value) || value.toolName !== "workflow" || value.isError === true) return false;
+    const details = isObject(value.details) ? value.details : undefined;
+    const validation = details && isObject(details.validation) ? details.validation : undefined;
+    return details?.captureIdentity === CAPTURE_IDENTITY && details.realWorkflowAgentsLaunched === 0 && validation?.valid === true;
+  };
   const inspectLine = (line: string) => {
     try {
       const event = JSON.parse(line) as unknown;
-      if (!isObject(event) || event.type !== "message_end" || !isObject(event.message)) return;
-      const tools = Array.isArray(event.message.content) ? event.message.content.flatMap((part) => isObject(part) && part.type === "toolCall" && typeof part.name === "string" ? [part.name] : []) : [];
-      if (tools.length) reportProgress(`${input.case.id}: parent tools: ${tools.join(", ")}`);
-      const usage = usageFrom(event.message);
-      if (!usage) return;
-      streamCost += usage.cost;
-      reportProgress(`${input.case.id}: parent turn complete, ${String(usage.totalTokens)} tokens, $${streamCost.toFixed(4)} total`);
-      if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+      if (!isObject(event)) return;
+      if (event.type === "message_end" && isObject(event.message)) {
+        const tools = Array.isArray(event.message.content) ? event.message.content.flatMap((part) => isObject(part) && part.type === "toolCall" && typeof part.name === "string" ? [part.name] : []) : [];
+        if (tools.includes("workflow")) workflowCallSeen = true;
+        if (tools.length) reportProgress(`${input.case.id}: parent tools: ${tools.join(", ")}`);
+        const usage = usageFrom(event.message);
+        if (!usage) return;
+        streamCost += usage.cost;
+        reportProgress(`${input.case.id}: parent turn complete, ${String(usage.totalTokens)} tokens, $${streamCost.toFixed(4)} total`);
+        if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+        return;
+      }
+      if (event.type === "turn_end") {
+        const toolResults = Array.isArray(event.toolResults) ? event.toolResults : [];
+        if (toolResults.some((result) => isObject(result) && result.toolName === "workflow")) workflowCallSeen = true;
+        if (toolResults.some(isValidatedCapture)) stopIntentionally();
+        return;
+      }
+      if (event.type === "agent_end" && !workflowCallSeen) {
+        const messages: unknown[] = Array.isArray(event.messages) ? event.messages as unknown[] : [];
+        let assistant: unknown;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          if (isObject(message) && message.role === "assistant") { assistant = message; break; }
+        }
+        if (isObject(assistant) && (assistant.stopReason === "error" || assistant.stopReason === "aborted")) return;
+        stopIntentionally();
+      }
     } catch { /* The JSON stream may contain a diagnostic line. */ }
   };
   child.stdout.on("data", (chunk: Buffer) => { lineBuffer += chunk.toString(); const lines = lineBuffer.split("\n"); lineBuffer = lines.pop() ?? ""; for (const line of lines) if (line) inspectLine(line); });
@@ -531,7 +558,7 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
   const exitCode = await close; if (timer) clearTimeout(timer);
   if (lineBuffer) inspectLine(lineBuffer);
   if (killPromise) processGroupTerminated ||= await killPromise;
-  return { exitCode, timedOut, budgetExceeded, processGroupTerminated, stderr, ...(spawnError ? { error: spawnError } : {}) };
+  return { exitCode, timedOut, budgetExceeded, processGroupTerminated, stoppedIntentionally, stderr, ...(spawnError ? { error: spawnError } : {}) };
 }
 
 function addUsage(left: ParentUsage, right: ParentUsage): ParentUsage {
@@ -587,7 +614,7 @@ async function runSemanticJudge(input: CaptureCaseInput, calls: readonly Capture
   const close = new Promise<number | null>((resolve) => { child.once("close", resolve); });
   const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
   const exitCode = await close; if (timer) clearTimeout(timer); if (lineBuffer) inspectLine(lineBuffer); if (killPromise) processGroupTerminated ||= await killPromise;
-  return { raw, usage, exitCode, timedOut, budgetExceeded, processGroupTerminated, stderr, ...(spawnError ? { error: spawnError } : {}) };
+  return { raw, usage, exitCode, timedOut, budgetExceeded, processGroupTerminated, stoppedIntentionally: false, stderr, ...(spawnError ? { error: spawnError } : {}) };
 }
 
 function seedEvalProject(cwd: string, home: string, model: string): void {
@@ -682,6 +709,8 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
     const validation = captureValidationReports(oracle, workflows);
     const requiredCount = input.case.expectedWorkflowCalls ?? (input.case.expectations.workflowCallCount === 0 ? 0 : 1);
     const selection = selectStaticCandidate(workflows, validation.reports, input.case.expectations, requiredCount);
+    const parentUsageThroughCandidate = usageThroughCandidate(oracle, workflows, selection.callIndices);
+    const parentAccounting = parentUsageThroughCandidate ?? oracle.usage;
     const unsafeTool = oracle.parentToolSequence.find((tool) => !SAFE_PARENT_EVAL_TOOLS.includes(tool as (typeof SAFE_PARENT_EVAL_TOOLS)[number]));
     const errors = [...evalExpectationErrors(oracle, input.case.expectations), ...validation.errors, ...(unsafeTool ? [`parent tool is outside the safe eval allowlist: ${unsafeTool}`] : [])];
     if (requiredCount > 0 && selection.callIndices.length === 0) errors.push("Catastrophic validity failure: no production-valid workflow candidate satisfied static expectations.");
@@ -691,7 +720,7 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
       const criteria = input.case.semanticCriteria ?? semantic("The workflow design is semantically appropriate for the original request.");
       const judgeCase = { ...input.case, semanticCriteria: criteria };
       reportProgress(`${input.case.id}: semantic judge starting`);
-      judgeProcess = await runSemanticJudge({ ...input, case: judgeCase }, selection.callIndices.map((index) => workflows[index] as CapturedWorkflowCall), cwd, home, sessionDir, Math.max(0, input.maxCost - oracle.usage.cost));
+      judgeProcess = await runSemanticJudge({ ...input, case: judgeCase }, selection.callIndices.map((index) => workflows[index] as CapturedWorkflowCall), cwd, home, sessionDir, Math.max(0, input.maxCost - parentAccounting.cost));
       reportProgress(`${input.case.id}: semantic judge finished`);
       diagnostics.push(judgeProcess.stderr, judgeProcess.error ? `Judge process error: ${judgeProcess.error}` : "");
       if (judgeProcess.exitCode !== 0 || judgeProcess.error) errors.push("Semantic judge process failed.");
@@ -703,9 +732,8 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
         } catch (error) { errors.push(`Invalid semantic judge output: ${error instanceof Error ? error.message : String(error)}`); }
       }
     }
-    const parentUsageThroughCandidate = usageThroughCandidate(oracle, workflows, selection.callIndices);
     const before = preliminaryTools(oracle, selection.callIndices[0]);
-    const accounting = addUsage(oracle.usage, judgeProcess?.usage ?? emptyAccounting());
+    const accounting = addUsage(parentAccounting, judgeProcess?.usage ?? emptyAccounting());
     const metrics: EvalMetrics = {
       parentUsageThroughCandidate,
       parentOutputTokensThroughCandidate: parentUsageThroughCandidate?.output ?? null,
@@ -723,8 +751,10 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
     };
     const timedOut = pi.timedOut || Boolean(judgeProcess?.timedOut);
     const overBudget = pi.budgetExceeded || Boolean(judgeProcess?.budgetExceeded) || accounting.cost > input.maxCost;
-    const status: EvalCaseResult["status"] = timedOut ? "timed_out" : overBudget ? "budget_exceeded" : errors.length || pi.exitCode !== 0 ? "failed" : "passed";
-    const result: EvalCaseResult = { id: input.case.id, status, limits: { ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs }), maxCost: input.maxCost }, oracle, workflows, productionValidation: validation.reports, ...(judge ? { semanticJudge: judge } : {}), metrics, accounting, accountingTrustworthy: !timedOut && pi.exitCode === 0 && (!judgeProcess || judgeProcess.exitCode === 0), diagnostics: diagnostics.filter(Boolean), errors, cleanup: { processExited: pi.exitCode !== null && (!judgeProcess || judgeProcess.exitCode !== null), processGroupTerminated: pi.processGroupTerminated || Boolean(judgeProcess?.processGroupTerminated), tempRootRemoved: false, captureIdentityVerified: validation.verified, realWorkflowAgentsLaunched: validation.verified ? 0 : null } };
+    const intentionalStop = pi.stoppedIntentionally && (pi.exitCode === 0 || pi.exitCode === null || pi.exitCode === 143);
+    const piSucceeded = pi.exitCode === 0 || intentionalStop;
+    const status: EvalCaseResult["status"] = timedOut ? "timed_out" : overBudget ? "budget_exceeded" : errors.length || !piSucceeded ? "failed" : "passed";
+    const result: EvalCaseResult = { id: input.case.id, status, limits: { ...(input.case.timeoutMs === undefined ? {} : { timeoutMs: input.case.timeoutMs }), maxCost: input.maxCost }, oracle, workflows, productionValidation: validation.reports, ...(judge ? { semanticJudge: judge } : {}), metrics, accounting, accountingTrustworthy: !timedOut && piSucceeded && (!judgeProcess || judgeProcess.exitCode === 0), diagnostics: diagnostics.filter(Boolean), errors, cleanup: { processExited: (pi.exitCode !== null || pi.stoppedIntentionally) && (!judgeProcess || judgeProcess.exitCode !== null), processGroupTerminated: pi.processGroupTerminated || Boolean(judgeProcess?.processGroupTerminated), tempRootRemoved: false, captureIdentityVerified: validation.verified, realWorkflowAgentsLaunched: validation.verified ? 0 : null } };
     return withTempRootRemoved(result);
   } finally {
     rmSync(root, { recursive: true, force: true });

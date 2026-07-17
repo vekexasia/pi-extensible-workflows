@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectWorkflowScript, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
-import { assertEvalScriptSafe, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
+import { assertEvalScriptSafe, captureEvalCase, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
 
 const schema = { type: "object", properties: { answer: { type: "number" }, label: { type: "string" } }, required: ["answer", "label"], additionalProperties: false };
 void test("defines the cheap initial evaluation matrix", () => {
@@ -64,6 +64,44 @@ void test("captures production-validated calls without execution and judges the 
   assert.equal(result.value.cleanup.captureIdentityVerified, true);
   assert.equal(result.value.cleanup.realWorkflowAgentsLaunched, 0);
   assert.equal(result.value.cleanup.tempRootRemoved, true);
+});
+
+void test("stops after a persisted validated capture without another parent turn", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-stop-after-capture-"));
+  const piPath = join(root, "fake-pi.mjs");
+  const marker = join(root, "extra-parent-turn");
+  try {
+    writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ criteria: [{ id: "intent", pass: true, evidence: "capture persisted" }] }) }], provider: "fake", model: "judge", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } })); process.exit(0); } const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const sessionPath = join(sessionDir, "parent.jsonl"); const script = 'return agent("captured")'; const assistant = { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "workflow", arguments: { name: "captured", script } }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; const result = { role: "toolResult", toolCallId: "call-1", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false }; const rows = [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }]; writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); setTimeout(() => { rows.push({ type: "message", message: result }); writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: result })); console.log(JSON.stringify({ type: "turn_end", message: assistant, toolResults: [result] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 200); }, 50); setInterval(() => {}, 1000);`);
+    chmodSync(piPath, 0o755);
+    const result = await captureEvalCase({ case: { id: "capture-stop", prompt: "capture one workflow", timeoutMs: 1_000, maxCost: 1, expectations: { workflowCallCount: 1 }, semanticCriteria: [{ id: "intent", description: "Capture the workflow." }] }, model: "fake/model", piCommand: piPath, maxCost: 1 });
+    assert.equal(result.status, "passed");
+    assert.equal(result.oracle?.assistantBatches.length, 1);
+    assert.equal(result.workflows.length, 1);
+    assert.equal(result.accounting.totalTokens, 7);
+    assert.equal(result.accountingTrustworthy, true);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("stops at agent_end when no workflow call occurs", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-agent-end-"));
+  const piPath = join(root, "fake-pi.mjs");
+  const marker = join(root, "extra-parent-turn");
+  try {
+    writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "text", text: "direct answer" }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); console.log(JSON.stringify({ type: "agent_end", messages: [assistant] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 200); setInterval(() => {}, 1000);`);
+    chmodSync(piPath, 0o755);
+    const result = await captureEvalCase({ case: { id: "direct-stop", prompt: "answer directly", timeoutMs: 1_000, maxCost: 1, expectations: { workflowCallCount: 0 }, expectedWorkflowCalls: 0 }, model: "fake/model", piCommand: piPath, maxCost: 1 });
+    assert.equal(result.status, "passed");
+    assert.equal(result.oracle?.assistantBatches.length, 1);
+    assert.equal(result.workflows.length, 0);
+    assert.equal(result.accounting.totalTokens, 5);
+    assert.equal(result.accountingTrustworthy, true);
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 void test("selects the required valid workflow set and records surplus valid calls", async () => {
