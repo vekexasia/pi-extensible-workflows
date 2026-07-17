@@ -16,20 +16,29 @@ pi install npm:pi-extensible-workflows
 
 For source installs and local development, see the [installation guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html#installation).
 
-## Quick start
+## Capabilities
 
-The package registers the `workflow` and `workflow_respond` tools plus the `/workflow` command. Run this first workflow with the `workflow` tool:
+The main Pi agent acts as the orchestrator: it writes workflow scripts on the fly for each task. Pi extensions can add reusable functions and variables to those scripts, or register complete workflows that can be invoked by name.
 
-```json
-{
-  "name": "release-check",
-  "script": "phase('inspect'); return agent('Inspect the package', { tools: ['read'] });"
-}
+A workflow can fan out across specialized agents, combine their results, and resume without rerunning completed work.
+
+```js
+const reviews = await parallel("review", {
+  correctness: () => agent("Review the current changes for correctness issues."),
+  security: () => agent("Review the current changes for security risks.", {
+    role: "security-specialist",
+  }),
+  tests: () => agent("Review the current changes for missing test coverage."),
+});
+
+const summary = await agent(
+  prompt("Deduplicate and prioritize these findings:\n\n{reviews}", { reviews }),
+);
+
+return summary;
 ```
 
-Runs execute in the background by default. Set `foreground: true` to wait for the final JSON value.
-
-Use `parallel()` and `pipeline()` for deterministic fan-out, `withWorktree()` for isolated Git worktrees, and `checkpoint()` for human approval. The complete contracts and examples live in the documentation:
+Learn more about roles, workflow contracts, and extension APIs in the documentation:
 
 - [Workflow tool and invocation API](https://vekexasia.github.io/pi-extensible-workflows/developers.html#tool-api)
 - [Workflow DSL and worktrees](https://vekexasia.github.io/pi-extensible-workflows/developers.html#dsl)
@@ -37,7 +46,6 @@ Use `parallel()` and `pipeline()` for deterministic fan-out, `withWorktree()` fo
 - [Run inspection and recovery](https://vekexasia.github.io/pi-extensible-workflows/developers.html#operations)
 - [Agent patterns and model selection](https://vekexasia.github.io/pi-extensible-workflows/agents.html#patterns)
 - [Checkpoints](https://vekexasia.github.io/pi-extensible-workflows/agents.html#checkpoints)
-
 
 ## CLI
 
