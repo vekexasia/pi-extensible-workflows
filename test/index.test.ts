@@ -738,12 +738,23 @@ void test("navigator opens a selected native transcript in a scrollable TUI over
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 2) {
           const initial = component.render(80).join("\n");
-          assert.match(initial, /\[user\]/);
-          assert.match(initial, /\[assistant\]/);
-          assert.match(initial, /Tool call: read/);
-          assert.match(initial, /FIRST_USER/);
+          assert.match(initial, /TRANSCRIPT_END/);
+          assert.doesNotMatch(initial, /FIRST_USER/);
+          assert.match(initial, /Home\/End jump/);
+          component.handleInput?.("tui.editor.cursorLineStart");
+          const first = component.render(80).join("\n");
+          assert.match(first, /\[user\]/);
+          assert.match(first, /\[assistant\]/);
+          assert.match(first, /Tool call: read/);
+          assert.match(first, /FIRST_USER/);
+          assert.doesNotMatch(first, /TRANSCRIPT_END/);
           for (let index = 0; index < 20; index += 1) component.handleInput?.("tui.select.pageDown");
           assert.match(component.render(80).join("\n"), /TRANSCRIPT_END/);
+          component.handleInput?.("tui.editor.cursorLineStart");
+          component.handleInput?.("tui.editor.cursorLineEnd");
+          const last = component.render(80).join("\n");
+          assert.match(last, /TRANSCRIPT_END/);
+          assert.doesNotMatch(last, /FIRST_USER/);
           component.handleInput?.("tui.select.cancel");
         } else {
           assert.match(component.render(80).join("\n"), /View transcript/);

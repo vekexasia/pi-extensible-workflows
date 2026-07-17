@@ -2365,23 +2365,24 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 try {
                   const entries = SessionManager.open(transcript).buildContextEntries();
                   await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
-                    let offset = 0;
+                    let offset: number | undefined;
                     let renderedLines: string[] = [];
                     const terminalRows = () => Math.max(1, ((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24);
                     const viewport = () => Math.max(1, terminalRows() - 3);
                     const move = (delta: number) => {
                       const maxOffset = Math.max(0, renderedLines.length - viewport());
-                      offset = Math.max(0, Math.min(maxOffset, offset + delta));
+                      offset = Math.max(0, Math.min(maxOffset, (offset ?? maxOffset) + delta));
                     };
                     return {
                       render(width: number) {
                         renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
-                        offset = Math.min(offset, Math.max(0, renderedLines.length - viewport()));
+                        const maxOffset = Math.max(0, renderedLines.length - viewport());
+                        offset = Math.min(offset ?? maxOffset, maxOffset);
                         return [
                           theme.fg("accent", "Native Pi transcript"),
                           ...renderedLines.slice(offset, offset + viewport()),
                           "",
-                          theme.fg("dim", "↑↓/pgup/pgdn scroll · esc close"),
+                          theme.fg("dim", "↑↓/pgup/pgdn scroll · Home/End jump · esc close"),
                         ];
                       },
                       invalidate() {},
@@ -2390,6 +2391,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                         else if (keybindings.matches(data, "tui.select.down")) move(1);
                         else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
                         else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
+                        else if (keybindings.matches(data, "tui.editor.cursorLineStart")) offset = 0;
+                        else if (keybindings.matches(data, "tui.editor.cursorLineEnd")) offset = Math.max(0, renderedLines.length - viewport());
                         else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
                         tui.requestRender();
                       },
