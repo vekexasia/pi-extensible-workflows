@@ -9,8 +9,9 @@ import * as acorn from "acorn";
 import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { copyToClipboard, parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type SessionFactory } from "./agent-execution.js";
+import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -2198,6 +2199,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
             else actions.set("View script", "view-script");
             const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
+            if (ctx.mode === "tui" && transcripts.length) actions.set("View transcript", "view-transcript");
             if (transcripts.length) actions.set("Transcript paths", "transcripts");
             if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
             if (ctx.mode === "tui") {
@@ -2345,6 +2347,48 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   },
                 };
               });
+              continue;
+            }
+            if (actionChoice === "View transcript") {
+              const transcript = await ctx.ui.select("Native Pi transcripts", [...view.transcripts, "Back"]);
+              if (transcript && transcript !== "Back") {
+                try {
+                  const entries = SessionManager.open(transcript).buildContextEntries();
+                  await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+                    let offset = 0;
+                    let renderedLines: string[] = [];
+                    const terminalRows = () => Math.max(1, ((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24);
+                    const viewport = () => Math.max(1, terminalRows() - 3);
+                    const move = (delta: number) => {
+                      const maxOffset = Math.max(0, renderedLines.length - viewport());
+                      offset = Math.max(0, Math.min(maxOffset, offset + delta));
+                    };
+                    return {
+                      render(width: number) {
+                        renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
+                        offset = Math.min(offset, Math.max(0, renderedLines.length - viewport()));
+                        return [
+                          theme.fg("accent", "Native Pi transcript"),
+                          ...renderedLines.slice(offset, offset + viewport()),
+                          "",
+                          theme.fg("dim", "↑↓/pgup/pgdn scroll · esc close"),
+                        ];
+                      },
+                      invalidate() {},
+                      handleInput(data: string) {
+                        if (keybindings.matches(data, "tui.select.up")) move(-1);
+                        else if (keybindings.matches(data, "tui.select.down")) move(1);
+                        else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
+                        else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
+                        else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
+                        tui.requestRender();
+                      },
+                    };
+                  }, { overlay: true });
+                } catch (error) {
+                  ctx.ui.notify(`Cannot open transcript ${transcript}: ${error instanceof Error ? error.message : String(error)}`, "warning");
+                }
+              }
               continue;
             }
             if (actionChoice === "Transcript paths") {
