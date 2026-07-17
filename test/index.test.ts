@@ -219,6 +219,10 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   const text = { ...run, agents: [{ ...agent, activity: { kind: "text" as const, text: "streaming answer" } }] };
   assert.match(formatWorkflowProgress(text), /> streaming answer/);
 });
+void test("workflow progress shows extension-function agent breadcrumbs", () => {
+  const run = { id: "run", workflowName: "review", cwd: "/repo", sessionId: "session", state: "running", agents: [{ id: "run:1", name: "agent-label", parentBreadcrumb: "git.reviewRepository", path: "run:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  assert.match(formatWorkflowProgress(run), /git\.reviewRepository > agent-label/);
+});
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-"));
