@@ -37,7 +37,7 @@ To pass structured input from the main agent, include `args`:
 { "workflow": "namespace.workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. Reuse its exposed global functions, variables, and registered workflows instead of recreating their logic in the script.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task. Do not Try to reinvent already exposed functions.
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
 
