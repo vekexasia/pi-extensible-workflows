@@ -19,7 +19,7 @@ let coldVariableCalls = 0;
 const acceptanceExtension: WorkflowExtension = {
   namespace: "issue48Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance globals",
   functions: {
-    echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { acceptanceFunctionCalls += 1; return { value: input.value as string }; } },
+    echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input, context) { acceptanceFunctionCalls += 1; return { value: context.prompt("{value}", { value: input.value as string }) }; } },
     orchestrate: {
       description: "Exercise host combinators", input: { type: "object", additionalProperties: false }, output: { type: "object" },
       async run(_input, context) {
@@ -81,7 +81,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-policy-reporting-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const parent = await agent(\"nested policies\"); return { role, parent };";
+  const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const named = await agent(\"named\", { label: \"API inspection\" }); const parent = await agent(\"nested policies\"); return { role, named, parent };";
   const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"] };
   const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2, maxAgentLaunches: 10 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, schemas: [] });
   await store.create({ id: "run-a", workflowName: "policy-reporting", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, snapshot);
@@ -108,7 +108,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
       messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
       prompt: async () => {
         if (input.sessionLabel.includes(":nested-role:attempt-1")) throw new Error("retry nested role");
-        if (input.sessionLabel.endsWith(":agent:attempt-1")) {
+        if (input.sessionLabel.endsWith(":root-model:attempt-1")) {
           await collectChild({ prompt: "nested role", label: "nested-role", role: "reviewer", retries: 1 });
           for (const options of [
             { prompt: "model only", label: "model-only", model: "case-provider/model-only" },
@@ -133,7 +133,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   const loaded = await store.load();
   assert.equal(loaded.run.state, "completed");
   const attempts = loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => ({ agent, attempt })));
-  assert.equal(inputs.size, 8);
+  assert.equal(inputs.size, 9);
   assert.equal(attempts.length, inputs.size);
   for (const { agent, attempt } of attempts) {
     const input = inputs.get(attempt.sessionId);
@@ -142,12 +142,16 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   }
   const topRole = loaded.run.agents.find((agent) => agent.name === "reviewer" && !agent.parentId);
   const nestedRole = loaded.run.agents.find((agent) => agent.name === "nested-role");
-  assert.ok(topRole && nestedRole);
+  const named = loaded.run.agents.find((agent) => agent.name === "API inspection");
+  assert.ok(topRole && nestedRole && named);
   assert.equal(topRole.role, "reviewer");
   assert.equal(nestedRole.role, "reviewer");
-  assert.equal(nestedRole.parentId, loaded.run.agents.find((agent) => agent.name === "agent")?.id);
-  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "agent")?.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
-  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "agent")?.tools, ["agent", "read"]);
+  assert.equal(named.role, undefined);
+  assert.deepEqual(named.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
+  assert.deepEqual(named.tools, ["agent", "read"]);
+  assert.equal(nestedRole.parentId, loaded.run.agents.find((agent) => agent.name === "root-model")?.id);
+  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "root-model")?.model, { provider: "root-provider", model: "root-model", thinking: "medium" });
+  assert.deepEqual(loaded.run.agents.find((agent) => agent.name === "root-model")?.tools, ["agent", "read"]);
   for (const policy of [
     { name: "model-only", model: { provider: "case-provider", model: "model-only", thinking: "medium" }, tools: ["agent", "read"] },
     { name: "thinking-only", model: { provider: "root-provider", model: "root-model", thinking: "low" }, tools: ["agent", "read"] },
@@ -165,12 +169,15 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   assert.match(dashboard, /root-provider\/root-model:medium/);
   assert.match(dashboard, /role=reviewer/);
   assert.match(dashboard, /tools=agent,read/);
-  assert.match(dashboard, /agent > nested-role/);
+  assert.match(dashboard, /root-model > nested-role/);
+  assert.match(dashboard, /API inspection/);
+  assert.doesNotMatch(dashboard, /role=custom/);
   assert.match(detail, /nested-role .*model=role-provider\/role-model:high role=reviewer tools=read/);
   assert.match(detail, /model-only .*model=case-provider\/model-only:medium tools=agent,read/);
   assert.match(detail, /combined .*model=case-provider\/model-and-thinking:high tools=read/);
   assert.match(detail, /thinking-only .*model=root-provider\/root-model:low tools=agent,read/);
   assert.match(detail, /tools-only .*model=root-provider\/root-model:medium tools=read/);
+  assert.match(detail, /API inspection .*model=root-provider\/root-model:medium/);
 });
 
 void test("cold resume rejects obsolete identity snapshots", async () => {

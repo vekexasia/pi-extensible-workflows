@@ -90,8 +90,9 @@
           </tbody>
         </table></div>
         <h3>Agent options</h3>
-        <p>Use <code>model</code> as <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and <code>isolation: "worktree"</code>. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
+        <p>Use <code>label</code> as an optional non-empty display name. If omitted, agents use their <code>role</code> name, or the effective model name for role-less agents. Use <code>model</code> as <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and <code>isolation: "worktree"</code>. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> report = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review the implementation"</span>, <span class="tok-punctuation">{</span>
+  <span class="tok-property">label</span><span class="tok-punctuation">:</span> <span class="tok-string">"Implementation review"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
 <span class="tok-punctuation">}</span>);</code></pre>
@@ -118,8 +119,8 @@ registerWorkflowExtension(<span class="tok-punctuation">{</span>
       <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review one focus"</span><span class="tok-punctuation">,</span>
       <span class="tok-property">input</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"object"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
       <span class="tok-property">output</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"string"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-      <span class="tok-function">async run</span>(input<span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> agent <span class="tok-punctuation">}</span>) <span class="tok-punctuation">{</span>
-        <span class="tok-keyword">return</span> agent(<span class="tok-string">`Review ${String(input.focus)}`</span>);
+      <span class="tok-function">async run</span>(input<span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> agent<span class="tok-punctuation">,</span> prompt <span class="tok-punctuation">}</span>) <span class="tok-punctuation">{</span>
+        <span class="tok-keyword">return</span> agent(prompt(<span class="tok-string">"Review {focus}"</span><span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> <span class="tok-property">focus</span><span class="tok-punctuation">:</span> input.focus <span class="tok-punctuation">}</span>));
       <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
     <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
   <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
@@ -130,7 +131,7 @@ registerWorkflowExtension(<span class="tok-punctuation">{</span>
     <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
   <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
 <span class="tok-punctuation">}</span>);</code></pre>
-        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source.</p>
+        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. Registered functions receive <code>agent</code>, <code>prompt</code>, the combinators, lifecycle helpers, and run metadata through their context. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source.</p>
         <h3>Role files</h3>
         <p>Global roles live under <code>~/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>. The legacy <code>~/.pi/piworkflows/roles/</code> and <code>&lt;cwd&gt;/.pi/piworkflows/roles/</code> paths remain readable for compatibility, with the new paths taking precedence when both define a role.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>

@@ -44,6 +44,7 @@ export interface PreflightCapabilities { models: ReadonlySet<string>; tools: Rea
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
 export interface WorkflowOrchestrationContext {
   agent: (...args: readonly unknown[]) => Promise<JsonValue>;
+  prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string;
   parallel: (...args: readonly unknown[]) => Promise<JsonValue>;
   pipeline: (...args: readonly unknown[]) => Promise<JsonValue>;
   withWorktree: (...args: readonly unknown[]) => Promise<JsonValue>;
@@ -485,6 +486,19 @@ function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue
   return valid;
 }
 
+function workflowPrompt(template: string, values: Readonly<Record<string, JsonValue>>): string {
+  if (typeof template !== "string") fail("INVALID_METADATA", "prompt() template must be a string");
+  if (!object(values) || Array.isArray(values) || !jsonValue(values)) fail("INVALID_METADATA", "prompt() values must be a plain JSON-compatible object");
+  const placeholders = [...template.matchAll(/{{|}}|{([A-Za-z_$][\w$]*)}/g)].flatMap((match) => match[1] === undefined ? [] : [match[1]]);
+  const used = new Set(placeholders);
+  const keys = Object.keys(values);
+  const missing = placeholders.find((key) => !Object.prototype.hasOwnProperty.call(values, key));
+  if (missing) fail("INVALID_METADATA", `Missing prompt value "${missing}"`);
+  const unused = keys.find((key) => !used.has(key));
+  if (unused !== undefined) fail("INVALID_METADATA", `Unused prompt value "${unused}"`);
+  return template.replace(/{{|}}|{([A-Za-z_$][\w$]*)}/g, (match, key: string | undefined) => match === "{{" ? "{" : match === "}}" ? "}" : typeof values[key as string] === "string" ? values[key as string] as string : JSON.stringify(values[key as string], null, 2));
+}
+
 function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonSchema {
   if (!object(schema) || Object.getPrototypeOf(schema) !== Object.prototype || !jsonValue(schema)) fail("INVALID_SCHEMA", `${at} must be a plain JSON-compatible Schema object`);
   if (typeof schema.type !== "string" && !Array.isArray(schema.type) && schema.$ref === undefined && schema.anyOf === undefined && schema.oneOf === undefined && schema.allOf === undefined && schema.const === undefined && schema.enum === undefined) fail("INVALID_SCHEMA", `${at} has no JSON Schema shape`);
@@ -492,9 +506,12 @@ function validateSchema(schema: unknown, at = "schema"): asserts schema is JsonS
   if (schema.properties !== undefined && !object(schema.properties)) fail("INVALID_SCHEMA", `${at}.properties must be an object`);
 }
 
-const AGENT_OPTION_KEYS = new Set(["model", "thinking", "tools", "role", "outputSchema", "retries", "timeoutMs", "isolation"]);
+const AGENT_OPTION_KEYS = new Set(["label", "model", "thinking", "tools", "role", "outputSchema", "retries", "timeoutMs", "isolation"]);
 function validateAgentOption(key: string, value: unknown): void {
   switch (key) {
+    case "label":
+      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent label must be a non-empty string");
+      break;
     case "model":
       if (typeof value !== "string") fail("INVALID_METADATA", "agent model must be a string");
       parseModelReference(value);
@@ -731,7 +748,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${namespace}.${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, agent: context.agent, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, agent: context.agent, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${namespace}.${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);
@@ -1244,7 +1261,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         const opts = validateAgentOptions(values[1]);
         const identity = readAgentIdentity(values[2]);
         const path = agentIdentityPath(identity);
-        const label = typeof opts.role === "string" ? opts.role : "agent";
+        const label = typeof opts.label === "string" ? opts.label : typeof opts.role === "string" ? opts.role : "agent";
         try {
           const result = await bridge.agent(values[0], opts, controller.signal, identity);
           value = branded({ name: label, ok: true, value: result ?? null });
@@ -1435,7 +1452,7 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = agentBreadcrumb(agent, byId);
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
-    const policy = [`model=${model}`, `tools=${agent.tools.join(",") || "(none)"}`, `role=${agent.role ?? "custom"}`];
+    const policy = [`model=${model}`, `tools=${agent.tools.join(",") || "(none)"}`, agent.role ? `role=${agent.role}` : ""];
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
     const parts = [`${icon} ${breadcrumb}`, agent.state, ...policy, tokens].filter(Boolean);
     lines.push(parts.join(" · "));
@@ -1640,6 +1657,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         functionAgentOccurrences.set(key, occurrence);
         return bridge.agent(args[0], options, signal, { structuralPath: [...structuralPath], callSite: `function:${path}`, occurrence, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
       },
+      prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
       pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
       withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences),
@@ -1878,9 +1896,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const role = typeof options.role === "string" ? options.role : undefined;
         const model = typeof options.model === "string" ? options.model : undefined;
         const thinking = parseThinking(options.thinking);
-        const tools = run.executor.resolve({ label: role ?? "agent", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) }).tools;
+        const resolved = run.executor.resolve({ label: typeof options.label === "string" ? options.label : role ?? "agent", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
+        const label = typeof options.label === "string" ? options.label : role ?? resolved.model.model;
+        const tools = resolved.tools;
         const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label: role ?? "agent", cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
@@ -1998,9 +2018,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const role = typeof options.role === "string" ? options.role : undefined;
           const model = typeof options.model === "string" ? options.model : undefined;
           const thinking = parseThinking(options.thinking);
-          const tools = executor.resolve({ label: role ?? "agent", workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) }).tools;
+          const resolved = executor.resolve({ label: typeof options.label === "string" ? options.label : role ?? "agent", workflowName: checked.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}) });
+          const label = typeof options.label === "string" ? options.label : role ?? resolved.model.model;
+          const tools = resolved.tools;
           const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-          const spawned = scheduler.spawn(runId, prompt, { label: role ?? "agent", cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
+          const spawned = scheduler.spawn(runId, prompt, { label, cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" && Number.isInteger(options.retries) && options.retries >= 0 ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}) });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });

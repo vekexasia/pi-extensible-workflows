@@ -12,5 +12,5 @@
     "noEmitOnError": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", ".pi/extensions/**/*.ts"]
 }

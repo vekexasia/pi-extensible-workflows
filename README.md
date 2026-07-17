@@ -147,11 +147,14 @@ Rendered prompts use the existing 10 MB worker RPC boundary; there is no separat
 
 ```js
 const text = await agent("Review the implementation", {
+  label: "Implementation review",
   model: "openai-codex/gpt-5.6-sol:high",
   role: "reviewer",
   tools: ["read", "grep", "find", "ls"],
 });
 ```
+
+`label` is an optional non-empty display name persisted in workflow runs and used in TUI names and breadcrumbs. If omitted, agents use their role name, or the effective model name for role-less agents.
 
 Role files may add an optional single-line `description` (1-1024 characters):
 
@@ -259,8 +262,8 @@ registerWorkflowExtension({
       description: "Review the current repository",
       input: { type: "object", properties: { focus: { type: "string" } }, required: ["focus"], additionalProperties: false },
       output: { type: "string" },
-      async run(input, { run, agent }) {
-        return agent(`Review ${run.cwd}, focusing on ${input.focus}`);
+      async run(input, { run, agent, prompt }) {
+        return agent(prompt("Review {cwd}, focusing on {focus}", { cwd: run.cwd, focus: input.focus }));
       },
     },
   },
@@ -288,7 +291,7 @@ return { branch: DEFAULT_BRANCH, review };
 ```
 
 Registered workflow names are qualified, for example `{ "workflow": "git.releaseCheck" }`; calling `releaseCheck` without its namespace fails. Registration requires a JavaScript-safe namespace, semantic version, descriptions, valid one-object function schemas, valid variable schemas, and local workflow keys without dots. Global names cannot collide with built-in or sandbox-denied names or another extension.
-Whenever it is available, `workflow_catalog` returns deterministic, flat metadata for registered functions, variables, and workflows. It never exposes implementations, resolvers, resolved values, or workflow source. Call it once before creating the first workflow for a task. Function calls validate input/output, replay completed journal entries, and expose only the public orchestration functions. Variables resolve in parallel before a run is persisted and are recomputed on cold resume.
+Whenever it is available, `workflow_catalog` returns deterministic, flat metadata for registered functions, variables, and workflows. It never exposes implementations, resolvers, resolved values, or workflow source. Call it once before creating the first workflow for a task. Function calls validate input/output, replay completed journal entries, and receive `agent`, `prompt`, `parallel`, `pipeline`, `withWorktree`, `checkpoint`, `phase`, `log`, and `run` through their context. Variables resolve in parallel before a run is persisted and are recomputed on cold resume.
 
 ## Lifecycle and recovery
 
