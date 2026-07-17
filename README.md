@@ -6,6 +6,8 @@ Turn multi-agent tasks into deterministic jobs that fan out in parallel, pause f
 
 [Documentation](https://vekexasia.github.io/pi-extensible-workflows/) | [Developer guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html) | [Agent guide](https://vekexasia.github.io/pi-extensible-workflows/agents.html)
 
+Requires Node.js 22.19 or newer. This is a trusted Pi extension with the same filesystem and process access as Pi.
+
 ## Install
 
 ```sh
@@ -36,17 +38,6 @@ Use `parallel()` and `pipeline()` for deterministic fan-out, `withWorktree()` fo
 - [Agent patterns and model selection](https://vekexasia.github.io/pi-extensible-workflows/agents.html#patterns)
 - [Checkpoints](https://vekexasia.github.io/pi-extensible-workflows/agents.html#checkpoints)
 
-### Reusable extension example
-
-Loaded workflow extensions can expose reusable functions. With the review-loop extension loaded:
-
-```json
-{
-  "name": "review-loop",
-  "script": "return developUntilApproved({ task: args.task });",
-  "args": { "task": "Implement the requested change" }
-}
-```
 
 ## CLI
 
