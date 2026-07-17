@@ -1,32 +1,22 @@
 # pi-extensible-workflows
 
-Deterministic, resumable multi-agent workflow orchestration for Pi.
+![pi-extensible-workflows workflow banner](https://raw.githubusercontent.com/vekexasia/pi-extensible-workflows/main/assets/pi-extensible-workflows-banner.png)
+
+Turn multi-agent tasks into deterministic jobs that fan out in parallel, pause for approval, and resume without rerunning completed work.
 
 [Documentation](https://vekexasia.github.io/pi-extensible-workflows/) | [Developer guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html) | [Agent guide](https://vekexasia.github.io/pi-extensible-workflows/agents.html)
 
-Requires Node.js 22.19 or newer. This is a trusted Pi extension with the same filesystem and process access as Pi.
-
 ## Install
 
-From Git:
-
 ```sh
-pi install git:git@github.com:vekexasia/pi-extensible-workflows.git
+pi install npm:pi-extensible-workflows
 ```
 
-From a local checkout:
-
-```sh
-npm ci
-npm run check
-pi install /absolute/path/to/pi-extensible-workflows
-```
-
-See the [installation guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html#installation) for trust requirements and local development options.
+For source installs and local development, see the [installation guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html#installation).
 
 ## Quick start
 
-The package registers the `workflow` and `workflow_respond` tools plus the `/workflow` command.
+The package registers the `workflow` and `workflow_respond` tools plus the `/workflow` command. Run this first workflow with the `workflow` tool:
 
 ```json
 {
@@ -45,6 +35,18 @@ Use `parallel()` and `pipeline()` for deterministic fan-out, `withWorktree()` fo
 - [Run inspection and recovery](https://vekexasia.github.io/pi-extensible-workflows/developers.html#operations)
 - [Agent patterns and model selection](https://vekexasia.github.io/pi-extensible-workflows/agents.html#patterns)
 - [Checkpoints](https://vekexasia.github.io/pi-extensible-workflows/agents.html#checkpoints)
+
+### Reusable extension example
+
+Loaded workflow extensions can expose reusable functions. With the review-loop extension loaded:
+
+```json
+{
+  "name": "review-loop",
+  "script": "return developUntilApproved({ task: args.task });",
+  "args": { "task": "Implement the requested change" }
+}
+```
 
 ## CLI
 

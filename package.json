@@ -6,7 +6,12 @@
   "repository": { "type": "git", "url": "git+https://github.com/vekexasia/pi-extensible-workflows.git" },
   "type": "module",
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi",
+    "workflow",
+    "multi-agent",
+    "orchestration",
+    "automation"
   ],
   "exports": "./dist/src/index.js",
   "bin": {
