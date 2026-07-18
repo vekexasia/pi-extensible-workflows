@@ -5,7 +5,7 @@ import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, S
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { AgentIdentity, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
-import { parseModelReference, resolveModelReference, WorkflowError } from "./index.js";
+import { resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
@@ -206,7 +206,6 @@ export class WorkflowAgentExecutor {
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options.budget?.beforeAttempt();
-      const started = Date.now();
       let accepted = false;
       let schemaResult: JsonValue | undefined;
       let session: NativeSession | undefined;
