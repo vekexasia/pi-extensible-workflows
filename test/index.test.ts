@@ -246,9 +246,22 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   const settled = { ...run, agents: [{ ...agent, state: "completed" as const, activity: { kind: "text" as const, text: "stale output" } }] } as Parameters<typeof formatWorkflowProgress>[0];
   assert.doesNotMatch(formatWorkflowProgress(settled), /stale output|◇ read/);
 });
-void test("workflow progress shows extension-function agent breadcrumbs", () => {
-  const run = { id: "run", workflowName: "review", cwd: "/repo", sessionId: "session", state: "running", agents: [{ id: "run:1", name: "agent-label", parentBreadcrumb: "git.reviewRepository", path: "run:1", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
-  assert.match(formatWorkflowProgress(run), /git\.reviewRepository > agent-label/);
+void test("workflow cards group structural scopes with stable creation order", () => {
+  const run = { id: "run", workflowName: "grouped", cwd: "/repo", sessionId: "session", state: "running", agents: [
+    { id: "run:1", name: "developer", path: "run:1", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "developer", path: "run:2", state: "running", structuralPath: ["issues", "issue-66"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:3", name: "reviewer", path: "run:3", state: "running", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:4", name: "child", path: "run:4", state: "running", parentId: "run:3", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const progress = formatWorkflowProgress(run);
+  const dashboard = formatNavigatorDashboard(run, [], [{ owner: "worktree/named/issue-65", branch: "hidden", path: "/hidden", cwd: "/hidden", base: "base" }]);
+  assert.match(progress, /issues > issue-65 > reviewLoop\.developUntilApproved/);
+  assert.match(dashboard, /issues > issue-65 > reviewLoop\.developUntilApproved/);
+  assert.doesNotMatch(dashboard, /worktree\/named|hidden|\/hidden/);
+  assert.ok(progress.indexOf("#1") < progress.indexOf("#3"));
+  assert.ok(progress.indexOf("#3") < progress.indexOf("#4"));
+  assert.ok(progress.indexOf("#3") < progress.indexOf("#2"));
+  assert.match(progress, /#4 ◇ child/);
 });
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
@@ -262,12 +275,13 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   await same.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
   const other = new RunStore(cwd, "session-b", "run-b", home);
   await other.create({ id: "run-b", workflowName: "other", cwd, sessionId: "session-b", state: "completed", agents: [], nativeSessions: [] }, snapshot);
-  const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "reviewer", branch: "pi-extensible-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
+  const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "worktree/named/reviewer", branch: "pi-extensible-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
   assert.match(rendered, /Phase: review/);
-  assert.match(rendered, /parent=root model=openai\/gpt:medium role=reviewer tools=read attempts=2 retries=1/);
+  assert.match(rendered, /reviewer state=failed model=openai\/gpt:medium role=reviewer tools=read attempts=2 retries=1/);
   assert.match(rendered, /error=AGENT_FAILED: boom/);
-  assert.match(rendered, /branch=pi-extensible-workflows\/run-a\/tree path=\/worktree/);
-  assert.match(rendered, /native-a: \/pi\/native-a\.jsonl/);
+  assert.match(rendered, /Worktrees: 1/);
+  assert.match(rendered, /Native Pi transcripts: 1/);
+  assert.doesNotMatch(rendered, /worktree\/named|branch=|native-a: \/pi\/native-a|\/worktree/);
 
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   const prompts: string[] = [];
@@ -277,7 +291,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] };
   workflowExtension(pi as never, home, async (value) => { copied.push(value); });
   let selectCall = 0;
-  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options.find((option) => option.includes("completed")); if (selectCall === 2) return "Transcript paths"; if (selectCall === 3) return "/pi/native-a.jsonl"; return "Close"; }, confirm: async () => deleteConfirmed } };
+  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options.find((option) => option.includes("completed")); if (selectCall === 2) return "Agents..."; if (selectCall === 3) return options.find((option) => option.includes("#1")); if (selectCall === 4) return "Back"; return "Close"; }, confirm: async () => deleteConfirmed } };
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
@@ -287,10 +301,9 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   assert.match(runList, /Close/);
   const dashActions = selections[1]?.join("\n") ?? "";
   assert.match(dashActions, /Delete|Stop|Approve|Reject/);
-  assert.match(dashActions, /Transcript paths/);
-  assert.doesNotMatch(dashActions, /View script/);
-  assert.doesNotMatch(dashActions, /Copy run path|Copy run ID|Copy branch|Copy worktree path/);
-  assert.ok(selections.some((options) => options.includes("/pi/native-a.jsonl")));
+  assert.match(dashActions, /Agents\.\.\./);
+  assert.doesNotMatch(dashActions, /Transcript paths|View transcript|Copy run path|Copy run ID|Copy branch|Copy worktree path/);
+  assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other|\/pi\/native-a/);
   assert.deepEqual(copied, []);
   assert.doesNotMatch(`${prompts.join("\n")}\n${selections.flat().join("\n")}`, /other/);
   await command("delete run-a", ctx as never);
@@ -299,8 +312,8 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   await command("delete run-a", ctx as never);
   assert.equal(existsSync(store.directory), false);
 });
-void test("TUI navigator copies full run artifacts and stays open on clipboard failure", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-copy-artifacts-"));
+void test("TUI navigator exposes agent-scoped transcript and worktree actions", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-actions-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-q", repo]);
@@ -309,23 +322,20 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
   writeFileSync(join(repo, "tracked.txt"), "tracked\n");
   execFileSync("git", ["-C", repo, "add", "."]);
   execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
-  const runId = `run-${"x".repeat(80)}`;
-  const transcriptA = join(home, `transcript-${"a".repeat(80)}.jsonl`);
-  const transcriptB = join(home, `transcript-${"b".repeat(80)}.jsonl`);
+  const runId = `run-${"x".repeat(40)}`;
+  const transcriptA = join(home, "transcript-a.jsonl");
+  const transcriptB = join(home, "transcript-b.jsonl");
   const store = new RunStore(repo, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'copy',description:'copy'}", args: null, metadata: { name: "copy", description: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
-  await store.create({
-    id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "native-a", sessionFile: transcriptA, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [{ sessionId: "native-a", sessionFile: transcriptA }, { sessionId: "native-b", sessionFile: transcriptB }],
-  }, snapshot);
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  await store.create({ id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", worktreeOwner: "copy-owner", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 1, sessionId: "native-a", sessionFile: transcriptA, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }, { attempt: 2, sessionId: "native-b", sessionFile: transcriptB, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
   const worktree = await store.worktree("copy-owner");
   const copied: string[] = [];
   const notifications: Array<{ message: string; type: string | undefined }> = [];
   const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
   const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] };
-  workflowExtension(pi as never, home, async (value) => { if (value === worktree.branch) throw new Error("clipboard unavailable"); copied.push(value); });
-  const dashboardChoices = ["Copy run path", "Copy run ID", "Transcript paths", "Transcript paths", `Copy branch (${worktree.owner})`, `Copy worktree path (${worktree.owner})`, "Close"];
-  let transcriptChoice = 0;
+  workflowExtension(pi as never, home, async (value) => { copied.push(value); });
   let customCalls = 0;
+  let detailActions = 0;
   const ctx = {
     cwd: repo, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
     ui: {
@@ -333,32 +343,31 @@ void test("TUI navigator copies full run artifacts and stays open on clipboard f
       confirm: async () => false,
       select: async (prompt: string, options: string[]) => {
         if (prompt === "Workflows\n") return options.find((option) => option.includes("copy")) ?? "Close";
-        assert.equal(prompt, "Native Pi transcript paths");
-        const value = transcriptChoice++ === 0 ? transcriptA : transcriptB;
-        assert.ok(options.includes(value));
-        return value;
+        if (prompt === "Agents") return options.find((option) => option.includes("#1")) ?? "Back";
+        if (prompt === "Transcript attempts") return "Attempt 2";
+        if (prompt.includes("issue-65")) { const action = ["Copy branch", "Copy worktree path", "Copy transcript path", "Copy agent ID", "Back"][detailActions] ?? "Back"; detailActions += 1; return options.includes(action) ? action : "Back"; }
+        return "Back";
       },
       custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; dispose?(): void }) => {
         customCalls += 1;
         const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: () => false }, () => {});
-        const rendered = component.render(40).join("\n");
-        assert.equal(rendered.includes(worktree.branch), false);
-        assert.equal(rendered.includes(worktree.path), false);
+        const rendered = component.render(80).join("\n");
+        assert.match(rendered, /Agents\.\.\./);
+        assert.doesNotMatch(rendered, /copy-owner|Copy branch|Copy worktree path/);
         component.dispose?.();
-        return dashboardChoices[customCalls - 1] ?? "Close";
+        return ["Copy run path", "Copy run ID", "Agents...", "Close"][customCalls - 1] ?? "Close";
       },
     },
   };
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
-  assert.deepEqual(copied, [store.directory, runId, transcriptA, transcriptB, worktree.path]);
-  assert.ok(notifications.some(({ message, type }) => message === "Copied run path." && type === "info"));
-  assert.ok(notifications.some(({ message, type }) => message === "Copied run ID." && type === "info"));
-  assert.ok(notifications.some(({ message, type }) => message === "Copied transcript path." && type === "info"));
-  assert.ok(notifications.some(({ message, type }) => message === "Copied worktree path." && type === "info"));
-  assert.ok(notifications.some(({ message, type }) => message === "Failed to copy branch: clipboard unavailable" && type === "error"));
-  assert.equal(customCalls, dashboardChoices.length);
+  assert.deepEqual(copied, [store.directory, runId, worktree.branch, worktree.path, transcriptB, "agent"]);
+  assert.ok(notifications.some(({ message }) => message === "Copied branch."));
+  assert.ok(notifications.some(({ message }) => message === "Copied worktree path."));
+  assert.ok(notifications.some(({ message }) => message === "Copied transcript path."));
+  assert.ok(notifications.some(({ message }) => message === "Copied agent ID."));
+  assert.equal(customCalls, 4);
   await store.delete(true);
 });
 
