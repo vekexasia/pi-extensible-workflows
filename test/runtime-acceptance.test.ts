@@ -9,6 +9,7 @@ import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavi
 import { createNativeAgentSession } from "../src/agent-execution.js";
 import { listRunIds, RunStore } from "../src/persistence.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
+function sessionStats(cost = 0.25) { return { tokens: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, total: 14 }, cost }; }
 let acceptanceFunctionCalls = 0;
 let acceptanceVariableCalls = 0;
 let variableSiblingAborted = false;
@@ -105,7 +106,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
     return {
       sessionId,
       sessionFile: `/sessions/${sessionId}.jsonl`,
-      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats,
       prompt: async () => {
         if (input.sessionLabel.includes(":nested-role:attempt-1")) throw new Error("retry nested role");
         if (input.sessionLabel.endsWith(":root-model:attempt-1")) {
@@ -292,7 +293,7 @@ void test("production Pi seam installs child tools and registers native steering
   session.dispose();
   let steer: ((message: string) => void | Promise<void>) | undefined;
   const received: string[] = [];
-  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => ({ sessionId: "s", sessionFile: "/s", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }], prompt: async () => {}, steer: async (message) => { received.push(message); }, dispose() {} }));
+  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => ({ sessionId: "s", sessionFile: "/s", messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }], getSessionStats: sessionStats, prompt: async () => {}, steer: async (message) => { received.push(message); }, dispose() {} }));
   await executor.execute("work", { label: "worker", workflowName: "flow" }, undefined, [], (handler) => { steer = handler; });
   assert.ok(steer); await steer("redirect"); assert.deepEqual(received, ["redirect"]);
 });
@@ -322,7 +323,7 @@ void test("concurrency-1 cancellation and nested containment retain accounting a
 
   let attempt = 0;
   let cleaned = 0;
-  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => { const current = ++attempt; return { sessionId: `s${String(current)}`, sessionFile: `/s${String(current)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } } }], prompt: async () => { if (current === 1) throw new Error("retry"); }, dispose() {} }; });
+  const executor = new WorkflowAgentExecutor({ cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: new Set() }, async () => { const current = ++attempt; return { sessionId: `s${String(current)}`, sessionFile: `/s${String(current)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }], usage: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.5 } } }], getSessionStats: () => sessionStats(0.5), prompt: async () => { if (current === 1) throw new Error("retry"); }, dispose() {} }; });
   const retried = await executor.execute("retry", { label: "retry", workflowName: "flow", retries: 1, timeoutMs: 100 }, undefined, [], undefined, () => { cleaned += 1; });
   assert.equal(cleaned, 1); assert.equal(retried.attempts.length, 2); assert.deepEqual(retried.attempts.map(({ accounting }) => accounting.cost), [0.5, 0.5]);
 });
@@ -413,7 +414,7 @@ void test("setup hooks conditionally install an inline Pi extension for one agen
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     inputs.push(input);
     for (const factory of input.extensionFactories ?? []) await (typeof factory === "function" ? factory({ registerTool(tool: { name: string }) { installed.push(tool.name); } } as never) : factory.factory({ registerTool(tool: { name: string }) { installed.push(tool.name); } } as never));
-    return { sessionId: `setup-${String(inputs.length)}`, sessionFile: `/sessions/setup-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+    return { sessionId: `setup-${String(inputs.length)}`, sessionFile: `/sessions/setup-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats, prompt: async () => {}, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home, async () => {}, createSession);
@@ -432,7 +433,7 @@ void test("parent registry survives nested agent session lifecycle", async () =>
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let nestedLifecycleRan = false;
   const createSession = async (): Promise<NativeSession> => ({
-    sessionId: "nested", sessionFile: "/sessions/nested.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    sessionId: "nested", sessionFile: "/sessions/nested.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats,
     prompt: async () => {
       const nestedHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-nested-registry-"));
       let nestedStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -495,7 +496,7 @@ void test("shared worktree scopes persist one owner across production agents and
     const sessionId = `shared-worktree-${String(++nextSession)}`;
     inputs.push(input);
     return {
-      sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats,
       prompt: async () => {
         writeFileSync(join(input.cwd, `${sessionId}.txt`), sessionId);
         if (failFirst) { failFirst = false; throw new Error("retry once"); }
@@ -582,7 +583,7 @@ void test("workflow_catalog is excluded from child tools", async () => {
   let nextSession = 0;
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     inputs.push(input);
-    return { sessionId: `catalog-child-${String(++nextSession)}`, sessionFile: "/tmp/catalog-child.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+    return { sessionId: `catalog-child-${String(++nextSession)}`, sessionFile: "/tmp/catalog-child.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats, prompt: async () => {}, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details?: { value?: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog", "read"] } as never, home, async () => {}, createSession);

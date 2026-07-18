@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type InlineExtension, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { AgentIdentity, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
@@ -63,10 +63,12 @@ export interface AgentSetup { prompt: string; options: Record<string, JsonValue>
 export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal }
 export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
 export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }
+type NativeSessionStats = Pick<SessionStats, "tokens" | "cost">;
 export interface NativeSession {
   readonly sessionId: string;
   readonly sessionFile: string | undefined;
   readonly messages: readonly AgentMessage[];
+  getSessionStats(): NativeSessionStats;
   readonly systemPrompt?: string;
   readonly agent?: { state: { tools: readonly { name: string }[] } };
   subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
@@ -100,16 +102,8 @@ function latestAssistantHasToolCall(messages: readonly AgentMessage[]): boolean 
   return hasToolCall(message);
 }
 
-function accounting(messages: readonly AgentMessage[]): AgentAccounting {
-  const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-  for (const message of messages) if (message.role === "assistant" && message.usage) {
-    total.input += typeof message.usage.input === "number" && Number.isFinite(message.usage.input) ? message.usage.input : 0;
-    total.output += typeof message.usage.output === "number" && Number.isFinite(message.usage.output) ? message.usage.output : 0;
-    total.cacheRead += typeof message.usage.cacheRead === "number" && Number.isFinite(message.usage.cacheRead) ? message.usage.cacheRead : 0;
-    total.cacheWrite += typeof message.usage.cacheWrite === "number" && Number.isFinite(message.usage.cacheWrite) ? message.usage.cacheWrite : 0;
-    total.cost += typeof message.usage.cost.total === "number" && Number.isFinite(message.usage.cost.total) ? message.usage.cost.total : 0;
-  }
-  return total;
+function accounting(stats: NativeSessionStats): AgentAccounting {
+  return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 
 export async function createNativeAgentSession(input: SessionInput): Promise<NativeSession> {
@@ -238,7 +232,7 @@ export class WorkflowAgentExecutor {
       };
       const report = (persist: boolean) => {
         if (!session || !options.onProgress) return;
-        const update = { accounting: accounting(session.messages), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
+        const update = { accounting: accounting(session.getSessionStats()), toolCalls: [...toolCalls.values()], ...(activity ? { activity } : {}), persist };
         progress = progress.then(() => options.onProgress?.(update)).then(() => undefined);
       };
       try {
@@ -251,7 +245,8 @@ export class WorkflowAgentExecutor {
         const started = Date.now();
         session = await setup.createSession(setup.sessionInput);
         await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
-        unsubscribe = session.subscribe?.((event) => {
+        const activeSession = session;
+        unsubscribe = activeSession.subscribe?.((event) => {
           if (event.type === "agent_start" && session?.systemPrompt !== undefined && this.root.runStore) {
             systemPromptTurn += 1;
             const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
@@ -266,7 +261,7 @@ export class WorkflowAgentExecutor {
             if (event.message.role === "assistant") {
               const needsMoreWork = hasToolCall(event.message);
               const final = !needsMoreWork || (options.schema !== undefined && accepted);
-              if (!budgetError) { try { options.budget?.afterTurn(accounting(session?.messages ?? []), final); if (!final) { const instruction = options.budget?.instruction(); if (instruction) void session?.steer?.(instruction); } } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
+              if (!budgetError) { try { options.budget?.afterTurn(accounting(activeSession.getSessionStats()), final); if (!final) { const instruction = options.budget?.instruction(); if (instruction) void session?.steer?.(instruction); } } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
               turnStarted = false;
               report(true);
             }
@@ -285,13 +280,13 @@ export class WorkflowAgentExecutor {
         options.budget?.beforeTurn();
         turnStarted = true;
         await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
-        { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
+        { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
           accepted = true;
-          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           if (!hasSchemaResult()) {
-            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.messages); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
@@ -301,7 +296,7 @@ export class WorkflowAgentExecutor {
         await progress;
         await flushSystemPrompts();
         unsubscribe?.();
-        const attemptAccounting = accounting(session.messages);
+        const attemptAccounting = accounting(session.getSessionStats());
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
         session.dispose();
         return { value, attempts, cwd: setupSummary.cwd };
@@ -312,7 +307,7 @@ export class WorkflowAgentExecutor {
           await progress;
           try { await flushSystemPrompts(); } catch { /* Preserve the agent failure that prompted this cleanup. */ }
           unsubscribe?.();
-          const attemptAccounting = accounting(session.messages);
+          const attemptAccounting = accounting(session.getSessionStats());
           if (!budgetError && typed.code !== "BUDGET_EXHAUSTED") { try { options.budget?.afterTurn(attemptAccounting, true); } catch (budgetFailure) { budgetError ??= budgetFailure instanceof WorkflowError ? budgetFailure : new WorkflowError("BUDGET_EXHAUSTED", budgetFailure instanceof Error ? budgetFailure.message : String(budgetFailure)); } }
           attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length && setupSummary ? { setup: setupSummary } : {}) });
           session.dispose();
