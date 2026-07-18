@@ -199,7 +199,7 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   await store.snapshotWorktree("agent/path");
   assert.deepEqual(await store.changedWorktrees(), [first]);
   assert.equal(execFileSync("git", ["-C", first.path, "show", "HEAD:packages/app/agent.txt"], { encoding: "utf8" }), "post-creation");
-  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%cn|%ce|%aI|%cI|%s"], { encoding: "utf8" }).trim(), "pi-extensible-workflows|pi-extensible-workflows@localhost|pi-extensible-workflows|pi-extensible-workflows@localhost|2000-01-01T00:00:00+00:00|2000-01-01T00:00:00+00:00|pi-extensible-workflows runtime snapshot");
+  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%cn|%ce|%at|%ct|%s"], { encoding: "utf8" }).trim(), "pi-extensible-workflows|pi-extensible-workflows@localhost|pi-extensible-workflows|pi-extensible-workflows@localhost|946684800|946684800|pi-extensible-workflows runtime snapshot");
   assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
   await assert.rejects(store.delete(false), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   assert.equal(existsSync(first.path), true);
