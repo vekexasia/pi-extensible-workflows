@@ -179,6 +179,7 @@ export class RunStore {
     await mkdir(dirname(this.directory), { recursive: true, mode: 0o700 });
     await mkdir(temporary, { mode: 0o700 });
     try {
+      await writeFile(join(temporary, "workflow.js"), snapshot.script, { encoding: "utf8", mode: 0o600 });
       await atomicJson(join(temporary, "snapshot.json"), snapshot);
       await atomicJson(join(temporary, "journal.json"), { completed: {}, awaiting: {}, decisions: {} });
       await atomicJson(join(temporary, "ownership.json"), []);
