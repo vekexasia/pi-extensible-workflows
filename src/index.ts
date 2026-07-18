@@ -44,7 +44,7 @@ export interface WorkflowMetadata { name: string; description?: string }
 export interface WorkflowSettings { concurrency: number; modelAliases?: Readonly<Record<string, string>> }
 export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelSpec; tools: readonly string[]; cwd: string }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; setup?: AgentSetupSummary }
-export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; parentBreadcrumb?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
+export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: "warning"; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 2;
@@ -1142,7 +1142,7 @@ export interface AgentIdentity { structuralPath: readonly string[]; callSite: st
 export interface WorkflowBridge {
   agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
-  function?: (namespace: string, name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string) => Promise<JsonValue>;
+  function?: (namespace: string, name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath?: readonly string[]) => Promise<JsonValue>;
   functions?: Readonly<Record<string, { namespace: string; name: string }>>;
   variables?: Readonly<Record<string, JsonValue>>;
   phase?: (name: string) => void | Promise<void>;
@@ -1316,7 +1316,8 @@ const functionPath = (namespace, name) => {
 };
 const functions = Object.freeze(Object.fromEntries(Object.entries(config.functions || {}).map(([local, target]) => [local, (...values) => {
   if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("RESULT_INVALID", local + " requires exactly one JSON object argument");
-  const result = rpc("function", [target.namespace, target.name, values[0], functionPath(target.namespace, target.name), worktreeOwners.getStore() || null]).then(unwrap);
+  const inherited = inheritedAgentPath.getStore() || [];
+  const result = rpc("function", [target.namespace, target.name, values[0], functionPath(target.namespace, target.name), worktreeOwners.getStore() || null, inherited]).then(unwrap);
   Object.defineProperty(result, "toJSON", { value() { throw workError("INVALID_METADATA", "Workflow function result is a Promise; await it before serialization"); } });
   return result;
 }])));
@@ -1496,10 +1497,12 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         }
       } else if (method === "function") {
         const worktreeOwner = values[4] === undefined || values[4] === null ? undefined : typeof values[4] === "string" && values[4] ? values[4] : fail("INTERNAL_ERROR", "function worktree scope is invalid");
+        const structuralPath = values[5] === undefined ? [] : values[5];
+        if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim()))) fail("INTERNAL_ERROR", "function structural scope is invalid");
         if (!bridge.function || typeof values[0] !== "string" || typeof values[1] !== "string" || !object(values[2]) || typeof values[3] !== "string") fail("INTERNAL_ERROR", "function requires an available bridge, names, object input, and path");
         const name = values[0] + "." + values[1];
         try {
-          const result = await bridge.function(values[0], values[1], values[2], values[3], controller.signal, worktreeOwner);
+          const result = await bridge.function(values[0], values[1], values[2], values[3], controller.signal, worktreeOwner, structuralPath);
           value = branded({ name, ok: true, value: result ?? null });
         } catch (error) {
           const typed = asWorkflowError(error);
@@ -1558,20 +1561,47 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
 
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
 
+type AgentGroup = { label: string; entries: readonly { agent: AgentRecord; index: number; depth: number }[] };
+function agentGroupKey(agent: AgentRecord): string { return JSON.stringify(agent.structuralPath ?? []); }
+function agentGroupLabel(agents: readonly AgentRecord[]): string {
+  const structural = agents[0]?.structuralPath ?? [];
+  const breadcrumbs = [...new Set(agents.map((agent) => agent.parentBreadcrumb).filter((value): value is string => Boolean(value)))];
+  return [...(structural.length ? [structural.join(" > ")] : []), ...(breadcrumbs.length === 1 ? breadcrumbs : breadcrumbs.length ? [breadcrumbs.join(" | ")] : [])].join(" > ") || "Agents";
+}
+function agentGroups(agents: readonly AgentRecord[]): AgentGroup[] {
+  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+  const groups = new Map<string, { agents: Array<{ agent: AgentRecord; index: number; depth: number }> }>();
+  for (const [index, agent] of agents.entries()) {
+    let depth = 0;
+    for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
+    const key = agentGroupKey(agent);
+    const group = groups.get(key) ?? { agents: [] };
+    group.agents.push({ agent, index, depth });
+    groups.set(key, group);
+  }
+  return [...groups].map(([, group]) => ({ label: agentGroupLabel(group.agents.map(({ agent }) => agent)), entries: group.agents }));
+}
+function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => string): string[] {
+  const groups = agentGroups(agents);
+  const grouped = groups.length > 1 || groups.some(({ label }) => label !== "Agents");
+  return groups.flatMap((group) => [
+    ...(grouped ? [`  ${group.label}`] : []),
+    ...group.entries.map((entry) => render(entry, grouped)),
+  ]);
+}
 export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): string {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
   if (run.phase) lines.push(`  Phase: ${run.phase}`);
   lines.push(...formatBudgetStatus(run).map((line) => `  ${line}`));
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
-  for (const [index, agent] of run.agents.entries()) {
-    let depth = 0;
-    for (let parent = agent.parentId; parent && byId.has(parent); parent = byId.get(parent)?.parentId) depth += 1;
+  lines.push(...renderGroupedAgents(run.agents, ({ agent, index, depth }, grouped) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
-    const indent = "  ".repeat(depth + 1);
+    const indent = "  ".repeat((grouped ? 2 : 1) + depth);
     const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner);
-    lines.push(`${indent}#${String(index + 1)} ${icon} ${agent.parentBreadcrumb ? `${agent.parentBreadcrumb} > ` : ""}${agent.label ?? agent.name} [${agent.state}]${activity ? ` ${activity}` : ""}`);
-  }
+    const name = grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId);
+    return `${indent}#${String(index + 1)} ${icon} ${name} [${agent.state}]${activity ? ` ${activity}` : ""}`;
+  }));
   return lines.join("\n");
 }
 
@@ -1637,15 +1667,16 @@ function navigatorRunLabels(entries: readonly { store: RunStore; loaded: { run: 
 
 function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): string {
   const name = agent.label ?? agent.name;
-  const parts: string[] = [name];
+  const parts: string[] = agent.parentBreadcrumb ? [agent.parentBreadcrumb] : [];
   const seen = new Set<string>([agent.id]);
   for (let parentId = agent.parentId; parentId; parentId = byId.get(parentId)?.parentId) {
     if (seen.has(parentId)) break; // ponytail: cycle guard for corrupt data
     seen.add(parentId);
     const parent = byId.get(parentId);
-    if (parent) parts.unshift(parent.label ?? parent.name);
+    if (parent) parts.push(parent.label ?? parent.name);
     else break;
   }
+  parts.push(name);
   return parts.length > 1 ? parts.join(" > ") : name;
 }
 
@@ -1662,7 +1693,9 @@ function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): s
   return `${new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(total).toLowerCase()} tok`;
 }
 
+
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
+  void worktrees;
   const done = run.agents.filter((a) => SETTLED_AGENT_STATES.has(a.state)).length;
   const totalAccounting = run.agents.reduce((sum, a) => ({ input: sum.input + (a.accounting?.input ?? 0), output: sum.output + (a.accounting?.output ?? 0), cacheRead: sum.cacheRead + (a.accounting?.cacheRead ?? 0), cacheWrite: sum.cacheWrite + (a.accounting?.cacheWrite ?? 0), cost: sum.cost + (a.accounting?.cost ?? 0) }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
   const hasAccounting = run.agents.some((a) => a.accounting);
@@ -1674,35 +1707,30 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   if (run.events?.length) lines.push(...run.events.map((event) => `Warning: ${event.message}`));
   lines.push("");
   const byId = new Map(run.agents.map((a) => [a.id, a]));
-  const activeStates = new Set(["running", "waiting_for_child", "queued", "retrying", "paused"]);
-  const prioritised = [...run.agents].sort((a, b) => {
-    const aActive = activeStates.has(a.state) || a.state === "failed" ? 0 : 1;
-    const bActive = activeStates.has(b.state) || b.state === "failed" ? 0 : 1;
-    return aActive - bActive;
-  });
-  for (const agent of prioritised) {
+  const render = ({ agent, depth }: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
-    const breadcrumb = agentBreadcrumb(agent, byId);
+    const breadcrumb = grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId);
     const setup = agent.attemptDetails?.at(-1)?.setup;
     const thinking = setup?.model.thinking ?? agent.model.thinking;
     const model = `${setup?.model.provider ?? agent.model.provider}/${setup?.model.model ?? agent.model.model}${thinking ? `:${thinking}` : ""}`;
     const policy = [`model=${model}`, agent.requestedModel ? `requested=${agent.requestedModel}` : "", `tools=${(setup?.tools ?? agent.tools).join(",") || "(none)"}`, agent.role ? `role=${agent.role}` : ""];
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
-    const parts = [`${icon} ${breadcrumb}`, agent.state, ...policy, tokens].filter(Boolean);
-    lines.push(parts.join(" · "));
+    const indent = "  ".repeat((grouped ? 2 : 1) + depth);
+    const result = [`${indent}${icon} ${breadcrumb} · ${agent.state} · ${policy.filter(Boolean).join(" · ")}${tokens ? ` · ${tokens}` : ""}`];
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
-      if (last?.error) lines.push(`  error: ${last.error.code}: ${last.error.message}`);
+      if (last?.error) result.push(`${indent}  error: ${last.error.code}: ${last.error.message}`);
     }
     const activity = !SETTLED_AGENT_STATES.has(agent.state) ? formatAgentActivity(agent, "⠦") : "";
-    if (activity) lines.push(`  ${activity}`);
-  }
+    if (activity) result.push(`${indent}  ${activity}`);
+    return result.join("\n");
+  };
+  lines.push(...renderGroupedAgents(run.agents, render));
   if (checkpoints.length) { lines.push(""); for (const cp of checkpoints) lines.push(`● checkpoint ${cp.name}: ${cp.prompt}`); }
-  if (worktrees.length) { lines.push(""); for (const wt of worktrees) lines.push(`branch ${wt.branch} (${wt.path})`); }
   return lines.join("\n");
 }
 
-export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[]): string {
+export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }, checkpoints: readonly AwaitingCheckpoint[], _worktrees: readonly WorktreeReference[]): string {
   const { run, snapshot } = loaded;
   const lines = [
     `Workflow: ${run.workflowName}`,
@@ -1719,27 +1747,23 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   if (aliases && Object.keys(aliases).length) lines.push(`Model aliases: ${Object.entries(aliases).map(([name, target]) => `${name}=${target}`).join(", ")}`);
   lines.push("Agents / ownership:");
   if (!run.agents.length) lines.push("  (none)");
-  for (const agent of run.agents) {
+  const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
+  lines.push(...renderGroupedAgents(run.agents, ({ agent, index, depth }, grouped) => {
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
     const role = agent.role ? ` role=${agent.role}` : "";
     const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${String(agent.accounting.cost)}` : "";
-    lines.push(`  ${agent.label ?? agent.name} (${agent.id}) state=${agent.state} parent=${agent.parentId ?? "root"} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`);
-    for (const attempt of agent.attemptDetails ?? []) {
-      lines.push(`    attempt ${String(attempt.attempt)} transcript=${attempt.sessionFile}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
-      if (attempt.setup) lines.push(`    setup hooks=${attempt.setup.hookNames.join(",") || "(none)"} model=${attempt.setup.model.provider}/${attempt.setup.model.model}${attempt.setup.model.thinking ? `:${attempt.setup.model.thinking}` : ""} tools=${attempt.setup.tools.join(",") || "(none)"} cwd=${attempt.setup.cwd}`);
-    }
-    for (const call of agent.toolCalls ?? []) lines.push(`    tool ${call.name} state=${call.state}`);
-  }
+    const indent = "  ".repeat((grouped ? 2 : 1) + depth);
+    const result = [`${indent}#${String(index + 1)} ${grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId)} state=${agent.state} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`];
+    for (const attempt of agent.attemptDetails ?? []) result.push(`${indent}  attempt ${String(attempt.attempt)}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
+    for (const call of agent.toolCalls ?? []) result.push(`${indent}  tool ${call.name} state=${call.state}`);
+    return result.join("\n");
+  }));
   lines.push("Checkpoints:");
   if (!checkpoints.length) lines.push("  (none)");
   for (const checkpoint of checkpoints) lines.push(`  ${checkpoint.name}: ${checkpoint.prompt} context=${JSON.stringify(checkpoint.context)}`);
-  lines.push("Worktrees / branches:");
-  if (!worktrees.length) lines.push("  (none)");
-  for (const worktree of worktrees) lines.push(`  ${worktree.owner}: branch=${worktree.branch} path=${worktree.path} cwd=${worktree.cwd}`);
-  lines.push("Native Pi transcript paths:");
-  if (!run.nativeSessions.length) lines.push("  (none)");
-  for (const session of run.nativeSessions) lines.push(`  ${session.sessionId}: ${session.sessionFile}`);
+  lines.push(`Worktrees: ${String(_worktrees.length)}`);
+  lines.push(`Native Pi transcripts: ${String(run.nativeSessions.length)}`);
   return lines.join("\n");
 }
 function formatCheckpointReview(checkpoint: AwaitingCheckpoint): string {
@@ -1881,7 +1905,7 @@ function nextNamedOccurrence(counters: Map<string, number>, label: string): stri
 function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>, registry: WorkflowRegistryApi): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionWorktreeOccurrences = new Map<string, number>();
-  return { ...bridge, functions: registry.globals(), variables, function: async (namespace, name, input, path, signal, worktreeOwner) => {
+  return { ...bridge, functions: registry.globals(), variables, function: async (namespace, name, input, path, signal, worktreeOwner, structuralPath = []) => {
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
     const sideEffects: Promise<void>[] = [];
@@ -1891,11 +1915,11 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
         const options = validateAgentOptions(args[1] === undefined ? {} : args[1]);
         const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
-        const structuralPath = inheritedHostAgentPath.getStore() ?? [];
-        const key = `${path}\0${JSON.stringify(structuralPath)}`;
+        const inherited = inheritedHostAgentPath.getStore() ?? [];
+        const key = `${path}\0${JSON.stringify(inherited)}`;
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
         functionAgentOccurrences.set(key, occurrence);
-        return bridge.agent(args[0], options, signal, { structuralPath: [...structuralPath], callSite: `function:${path}`, occurrence, parentBreadcrumb: `${namespace}.${name}`, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
+        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: `${namespace}.${name}`, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
       },
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
@@ -1908,7 +1932,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
       log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
     };
-    const result = await registry.invokeFunction(namespace, name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } });
+    const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(namespace, name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
     await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
@@ -2023,7 +2047,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         let effective: { model: ModelSpec; requestedModel?: string; tools: readonly string[] };
         try { effective = run.executor.resolve(requested); }
         catch { effective = previous ? { model: previous.model, ...(previous.requestedModel ? { requestedModel: previous.requestedModel } : {}), tools: previous.tools } : { model: node.options.model ? modelSpec(node.options.model, run.model) : { ...run.model, ...(node.options.thinking ? { thinking: node.options.thinking } : {}) }, ...(node.options.model ? { requestedModel: node.options.model } : {}), tools: node.options.tools }; }
-        return { id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.role ? { role: node.options.role } : {}), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
+        return { id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.role ? { role: node.options.role } : {}), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}) };
       });
       return { ...current, agents };
     });
@@ -2627,6 +2651,38 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               ctx.ui.notify(`Failed to copy ${artifact}: ${error instanceof Error ? error.message : String(error)}`, "error");
             }
           };
+          const openTranscript = async (transcript: string): Promise<void> => {
+            try {
+              const entries = SessionManager.open(transcript).buildContextEntries();
+              if (ctx.mode !== "tui") { ctx.ui.notify(`Transcript: ${transcript}`, "info"); return; }
+              await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
+                let offset = 0;
+                let renderedLines: string[] = [];
+                const viewport = () => Math.max(1, (((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24) - 3);
+                const move = (delta: number) => { offset = Math.max(0, Math.min(Math.max(0, renderedLines.length - viewport()), offset + delta)); };
+                return {
+                  render(width: number) {
+                    renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
+                    offset = Math.min(offset, Math.max(0, renderedLines.length - viewport()));
+                    return [theme.fg("accent", "Native Pi transcript"), ...renderedLines.slice(offset, offset + viewport()), "", theme.fg("dim", "↑↓/pgup/pgdn scroll · esc close")];
+                  },
+                  invalidate() {},
+                  handleInput(data: string) {
+                    if (keybindings.matches(data, "tui.select.up")) move(-1);
+                    else if (keybindings.matches(data, "tui.select.down")) move(1);
+                    else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
+                    else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
+                    else if (keybindings.matches(data, "tui.editor.cursorLineStart")) offset = 0;
+                    else if (keybindings.matches(data, "tui.editor.cursorLineEnd")) offset = Math.max(0, renderedLines.length - viewport());
+                    else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
+                    tui.requestRender();
+                  },
+                };
+              }, { overlay: true });
+            } catch (error) {
+              ctx.ui.notify(`Cannot open transcript: ${error instanceof Error ? error.message : String(error)}`, "warning");
+            }
+          };
           const loadDashboard = async () => {
             const loaded = await store.load();
             const checkpoints = await store.awaitingCheckpoints();
@@ -2658,18 +2714,59 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
             else actions.set("View script", "view-script");
             const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
-            if (ctx.mode === "tui" && transcripts.length) actions.set("View transcript", "view-transcript");
-            if (transcripts.length) actions.set("Transcript paths", "transcripts");
+            if (loaded.run.agents.length) actions.set("Agents...", "agents");
+            if (!loaded.run.agents.length && ctx.mode === "tui" && transcripts.length) actions.set("View transcript", "view-transcript");
+            if (!loaded.run.agents.length && transcripts.length) actions.set("Transcript paths", "transcripts");
             if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
             if (ctx.mode === "tui") {
               addCopy("Copy run path", store.directory, "run path");
               addCopy("Copy run ID", store.runId, "run ID");
-              for (const worktree of worktrees) {
-                addCopy(`Copy branch (${worktree.owner})`, worktree.branch, "branch");
-                addCopy(`Copy worktree path (${worktree.owner})`, worktree.path, "worktree path");
+            }
+            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, transcripts, script: loaded.snapshot.script, agents: loaded.run.agents, worktrees };
+          };
+          const selectAgent = async (dashboard: Awaited<ReturnType<typeof loadDashboard>>): Promise<void> => {
+            const byId = new Map(dashboard.agents.map((agent) => [agent.id, agent]));
+            const title = (agent: AgentRecord): string => {
+              const parents: string[] = [];
+              for (let parentId = agent.parentId; parentId; parentId = byId.get(parentId)?.parentId) {
+                const parent = byId.get(parentId);
+                if (!parent) break;
+                parents.unshift(parent.label ?? parent.name);
+              }
+              return [...((agent.structuralPath ?? []).length ? [(agent.structuralPath ?? []).join(" > ")] : []), ...(agent.parentBreadcrumb ? [agent.parentBreadcrumb] : []), ...parents, agent.label ?? agent.name].join(" > ");
+            };
+            const labels = dashboard.agents.map((agent, index) => `#${String(index + 1)} ${title(agent)} [${agent.state}]`);
+            const selectedLabel = await ctx.ui.select("Agents", [...labels, "Back"]);
+            const selectedIndex = selectedLabel ? labels.indexOf(selectedLabel) : -1;
+            const selected = selectedIndex >= 0 ? dashboard.agents[selectedIndex] : undefined;
+            if (!selected) return;
+            const attempts = [...(selected.attemptDetails ?? [])].sort((left, right) => left.attempt - right.attempt);
+            const worktree = selected.worktreeOwner ? dashboard.worktrees.find((candidate) => candidate.owner === selected.worktreeOwner) : undefined;
+            const actions = [
+              ...(attempts.length ? ["View transcript", "Copy transcript path"] : []),
+              ...(worktree ? ["Copy branch", "Copy worktree path"] : []),
+              "Copy agent ID",
+              "Back",
+            ];
+            const chooseAttempt = async (): Promise<AgentAttemptSummary | undefined> => {
+              const choices = attempts.map((attempt) => `Attempt ${String(attempt.attempt)}`);
+              const choice = choices.length === 1 ? choices[0] : await ctx.ui.select("Transcript attempts", [...choices, "Back"]);
+              const index = choice ? choices.indexOf(choice) : -1;
+              return index >= 0 ? attempts[index] : undefined;
+            };
+            for (;;) {
+              const action = await ctx.ui.select(title(selected), actions);
+              if (!action || action === "Back") return;
+              if (action === "Copy agent ID") { await copyArtifact(selected.id, "agent ID"); continue; }
+              if (action === "Copy branch" && worktree) { await copyArtifact(worktree.branch, "branch"); continue; }
+              if (action === "Copy worktree path" && worktree) { await copyArtifact(worktree.path, "worktree path"); continue; }
+              if (action === "View transcript" || action === "Copy transcript path") {
+                const attempt = await chooseAttempt();
+                if (!attempt) continue;
+                if (action === "Copy transcript path") await copyArtifact(attempt.sessionFile, "transcript path");
+                else await openTranscript(attempt.sessionFile);
               }
             }
-            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, transcripts, script: loaded.snapshot.script };
           };
           for (;;) {
             let view = await loadDashboard();
@@ -2773,6 +2870,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 }, { overlay: true })
               : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Close"]);
             if (!actionChoice || actionChoice === "Close") return;
+            if (actionChoice === "Agents...") { await selectAgent(view); continue; }
             if (actionChoice === "Refresh") continue;
             if (actionChoice === "View script") {
               await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
@@ -2811,47 +2909,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             }
             if (actionChoice === "View transcript") {
               const transcript = await ctx.ui.select("Native Pi transcripts", [...view.transcripts, "Back"]);
-              if (transcript && transcript !== "Back") {
-                try {
-                  const entries = SessionManager.open(transcript).buildContextEntries();
-                  await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
-                    let offset: number | undefined;
-                    let renderedLines: string[] = [];
-                    const terminalRows = () => Math.max(1, ((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24);
-                    const viewport = () => Math.max(1, terminalRows() - 3);
-                    const move = (delta: number) => {
-                      const maxOffset = Math.max(0, renderedLines.length - viewport());
-                      offset = Math.max(0, Math.min(maxOffset, (offset ?? maxOffset) + delta));
-                    };
-                    return {
-                      render(width: number) {
-                        renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
-                        const maxOffset = Math.max(0, renderedLines.length - viewport());
-                        offset = Math.min(offset ?? maxOffset, maxOffset);
-                        return [
-                          theme.fg("accent", "Native Pi transcript"),
-                          ...renderedLines.slice(offset, offset + viewport()),
-                          "",
-                          theme.fg("dim", "↑↓/pgup/pgdn scroll · Home/End jump · esc close"),
-                        ];
-                      },
-                      invalidate() {},
-                      handleInput(data: string) {
-                        if (keybindings.matches(data, "tui.select.up")) move(-1);
-                        else if (keybindings.matches(data, "tui.select.down")) move(1);
-                        else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
-                        else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
-                        else if (keybindings.matches(data, "tui.editor.cursorLineStart")) offset = 0;
-                        else if (keybindings.matches(data, "tui.editor.cursorLineEnd")) offset = Math.max(0, renderedLines.length - viewport());
-                        else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
-                        tui.requestRender();
-                      },
-                    };
-                  }, { overlay: true });
-                } catch (error) {
-                  ctx.ui.notify(`Cannot open transcript ${transcript}: ${error instanceof Error ? error.message : String(error)}`, "warning");
-                }
-              }
+              if (transcript && transcript !== "Back") await openTranscript(transcript);
               continue;
             }
             if (actionChoice === "Transcript paths") {

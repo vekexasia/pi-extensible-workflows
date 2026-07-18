@@ -385,6 +385,35 @@ void test("terminal failed attempts remain persisted", async () => {
   assert.deepEqual(persisted.nativeSessions, [{ sessionId: "failed-session", sessionFile: "/sessions/failed.jsonl" }]);
 });
 
+void test("registered extension agents persist structural scope for late siblings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-issue69-identity-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId?: string; value?: unknown } }> }> = [];
+  let nextSession = 0;
+  const createSession = async (): Promise<NativeSession> => ({
+    sessionId: `issue69-${String(++nextSession)}`,
+    sessionFile: `/sessions/${String(nextSession)}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    prompt: async () => {},
+    steer: async () => {},
+    dispose() {},
+  });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  registerWorkflowExtension({ namespace: "issue69Identity", version: "1.0.0", headline: "Identity", description: "Identity acceptance", functions: { review: { description: "Review", input: { type: "object" }, output: { type: "string" }, run: (_input, context) => context.agent("developer", { label: "developer" }) } } });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "issue69", script: `return parallel("issues", { "issue-65": async () => { const first = await review({}); await Promise.resolve(); const second = await review({}); return [first, second]; }, "issue-66": () => review({}) });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const run = new RunStore(home, "session", result.details.runId ?? "", home);
+  const loaded = await run.load();
+  const issue65 = loaded.run.agents.filter((agent) => JSON.stringify(agent.structuralPath) === JSON.stringify(["issues", "issue-65"]));
+  const issue66 = loaded.run.agents.filter((agent) => JSON.stringify(agent.structuralPath) === JSON.stringify(["issues", "issue-66"]));
+  assert.equal(issue65.length, 2);
+  assert.equal(issue66.length, 1);
+  assert.ok(loaded.run.agents.every((agent) => agent.parentBreadcrumb === "issue69Identity.review"));
+  assert.ok(loaded.run.agents.every((agent) => !agent.worktreeOwner));
+  const rendered = formatNavigatorDashboard(loaded.run, [], []);
+  assert.match(rendered, /issues > issue-65 > issue69Identity\.review/);
+  assert.match(rendered, /issues > issue-66 > issue69Identity\.review/);
+});
 void test("production workflow exposes registered global functions and replays them structurally", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-global-acceptance-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId: string; value: unknown } }> }> = [];
@@ -537,7 +566,8 @@ void test("shared worktree scopes persist one owner across production agents and
   assert.equal(sharedCwds.size, 1);
   assert.equal(inputs.at(-1)?.cwd, cwd);
   const detail = formatNavigatorRun(loaded, [], worktrees);
-  assert.equal((detail.match(/branch=/g) ?? []).length, 1);
+  assert.match(detail, /Worktrees: 1/);
+  assert.doesNotMatch(detail, /branch=|worktree\/named|\/worktree/);
   for (let attempt = 0; attempt < 100 && !messages.length; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   const branch = worktrees[0]?.branch;
   const completion = messages.find((message) => message.includes("Changes:"));

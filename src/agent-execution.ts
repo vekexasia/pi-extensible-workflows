@@ -516,11 +516,12 @@ export class FairAgentScheduler {
 
   #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
-    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}) });
+    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(options.agentIdentity ? { agentIdentity: Object.freeze({ ...options.agentIdentity, structuralPath: Object.freeze([...options.agentIdentity.structuralPath]) }) } : {}) });
     if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const forbidden = options.tools.find((tool) => !parent.options.tools.includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
-    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
+    const identity = options.agentIdentity ?? parent.options.agentIdentity;
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...options.tools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(parent.options.parentBreadcrumb && !options.parentBreadcrumb ? { parentBreadcrumb: parent.options.parentBreadcrumb } : {}), ...(identity ? { agentIdentity: Object.freeze({ ...identity, structuralPath: Object.freeze([...identity.structuralPath]) }) } : {}), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
   }
   /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument, @typescript-eslint/restrict-template-expressions */
 
