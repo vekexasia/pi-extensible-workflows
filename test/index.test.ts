@@ -1268,7 +1268,7 @@ void test("production role policy rejects overrides before persistence and prese
   const inputs: SessionInput[] = [];
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     inputs.push(input);
-    return { sessionId: `session-${String(inputs.length)}`, sessionFile: `/sessions/${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+    return { sessionId: `session-${String(inputs.length)}`, sessionFile: `/sessions/${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "agent", "workflow"] } as never, home, async () => {}, createSession);
@@ -2082,6 +2082,16 @@ function budgetSession(responses: readonly BudgetResponse[], steered: string[] =
     sessionId: `budget-session-${String(Math.random())}`,
     sessionFile: "/sessions/budget.jsonl",
     messages,
+    getSessionStats() {
+      const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+      let cost = 0;
+      for (const message of messages) {
+        const usage = message.usage;
+        if (!usage) continue;
+        tokens.input += usage.input; tokens.output += usage.output; tokens.cacheRead += usage.cacheRead; tokens.cacheWrite += usage.cacheWrite; cost += usage.cost.total;
+      }
+      return { tokens: { ...tokens, total: tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite }, cost };
+    },
     subscribe(candidate) { listener = candidate; return () => { listener = undefined; }; },
     async prompt() {
       while (responseIndex < responses.length && !aborted.value) {
