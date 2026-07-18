@@ -94,6 +94,34 @@ void test("stores exact cwd and Pi session snapshots atomically and rejects cros
   assert.notEqual(projectStorageKey(join(home, "a", "same-name")), projectStorageKey(join(home, "b", "same-name")));
   assert.deepEqual(readFileSync(join(store.directory, "state.json"), "utf8").trim().startsWith("{"), true);
 });
+void test("persists exact multiline Unicode workflow source without rewriting it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-source-"));
+  const cwd = join(home, "project");
+  const script = "const message = 'café 日本語 👩‍💻';\r\n\nreturn message;\r\n";
+  const launch = createLaunchSnapshot({ ...snapshot, script });
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), launch);
+  const workflowPath = join(store.directory, "workflow.js");
+  assert.equal(readFileSync(workflowPath, "utf8"), script);
+  await store.updateState((current) => ({ ...current, phase: "paused" }));
+  await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
+  assert.equal(readFileSync(workflowPath, "utf8"), script);
+});
+void test("loads and resumes legacy runs without workflow.js", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-legacy-run-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ ...run(cwd), state: "interrupted" }, snapshot);
+  rmSync(join(store.directory, "workflow.js"));
+  assert.equal(await store.isComplete(), true);
+  const loaded = await new RunStore(cwd, "session-a", "run-a", home).load();
+  assert.equal(loaded.run.state, "interrupted");
+  assert.equal(loaded.snapshot.script, snapshot.script);
+  await store.updateState((current) => ({ ...current, state: "running" }));
+  const resumed = await store.load();
+  assert.equal(resumed.run.state, "running");
+  assert.equal(resumed.snapshot.script, snapshot.script);
+});
 void test("persists exact effective system prompts as private run artifacts", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-system-prompts-"));
   const cwd = join(home, "project");
