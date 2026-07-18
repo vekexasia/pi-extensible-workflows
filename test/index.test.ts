@@ -1893,6 +1893,38 @@ if (catalog.workflows.length !== 1 || catalog.workflows[0]?.name !== "loaderBoun
 `;
   execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
 });
+void test("keeps workflow_catalog active after Pi session replacement", () => {
+  const script = `
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { ModelRuntime, createAgentSessionFromServices, createAgentSessionRuntime, createAgentSessionServices, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+const cwd = process.cwd();
+const agentDir = mkdtempSync(join(tmpdir(), "pi-workflow-catalog-reload-"));
+mkdirSync(join(agentDir, "extensions"));
+writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [cwd] }));
+writeFileSync(join(agentDir, "extensions", "catalog.ts"), \`import { registerWorkflowExtension } from \${JSON.stringify(join(cwd, "dist/src/index.js"))};\nconst extension = { namespace: "reloadCatalog", version: "1.0.0", headline: "Reload", description: "Reload test", functions: { ping: { description: "Ping", input: { type: "object" }, output: { type: "string" }, run: () => "pong" } } };\nexport default function() { registerWorkflowExtension(extension); }\`);
+process.env.PI_OFFLINE = "1";
+const credentials = new InMemoryCredentialStore();
+const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
+  const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: true });
+  const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: join(agentDir, "models.json") });
+  const services = await createAgentSessionServices({ cwd, agentDir, settingsManager, modelRuntime, resourceLoaderOptions: { noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true }, resourceLoaderReloadOptions: { resolveProjectTrust: async () => true } });
+  return { ...await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: modelRuntime.getModels()[0] }), services, diagnostics: [] };
+};
+const runtime = await createAgentSessionRuntime(createRuntime, { cwd, agentDir, sessionManager: SessionManager.inMemory(cwd), sessionStartEvent: { type: "session_start", reason: "startup" } });
+runtime.setRebindSession((session) => session.bindExtensions({ mode: "print" }));
+await runtime.session.bindExtensions({ mode: "print" });
+const catalogActive = () => runtime.session.agent.state.tools.some(({ name }) => name === "workflow_catalog");
+assert.equal(catalogActive(), true);
+await runtime.newSession();
+assert.equal(catalogActive(), true);
+await runtime.dispose();
+`;
+  execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
+});
 
 void test("navigator stop reports cleanup failures without closing unexpectedly", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-failure-"));

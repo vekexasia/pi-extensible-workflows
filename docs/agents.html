@@ -25,6 +25,7 @@
       <a href="#script-contract">Script and args</a>
       <a href="#patterns">Workflow patterns</a>
       <a href="#selection">Roles and models</a>
+      <a href="#budgets">Run budgets</a>
       <a href="#checkpoints">Checkpoints</a>
       <a href="#recovery">Failure and recovery</a>
     </aside>
@@ -34,7 +35,7 @@
       <p class="lead">Use the workflow tools when a task benefits from explicit orchestration, parallel work, durable checkpoints, or worktree-scoped agent changes.</p>
       <section id="quick-start">
         <h2>Quick start</h2>
-        <p>Call <code>workflow</code> with either an inline script or a registered workflow. Use <code>workflow_respond</code> only to answer a pending checkpoint.</p>
+        <p>Call <code>workflow</code> with either an inline script or a registered workflow. Use <code>workflow_respond</code> only to answer a pending checkpoint or budget-adjustment proposal, using the exact name or proposal ID reported by the run.</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"release-check"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"phase('inspect'); return await agent('Inspect the package');"</span><span class="tok-punctuation">,</span>
@@ -83,13 +84,25 @@
       </section>
       <section id="selection">
         <h2>Role and model selection</h2>
-        <p>An agent can select a <code>role</code>, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary.</p>
+        <p>An agent can select a <code>role</code>, a configured model alias, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary. When <code>workflow_catalog</code> exposes model aliases, an exact alias name takes precedence over a matching native bare model name; explicit call-level <code>thinking</code> overrides the alias suffix.</p>
         <p>Optional controls are <code>outputSchema</code>, non-negative integer <code>retries</code>, positive integer or <code>null</code> <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. Use separate named scopes for independent branches and one enclosing scope for collaborators.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the package API"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">,</span> <span class="tok-string">"find"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
   <span class="tok-property">timeoutMs</span><span class="tok-punctuation">:</span> <span class="tok-number">120000</span><span class="tok-punctuation">,</span>
 <span class="tok-punctuation">}</span>);</code></pre>
+      </section>
+      <section id="budgets">
+        <h2>Run budgets</h2>
+        <p>Add <code>budget</code> only when a run needs aggregate token, USD cost, active-duration, or agent-launch limits. Each dimension accepts optional <code>soft</code> and <code>hard</code> values; omitted values are unlimited.</p>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span>
+  <span class="tok-property">"budget"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+    <span class="tok-property">"tokens"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"soft"</span><span class="tok-punctuation">:</span> <span class="tok-number">100000</span><span class="tok-punctuation">,</span> <span class="tok-property">"hard"</span><span class="tok-punctuation">:</span> <span class="tok-number">120000</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
+    <span class="tok-property">"agentLaunches"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"hard"</span><span class="tok-punctuation">:</span> <span class="tok-number">10</span> <span class="tok-punctuation">}</span>
+  <span class="tok-punctuation">}</span>
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Soft crossings ask agents to wrap up; hard limits block new launches or turns but accept an already-finished final response. Usage includes retries and descendants. If more model work is attempted after exhaustion, the run enters <code>budget_exhausted</code>.</p>
+        <p>Resume an exhausted run with <code>workflow_resume</code> and an optional budget patch. Omitted values remain unchanged and <code>null</code> removes a limit. Tightening resumes directly; raising or removing a limit requires human approval through <code>workflow_respond</code> with the exact proposal ID. Do not retry ordinary agent work to bypass an exhausted budget.</p>
       </section>
       <section id="checkpoints">
         <h2>Checkpoints and <code>workflow_respond</code></h2>
@@ -109,10 +122,10 @@
         <ul>
           <li><strong>Failure:</strong> catch workflow-source failures as ordinary <code>Error</code> values and inspect <code>code</code> and <code>message</code>. Host tool calls reject with <code>WorkflowError</code>.</li>
           <li><strong>Retry:</strong> set <code>retries</code> only for safe, repeatable agent work. Each retry gets a fresh Pi session but preserves filesystem changes.</li>
-          <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. Completed, failed, and stopped runs are terminal.</li>
+          <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. A <code>budget_exhausted</code> run can resume through <code>workflow_resume</code> with retained historical usage and an acceptable budget; completed, failed, and stopped runs remain non-resumable.</li>
           <li><strong>Cancellation:</strong> stopping a run is immediate, cascades to owned agents, and cannot be undone. A cancelled workflow reports <code>CANCELLED</code> or a stopped run state.</li>
         </ul>
-        <p>Use <code>/workflow</code> to inspect state, pause, resume, stop, approve, reject, or delete a run. The run ID returned by a background invocation is the handle for these actions.</p>
+        <p>Use <code>/workflow</code> to inspect state and budgets, manage model aliases, pause, resume, adjust an exhausted budget, stop, approve, reject, or delete a run. The run ID returned by a background invocation is the handle for these actions.</p>
       </section>
       <section class="callout">
         <h2>Need the implementation details?</h2>

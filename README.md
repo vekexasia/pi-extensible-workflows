@@ -41,6 +41,8 @@ return summary;
 Learn more about roles, workflow contracts, and extension APIs in the documentation:
 
 - [Workflow tool and invocation API](https://vekexasia.github.io/pi-extensible-workflows/developers.html#tool-api)
+- [Global model aliases](https://vekexasia.github.io/pi-extensible-workflows/developers.html#model-aliases)
+- [Aggregate run budgets](https://vekexasia.github.io/pi-extensible-workflows/developers.html#budgets)
 - [Workflow DSL and worktrees](https://vekexasia.github.io/pi-extensible-workflows/developers.html#dsl)
 - [Reusable extension primitives](https://vekexasia.github.io/pi-extensible-workflows/developers.html#extensions)
 - [Run inspection and recovery](https://vekexasia.github.io/pi-extensible-workflows/developers.html#operations)

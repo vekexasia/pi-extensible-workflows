@@ -23,10 +23,12 @@
       <p class="toc-title">Developers</p>
       <a href="#installation">Installation</a>
       <a href="#tool-api">Tool API</a>
+      <a href="#budgets">Run budgets</a>
       <a href="#dsl">Workflow DSL</a>
       <a href="#extensions">Extensions and roles</a>
       <a href="#lifecycle">Lifecycle</a>
       <a href="#operations">Operations</a>
+      <a href="#model-aliases">Model aliases</a>
       <a href="#evaluation">Evaluation</a>
     </aside>
     <article class="prose">
@@ -77,6 +79,25 @@
         <pre><code class="language-json"><span class="tok-punctuation">{</span> <span class="tok-property">"runId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"..."</span><span class="tok-punctuation">,</span> <span class="tok-property">"budget"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"tokens"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"hard"</span><span class="tok-punctuation">:</span> <span class="tok-number">120000</span> <span class="tok-punctuation">}</span> <span class="tok-punctuation">}</span> <span class="tok-punctuation">}</span></code></pre>
         <p>Background workflow calls return a run ID immediately. Completion or failure is delivered as one follow-up. Foreground calls return the workflow value inline.</p>
       </section>
+      <section id="budgets">
+        <h2>Aggregate run budgets</h2>
+        <p>A launch may set run-wide soft and hard limits. Every dimension and threshold is optional; omitted values are unlimited.</p>
+        <pre><code class="language-javascript">{
+  budget: {
+    tokens: { soft: 100000, hard: 120000 },
+    costUsd: { soft: 5, hard: 6 },
+    durationMs: { soft: 900000, hard: 1200000 },
+    agentLaunches: { soft: 8, hard: 10 },
+  },
+}</code></pre>
+        <p>Token, duration, and launch limits are non-negative integers; cost limits are finite non-negative numbers. Zero is valid, and <code>soft</code> must be lower than <code>hard</code> when both are set. The former <code>maxAgentLaunches</code> setting and launch field have been removed; use <code>budget.agentLaunches</code>.</p>
+        <p>Usage covers all workflow-agent attempts, retries, and descendants but excludes the main orchestrator. Tokens count reported input plus output and exclude cache reads and writes. Cost uses provider-reported USD values; unmetered usage contributes only what the provider reports. Replayed calls retain their historical usage without counting as new launches.</p>
+        <p>A soft crossing is recorded once per budget version. If more model work remains, active agents receive one wrap-up instruction before their next turn and later agents are annotated; a final crossing response completes without an injected message.</p>
+        <p>Hard launch limits are checked immediately before dispatch. Token, cost, and duration limits are checked between model turns. In-flight turns and tools may finish: a final overshooting response is accepted, while a response requiring tools or another turn stops with <code>BUDGET_EXHAUSTED</code> before that work begins. If accepted results let the workflow return without more model work, the run completes with an overrun event; otherwise it enters the resumable <code>budget_exhausted</code> state.</p>
+        <p>Duration includes active workflow JavaScript, agent work, and tool calls, but excludes pauses, checkpoint waits, and offline time. Historical usage remains charged after resume.</p>
+        <p><code>workflow_resume</code> accepts the exact run ID and an optional budget patch. Omitted patch values stay unchanged and explicit <code>null</code> removes a limit. Tightening applies immediately; raising or removing a limit creates a persisted human-approval proposal. Every exhausted hard dimension must be raised above retained usage or removed. Answer the exact proposal ID with <code>workflow_respond</code>.</p>
+        <p><code>/workflow</code> and the inspector show limits, usage, percentages, budget versions, crossings, and overruns. For an exhausted run, the navigator offers <code>Resume unchanged</code> or <code>Adjust budget</code>.</p>
+      </section>
       <section id="dsl">
         <h2>Workflow DSL</h2>
         <p>Workflow source is plain sandboxed JavaScript. It has no imports, filesystem, network, process, timer, or dynamic-code globals. The deterministic primitives are:</p>
@@ -94,7 +115,7 @@
           </tbody>
         </table></div>
         <h3>Agent options</h3>
-        <p>Use <code>label</code> as an optional non-empty display name. If omitted, agents use their <code>role</code> name, or the effective model name for role-less agents. Use <code>model</code> as <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
+        <p>Use <code>label</code> as an optional non-empty display name. If omitted, agents use their <code>role</code> name, or the effective model name for role-less agents. Use <code>model</code> as a configured model alias or <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> report = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review the implementation"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">label</span><span class="tok-punctuation">:</span> <span class="tok-string">"Implementation review"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
@@ -111,9 +132,9 @@
       </section>
       <section id="extensions">
         <h2>Extensions, reusable workflows, and roles</h2>
-        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Registration validates the namespace, semantic version, descriptions, schemas, and workflow source.</p>
+        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the namespace, semantic version, descriptions, schemas, and workflow source.</p>
         <pre><code class="language-typescript"><span class="tok-keyword">import</span> <span class="tok-punctuation">{</span> registerWorkflowExtension <span class="tok-punctuation">}</span> <span class="tok-keyword">from</span> <span class="tok-string">"pi-extensible-workflows"</span>;
-registerWorkflowExtension(<span class="tok-punctuation">{</span>
+<span class="tok-keyword">const</span> reviewExtension <span class="tok-punctuation">=</span> <span class="tok-punctuation">{</span>
   <span class="tok-property">namespace</span><span class="tok-punctuation">:</span> <span class="tok-string">"review"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review helpers"</span><span class="tok-punctuation">,</span>
@@ -134,8 +155,11 @@ registerWorkflowExtension(<span class="tok-punctuation">{</span>
       <span class="tok-property">script</span><span class="tok-punctuation">:</span> <span class="tok-string">`return review({ focus: "release readiness" });`</span><span class="tok-punctuation">,</span>
     <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
   <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-<span class="tok-punctuation">}</span>);</code></pre>
-        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. Registered functions receive <code>agent</code>, <code>prompt</code>, the combinators, lifecycle helpers, and run metadata through their context. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source; call it once and reuse exposed functions instead of recreating them.</p>
+<span class="tok-punctuation">}</span>;
+<span class="tok-keyword">export default function</span> <span class="tok-function">extension</span>() <span class="tok-punctuation">{</span>
+  registerWorkflowExtension(reviewExtension);
+<span class="tok-punctuation">}</span></code></pre>
+        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. Registered functions receive <code>agent</code>, <code>prompt</code>, the combinators, lifecycle helpers, and run metadata through their context. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source, plus configured model alias names and concrete targets without availability probing; call it once and reuse exposed functions instead of recreating them.</p>
         <h3>Role files</h3>
         <p>Global roles live under <code>&lt;agentDir&gt;/pi-extensible-workflows/roles/&lt;name&gt;.md</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/roles/&lt;name&gt;.md</code>; set <code>PI_CODING_AGENT_DIR</code> to change it. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
@@ -148,7 +172,7 @@ Focus on correctness and regressions.</code></pre>
         <p>When <code>role</code> is present, omit <code>model</code>, <code>thinking</code>, and <code>tools</code> from the agent call. The role body is appended to the native Pi system prompt.</p>
         <h3>Prioritized agent setup hooks</h3>
         <p><strong>Security:</strong> setup hooks are trusted extension code. They run after ordinary workflow model, tool, cwd, and role policy validation, but before the native Pi session is created. Hooks can bypass those boundaries by mutating the prompt, raw options, resolved session input, or session factory; never register untrusted code as a setup hook.</p>
-        <p>Register named hooks with an optional finite <code>priority</code>. Hooks run in ascending priority order (default <code>10</code>); equal priorities use the stable fully qualified hook name (<code>namespace.name</code>) as the tie-breaker. Each retry starts from a fresh baseline and runs every hook again. Hooks receive the workflow cancellation signal, and their asynchronous runtime is not charged against <code>timeoutMs</code>.</p>
+        <p>Register named hooks with an optional finite <code>priority</code>. Hooks run in ascending priority order (default <code>10</code>); equal priorities use the stable fully qualified hook name (<code>namespace.name</code>) as the tie-breaker. Each retry starts from a fresh baseline and runs every hook again. Hooks receive the workflow cancellation signal, and their asynchronous runtime is not charged against <code>timeoutMs</code>. A thrown hook error fails the agent immediately, prevents later hooks and session creation, and is not retried as a native-session failure.</p>
         <pre><code class="language-typescript">registerWorkflowExtension({
   namespace: "advisor", version: "1.0.0", headline: "Advisor setup",
   description: "Adds optional advisor behavior",
@@ -164,11 +188,11 @@ Focus on correctness and regressions.</code></pre>
     },
   },
 });</code></pre>
-        <p>Unknown JSON-compatible agent options are preserved for setup hooks and native setup, but are not inherited by child agents. Inspection records only executed hook names and the effective model, tools, and cwd; it never serializes hook functions, opaque setup values, or raw options.</p>
+        <p>Unknown JSON-compatible agent options are preserved for setup hooks and native setup, but are not inherited by child agents. Inspection records only executed hook names and the effective model, tools, and cwd; it never serializes hook functions, opaque setup values, or raw options. Cold recovery reruns the hooks currently registered with the host; persisted runs do not pin an extension version.</p>
       </section>
       <section id="lifecycle">
         <h2>Lifecycle, checkpoints, and worktrees</h2>
-        <p>Run states are <code>queued</code>, <code>running</code>, <code>pausing</code>, <code>paused</code>, <code>awaiting_input</code>, <code>completed</code>, <code>failed</code>, <code>stopped</code>, and <code>interrupted</code>. Agent states include <code>queued</code>, <code>running</code>, <code>waiting_for_child</code>, <code>paused</code>, <code>retrying</code>, <code>completed</code>, <code>failed</code>, and <code>cancelled</code>.</p>
+        <p>Run states are <code>queued</code>, <code>running</code>, <code>pausing</code>, <code>paused</code>, <code>awaiting_input</code>, <code>budget_exhausted</code>, <code>completed</code>, <code>failed</code>, <code>stopped</code>, and <code>interrupted</code>. <code>budget_exhausted</code> is terminal for the current execution segment but can be resumed with an acceptable budget. Agent states include <code>queued</code>, <code>running</code>, <code>waiting_for_child</code>, <code>paused</code>, <code>retrying</code>, <code>completed</code>, <code>failed</code>, and <code>cancelled</code>.</p>
         <p>Use a checkpoint when an agent must wait for a human or parent decision:</p>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> decision = <span class="tok-keyword">await</span> <span class="tok-function">checkpoint</span>(<span class="tok-punctuation">{</span>
   <span class="tok-property">name</span><span class="tok-punctuation">:</span> <span class="tok-string">"ship"</span><span class="tok-punctuation">,</span>
@@ -197,13 +221,20 @@ Focus on correctness and regressions.</code></pre>
 /workflow approve &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow reject &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow delete &lt;run-id&gt;</code></pre>
-        <p>The navigator discovers only runs from the exact current cwd and Pi session. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
-        <h3>Settings and errors</h3>
+        <p>The navigator discovers only runs from the exact current cwd and Pi session. It also exposes <code>Model aliases</code> even when no runs exist and shows budget status and adjustment controls for exhausted runs. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
+        <h3 id="model-aliases">Settings, model aliases, and errors</h3>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
-  <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span>
+  <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"modelAliases"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
+    <span class="tok-property">"reviewer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"anthropic/claude-fable-5:high"</span><span class="tok-punctuation">,</span>
+    <span class="tok-property">"developer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-luna:xhigh"</span>
+  <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Optional strict settings live at <code>&lt;agentDir&gt;/pi-extensible-workflows/settings.json</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/settings.json</code>. Invocation options override the defaults. The session-wide active-agent ceiling is 16.</p>
-        <p>Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, or script issue before retrying.</p>
+        <p>Optional strict settings live at <code>&lt;agentDir&gt;/pi-extensible-workflows/settings.json</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/settings.json</code>. Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>. Targets must be concrete <code>provider/model</code> references with an optional recognized thinking suffix; aliases cannot contain <code>/</code> or <code>:</code>, and alias chaining is rejected.</p>
+        <p>Aliases work anywhere the workflow runtime accepts a model, including role files. An exact configured alias wins over a native bare model name. Explicit call-level <code>thinking</code> overrides the alias suffix; otherwise existing role, workflow, and root precedence applies. Resolution never falls back: malformed configuration fails with <code>CONFIG_ERROR</code>, and a missing alias or unavailable target fails with <code>UNKNOWN_MODEL</code> including the requested alias, resolved target when known, and settings path. Provider credential failures remain authentication errors.</p>
+        <p>Each launch and resume snapshots one alias mapping for that active run segment. Completed and replayed calls keep their results; pending, retried, and new calls use the mapping reloaded on resume. Changed mappings emit one persisted, non-blocking <code>Model alias mappings changed on resume: name: old target -&gt; new target</code> warning in run events and the inspector.</p>
+        <p><code>workflow_catalog</code> lists configured alias names and concrete targets without probing availability or injecting them into guidance. The <code>/workflow</code> navigator can list, add, edit, and delete aliases. Alias names are immutable during edit, unknown manual targets require a warning confirmation, and deletion requires confirmation. Saves reread the settings file, atomically update only <code>modelAliases</code>, preserve other keys, and affect new launches and resumes without reloading the extension.</p>
+        <p>Invocation options override settings defaults, and the session-wide active-agent ceiling is 16. Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>CONFIG_ERROR</code>, <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, settings, or script issue before retrying.</p>
       </section>
       <section id="evaluation">
         <h2>Evaluation and package checks</h2>

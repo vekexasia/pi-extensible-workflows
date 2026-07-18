@@ -37,7 +37,7 @@ To pass structured input from the main agent, include `args`:
 { "workflow": "namespace.workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, and registered workflows as needed for the rest of that task. Do not try to reinvent already exposed functions.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, registered workflows, and configured model aliases as needed for the rest of that task. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
 
@@ -46,7 +46,7 @@ Pass downstream only needed results. Workflow JavaScript has no imports, filesys
 ```typescript
 interface AgentOptions {
   label?: string; // optional non-empty display name
-  model?: `${provider}/${model}` | `${provider}/${model}:${thinking}`;
+  model?: string; // configured alias or provider/model[:thinking]
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
   role?: string; // one of the available workflow roles
   tools?: string[]; // [] = no tools; omitted uses role or launch tools
@@ -56,7 +56,9 @@ interface AgentOptions {
 }
 ```
 
-Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; aliases are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
+Extensions may define additional JSON-compatible agent option keys such as `advisor: true`. Core-owned keys still use the validation and role constraints above; extension options are passed to setup hooks and native setup but are not inherited by child agents.
+
+Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; JavaScript aliases for workflow calls are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
 ## Shared worktree scope
 
@@ -101,7 +103,8 @@ Registered extension functions receive `withWorktree` in their context, so they 
 - Preserve item metadata in workflow code between pipeline stages instead of requiring agents to echo it through `outputSchema`.
 - Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
-- Add `budget` only when the run needs aggregate token, cost, duration, or launch limits; each dimension accepts optional `soft` and `hard` values.
+- Add `budget` only when the run needs aggregate token, cost, duration, or launch limits; each dimension accepts optional `soft` and `hard` values. Soft crossings request wrap-up, while hard exhaustion blocks further budgeted work.
+- A `budget_exhausted` run is resumable through `workflow_resume`. Omitted patch values stay unchanged, explicit `null` removes a limit, and any relaxation requires an exact human-approved proposal through `workflow_respond`.
 - `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
 - Use `outputSchema` only when another phase must compare, aggregate, or validate the result. Never add it to a final agent whose prose is returned directly. Keep only fields the consumer needs, and avoid repeating the same evidence in multiple schemas.
