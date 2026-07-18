@@ -392,7 +392,7 @@ void test("registered extension agents persist structural scope for late sibling
   const createSession = async (): Promise<NativeSession> => ({
     sessionId: `issue69-${String(++nextSession)}`,
     sessionFile: `/sessions/${String(nextSession)}.jsonl`,
-    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats,
     prompt: async () => {},
     steer: async () => {},
     dispose() {},

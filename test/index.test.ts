@@ -1427,7 +1427,7 @@ void test("active run keeps its alias snapshot after settings edits", async () =
   const inputs: SessionInput[] = [];
   const executor = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "root", model: "model", thinking: "medium" }, tools: new Set(), knownModels: new Set(["root/model", "old/model", "new/model"]), modelAliases: validateModelAliases({ reviewer: "old/model" }, settingsPath), settingsPath }, async (input) => {
     inputs.push(input);
-    return { sessionId: `active-${String(inputs.length)}`, sessionFile: `/sessions/active-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+    return { sessionId: `active-${String(inputs.length)}`, sessionFile: `/sessions/active-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
   });
   await executor.execute("before", { label: "before", workflowName: "active", model: "reviewer" });
   saveModelAliases(settingsPath, { reviewer: "new/model" });
@@ -1458,7 +1458,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     inputs.push(input);
     return {
       sessionId: `alias-${String(inputs.length)}`, sessionFile: `/sessions/alias-${String(inputs.length)}.jsonl`,
-      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
       prompt: async (text: string) => { if (text.includes("pending") && !failedPending) { failedPending = true; throw new Error("retry pending"); } },
       steer: async () => {}, dispose() {},
     };
