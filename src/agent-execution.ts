@@ -47,6 +47,7 @@ export interface AgentExecutionRoot {
   knownModels?: ReadonlySet<string>;
   modelAliases?: Readonly<Record<string, string>>;
   blockedAliases?: ReadonlySet<string>;
+  blockedAliasTargets?: Readonly<Record<string, string>>;
   settingsPath?: string;
   runStore?: RunStore;
   providerPause?: () => Promise<void>;
@@ -148,7 +149,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, createSession: Sessio
     if (setupSignal.reason !== undefined) throw new WorkflowError("CANCELLED", "Agent cancelled");
   }
   setup.sessionInput.options = setup.options;
-  if (changedOption(setup.options, baselineOptions, "model") && typeof setup.options.model === "string") setup.sessionInput.model = parseModel(setup.options.model, setup.sessionInput.model, validThinking(setup.options.thinking) ? setup.options.thinking : setup.sessionInput.model.thinking);
+  if (changedOption(setup.options, baselineOptions, "model") && typeof setup.options.model === "string") setup.sessionInput.model = parseModel(setup.options.model, setup.sessionInput.model, changedOption(setup.options, baselineOptions, "thinking") && validThinking(setup.options.thinking) ? setup.options.thinking : undefined, root.modelAliases, root.knownModels ?? root.availableModels, root.settingsPath);
   if (changedOption(setup.options, baselineOptions, "thinking") && validThinking(setup.options.thinking)) setup.sessionInput.model = { ...setup.sessionInput.model, thinking: setup.options.thinking };
   if (changedOption(setup.options, baselineOptions, "tools") && Array.isArray(setup.options.tools) && setup.options.tools.every((tool) => typeof tool === "string")) setup.sessionInput.tools = [...setup.options.tools];
   if (changedOption(setup.options, baselineOptions, "cwd") && typeof setup.options.cwd === "string") setup.sessionInput.cwd = setup.options.cwd;
@@ -171,8 +172,9 @@ export class WorkflowAgentExecutor {
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
     const requestedModel = options.model ?? definition?.model;
     const hasAlias = requestedModel !== undefined && Object.prototype.hasOwnProperty.call(this.root.modelAliases ?? {}, requestedModel);
-    if (requestedModel !== undefined && this.root.blockedAliases?.has(requestedModel) && !hasAlias) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
-    const model = parseModel(requestedModel, this.root.model, options.thinking ?? definition?.thinking, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
+    if (requestedModel !== undefined && this.root.blockedAliases?.has(requestedModel) && !hasAlias) { const target = this.root.blockedAliasTargets?.[requestedModel]; throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${target ? ` resolved to ${target}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`); }
+    const aliasThinking = requestedModel !== undefined && hasAlias ? resolveModelReference(requestedModel, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath).thinking : undefined;
+    const model = parseModel(requestedModel, this.root.model, options.thinking ?? (aliasThinking === undefined ? definition?.thinking : undefined), this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
     const availableModels = this.root.knownModels ?? this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
     if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model${requestedModel ? ` ${requestedModel} resolved to ${modelCapability(model)}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
     return { model, ...(hasAlias ? { requestedModel } : {}), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };

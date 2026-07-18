@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -1349,17 +1349,136 @@ void test("validates and resolves portable model aliases", () => {
   assert.deepEqual(resolveModelReference("opus", aliases, new Set(["openai/opus", "anthropic/opus"])), { provider: "openai", model: "gpt" });
   assert.throws(() => validateModelAliases({ "bad/name": "p/m" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
   assert.throws(() => validateModelAliases({ chained: "reviewer-model" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
+  assert.throws(() => validateModelAliases({ invalidTarget: "provider/model:turbo" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
   assert.throws(() => preflight('agent("x", { model: "reviewer-model" })', { models: new Set(["openai/gpt"]), knownModels: new Set(["openai/gpt"]), tools: new Set(), agentTypes: new Set(), modelAliases: { "reviewer-model": "anthropic/opus" }, settingsPath: path }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("reviewer-model") && error.message.includes("anthropic/opus") && error.message.includes(path));
-  const executor = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: { "reviewer-model": "anthropic/opus:high" }, agentDefinitions: { reviewer: { model: "reviewer-model" } }, settingsPath: path });
+  const executor = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: { "reviewer-model": "anthropic/opus:high" }, agentDefinitions: { reviewer: { model: "reviewer-model", thinking: "low" } }, settingsPath: path });
   assert.equal(executor.resolve({ label: "direct", workflowName: "test", model: "reviewer-model", thinking: "low" }).model.thinking, "low");
   assert.equal(executor.resolve({ label: "role", workflowName: "test", role: "reviewer" }).model.thinking, "high");
   assert.throws(() => executor.resolve({ label: "missing", workflowName: "test", model: "missing-model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
-  const blocked = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: {}, blockedAliases: new Set(["reviewer-model"]), settingsPath: path });
-  assert.throws(() => blocked.resolve({ label: "deleted", workflowName: "test", model: "reviewer-model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("reviewer-model"));
+  const blocked = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: {}, blockedAliases: new Set(["reviewer-model"]), blockedAliasTargets: { "reviewer-model": "anthropic/opus:high" }, settingsPath: path });
+  assert.throws(() => blocked.resolve({ label: "deleted", workflowName: "test", model: "reviewer-model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("reviewer-model") && error.message.includes("anthropic/opus:high") && error.message.includes(path));
   saveModelAliases(path, { "reviewer-model": "anthropic/opus:high" });
   assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { concurrency: 4, modelAliases: { "reviewer-model": "anthropic/opus:high" } });
   writeFileSync(path, "{");
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
+});
+void test("workflow TUI manages aliases without runs and preserves settings", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-alias-tui-"));
+  const cwd = join(home, "project");
+  const agentDir = join(home, "agent");
+  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 3 }));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const notices: string[] = [];
+  const confirmations: string[] = [];
+  let menuCalls = 0;
+  let targetCalls = 0;
+  let inputCalls = 0;
+  const select = async (prompt: string, options: string[]) => {
+    if (prompt === "Workflows\n") { assert.ok(options.includes("Model aliases")); return "Close"; }
+    if (prompt.startsWith("Model aliases")) { menuCalls += 1; return (["Add alias", "Edit portable", "Delete portable", "Back"][menuCalls - 1] ?? "Back"); }
+    targetCalls += 1;
+    return targetCalls === 1 ? "Manual model ID" : "openai/gpt";
+  };
+  const ctx = {
+    cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
+    modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }] },
+    ui: {
+      notify(message: string) { notices.push(message); },
+      confirm: async (_title: string, message: string) => { confirmations.push(message); return true; },
+      select,
+      input: async () => { inputCalls += 1; return inputCalls === 1 ? "portable" : "private/model:high"; },
+    },
+  };
+  try {
+    workflowExtension({ registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+    assert.ok(start && command);
+    await start({}, ctx);
+    await command("", ctx);
+    await command("model-aliases", ctx);
+    assert.equal(inputCalls, 2);
+    assert.equal(targetCalls, 2);
+    assert.ok(notices.some((message) => message.includes("not currently available")));
+    assert.ok(confirmations.some((message) => /Future workflow resumes/.test(message)));
+    assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), { concurrency: 3, modelAliases: {} });
+  } finally {
+    await shutdown?.();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
+void test("active run keeps its alias snapshot after settings edits", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-alias-active-"));
+  const settingsPath = join(dir, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ modelAliases: { reviewer: "old/model" } }));
+  const inputs: SessionInput[] = [];
+  const executor = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "root", model: "model", thinking: "medium" }, tools: new Set(), knownModels: new Set(["root/model", "old/model", "new/model"]), modelAliases: validateModelAliases({ reviewer: "old/model" }, settingsPath), settingsPath }, async (input) => {
+    inputs.push(input);
+    return { sessionId: `active-${String(inputs.length)}`, sessionFile: `/sessions/active-${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], prompt: async () => {}, steer: async () => {}, dispose() {} };
+  });
+  await executor.execute("before", { label: "before", workflowName: "active", model: "reviewer" });
+  saveModelAliases(settingsPath, { reviewer: "new/model" });
+  await executor.execute("after", { label: "after", workflowName: "active", model: "reviewer" });
+  assert.deepEqual(inputs.map(({ model }) => ({ provider: model.provider, model: model.model })), [{ provider: "old", model: "model" }, { provider: "old", model: "model" }]);
+});
+void test("resume reloads aliases for pending and retried calls while replaying completed calls", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-alias-resume-"));
+  const cwd = join(home, "project");
+  const agentDir = join(home, "agent");
+  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  const oldAliases = { reviewer: "old/model" };
+  const newAliases = { reviewer: "new/model" };
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: oldAliases }));
+  const script = `const replayed = await agent("replayed", { model: "reviewer" }); const pending = await agent("pending", { model: "reviewer", label: "pending", retries: 1 }); const fresh = await agent("fresh", { model: "reviewer" }); return { replayed, pending, fresh };`;
+  const replayPaths: string[] = [];
+  await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPaths.push(structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`)); return "original"; } }).result;
+  const store = new RunStore(cwd, "session", "run", home);
+  await store.create({ id: "run", workflowName: "alias-resume", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "alias-resume" }, settings: { concurrency: 2, modelAliases: oldAliases }, modelAliases: oldAliases, models: ["root/model", "old/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.complete(replayPaths[0] as string, "replayed");
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: newAliases }));
+  const inputs: SessionInput[] = [];
+  let failedPending = false;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    return {
+      sessionId: `alias-${String(inputs.length)}`, sessionFile: `/sessions/alias-${String(inputs.length)}.jsonl`,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      prompt: async (text: string) => { if (text.includes("pending") && !failedPending) { failedPending = true; throw new Error("retry pending"); } },
+      steer: async () => {}, dispose() {},
+    };
+  };
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const ctx = {
+    cwd, hasUI: false, model: { provider: "root", id: "model" }, sessionManager: { getSessionId: () => "session" },
+    modelRegistry: { getAll: () => [{ provider: "root", id: "model" }, { provider: "new", id: "model" }] }, ui: { notify() {} },
+  };
+  try {
+    workflowExtension({ registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+    assert.ok(start && command);
+    await start({}, ctx);
+    await command("resume run", ctx);
+    for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    const loaded = await store.load();
+    assert.equal(loaded.run.state, "completed");
+    assert.equal(inputs.length, 3);
+    assert.deepEqual(inputs.map(({ model }) => ({ provider: model.provider, model: model.model })), [{ provider: "new", model: "model" }, { provider: "new", model: "model" }, { provider: "new", model: "model" }]);
+    assert.equal(loaded.run.agents.find((agent) => agent.name === "pending")?.attempts, 2);
+    assert.deepEqual(loaded.snapshot.modelAliases, newAliases);
+    assert.deepEqual(loaded.run.events, [{ type: "warning", message: "Model alias mappings changed on resume: reviewer: old/model -> new/model" }]);
+    assert.match(formatNavigatorRun(loaded, [], []), /Model alias mappings changed on resume/);
+  } finally {
+    await shutdown?.();
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+  }
 });
 void test("persists resume snapshots and warning events", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resume-snapshot-"));
