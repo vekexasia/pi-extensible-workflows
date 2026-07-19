@@ -363,7 +363,7 @@ type ScheduledNode = {
   options: Readonly<ScheduledAgentOptions>;
   children: Set<string>;
   collected: boolean;
-  state: "queued" | "running" | "waiting_for_child" | "completed" | "failed" | "cancelled";
+  state: "queued" | "running" | "waiting_for_child" | "paused" | "retrying" | "completed" | "failed" | "cancelled";
   controller: AbortController;
   promise: Promise<ScheduledAgentResult>;
   resolve: (result: ScheduledAgentResult) => void;
@@ -453,6 +453,15 @@ export class FairAgentScheduler {
 
   cancelChildren(id: string): void {
     for (const childId of this.#node(id).children) { const child = this.#nodes.get(childId); if (child) this.#cancelTree(child); }
+  }
+  retry(id: string): void {
+    const node = this.#node(id);
+    if (node.state === "running") { node.state = "retrying"; this.#persist(node.runId); }
+  }
+
+  attemptStarted(id: string): void {
+    const node = this.#node(id);
+    if (node.state === "retrying") { node.state = "running"; this.#persist(node.runId); }
   }
 
   async cancelRun(runId: string): Promise<void> {
@@ -556,7 +565,7 @@ export class FairAgentScheduler {
 
   #settle(node: ScheduledNode, result: ScheduledAgentResult): void {
     if (["completed", "failed", "cancelled"].includes(node.state)) return;
-    const heldPermit = node.state === "running";
+    const heldPermit = node.state === "running" || node.state === "retrying";
     node.state = result.ok ? "completed" : result.error.code === "CANCELLED" ? "cancelled" : "failed";
     this.#persist(node.runId);
     if (heldPermit) this.#release(node.runId);
