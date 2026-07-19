@@ -41,7 +41,12 @@ const landing = readFileSync(resolve(docsDir, "index.html"), "utf8");
 for (const link of ["developers.html", "agents.html"]) {
   if (!landing.includes(`href="${link}"`)) errors.push(`landing page does not link to ${link}`);
 }
-if (!htmlFiles.every((file) => readFileSync(resolve(docsDir, file), "utf8").includes("language-"))) errors.push("every HTML page must contain a syntax-highlighted example");
+for (const file of htmlFiles) {
+  const source = readFileSync(resolve(docsDir, file), "utf8");
+  const examples = [...source.matchAll(/<pre><code class="language-(?!text\b)[^"]*">([\s\S]*?)<\/code><\/pre>/g)];
+  if (!examples.length) errors.push(`${file}: missing syntax-highlighted example`);
+  if (examples.some((match) => !match[1].includes('class="tok-'))) errors.push(`${file}: code example missing syntax highlighting`);
+}
 
 if (errors.length) {
   console.error(errors.map((error) => `docs check: ${error}`).join("\n"));
