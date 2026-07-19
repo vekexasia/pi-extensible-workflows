@@ -113,6 +113,22 @@ void test("doctor respects untrusted projects and does not mutate fixtures", asy
   assert.equal(report.roles.find((role) => role.scope === "project")?.active, false);
   assert.equal(doctorExitCode(report), 0);
 });
+void test("doctor reports effective resource exclusions and unmatched selectors", async () => {
+  const paths = fixture();
+  const globalSettings = join(paths.agentDir, "pi-extensible-workflows", "settings.json");
+  const globalExtension = join(paths.agentDir, "extensions", "interactive.ts");
+  const projectExtension = join(paths.cwd, ".pi", "project.ts");
+  mkdirSync(join(paths.agentDir, "extensions"), { recursive: true });
+  writeFileSync(globalSettings, JSON.stringify({ disabledAgentResources: { skills: ["global-skill", "missing-skill"], extensions: [globalExtension] } }));
+  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ disabledAgentResources: { skills: ["project-skill"], extensions: ["../project.ts"] } }));
+  const report = await withHome(paths.root, () => doctor({ ...paths, settingsPath: globalSettings, discoverPi: async () => pi({ extensions: [globalExtension, projectExtension], skills: ["global-skill", "project-skill"] }) }));
+  assert.deepEqual(report.resourcePolicy.effective.skills, ["global-skill", "missing-skill", "project-skill"]);
+  assert.deepEqual(report.resourcePolicy.effective.extensions, [globalExtension, projectExtension]);
+  assert.deepEqual(report.resourcePolicy.unmatchedSkills, ["missing-skill"]);
+  assert.deepEqual(report.resourcePolicy.unmatchedExtensions, []);
+  assert.equal(report.diagnostics.filter(({ code }) => code === "AGENT_RESOURCE_UNMATCHED").length, 1);
+  assert.match(formatDoctorReport(report), /Effective skills: global-skill, missing-skill, project-skill/);
+});
 void test("doctor excludes workflow_catalog from active capabilities and output", async () => {
   const paths = fixture();
   const report = await withHome(paths.root, () => doctor({ ...paths, activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"], discoverPi: async () => pi({ activeTools: ["read", "workflow", "workflow_respond", "workflow_catalog"] }) }));

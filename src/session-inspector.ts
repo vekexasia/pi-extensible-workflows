@@ -278,7 +278,16 @@ function detailLines(workflow: WorkflowReport): string[] {
   for (const agent of workflow.agents) {
     lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.requestedModel ? `requested=${agent.requestedModel} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
     for (const attempt of agent.attempts) {
-      lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`, ...(attempt.setup ? [`Hooks: ${attempt.setup.hookNames.join(", ") || "(none)"}`, `Effective: model=${attempt.setup.model.provider}/${attempt.setup.model.model}${attempt.setup.model.thinking ? `:${attempt.setup.model.thinking}` : ""} tools=${attempt.setup.tools.join(",") || "(none)"} cwd=${attempt.setup.cwd}`] : []));
+      lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`, ...(attempt.setup ? [
+        `Hooks: ${attempt.setup.hookNames.join(", ") || "(none)"}`,
+        `Effective: model=${attempt.setup.model.provider}/${attempt.setup.model.model}${attempt.setup.model.thinking ? `:${attempt.setup.model.thinking}` : ""} tools=${attempt.setup.tools.join(",") || "(none)"} cwd=${attempt.setup.cwd}`,
+        ...(attempt.setup.disabledAgentResources ? [
+          `Disabled skills: ${attempt.setup.disabledAgentResources.skills.join(", ") || "(none)"}`,
+          `Disabled extensions: ${attempt.setup.disabledAgentResources.extensions.join(", ") || "(none)"}`,
+          `Unmatched skills: ${attempt.setup.disabledAgentResources.unmatchedSkills.join(", ") || "(none)"}`,
+          `Unmatched extensions: ${attempt.setup.disabledAgentResources.unmatchedExtensions.join(", ") || "(none)"}`,
+        ] : []),
+      ] : []));
     }
   }
   return lines.filter((line, index) => line || index !== 2);
