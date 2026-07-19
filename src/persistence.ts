@@ -473,8 +473,16 @@ export class RunStore {
     try {
       const write = this.snapshotWrite.then(async () => {
         const record = await this.worktree(owner);
-        await git(record.path, ["add", "-A"]);
-        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          await git(record.path, ["add", "-A"]);
+          if (!(await git(record.path, ["status", "--porcelain"])).trim()) break;
+          try {
+            await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
+            break;
+          } catch (error) {
+            if (attempt === 2) throw error;
+          }
+        }
         return (await git(record.path, ["rev-parse", "HEAD"])).trim();
       });
       this.snapshotWrite = write.then(() => undefined, () => undefined);

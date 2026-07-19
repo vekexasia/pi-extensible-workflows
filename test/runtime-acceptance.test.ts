@@ -566,16 +566,16 @@ void test("shared worktree scopes persist one owner across production agents and
   };
   const inputs: SessionInput[] = [];
   let nextSession = 0;
-  let failFirst = true;
+  let failRetry = true;
   let spawnedChild = false;
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
     const sessionId = `shared-worktree-${String(++nextSession)}`;
     inputs.push(input);
     return {
       sessionId, sessionFile: `/sessions/${sessionId}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: sessionStats,
-      prompt: async () => {
+      prompt: async (prompt) => {
         writeFileSync(join(input.cwd, `${sessionId}.txt`), sessionId);
-        if (failFirst) { failFirst = false; throw new Error("retry once"); }
+        if (prompt.includes("Task:\nretry") && failRetry) { failRetry = false; throw new Error("retry once"); }
         const childTool = input.customTools?.find(({ name }) => name === "agent");
         const resultTool = input.customTools?.find(({ name }) => name === "get_subagent_result");
         if (!spawnedChild && childTool && resultTool) {
