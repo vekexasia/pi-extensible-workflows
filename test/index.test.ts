@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -153,7 +153,146 @@ void test("background workflows emit compatible lifecycle events", async () => {
   assert.ok(runId);
   const stored = new RunStore(home, "session", runId, home);
   assert.equal(JSON.parse(readFileSync(join(stored.directory, "result.json"), "utf8")), true);
-  assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT]);
+  assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT]);
+});
+void test("foreground lifecycle events are redacted and throwing listeners cannot stop execution", async () => {
+  const events: Array<{ channel: string; data: unknown }> = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lifecycle-events-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); throw new Error("listener failure"); } } } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await workflow.execute("id", { name: "foreground-events", args: { secret: "ARG_SECRET" }, script: "phase('build'); return {value:'RESULT_SECRET'}; // SOURCE_SECRET", foreground: true }, new AbortController().signal, undefined, context);
+  assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT]);
+  assert.doesNotMatch(JSON.stringify(events), /ARG_SECRET|RESULT_SECRET|SOURCE_SECRET|listener failure/);
+  const failedEvents: Array<{ channel: string; data: unknown }> = [];
+  const failedHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-failed-events-"));
+  const failedTools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof failedTools)[number]) { failedTools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { failedEvents.push({ channel, data }); throw new Error("listener failure"); } } } as never, failedHome);
+  const failedWorkflow = failedTools.find(({ name }) => name === "workflow");
+  assert.ok(failedWorkflow);
+  await assert.rejects(failedWorkflow.execute("id", { name: "failed-events", script: "throw new Error('RESULT_SECRET');", foreground: true }, new AbortController().signal, undefined, { ...context, cwd: failedHome }), (error: unknown) => error instanceof WorkflowError);
+  assert.ok(failedEvents.some(({ channel }) => channel === WORKFLOW_RUN_FAILED_EVENT));
+  assert.ok(failedEvents.some(({ channel }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT));
+  assert.doesNotMatch(JSON.stringify(failedEvents), /RESULT_SECRET|listener failure/);
+});
+void test("orchestration lifecycle events cover phase, worktree, retry, checkpoint, and agent ordering", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-orchestration-events-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const events: Array<{ channel: string; data: unknown }> = [];
+  let sessions = 0;
+  const createSession = async (): Promise<NativeSession> => {
+    const attempt = ++sessions;
+    return { sessionId: `event-session-${String(attempt)}`, sessionFile: `/sessions/event-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (attempt === 1) throw new Error("PROMPT_SECRET"); }, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "orchestration-events", args: { secret: "ARG_SECRET" }, script: "phase('build'); return withWorktree('OWNER_SECRET', async () => { const value = await agent('PROMPT_SECRET', {label:'worker', retries:1}); const approved = await checkpoint({name:'ship', prompt:'CHECKPOINT_SECRET', context:{secret:'CONTEXT_SECRET'}}); const rejected = await checkpoint({name:'reject', prompt:'Reject?', context:{secret:'REJECT_CONTEXT_SECRET'}}); return {value, approved, rejected}; });", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { select: async (prompt: string) => prompt === "Reject?" ? "Reject" : "Approve" } }) as { details?: { value?: unknown } };
+  assert.deepEqual(result.details?.value, { value: "done", approved: "approved", rejected: "rejected" });
+  const channels = events.map(({ channel }) => channel);
+  assert.equal(channels.filter((channel) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 1);
+  assert.ok(channels.includes(WORKFLOW_PHASE_CHANGED_EVENT));
+  assert.ok(channels.includes(WORKFLOW_WORKTREE_CREATED_EVENT));
+  assert.ok(channels.includes(WORKFLOW_AGENT_STATE_CHANGED_EVENT));
+  assert.ok(channels.includes(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT));
+  assert.ok(channels.includes(WORKFLOW_RUN_COMPLETED_EVENT));
+  const agentStates = events.filter(({ channel }) => channel === WORKFLOW_AGENT_STATE_CHANGED_EVENT).map(({ data }) => (data as { state: string }).state);
+  assert.ok(agentStates.includes("retrying"));
+  assert.ok(agentStates.includes("completed"));
+  const checkpointStates = events.filter(({ channel }) => channel === WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT).map(({ data }) => (data as { state: string }).state);
+  assert.deepEqual(checkpointStates, ["awaiting", "approved", "awaiting", "rejected"]);
+  assert.ok(channels.indexOf(WORKFLOW_RUN_STARTED_EVENT) < channels.indexOf(WORKFLOW_PHASE_CHANGED_EVENT));
+  assert.ok(channels.indexOf(WORKFLOW_WORKTREE_CREATED_EVENT) < channels.indexOf(WORKFLOW_AGENT_STATE_CHANGED_EVENT));
+  assert.ok(channels.indexOf(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT) < channels.indexOf(WORKFLOW_RUN_COMPLETED_EVENT));
+  assert.doesNotMatch(JSON.stringify(events), /PROMPT_SECRET|RESULT_SECRET|ARG_SECRET|CHECKPOINT_SECRET|CONTEXT_SECRET/);
+});
+void test("budget exhaustion emits a budget event and state change, not run failure", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-events-"));
+  const events: string[] = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string) { events.push(channel); } } } as never, home, async () => {}, async () => { throw new Error("must not launch"); });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  await assert.rejects(workflow.execute("id", { name: "budget-events", script: "return agent('PROMPT_SECRET');", budget: { agentLaunches: { hard: 0 } }, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError);
+  assert.ok(events.includes(WORKFLOW_BUDGET_EVENT));
+  assert.ok(events.includes(WORKFLOW_RUN_STATE_CHANGED_EVENT));
+  assert.equal(events.includes(WORKFLOW_RUN_FAILED_EVENT), false);
+  assert.equal(events.includes(WORKFLOW_RUN_COMPLETED_EVENT), false);
+});
+void test("run control lifecycle events cover pause, resume, and stop", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-run-control-events-"));
+  const events: Array<{ channel: string; data: unknown }> = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  let shutdown: (() => Promise<void>) | undefined;
+  let resolvePause!: (runId: string) => void;
+  let resolveStop!: (runId: string) => void;
+  const pauseReady = new Promise<string>((resolve) => { resolvePause = resolve; });
+  const stopReady = new Promise<string>((resolve) => { resolveStop = resolve; });
+  let releaseAgent!: () => void;
+  const agentReady = new Promise<void>((resolve) => { releaseAgent = resolve; });
+  const createSession = async (): Promise<NativeSession> => ({ sessionId: "control-session", sessionFile: "/sessions/control.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { await agentReady; }, steer: async () => {}, dispose() {} });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); if (channel === WORKFLOW_PHASE_CHANGED_EVENT) { const event = data as { phase: string; runId: string }; if (event.phase === "pause") { const action = commands[0]?.handler(`pause ${event.runId}`, context); if (action) void action.then(() => { setImmediate(() => { resolvePause(event.runId); }); }); } if (event.phase === "stop") { const action = commands[0]?.handler(`stop ${event.runId}`, context); if (action) void action.then(() => { setImmediate(() => { resolveStop(event.runId); }); }); } } } } } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  try {
+    const pausedRun = workflow.execute("id", { name: "pause-events", script: "phase('pause'); const value = await agent('PROMPT_SECRET'); await phase('after'); return value;", foreground: true }, new AbortController().signal, undefined, context);
+    const pausedRunId = await pauseReady;
+    releaseAgent();
+    for (let attempt = 0; attempt < 1000 && (await new RunStore(home, "session", pausedRunId, home).load()).run.state !== "paused"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal((await new RunStore(home, "session", pausedRunId, home).load()).run.state, "paused");
+    await command(`resume ${pausedRunId}`, context);
+    await pausedRun;
+    const stoppedRun = workflow.execute("id", { name: "stop-events", script: "phase('stop'); return await agent('PROMPT_SECRET');", foreground: true }, new AbortController().signal, undefined, context);
+    void stoppedRun.catch(() => undefined);
+    const stoppedRunId = await stopReady;
+    await assert.rejects(stoppedRun, (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
+    const stoppedEvents = events.filter(({ data }) => (data as { runId: string }).runId === stoppedRunId);
+    assert.equal(stoppedEvents.filter(({ channel }) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 1);
+    assert.equal(stoppedEvents.some(({ channel }) => channel === WORKFLOW_RUN_COMPLETED_EVENT || channel === WORKFLOW_RUN_FAILED_EVENT), false);
+    assert.equal((await new RunStore(home, "session", stoppedRunId, home).load()).run.state, "stopped");
+    const pausedStates = events.filter(({ data, channel }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT && (data as { runId: string }).runId === pausedRunId).map(({ data }) => (data as { state: string }).state);
+    assert.deepEqual(pausedStates, ["pausing", "paused", "running", "completed"]);
+    assert.equal(events.filter(({ channel, data }) => channel === WORKFLOW_RUN_RESUMED_EVENT && (data as { runId: string }).runId === pausedRunId).length, 1);
+    assert.equal(events.filter(({ channel, data }) => channel === WORKFLOW_RUN_STARTED_EVENT && (data as { runId: string }).runId === pausedRunId).length, 1);
+  } finally {
+    await shutdown?.();
+  }
+});
+void test("session recovery emits interruption as state change only", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-interruption-events-"));
+  const cwd = join(home, "project");
+  const runId = "interrupted-run";
+  const store = new RunStore(cwd, "session", runId, home);
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "interrupted" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  await store.create({ id: runId, workflowName: "interrupted", cwd, sessionId: "session", state: "running", agents: [], nativeSessions: [] }, snapshot);
+  const events: Array<{ channel: string; data: unknown }> = [];
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  workflowExtension({ registerTool() {}, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } } as never, home);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  try {
+    assert.ok(start);
+    await start({}, context);
+    const interruption = events.find(({ channel }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT);
+    assert.deepEqual(interruption && { previousState: (interruption.data as { previousState: string }).previousState, state: (interruption.data as { state: string }).state, reason: (interruption.data as { reason: string }).reason }, { previousState: "running", state: "interrupted", reason: "session_shutdown" });
+    assert.equal((await store.load()).run.state, "interrupted");
+    assert.equal(events.some(({ channel }) => channel === WORKFLOW_RUN_COMPLETED_EVENT || channel === WORKFLOW_RUN_FAILED_EVENT), false);
+  } finally {
+    await shutdown?.();
+  }
 });
 
 void test("/workflow doctor formats the shared doctor report with active session tools", async () => {
@@ -1519,7 +1658,8 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     modelRegistry: { getAll: () => [{ provider: "root", id: "model" }, { provider: "new", id: "model" }] }, ui: { notify() {} },
   };
   try {
-    workflowExtension({ registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+    const events: Array<{ channel: string; data: unknown }> = [];
+    workflowExtension({ registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } } as never, home, async () => {}, createSession);
     assert.ok(start && command);
     await start({}, ctx);
     await command("resume run", ctx);
@@ -1532,6 +1672,9 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     assert.deepEqual(loaded.snapshot.modelAliases, newAliases);
     assert.deepEqual(loaded.run.events, [{ type: "warning", message: "Model alias mappings changed on resume: reviewer: old/model -> new/model" }]);
     assert.match(formatNavigatorRun(loaded, [], []), /Model alias mappings changed on resume/);
+    assert.equal(events.filter(({ channel }) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 0);
+    assert.equal(events.filter(({ channel }) => channel === WORKFLOW_RUN_RESUMED_EVENT).length, 1);
+    assert.ok(events.some(({ channel }) => channel === WORKFLOW_RUN_COMPLETED_EVENT));
   } finally {
     await shutdown?.();
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
@@ -2419,8 +2562,9 @@ void test("workflow_resume persists exact proposals and approval or rejection co
   const store = new RunStore(cwd, "session", runId, home);
   await store.create({ id: runId, workflowName: "resume-budget", cwd, sessionId: "session", state: "budget_exhausted", agents: [], nativeSessions: [], budget, budgetVersion: 1, usage, budgetEvents: [exhausted] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "resume-budget" }, settings: { concurrency: 1 }, budget, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const events: Array<{ channel: string; data: unknown }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"] } as never, home);
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } } as never, home);
   const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   assert.ok(start);
   await start({}, context);
@@ -2448,4 +2592,8 @@ void test("workflow_resume persists exact proposals and approval or rejection co
   assert.equal(loaded.run.state, "completed");
   assert.equal(loaded.run.budgetVersion, 2);
   assert.deepEqual(loaded.run.budget, { tokens: { soft: 2, hard: 10 } });
+  assert.equal(events.filter(({ channel }) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 0);
+  assert.equal(events.filter(({ channel }) => channel === WORKFLOW_RUN_RESUMED_EVENT).length, 1);
+  assert.deepEqual(events.filter(({ channel }) => channel === WORKFLOW_BUDGET_EVENT).map(({ data }) => (data as { type: string }).type), ["adjustment_requested", "adjustment_rejected", "adjustment_requested", "adjustment_approved", "soft_crossed"]);
+  assert.ok(events.some(({ channel, data }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT && (data as { state: string }).state === "running"));
 });
