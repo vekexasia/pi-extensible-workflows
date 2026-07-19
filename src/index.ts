@@ -17,8 +17,6 @@ import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./pers
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
-export const WORKFLOW_ASYNC_STARTED_EVENT = "workflow:async-started";
-export const WORKFLOW_ASYNC_COMPLETE_EVENT = "workflow:async-complete";
 export const WORKFLOW_RUN_STARTED_EVENT = "workflow:run-started";
 export const WORKFLOW_RUN_RESUMED_EVENT = "workflow:run-resumed";
 export const WORKFLOW_RUN_STATE_CHANGED_EVENT = "workflow:run-state-changed";
@@ -1890,12 +1888,8 @@ class WorkflowEventPublisher {
     this.#budgetEvents.set(runId, seen);
   }
 
-  async runStarted(store: RunStore, metadata: WorkflowMetadata, background: boolean): Promise<void> {
+  async runStarted(store: RunStore, metadata: WorkflowMetadata): Promise<void> {
     await this.#publish(store, metadata, WORKFLOW_RUN_STARTED_EVENT, {});
-    if (background) await this.legacyStarted(store, metadata);
-  }
-
-  async legacyStarted(store: RunStore, metadata: WorkflowMetadata): Promise<void> { await this.#publish(store, metadata, WORKFLOW_ASYNC_STARTED_EVENT, { id: store.runId, runId: store.runId, pid: process.pid, sessionId: store.sessionId, asyncDir: store.directory, agent: metadata.name });
   }
 
   async runResumed(store: RunStore, metadata: WorkflowMetadata): Promise<void> { await this.#publish(store, metadata, WORKFLOW_RUN_RESUMED_EVENT, {}); }
@@ -1905,17 +1899,12 @@ class WorkflowEventPublisher {
     if ((previousState === "paused" || previousState === "interrupted" || previousState === "budget_exhausted") && state === "running") await this.runResumed(store, metadata);
   }
 
-  async runCompleted(store: RunStore, metadata: WorkflowMetadata, resultPath: string, background: boolean): Promise<void> {
+  async runCompleted(store: RunStore, metadata: WorkflowMetadata, resultPath: string): Promise<void> {
     await this.#publish(store, metadata, WORKFLOW_RUN_COMPLETED_EVENT, { resultPath });
-    if (background) await this.#publish(store, metadata, WORKFLOW_ASYNC_COMPLETE_EVENT, { id: store.runId, runId: store.runId, sessionId: store.sessionId, asyncDir: store.directory, success: true, state: "complete" });
   }
 
-  async runFailed(store: RunStore, metadata: WorkflowMetadata, error: unknown, background: boolean, state: "failed" | "stopped" | "interrupted" | "budget_exhausted"): Promise<void> {
-    if (state === "failed") await this.#publish(store, metadata, WORKFLOW_RUN_FAILED_EVENT, { error: safeEventError(error) });
-    if (background) {
-      const legacyState = state === "interrupted" ? "failed" : state;
-      await this.#publish(store, metadata, WORKFLOW_ASYNC_COMPLETE_EVENT, { id: store.runId, runId: store.runId, sessionId: store.sessionId, asyncDir: store.directory, success: false, state: legacyState, ...(state === "stopped" ? { stopped: true } : {}), ...(legacyState === "budget_exhausted" || legacyState === "failed" ? { error: safeEventError(error).message } : {}) });
-    }
+  async runFailed(store: RunStore, metadata: WorkflowMetadata, error: unknown): Promise<void> {
+    await this.#publish(store, metadata, WORKFLOW_RUN_FAILED_EVENT, { error: safeEventError(error) });
   }
 
   async agentState(store: RunStore, metadata: WorkflowMetadata, previous: AgentRecord | undefined, agent: AgentRecord): Promise<void> {
@@ -2412,7 +2401,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     try { variables = await resolveWorkflowVariables(runContext, controller, registry); }
     catch (error) {
       const typed = asWorkflowError(error);
-      if (!["completed", "failed", "stopped"].includes(run.lifecycle.state)) { await run.lifecycle.terminal("failed", typed.code).catch(() => undefined); const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, error: { code: typed.code, message: typed.message } })); await eventPublisher.runFailed(run.store, run.metadata, typed, true, run.lifecycle.state === "interrupted" ? "interrupted" : "failed"); run.update?.(workflowToolUpdate(persisted)); }
+      if (!["completed", "failed", "stopped"].includes(run.lifecycle.state)) { await run.lifecycle.terminal("failed", typed.code).catch(() => undefined); const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, error: { code: typed.code, message: typed.message } })); if (run.lifecycle.state === "failed") await eventPublisher.runFailed(run.store, run.metadata, typed); run.update?.(workflowToolUpdate(persisted)); }
       throw typed;
     }
     await scheduler.cancelRun(run.store.runId);
@@ -2443,13 +2432,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       } finally { await run.lifecycle.leave(); }
     }, checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { let previousPhase: string | undefined; const persisted = await persistRunState(run.store, run.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; }); await eventPublisher.phase(run.store, run.metadata, previousPhase, phase); runs.get(run.store.runId)?.update?.(workflowToolUpdate(persisted)); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
     run.execution = execution;
-    await eventPublisher.legacyStarted(run.store, run.metadata);
     const completion = execution.result.then(async (value) => {
       await scheduler.flush();
       if (run.budget.hardExhausted) throw new WorkflowError("BUDGET_EXHAUSTED", "Budgeted work was attempted after hard exhaustion");
       const resultPath = await run.store.saveResult(value);
       await run.lifecycle.terminal("completed", "completed");
-      await eventPublisher.runCompleted(run.store, run.metadata, resultPath, true);
+      await eventPublisher.runCompleted(run.store, run.metadata, resultPath);
       return { value, resultPath };
     }).catch(async (error: unknown) => {
       await scheduler.flush();
@@ -2457,7 +2445,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) await run.lifecycle.terminal(typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
       const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot(), error: { code: typed.code, message: typed.message } }));
       const state = run.lifecycle.state === "stopped" || run.lifecycle.state === "interrupted" || run.lifecycle.state === "budget_exhausted" ? run.lifecycle.state : "failed";
-      await eventPublisher.runFailed(run.store, run.metadata, typed, true, state);
+      if (state === "failed") await eventPublisher.runFailed(run.store, run.metadata, typed);
       run.update?.(workflowToolUpdate(persisted));
       if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) deliverFailure(pi, run.metadata.name, error);
     });
@@ -2653,13 +2641,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         } finally { await lifecycle.leave(); }
       }, log: logBridge(lifecycle, checked.metadata.name) }, store, runContext, variables, registry), runController.signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
-      await eventPublisher.runStarted(store, checked.metadata, background);
+      await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {
         await scheduler.flush();
         if (budgetRuntime.hardExhausted) throw new WorkflowError("BUDGET_EXHAUSTED", "Budgeted work was attempted after hard exhaustion");
         const resultPath = await store.saveResult(value);
         await lifecycle.terminal("completed", "completed");
-        await eventPublisher.runCompleted(store, checked.metadata, resultPath, background);
+        await eventPublisher.runCompleted(store, checked.metadata, resultPath);
         return { value, resultPath };
       }).catch(async (error: unknown) => {
         await scheduler.flush();
@@ -2667,7 +2655,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         if (!["stopped", "interrupted", "budget_exhausted"].includes(lifecycle.state)) await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
         await persistRunState(store, checked.metadata, (current) => ({ ...current, ...budgetRuntime.snapshot(), error: { code: typed.code, message: typed.message } }));
         const state = lifecycle.state === "stopped" || lifecycle.state === "interrupted" || lifecycle.state === "budget_exhausted" ? lifecycle.state : "failed";
-        await eventPublisher.runFailed(store, checked.metadata, typed, background, state);
+        if (state === "failed") await eventPublisher.runFailed(store, checked.metadata, typed);
         throw typed;
       });
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).completion = finish;

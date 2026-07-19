@@ -84,7 +84,7 @@
       </section>
       <section id="selection">
         <h2>Role and model selection</h2>
-        <p>An agent can select a <code>role</code>, a configured model alias, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary. When <code>workflow_catalog</code> exposes model aliases, an exact alias name takes precedence over a matching native bare model name; explicit call-level <code>thinking</code> overrides the alias suffix.</p>
+        <p>An agent can select a <code>role</code>, a configured model alias, an explicit <code>model</code> such as <code>provider/model:thinking</code>, a <code>thinking</code> level, and a list of <code>tools</code>. Role policy takes precedence and cannot be mixed with model, thinking, or tools options. A requested model or tool must be inside the launching session boundary. When <code>workflow_catalog</code> exposes model aliases, an exact alias name takes precedence over a matching native bare model name; explicit call-level <code>thinking</code> overrides the alias suffix. See <a href="developers.html#settings">global workflow settings</a> for alias and workflow-agent resource policy.</p>
         <p>Optional controls are <code>outputSchema</code>, non-negative integer <code>retries</code>, positive integer or <code>null</code> <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. Use separate named scopes for independent branches and one enclosing scope for collaborators.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the package API"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
@@ -101,7 +101,7 @@
     <span class="tok-property">"agentLaunches"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"hard"</span><span class="tok-punctuation">:</span> <span class="tok-number">10</span> <span class="tok-punctuation">}</span>
   <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Soft crossings ask agents to wrap up; hard limits block new launches or turns but accept an already-finished final response. Usage includes retries and descendants. If more model work is attempted after exhaustion, the run enters <code>budget_exhausted</code>.</p>
+        <p>Soft crossings ask agents to wrap up; hard limits block new launches or turns but accept an already-finished final response. Usage includes retries and descendants and remains cumulative across Pi context compaction. If more model work is attempted after exhaustion, the run enters <code>budget_exhausted</code>. Runs without effective limits omit budget information from compact TUI views.</p>
         <p>Resume an exhausted run with <code>workflow_resume</code> and an optional budget patch. Omitted values remain unchanged and <code>null</code> removes a limit. Tightening resumes directly; raising or removing a limit requires human approval through <code>workflow_respond</code> with the exact proposal ID. Do not retry ordinary agent work to bypass an exhausted budget.</p>
       </section>
       <section id="checkpoints">
@@ -125,11 +125,11 @@
           <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. A <code>budget_exhausted</code> run can resume through <code>workflow_resume</code> with retained historical usage and an acceptable budget; completed, failed, and stopped runs remain non-resumable.</li>
           <li><strong>Cancellation:</strong> stopping a run is immediate, cascades to owned agents, and cannot be undone. A cancelled workflow reports <code>CANCELLED</code> or a stopped run state.</li>
         </ul>
-        <p>Use <code>/workflow</code> to inspect state and budgets, manage model aliases, pause, resume, adjust an exhausted budget, stop, approve, reject, or delete a run. The run ID returned by a background invocation is the handle for these actions.</p>
+        <p>Use <code>/workflow</code> to inspect state and budgets, manage model aliases, pause, resume, adjust an exhausted budget, stop, approve, reject, or delete a run. Agents are grouped by structural task scope; select one to inspect its transcript, ID, and applicable branch or worktree actions. The run ID returned by a background invocation is the handle for run-level actions.</p>
       </section>
       <section class="callout">
         <h2>Need the implementation details?</h2>
-        <p>See the <a href="developers.html#operations">developer operations guide</a> for storage, doctor, inspector, and evaluation commands.</p>
+        <p>See the <a href="developers.html#settings">developer configuration guide</a> for global and project settings, or <a href="developers.html#operations">operations</a> for storage, doctor, inspector, and evaluation commands.</p>
       </section>
       <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
     </article>

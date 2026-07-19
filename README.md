@@ -2,6 +2,8 @@
 
 ![pi-extensible-workflows workflow banner](https://raw.githubusercontent.com/vekexasia/pi-extensible-workflows/main/assets/pi-extensible-workflows-banner.png)
 
+> There are many workflow extensions but this one is **Yours.**
+
 Turn multi-agent tasks into deterministic jobs that fan out in parallel, pause for approval, and resume without rerunning completed work.
 
 [Documentation](https://vekexasia.github.io/pi-extensible-workflows/) | [Developer guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html) | [Agent guide](https://vekexasia.github.io/pi-extensible-workflows/agents.html)
@@ -41,13 +43,18 @@ return summary;
 Learn more about roles, workflow contracts, and extension APIs in the documentation:
 
 - [Workflow tool and invocation API](https://vekexasia.github.io/pi-extensible-workflows/developers.html#tool-api)
-- [Global model aliases](https://vekexasia.github.io/pi-extensible-workflows/developers.html#model-aliases)
+- [Global and project settings](https://vekexasia.github.io/pi-extensible-workflows/developers.html#settings)
 - [Aggregate run budgets](https://vekexasia.github.io/pi-extensible-workflows/developers.html#budgets)
 - [Workflow DSL and worktrees](https://vekexasia.github.io/pi-extensible-workflows/developers.html#dsl)
 - [Reusable extension primitives](https://vekexasia.github.io/pi-extensible-workflows/developers.html#extensions)
+- [Run artifacts and lifecycle events](https://vekexasia.github.io/pi-extensible-workflows/developers.html#lifecycle)
 - [Run inspection and recovery](https://vekexasia.github.io/pi-extensible-workflows/developers.html#operations)
 - [Agent patterns and model selection](https://vekexasia.github.io/pi-extensible-workflows/agents.html#patterns)
 - [Checkpoints](https://vekexasia.github.io/pi-extensible-workflows/agents.html#checkpoints)
+
+## Configuration
+
+Global workflow settings live at `~/.pi/agent/pi-extensible-workflows/settings.json` by default and configure concurrency, model aliases, and workflow-agent skill or extension exclusions. Trusted projects can add resource exclusions at `<project>/.pi/pi-extensible-workflows/settings.json`; they cannot override global aliases or concurrency. See [global and project settings](https://vekexasia.github.io/pi-extensible-workflows/developers.html#settings) for the schema and merge rules.
 
 ## CLI
 

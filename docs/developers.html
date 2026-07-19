@@ -22,13 +22,13 @@
     <aside class="toc" aria-label="On this page">
       <p class="toc-title">Developers</p>
       <a href="#installation">Installation</a>
+      <a href="#settings">Configuration</a>
       <a href="#tool-api">Tool API</a>
       <a href="#budgets">Run budgets</a>
       <a href="#dsl">Workflow DSL</a>
       <a href="#extensions">Extensions and roles</a>
       <a href="#lifecycle">Lifecycle</a>
       <a href="#operations">Operations</a>
-      <a href="#model-aliases">Model aliases</a>
       <a href="#evaluation">Evaluation</a>
     </aside>
     <article class="prose">
@@ -44,6 +44,37 @@
         <p>For a one-session trial without changing Pi settings:</p>
         <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension /absolute/path/to/pi-extensible-workflows/src/index.ts</code></pre>
         <p>The package declares Pi AI, Pi coding agent, and TypeBox as peer dependencies. The repository development setup currently pins the Pi packages to 0.80.9.</p>
+      </section>
+      <section id="settings">
+        <h2>Global and project settings</h2>
+        <p>The optional global settings file is <code>&lt;agentDir&gt;/pi-extensible-workflows/settings.json</code>, normally <code>~/.pi/agent/pi-extensible-workflows/settings.json</code>. If <code>PI_CODING_AGENT_DIR</code> is set, it replaces <code>~/.pi/agent</code>. Missing files use defaults. The schema is strict: unknown keys, malformed JSON, and invalid values stop launch or resume with the settings path in the error.</p>
+        <pre><code class="language-json">{
+  "concurrency": 8,
+  "modelAliases": {
+    "reviewer-model": "anthropic/claude-fable-5:high",
+    "developer-model": "openai-codex/gpt-5.6-luna:xhigh"
+  },
+  "disabledAgentResources": {
+    "skills": ["learning-opportunities"],
+    "extensions": ["~/.pi/agent/extensions/review-loop.ts"]
+  }
+}</code></pre>
+        <p><code>concurrency</code> defaults to 8 and accepts integers from 1 through 16. A workflow call's <code>concurrency</code> field overrides this default for that run.</p>
+        <h3 id="model-aliases">Model aliases</h3>
+        <p>Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>. Targets must be concrete <code>provider/model</code> references with an optional recognized thinking suffix. Alias chaining is rejected.</p>
+        <p>Aliases work anywhere the workflow runtime accepts a model, including role files. An exact configured alias wins over a native bare model name. Explicit call-level <code>thinking</code> overrides the alias suffix. Resolution never falls back: an unavailable target fails with <code>UNKNOWN_MODEL</code> and identifies the alias, resolved target when known, and settings path.</p>
+        <p>Each launch and resume snapshots one alias mapping for that execution segment. Completed and replayed calls retain their results; pending, retried, and new calls use mappings reloaded on resume. Mapping changes produce one persisted warning in run events and the inspector.</p>
+        <p><code>workflow_catalog</code> lists alias names and concrete targets without probing availability or injecting them into guidance. <code>/workflow</code> can list, add, edit, and delete global aliases. It atomically updates only <code>modelAliases</code>, preserves other settings, and affects new launches and resumes without <code>/reload</code>.</p>
+        <h3 id="agent-resource-exclusions">Workflow-agent resource exclusions</h3>
+        <p>Trusted projects can add exclusions in <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/settings.json</code>. Only <code>disabledAgentResources</code> is used as project policy; global concurrency and model aliases are not overridden. Project exclusions are ignored when the project is untrusted and merge additively with global exclusions when trusted.</p>
+        <pre><code class="language-json">{
+  "disabledAgentResources": {
+    "skills": ["project-interactive-skill"],
+    "extensions": ["../../extensions/project-only-extension.ts"]
+  }
+}</code></pre>
+        <p>Skill selectors are exact declared skill names. Extension selectors are exact source paths; relative paths resolve from the settings file, <code>~</code> expands to the home directory, and paths are canonicalized and deduplicated. Missing keys and empty arrays exclude nothing.</p>
+        <p>Exclusions affect workflow agents only. The parent Pi session keeps its normal resources. Disabled extensions are filtered before their factories run, and disabled skills are removed before prompts and skill commands are registered. Fresh attempts, retries, resumes, and recovered runs reevaluate current policy. <code>workflow doctor</code> reports global, project, effective, and currently unmatched selectors.</p>
       </section>
       <section id="tool-api">
         <h2>Tool API</h2>
@@ -91,12 +122,12 @@
   },
 }</code></pre>
         <p>Token, duration, and launch limits are non-negative integers; cost limits are finite non-negative numbers. Zero is valid, and <code>soft</code> must be lower than <code>hard</code> when both are set. The former <code>maxAgentLaunches</code> setting and launch field have been removed; use <code>budget.agentLaunches</code>.</p>
-        <p>Usage covers all workflow-agent attempts, retries, and descendants but excludes the main orchestrator. Tokens count reported input plus output and exclude cache reads and writes. Cost uses provider-reported USD values; unmetered usage contributes only what the provider reports. Replayed calls retain their historical usage without counting as new launches.</p>
+        <p>Usage covers all workflow-agent attempts, retries, and descendants but excludes the main orchestrator. Tokens count reported input plus output and exclude cache reads and writes. Accounting uses Pi's cumulative session statistics, so compaction cannot remove earlier token or cost usage from progress, budgets, or persisted attempt totals. Replayed calls retain historical usage without counting as new launches.</p>
         <p>A soft crossing is recorded once per budget version. If more model work remains, active agents receive one wrap-up instruction before their next turn and later agents are annotated; a final crossing response completes without an injected message.</p>
         <p>Hard launch limits are checked immediately before dispatch. Token, cost, and duration limits are checked between model turns. In-flight turns and tools may finish: a final overshooting response is accepted, while a response requiring tools or another turn stops with <code>BUDGET_EXHAUSTED</code> before that work begins. If accepted results let the workflow return without more model work, the run completes with an overrun event; otherwise it enters the resumable <code>budget_exhausted</code> state.</p>
         <p>Duration includes active workflow JavaScript, agent work, and tool calls, but excludes pauses, checkpoint waits, and offline time. Historical usage remains charged after resume.</p>
         <p><code>workflow_resume</code> accepts the exact run ID and an optional budget patch. Omitted patch values stay unchanged and explicit <code>null</code> removes a limit. Tightening applies immediately; raising or removing a limit creates a persisted human-approval proposal. Every exhausted hard dimension must be raised above retained usage or removed. Answer the exact proposal ID with <code>workflow_respond</code>.</p>
-        <p><code>/workflow</code> and the inspector show limits, usage, percentages, budget versions, crossings, and overruns. For an exhausted run, the navigator offers <code>Resume unchanged</code> or <code>Adjust budget</code>.</p>
+        <p><code>/workflow</code> and the inspector show limits, usage, percentages, budget versions, crossings, and overruns. Compact TUI surfaces omit budget rows entirely when a run has no effective limit, including after a patch removes every limit. Required exhaustion, adjustment, and approval context remains visible.</p>
       </section>
       <section id="dsl">
         <h2>Workflow DSL</h2>
@@ -202,14 +233,18 @@ Focus on correctness and regressions.</code></pre>
 <span class="tok-keyword">if</span> (decision !== <span class="tok-string">"approved"</span>) <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">approved</span><span class="tok-punctuation">:</span> <span class="tok-boolean">false</span> <span class="tok-punctuation">}</span>;</code></pre>
         <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Sandboxed workflow scripts receive <code>"approved"</code> or <code>"rejected"</code> from direct <code>checkpoint()</code>; registered workflow functions receive a boolean from <code>WorkflowOrchestrationContext.checkpoint</code>. Responses are journaled and replay after cold recovery.</p>
         <p>Use <code>withWorktree(name, callback)</code> for canonical worktree scopes: put collaborating top-level agents in one named callback, or put each independent parallel branch in its own named callback. The runtime creates deterministic owned branches and worktrees lazily; the caller branch is unchanged, children and retries reuse the enclosing scope, and recovery preserves the existing ownership and cleanup behavior.</p>
+        <h3 id="agent-observability">Agent grouping and drilldown</h3>
+        <p>The live workflow card and <code>/workflow</code> group agents by their structural workflow path and include registered-function context as a breadcrumb. Groups remain stable as later agents start, creation order is preserved inside each group, and actual parent-child agents remain nested.</p>
+        <p>The navigator's agent picker opens contextual actions for the selected agent: view or copy its transcript, copy its agent ID, and, when it owns a worktree, copy that branch or worktree path. Worktree ownership IDs and per-worktree copy actions are not exposed in the top-level run menu.</p>
+        <h3 id="run-artifacts">Run storage and executed source</h3>
         <p>Runs are stored under <code>~/.pi/workflows/projects/&lt;cwd-slug&gt;-&lt;cwd-hash&gt;/sessions/&lt;session-id&gt;/runs/&lt;run-id&gt;/</code>. Identity checks use the resolved launch cwd and Pi session ID.</p>
+        <p>Every new run contains <code>workflow.js</code> with the exact UTF-8 JavaScript source that was preflighted and executed. It is an immutable inspection artifact written during atomic run creation. <code>snapshot.json</code> remains authoritative for execution and resume; historical runs without <code>workflow.js</code> remain loadable.</p>
         <p>Each run's private <code>system-prompts.json</code> records the full effective system prompt at every native Pi <code>agent_start</code>, after <code>before_agent_start</code> extensions have run. Entries include the native session ID, attempt, turn, SHA-256 digest, and prompt. Native Pi JSONL transcripts intentionally omit system prompts.</p>
         <p>Run directories use mode <code>0700</code> and the prompt artifact uses <code>0600</code>. Treat it as sensitive because it can contain role bodies, project instructions, tool guidance, and extension modifications. Confirmed run deletion removes it; native Pi transcripts remain in Pi session storage.</p>
-        <h3>Workflow lifecycle events</h3>
+        <h3 id="lifecycle-events">Workflow lifecycle events</h3>
         <p>The package exports <code>WORKFLOW_RUN_STARTED_EVENT</code>, <code>WORKFLOW_RUN_RESUMED_EVENT</code>, <code>WORKFLOW_RUN_STATE_CHANGED_EVENT</code>, <code>WORKFLOW_RUN_COMPLETED_EVENT</code>, <code>WORKFLOW_RUN_FAILED_EVENT</code>, <code>WORKFLOW_AGENT_STATE_CHANGED_EVENT</code>, <code>WORKFLOW_PHASE_CHANGED_EVENT</code>, <code>WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT</code>, <code>WORKFLOW_BUDGET_EVENT</code>, and <code>WORKFLOW_WORKTREE_CREATED_EVENT</code>, plus matching TypeScript payload types such as <code>WorkflowEventBase</code> and <code>WorkflowRunCompletedEvent</code>.</p>
         <p>Subscribe through <code>pi.events</code>. Events are in-process, best-effort, emitted after the corresponding run artifact or state persistence, and ordered within each run. Payloads contain correlation and safe inspection metadata only: prompts, responses, results, tool data, environment values, and workflow source are never included. Manual stop, interruption, pause, awaiting input, and budget exhaustion are state changes, not run completion or failure.</p>
         <pre><code class="language-typescript">pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event: WorkflowRunCompletedEvent) =&gt; console.log(event.runId, event.resultPath));</code></pre>
-        <p><code>WORKFLOW_ASYNC_STARTED_EVENT</code> and <code>WORKFLOW_ASYNC_COMPLETE_EVENT</code> remain legacy background-run compatibility events and are derived from the same persisted transitions.</p>
       </section>
       <section id="operations">
         <h2>Operations and debugging</h2>
@@ -226,19 +261,7 @@ Focus on correctness and regressions.</code></pre>
 /workflow approve &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow reject &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow delete &lt;run-id&gt;</code></pre>
-        <p>The navigator discovers only runs from the exact current cwd and Pi session. It also exposes <code>Model aliases</code> even when no runs exist and shows budget status and adjustment controls for exhausted runs. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
-        <h3 id="model-aliases">Settings, model aliases, and errors</h3>
-        <pre><code class="language-json"><span class="tok-punctuation">{</span>
-  <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">"modelAliases"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
-    <span class="tok-property">"reviewer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"anthropic/claude-fable-5:high"</span><span class="tok-punctuation">,</span>
-    <span class="tok-property">"developer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-luna:xhigh"</span>
-  <span class="tok-punctuation">}</span>
-<span class="tok-punctuation">}</span></code></pre>
-        <p>Optional strict settings live at <code>&lt;agentDir&gt;/pi-extensible-workflows/settings.json</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/settings.json</code>. Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>. Targets must be concrete <code>provider/model</code> references with an optional recognized thinking suffix; aliases cannot contain <code>/</code> or <code>:</code>, and alias chaining is rejected.</p>
-        <p>Aliases work anywhere the workflow runtime accepts a model, including role files. An exact configured alias wins over a native bare model name. Explicit call-level <code>thinking</code> overrides the alias suffix; otherwise existing role, workflow, and root precedence applies. Resolution never falls back: malformed configuration fails with <code>CONFIG_ERROR</code>, and a missing alias or unavailable target fails with <code>UNKNOWN_MODEL</code> including the requested alias, resolved target when known, and settings path. Provider credential failures remain authentication errors.</p>
-        <p>Each launch and resume snapshots one alias mapping for that active run segment. Completed and replayed calls keep their results; pending, retried, and new calls use the mapping reloaded on resume. Changed mappings emit one persisted, non-blocking <code>Model alias mappings changed on resume: name: old target -&gt; new target</code> warning in run events and the inspector.</p>
-        <p><code>workflow_catalog</code> lists configured alias names and concrete targets without probing availability or injecting them into guidance. The <code>/workflow</code> navigator can list, add, edit, and delete aliases. Alias names are immutable during edit, unknown manual targets require a warning confirmation, and deletion requires confirmation. Saves reread the settings file, atomically update only <code>modelAliases</code>, preserve other keys, and affect new launches and resumes without reloading the extension.</p>
+        <p>The navigator discovers only runs from the exact current cwd and Pi session. It exposes <code>Model aliases</code> even when no runs exist, groups agents by structural scope with agent-specific transcript and worktree actions, and shows budget status and adjustment controls only when relevant. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
         <p>Invocation options override settings defaults, and the session-wide active-agent ceiling is 16. Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>CONFIG_ERROR</code>, <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, settings, or script issue before retrying.</p>
       </section>
       <section id="evaluation">
