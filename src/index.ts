@@ -435,22 +435,25 @@ function normalizedResourcePath(value: string, settingsPath: string): string {
   const resolved = resolve(dirname(settingsPath), expanded);
   try { return realpathSync(resolved); } catch { return resolved; }
 }
-function validateAgentResourceExclusions(value: unknown, settingsPath: string): AgentResourceExclusions | undefined {
+export function mergeAgentResourceExclusions(...values: (AgentResourceExclusions | undefined)[]): AgentResourceExclusions {
+  return { skills: [...new Set(values.flatMap((value) => value?.skills ?? []))], extensions: [...new Set(values.flatMap((value) => value?.extensions ?? []))] };
+}
+function validateAgentResourceExclusions(value: unknown, settingsPath: string, errorCode: "INVALID_SETTINGS" | "INVALID_METADATA" = "INVALID_SETTINGS"): AgentResourceExclusions | undefined {
   if (value === undefined) return undefined;
   const base = `${settingsPath}.disabledAgentResources`;
-  if (!object(value)) fail("INVALID_SETTINGS", `${base} must be an object`);
-  for (const key of Object.keys(value)) if (key !== "skills" && key !== "extensions") fail("INVALID_SETTINGS", `${base}.${key} is not supported`);
+  if (!object(value)) fail(errorCode, `${base} must be an object`);
+  for (const key of Object.keys(value)) if (key !== "skills" && key !== "extensions") fail(errorCode, `${base}.${key} is not supported`);
   const normalized: { skills: string[]; extensions: string[] } = { skills: [], extensions: [] };
   for (const kind of ["skills", "extensions"] as const) {
     const entries = value[kind];
     if (entries === undefined) continue;
-    if (!Array.isArray(entries)) fail("INVALID_SETTINGS", `${base}.${kind} must be an array`);
+    if (!Array.isArray(entries)) fail(errorCode, `${base}.${kind} must be an array`);
     const seen = new Set<string>();
     for (const [index, entry] of entries.entries()) {
-      if (typeof entry !== "string" || !entry.trim()) fail("INVALID_SETTINGS", `${base}.${kind}[${String(index)}] must be a non-empty string`);
+      if (typeof entry !== "string" || !entry.trim()) fail(errorCode, `${base}.${kind}[${String(index)}] must be a non-empty string`);
       let selector = entry.trim();
       if (kind === "extensions") {
-        try { selector = normalizedResourcePath(selector, settingsPath); } catch (error) { fail("INVALID_SETTINGS", `${base}.${kind}[${String(index)}] must be a valid path: ${errorText(error)}`); }
+        try { selector = normalizedResourcePath(selector, settingsPath); } catch (error) { fail(errorCode, `${base}.${kind}[${String(index)}] must be a valid path: ${errorText(error)}`); }
       }
       if (!seen.has(selector)) { seen.add(selector); normalized[kind].push(selector); }
     }
@@ -478,7 +481,7 @@ export function resolveAgentResourcePolicy(cwd: string, projectTrusted: boolean,
   const projectSettingsPath = workflowProjectSettingsPath(cwd);
   const global = loadSettings(globalSettingsPath).disabledAgentResources ?? EMPTY_AGENT_RESOURCE_EXCLUSIONS;
   const project = projectTrusted ? loadSettings(projectSettingsPath).disabledAgentResources ?? EMPTY_AGENT_RESOURCE_EXCLUSIONS : EMPTY_AGENT_RESOURCE_EXCLUSIONS;
-  const effective = { skills: [...new Set([...global.skills, ...project.skills])], extensions: [...new Set([...global.extensions, ...project.extensions])] };
+  const effective = mergeAgentResourceExclusions(global, project);
   return { globalSettingsPath, projectSettingsPath, projectTrusted, global, project, effective, unmatchedSkills: [], unmatchedExtensions: [] };
 }
 export function saveModelAliases(path = workflowSettingsPath(), aliases: Readonly<Record<string, string>> = {}): void {
@@ -496,7 +499,7 @@ export function saveModelAliases(path = workflowSettingsPath(), aliases: Readonl
   renameSync(temporary, path);
 }
 
-export function parseRoleMarkdown(content: string, strict = false): AgentDefinition {
+export function parseRoleMarkdown(content: string, strict = false, rolePath?: string): AgentDefinition {
   if (!strict) {
     if (!content.startsWith("---\n")) return { prompt: content };
     const end = content.indexOf("\n---", 4);
@@ -522,12 +525,13 @@ export function parseRoleMarkdown(content: string, strict = false): AgentDefinit
   try { parsed = parseFrontmatter(content); }
   catch (error) { fail("INVALID_METADATA", `Invalid role frontmatter: ${errorText(error)}`); }
   if (!object(parsed.frontmatter)) fail("INVALID_METADATA", "Role frontmatter must be an object");
-  const { model, thinking, tools, description } = parsed.frontmatter;
+  const { model, thinking, tools, description, disabledAgentResources } = parsed.frontmatter;
   if (model !== undefined && (typeof model !== "string" || model.trim() === "")) fail("INVALID_METADATA", "Role model must be a non-empty string");
   if (thinking !== undefined && (typeof thinking !== "string" || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(thinking))) fail("INVALID_METADATA", `Invalid role thinking level: ${typeof thinking === "string" ? thinking : typeof thinking}`);
   if (description !== undefined && (typeof description !== "string" || description.trim() === "" || description.length > 1024 || /[\r\n]/.test(description))) fail("INVALID_METADATA", "Role description must be a non-empty single-line string of at most 1024 characters");
   if (tools !== undefined && (!Array.isArray(tools) || tools.some((tool) => typeof tool !== "string" || tool.trim() === ""))) fail("INVALID_METADATA", "Role tools must be an array of non-empty strings");
-  return { prompt: parsed.body, ...(typeof description === "string" ? { description: description.trim() } : {}), ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}) };
+  const normalizedResources = validateAgentResourceExclusions(disabledAgentResources, rolePath ?? "<role>", "INVALID_METADATA");
+  return { prompt: parsed.body, ...(typeof description === "string" ? { description: description.trim() } : {}), ...(typeof model === "string" ? { model: model.trim() } : {}), ...(typeof thinking === "string" ? { thinking: thinking as NonNullable<AgentDefinition["thinking"]> } : {}), ...(Array.isArray(tools) ? { tools: tools.map((tool) => (tool as string).trim()) } : {}), ...(normalizedResources ? { disabledAgentResources: normalizedResources } : {}) };
 }
 
 const ROLE_DIRECTORY = "pi-extensible-workflows";
@@ -544,7 +548,7 @@ function readAgentDefinitions(dir: string): Record<string, AgentDefinition> {
   try {
     return Object.fromEntries(readdirSync(dir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && extname(entry.name) === ".md")
-      .map((entry) => [basename(entry.name, ".md"), parseRoleMarkdown(readFileSync(join(dir, entry.name), "utf8"), true)]));
+      .map((entry) => { const path = join(dir, entry.name); return [basename(entry.name, ".md"), parseRoleMarkdown(readFileSync(path, "utf8"), true, path)]; }));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw error;

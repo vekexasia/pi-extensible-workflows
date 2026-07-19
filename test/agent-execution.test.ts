@@ -545,6 +545,28 @@ void test("refreshes resource exclusions for every fresh attempt and inspects th
   assert.deepEqual(inputs.map(({ effective }) => effective), [{ skills: ["skill-1"], extensions: ["/extensions/extension-1.ts"] }, { skills: ["skill-2"], extensions: ["/extensions/extension-2.ts"] }]);
   assert.deepEqual(result.attempts.map(({ setup }) => setup?.disabledAgentResources?.skills), [["skill-1"], ["skill-2"]]);
 });
+void test("isolates role resource exclusions and reapplies them on retries", async () => {
+  const roleExtension = "/role/extension.ts";
+  const basePolicy = { globalSettingsPath: "/global/settings.json", projectSettingsPath: "/project/settings.json", projectTrusted: true, global: { skills: ["global"], extensions: ["/global.ts"] }, project: { skills: ["project"], extensions: ["/project.ts"] }, effective: { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] }, unmatchedSkills: [], unmatchedExtensions: [] };
+  const policies: Array<NonNullable<Parameters<SessionFactory>[0]["resourcePolicy"]>> = [];
+  let sessions = 0;
+  const executor = new WorkflowAgentExecutor({ ...root, agentDefinitions: { ...root.agentDefinitions, reviewer: { ...root.agentDefinitions?.reviewer, disabledAgentResources: { skills: ["role", "global"], extensions: [roleExtension, "/global.ts"] } }, scout: { ...root.agentDefinitions?.scout } }, agentResourcePolicy: () => structuredClone(basePolicy) }, async (input) => {
+    assert.ok(input.resourcePolicy);
+    policies.push(input.resourcePolicy);
+    const session = ++sessions;
+    return { sessionId: `role-policy-${String(session)}`, sessionFile: `/sessions/role-policy-${String(session)}.jsonl`, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() { if (session === 1) throw new Error("retry"); }, dispose() {} };
+  });
+  await executor.execute("role", { label: "role", workflowName: "flow", role: "reviewer", retries: 1 });
+  await executor.execute("other", { label: "other", workflowName: "flow", role: "scout" });
+  await executor.execute("plain", { label: "plain", workflowName: "flow" });
+  assert.deepEqual(policies.map(({ effective }) => effective), [
+    { skills: ["global", "project", "role"], extensions: ["/global.ts", "/project.ts", roleExtension] },
+    { skills: ["global", "project", "role"], extensions: ["/global.ts", "/project.ts", roleExtension] },
+    { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] },
+    { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] },
+  ]);
+  assert.deepEqual(basePolicy.effective, { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] });
+});
 void test("filters disabled native extensions before factories and skills before session registration", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-loader-"));
   const agentDir = join(rootDir, "agent");

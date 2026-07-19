@@ -174,7 +174,7 @@ function validateModel(value: string, known: ReadonlySet<string>, available: Rea
 
 function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, settingsPath: string): AgentDefinition | undefined {
   let definition: AgentDefinition;
-  try { definition = parseRoleMarkdown(readFileSync(path, "utf8"), true); }
+  try { definition = parseRoleMarkdown(readFileSync(path, "utf8"), true, path); }
   catch (error) {
     diagnostics.push(diagnostic("error", "ROLE_FRONTMATTER", (error as Error).message, path, "Fix the role YAML frontmatter."));
     return undefined;

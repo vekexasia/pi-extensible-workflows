@@ -251,6 +251,13 @@
 <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>read<span class="tok-punctuation">,</span> grep<span class="tok-punctuation">]</span>
 <span class="tok-punctuation">---</span>
 Focus on correctness and regressions.</code></pre>
+        <p>Role frontmatter may also define <code>disabledAgentResources</code> with optional <code>skills</code> and <code>extensions</code> arrays. These exclusions merge with global and trusted-project policy only for agents using that role; unroled agents and other roles are unchanged.</p>
+        <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
+<span class="tok-property">disabledAgentResources</span><span class="tok-punctuation">:</span>
+  <span class="tok-property">skills</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>interactive-skill<span class="tok-punctuation">]</span>
+  <span class="tok-property">extensions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>../extensions/review-only.ts<span class="tok-punctuation">]</span>
+<span class="tok-punctuation">---</span></code></pre>
+        <p>Skill selectors are names; extension paths are normalized relative to the role file, with the same <code>~</code>, <code>file://</code>, canonicalization, and deduplication rules as settings.</p>
         <p>When <code>role</code> is present, omit <code>model</code>, <code>thinking</code>, and <code>tools</code> from the agent call. The role body is appended to the native Pi system prompt.</p>
         <h3>Prioritized agent setup hooks</h3>
         <p><strong>Security:</strong> setup hooks are trusted extension code. They run after ordinary workflow model, tool, cwd, and role policy validation, but before the native Pi session is created. Hooks can bypass those boundaries by mutating the prompt, raw options, resolved session input, or session factory; never register untrusted code as a setup hook.</p>

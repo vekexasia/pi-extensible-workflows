@@ -5,8 +5,8 @@ import { Value } from "typebox/value";
 import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
-import type { AgentIdentity, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
-import { resolveModelReference, WorkflowError } from "./index.js";
+import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
+import { mergeAgentResourceExclusions, resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
@@ -15,7 +15,7 @@ export interface AgentBudgetHooks {
   afterTurn(accounting: AgentAccounting, final: boolean): void;
   instruction(): string | undefined;
 }
-export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[] }
+export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[]; disabledAgentResources?: AgentResourceExclusions }
 export interface AgentExecutionOptions {
   label: string;
   workflowName: string;
@@ -173,7 +173,9 @@ function resourcePolicySummary(policy: AgentResourcePolicy): NonNullable<AgentSe
 async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
-  const resourcePolicy = await root.agentResourcePolicy?.();
+  const baseResourcePolicy = await root.agentResourcePolicy?.();
+  const roleExclusions = options.role ? root.agentDefinitions?.[options.role]?.disabledAgentResources : undefined;
+  const resourcePolicy = baseResourcePolicy && roleExclusions ? { ...baseResourcePolicy, effective: mergeAgentResourceExclusions(baseResourcePolicy.effective, roleExclusions) } : baseResourcePolicy;
   const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
   const setup: AgentSetup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, createSession };
   const base = fallbackSetupContext(root, options, setupSignal);

@@ -83,7 +83,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   const script = "const role = await agent(\"top role\", { role: \"reviewer\" }); const named = await agent(\"named\", { label: \"API inspection\" }); const parent = await agent(\"nested policies\"); return { role, named, parent };";
-  const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"] };
+  const role = { prompt: "Review role", model: "role-provider/role-model", thinking: "high" as const, tools: ["read"], disabledAgentResources: { skills: ["role-only"], extensions: [join(home, "role-only.ts")] } };
   const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "policy-reporting" }, settings: { concurrency: 2 }, models: ["root-provider/root-model", "role-provider/role-model", "case-provider/model-only", "case-provider/model-and-thinking"], tools: ["agent", "read"], agentTypes: ["reviewer"], roles: { reviewer: role }, schemas: [] });
   await store.create({ id: "run-a", workflowName: "policy-reporting", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, snapshot);
   await store.saveOwnership([]);
@@ -133,6 +133,7 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise((resolve) => setImmediate(resolve));
   const loaded = await store.load();
   assert.equal(loaded.run.state, "completed");
+  assert.deepEqual(loaded.snapshot.roles?.reviewer?.disabledAgentResources, role.disabledAgentResources);
   const attempts = loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => ({ agent, attempt })));
   assert.equal(inputs.size, 9);
   assert.equal(attempts.length, inputs.size);
@@ -141,6 +142,12 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
     assert.ok(input);
     assert.deepEqual({ provider: input.model.provider, model: input.model.model, thinking: input.model.thinking, tools: input.tools }, { provider: agent.model.provider, model: agent.model.model, thinking: agent.model.thinking, tools: agent.tools });
   }
+  const roleInputs = [...inputs.values()].filter(({ model }) => model.provider === "role-provider");
+  assert.equal(roleInputs.length, 3);
+  assert.ok(roleInputs.every((input) => input.resourcePolicy?.effective.skills.includes("role-only")));
+  const unroledInput = [...inputs.values()].find(({ model, sessionLabel }) => model.provider === "root-provider" && sessionLabel.includes("API inspection"));
+  assert.ok(unroledInput);
+  assert.equal(unroledInput.resourcePolicy?.effective.skills.includes("role-only"), false);
   const topRole = loaded.run.agents.find((agent) => agent.name === "reviewer" && !agent.parentId);
   const nestedRole = loaded.run.agents.find((agent) => agent.name === "nested-role");
   const named = loaded.run.agents.find((agent) => agent.name === "API inspection");

@@ -1407,6 +1407,26 @@ void test("strict role frontmatter rejects malformed metadata", () => {
   ];
   for (const content of invalid) assert.throws(() => parseRoleMarkdown(content, true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
+void test("strict role resource exclusions normalize relative and portable paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-resources-"));
+  const rolePath = join(root, "roles", "reviewer.md");
+  const extension = join(root, "role-extension.ts");
+  mkdirSync(join(root, "roles"), { recursive: true });
+  writeFileSync(extension, "");
+  const previousHome = process.env.HOME;
+  process.env.HOME = root;
+  try {
+    const definition = parseRoleMarkdown(`---\ndisabledAgentResources:\n  skills: [" role-skill", role-skill]\n  extensions:\n    - "../role-extension.ts"\n    - "~/role-extension.ts"\n    - "${pathToFileURL(extension).href}"\n---\nbody`, true, rolePath);
+    assert.deepEqual(definition, { prompt: "body", disabledAgentResources: { skills: ["role-skill"], extensions: [extension] } });
+    for (const content of [
+      "---\ndisabledAgentResources: { unknown: [x] }\n---\nbody",
+      "---\ndisabledAgentResources:\n  skills: ['']\n---\nbody",
+      "---\ndisabledAgentResources:\n  extensions: [2]\n---\nbody",
+    ]) assert.throws(() => parseRoleMarkdown(content, true, rolePath), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
 
 void test("rejects invalid role policy before persisting a run", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-policy-"));
@@ -1820,13 +1840,15 @@ void test("AST preflight validates combinator signatures", () => {
 });
 
 void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original" } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
+  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original", disabledAgentResources: { skills: ["role-skill"], extensions: ["/role-extension.ts"] } } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
   const snapshot = createLaunchSnapshot(input);
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
+  input.roles.reviewer.disabledAgentResources.skills.push("mutated");
   assert.deepEqual(snapshot.args, { nested: [1] });
   assert.equal(snapshot.identityVersion, 3);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
+  assert.deepEqual(snapshot.roles.reviewer.disabledAgentResources, { skills: ["role-skill"], extensions: ["/role-extension.ts"] });
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
 });
