@@ -130,8 +130,8 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
       if (!header || canonicalSourcePath(header.cwd) !== canonicalSourcePath(input.cwd) || manager.getSessionId() !== input.continuation.sessionId || !manager.getEntry(input.continuation.leafId)) throw new Error("Persisted transcript identity does not match the conversation head");
       manager.branch(input.continuation.leafId);
       const context = manager.buildSessionContext();
-      if (context.model && (context.model.provider !== input.model.provider || context.model.modelId !== input.model.model)) throw new Error("Persisted transcript model does not match the conversation policy");
-      if (input.model.thinking && context.thinkingLevel !== input.model.thinking) throw new Error("Persisted transcript thinking level does not match the conversation policy");
+      if (context.model && (context.model.provider !== input.model.provider || context.model.modelId !== input.model.model)) throw new Error("Persisted transcript model does not match the conversation execution policy");
+      if (input.model.thinking && context.thinkingLevel !== input.model.thinking) throw new Error("Persisted transcript thinking level does not match the conversation execution policy");
     } catch (error) {
       if (error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE") throw error;
       throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot reopen conversation transcript: ${error instanceof Error ? error.message : String(error)}`);
@@ -208,12 +208,12 @@ function canonicalJson(value: unknown): unknown {
 function fingerprint(value: unknown): string { return createHash("sha256").update(JSON.stringify(canonicalJson(value))).digest("hex"); }
 function promptFingerprint(value: string): string { return createHash("sha256").update(value).digest("hex"); }
 function fixedConversationOptions(options: Readonly<Record<string, JsonValue>>): JsonValue {
-  const fixed = structuredClone(options) as Record<string, JsonValue>;
-  delete fixed.timeoutMs;
-  delete fixed.retries;
-  return fixed;
+  const fixedOptions = structuredClone(options) as Record<string, JsonValue>;
+  delete fixedOptions.timeoutMs;
+  delete fixedOptions.retries;
+  return fixedOptions;
 }
-function conversationPolicy(options: AgentExecutionOptions, setup: AgentSetup): JsonValue {
+function conversationExecutionPolicy(options: AgentExecutionOptions, setup: AgentSetup): JsonValue {
   return structuredClone({
     model: setup.sessionInput.model,
     tools: [...setup.sessionInput.tools],
@@ -310,7 +310,7 @@ export class WorkflowAgentExecutor {
       if (conversationRecord ? conversationRecord.head.turn + 1 !== options.conversation.turn : options.conversation.turn !== 1) throw conversationFailure(`Conversation turn ${String(options.conversation.turn)} does not continue its persisted head`);
     }
     const attempts: AgentAttempt[] = [];
-    let conversationBaseline: { policy: JsonValue; toolDefinitionsSha256: string; systemPrompt?: string; systemPromptSha256?: string } | undefined;
+    let conversationBaseline: { executionPolicy: JsonValue; toolDefinitionsSha256: string; systemPrompt?: string; systemPromptSha256?: string } | undefined;
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options.budget?.beforeAttempt();
@@ -366,18 +366,18 @@ export class WorkflowAgentExecutor {
         if (options.conversation) {
           conversationSystemPrompt = session.systemPrompt ?? "";
           conversationToolDefinitionsSha256 = fingerprint(session.getToolDefinitions?.() ?? session.agent?.state.tools ?? []);
-          const currentPolicy = conversationPolicy(options, setup);
+          const currentExecutionPolicy = conversationExecutionPolicy(options, setup);
           if (conversationRecord) {
             if (session.sessionId !== conversationRecord.head.sessionId || requiredFile(session.sessionFile) !== conversationRecord.head.sessionFile) throw conversationFailure("Conversation transcript identity changed");
             if (!session.getLeafId || session.getLeafId() !== conversationRecord.head.leafId) throw conversationFailure("Conversation transcript leaf identity changed");
-            if (fingerprint(currentPolicy) !== fingerprint(conversationRecord.policy)) throw conversationFailure("Conversation execution policy changed");
+            if (fingerprint(currentExecutionPolicy) !== fingerprint(conversationRecord.policy)) throw conversationFailure("Conversation execution policy changed");
             if (!session.subscribe && (promptFingerprint(conversationSystemPrompt) !== conversationRecord.head.systemPromptSha256 || conversationSystemPrompt !== conversationRecord.head.systemPrompt)) throw conversationFailure("Conversation system prompt changed");
             if (conversationToolDefinitionsSha256 !== conversationRecord.head.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
           } else if (conversationBaseline) {
-            if (fingerprint(currentPolicy) !== fingerprint(conversationBaseline.policy)) throw conversationFailure("Conversation execution policy changed");
+            if (fingerprint(currentExecutionPolicy) !== fingerprint(conversationBaseline.executionPolicy)) throw conversationFailure("Conversation execution policy changed");
             if (conversationToolDefinitionsSha256 !== conversationBaseline.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
           } else {
-            conversationBaseline = { policy: currentPolicy, toolDefinitionsSha256: conversationToolDefinitionsSha256 };
+            conversationBaseline = { executionPolicy: currentExecutionPolicy, toolDefinitionsSha256: conversationToolDefinitionsSha256 };
           }
           if (!session.subscribe) {
             const expectedPrompt = conversationRecord?.head.systemPrompt ?? conversationBaseline?.systemPrompt;
@@ -461,7 +461,7 @@ export class WorkflowAgentExecutor {
           if (!leafId) throw conversationFailure("Conversation transcript has no persisted leaf");
           const store = this.root.runStore;
           if (!store) throw conversationFailure("Conversation persistence is unavailable");
-          await store.saveConversation({ id: options.conversation.id, policy: conversationPolicy(options, setup), head: { turn: options.conversation.turn, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), leafId, systemPrompt: conversationSystemPrompt, systemPromptSha256: promptFingerprint(conversationSystemPrompt), toolDefinitionsSha256: conversationToolDefinitionsSha256 } });
+          await store.saveConversation({ id: options.conversation.id, policy: conversationExecutionPolicy(options, setup), head: { turn: options.conversation.turn, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), leafId, systemPrompt: conversationSystemPrompt, systemPromptSha256: promptFingerprint(conversationSystemPrompt), toolDefinitionsSha256: conversationToolDefinitionsSha256 } });
         }
         const includeCompletedSetup = Boolean(this.root.agentSetupHooks?.length || setup.sessionInput.resourcePolicy);
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(includeCompletedSetup ? { setup: setupSummary } : {}) });

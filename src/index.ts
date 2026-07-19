@@ -1115,7 +1115,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   for (const call of calls) {
     const operation = call.callee.name;
     if (operation === "agent" || operation === "conversation") {
-      if (operation === "conversation" && (!literalString(call.arguments[0])?.trim() || call.arguments.length > 2)) fail("INVALID_METADATA", "conversation requires a stable name and optional policy object");
+      if (operation === "conversation" && (!literalString(call.arguments[0])?.trim() || call.arguments.length > 2)) fail("INVALID_METADATA", "conversation requires a stable name and optional options object");
       validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
     }
     if (operation === "withWorktree") validateStaticWithWorktree(call);
@@ -1325,17 +1325,17 @@ const internalConversation = (...values) => {
   if (typeof callSite !== "string") throw workError("INTERNAL_ERROR", "Missing workflow conversation call-site identity");
   const name = values[0];
   if (typeof name !== "string" || !name.trim()) throw workError("INVALID_METADATA", "conversation requires a non-empty name");
-  const supplied = values.length < 2 || values[1] === undefined ? {} : values[1];
-  if (!supplied || typeof supplied !== "object" || Array.isArray(supplied)) throw workError("INVALID_METADATA", "conversation policy must be a JSON object");
+  const conversationOptions = values.length < 2 || values[1] === undefined ? {} : values[1];
+  if (!conversationOptions || typeof conversationOptions !== "object" || Array.isArray(conversationOptions)) throw workError("INVALID_METADATA", "conversation options must be a JSON object");
   const inherited = inheritedAgentPath.getStore() || [];
   const occurrenceKey = JSON.stringify([inherited, callSite, name]);
   const occurrence = (conversationOccurrences.get(occurrenceKey) || 0) + 1;
   conversationOccurrences.set(occurrenceKey, occurrence);
-  const fixed = structuredClone(supplied);
-  const defaultTimeout = fixed.timeoutMs;
-  const defaultRetries = fixed.retries;
-  delete fixed.timeoutMs;
-  delete fixed.retries;
+  const fixedOptions = structuredClone(conversationOptions);
+  const defaultTimeout = fixedOptions.timeoutMs;
+  const defaultRetries = fixedOptions.retries;
+  delete fixedOptions.timeoutMs;
+  delete fixedOptions.retries;
   const worktreeOwner = worktreeOwners.getStore();
   let turn = 0;
   let active = false;
@@ -1346,7 +1346,7 @@ const internalConversation = (...values) => {
       if (active) throw workError("RESUME_INCOMPATIBLE", "Conversation turns cannot overlap");
       active = true;
       const turnNumber = turn + 1;
-      const options = { ...fixed, ...(defaultTimeout !== undefined && turnOptions.timeoutMs === undefined ? { timeoutMs: defaultTimeout } : {}), ...(defaultRetries !== undefined && turnOptions.retries === undefined ? { retries: defaultRetries } : {}), ...turnOptions };
+      const options = { ...fixedOptions, ...(defaultTimeout !== undefined && turnOptions.timeoutMs === undefined ? { timeoutMs: defaultTimeout } : {}), ...(defaultRetries !== undefined && turnOptions.retries === undefined ? { retries: defaultRetries } : {}), ...turnOptions };
       const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}), conversation: { name: name.trim(), turn: turnNumber } };
       const result = rpc("agent", [prompt, options, identity]).then(value => { const unwrapped = unwrap(value); turn = turnNumber; return unwrapped; }).finally(() => { active = false; });
       Object.defineProperties(result, {

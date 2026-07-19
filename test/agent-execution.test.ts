@@ -688,7 +688,7 @@ void test("filters disabled native extensions before factories and skills before
   assert.match(parent.systemPrompt ?? "", /disabled-skill/);
   parent.dispose();
 });
-void test("continues a persisted conversation head and fails closed on policy or prompt drift", async () => {
+void test("continues a persisted conversation head and fails closed on execution-policy or prompt drift", async () => {
   const conversations = new Map<string, { id: string; policy: unknown; head: { turn: number; sessionId: string; sessionFile: string; leafId: string; systemPrompt: string; systemPromptSha256: string; toolDefinitionsSha256: string } }>();
   const inputs: Array<{ continuation?: { sessionId: string; sessionFile: string; leafId: string } }> = [];
   let created = 0;
