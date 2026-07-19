@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress, type SessionFactory } from "../src/agent-execution.js";
-import { getAgentDir, type AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { WorkflowError } from "../src/index.js";
 import type { RunStore } from "../src/persistence.js";
 
@@ -626,8 +626,8 @@ void test("filters disabled native extensions before factories and skills before
   mkdirSync(projectExtensions, { recursive: true });
   mkdirSync(projectSkills, { recursive: true });
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
-  copyFileSync(join(getAgentDir(), "models.json"), join(agentDir, "models.json"));
-  copyFileSync(join(getAgentDir(), "auth.json"), join(agentDir, "auth.json"));
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
   const disabledExtension = join(agentDir, "extensions", "disabled.ts");
   const allowedExtension = join(agentDir, "extensions", "allowed.ts");
   const disabledMarker = join(rootDir, "disabled-extension-ran");
