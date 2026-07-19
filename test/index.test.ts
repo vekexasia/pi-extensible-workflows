@@ -83,8 +83,14 @@ void test("registers the workflow tool, command, and conditional skill", async (
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 void test("registers workflow_catalog only for active non-empty registries", async () => {
-  const empty = new WorkflowRegistry();
-  assert.deepEqual(empty.catalog(), { functions: [], variables: [], workflows: [] });
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-settings-"));
+  try {
+    const empty = new WorkflowRegistry();
+    assert.deepEqual(empty.catalog(), { functions: [], variables: [], workflows: [] });
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  }
   const inactiveHome = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-inactive-"));
   const inactiveTools: Array<{ name: string }> = [];
   let inactiveStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
