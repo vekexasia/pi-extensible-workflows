@@ -18,7 +18,7 @@ let markStopVariableStarted: (() => void) | undefined;
 let stopVariableAborted = false;
 let coldVariableCalls = 0;
 const acceptanceExtension: WorkflowExtension = {
-  namespace: "issue48Acceptance", version: "1.0.0", headline: "Acceptance", description: "Acceptance globals",
+  version: "1.0.0", headline: "Acceptance", description: "Acceptance globals",
   functions: {
     echo: { description: "Echo once", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input, context) { acceptanceFunctionCalls += 1; return { value: context.prompt("{value}", { value: input.value as string }) }; } },
     orchestrate: {
@@ -398,7 +398,7 @@ void test("registered extension agents persist structural scope for late sibling
     dispose() {},
   });
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
-  registerWorkflowExtension({ namespace: "issue69Identity", version: "1.0.0", headline: "Identity", description: "Identity acceptance", functions: { review: { description: "Review", input: { type: "object" }, output: { type: "string" }, run: (_input, context) => context.agent("developer", { label: "developer" }) } } });
+  registerWorkflowExtension({ version: "1.0.0", headline: "Identity", description: "Identity acceptance", functions: { review: { description: "Review", input: { type: "object" }, output: { type: "string" }, run: (_input, context) => context.agent("developer", { label: "developer" }) } } });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const result = await workflow.execute("id", { name: "issue69", script: `return parallel("issues", { "issue-65": async () => { const first = await review({}); await Promise.resolve(); const second = await review({}); return [first, second]; }, "issue-66": () => review({}) });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
@@ -408,11 +408,11 @@ void test("registered extension agents persist structural scope for late sibling
   const issue66 = loaded.run.agents.filter((agent) => JSON.stringify(agent.structuralPath) === JSON.stringify(["issues", "issue-66"]));
   assert.equal(issue65.length, 2);
   assert.equal(issue66.length, 1);
-  assert.ok(loaded.run.agents.every((agent) => agent.parentBreadcrumb === "issue69Identity.review"));
+  assert.ok(loaded.run.agents.every((agent) => agent.parentBreadcrumb === "review"));
   assert.ok(loaded.run.agents.every((agent) => !agent.worktreeOwner));
   const rendered = formatNavigatorDashboard(loaded.run, [], []);
-  assert.match(rendered, /issues > issue-65 > issue69Identity\.review/);
-  assert.match(rendered, /issues > issue-66 > issue69Identity\.review/);
+  assert.match(rendered, /issues > issue-65 > review/);
+  assert.match(rendered, /issues > issue-66 > review/);
 });
 void test("production workflow exposes registered global functions and replays them structurally", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-global-acceptance-"));
@@ -429,11 +429,11 @@ void test("production workflow exposes registered global functions and replays t
   const store = new RunStore(home, "session", result.details.runId, home);
   assert.equal((await store.load()).run.phase, "verify");
   assert.equal((await store.load()).snapshot.tools.includes("workflow_catalog"), false);
-  assert.deepEqual(await store.replay("function/issue48Acceptance/echo/1"), { path: "function/issue48Acceptance/echo/1", value: { value: "first" } });
-  assert.deepEqual(await store.replay("function/issue48Acceptance/echo/2"), { path: "function/issue48Acceptance/echo/2", value: { value: "second" } });
-  assert.deepEqual(await store.replay("function/global-parallel/first/issue48Acceptance/echo/1"), { path: "function/global-parallel/first/issue48Acceptance/echo/1", value: { value: "parallel-first" } });
-  assert.deepEqual(await store.replay("function/global-parallel/second/issue48Acceptance/echo/1"), { path: "function/global-parallel/second/issue48Acceptance/echo/1", value: { value: "parallel-second" } });
-  assert.deepEqual(await store.replay("function/global-pipeline/first/echo/issue48Acceptance/echo/1"), { path: "function/global-pipeline/first/echo/issue48Acceptance/echo/1", value: { value: "pipeline-value" } });
+  assert.deepEqual(await store.replay("function/echo/1"), { path: "function/echo/1", value: { value: "first" } });
+  assert.deepEqual(await store.replay("function/echo/2"), { path: "function/echo/2", value: { value: "second" } });
+  assert.deepEqual(await store.replay("function/global-parallel/first/echo/1"), { path: "function/global-parallel/first/echo/1", value: { value: "parallel-first" } });
+  assert.deepEqual(await store.replay("function/global-parallel/second/echo/1"), { path: "function/global-parallel/second/echo/1", value: { value: "parallel-second" } });
+  assert.deepEqual(await store.replay("function/global-pipeline/first/echo/echo/1"), { path: "function/global-pipeline/first/echo/echo/1", value: { value: "pipeline-value" } });
 });
 void test("setup hooks conditionally install an inline Pi extension for one agent", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-setup-hooks-"));
@@ -447,7 +447,7 @@ void test("setup hooks conditionally install an inline Pi extension for one agen
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] } as never, home, async () => {}, createSession);
-  registerWorkflowExtension({ namespace: "setupHookAcceptance", version: "1.0.0", headline: "Setup hooks", description: "Setup hook fixture", agentSetupHooks: { advisor: { setup(agent) { if (agent.options.advisor !== true) return; agent.sessionInput.extensionFactories ??= []; agent.sessionInput.extensionFactories.push(scopedAdvisorFactory); } } } });
+  registerWorkflowExtension({ version: "1.0.0", headline: "Setup hooks", description: "Setup hook fixture", agentSetupHooks: { advisor: { setup(agent) { if (agent.options.advisor !== true) return; agent.sessionInput.extensionFactories ??= []; agent.sessionInput.extensionFactories.push(scopedAdvisorFactory); } } } });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const result = await workflow.execute("id", { name: "setup-hooks", script: `return parallel("agents", { marked: () => agent("marked", { advisor: true }), plain: () => agent("plain") });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
@@ -477,7 +477,7 @@ void test("parent registry survives nested agent session lifecycle", async () =>
   });
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog"], on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; } } as never, home, async () => {}, createSession);
   registerWorkflowExtension({
-    namespace: "registrySessionAcceptance", version: "1.0.0", headline: "Registry session", description: "Registry session acceptance",
+    version: "1.0.0", headline: "Registry session", description: "Registry session acceptance",
     functions: {
       afterNested: {
         description: "Run after a nested session",
@@ -511,7 +511,7 @@ void test("shared worktree scopes persist one owner across production agents and
   execFileSync("git", ["-C", cwd, "add", "."]);
   execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
   const extension: WorkflowExtension = {
-    namespace: "issue53Acceptance", version: "1.0.0", headline: "Shared worktree", description: "Shared worktree acceptance",
+    version: "1.0.0", headline: "Shared worktree", description: "Shared worktree acceptance",
     functions: {
       inherited: { description: "Use the inherited scope", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.parallel("function-agents", { left: () => context.agent("function-left"), right: () => context.agent("function-right") }); } },
       scoped: { description: "Use a named scope", input: { type: "object" }, output: { type: "string" }, async run(_input, context) { return context.withWorktree("shared", async () => context.agent("function-scoped")); } },
@@ -643,7 +643,7 @@ void test("cold resume recomputes variables and marks resolver failures", { time
   assert.equal(JSON.parse(readFileSync(join(cold.directory, "result.json"), "utf8")), "cold-1");
   assert.equal(coldVariableCalls, 1);
   await assert.rejects(command("resume failed-run", context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
-  assert.deepEqual((await failed.load()).run.error, { code: "INTERNAL_ERROR", message: "issue48Acceptance.resumeFailureVariable: resume variable failure" });
+  assert.deepEqual((await failed.load()).run.error, { code: "INTERNAL_ERROR", message: "resumeFailureVariable: resume variable failure" });
   assert.equal((await failed.load()).run.state, "failed");
   const started = new Promise<void>((resolve) => { markStopVariableStarted = resolve; });
   stopVariableAborted = false;

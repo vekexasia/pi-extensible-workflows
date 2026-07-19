@@ -92,7 +92,7 @@
             <tr><td><code>name</code></td><td>string</td><td>Required for an inline script; registered workflows use their registered name.</td></tr>
             <tr><td><code>description</code></td><td>string</td><td>Optional human-readable metadata.</td></tr>
             <tr><td><code>script</code></td><td>string</td><td>Immutable workflow source. Mutually exclusive with <code>workflow</code>.</td></tr>
-            <tr><td><code>workflow</code></td><td>string</td><td>Registered reusable workflow as <code>namespace.name</code>.</td></tr>
+            <tr><td><code>workflow</code></td><td>string</td><td>Registered reusable workflow by its unqualified name.</td></tr>
             <tr><td><code>args</code></td><td>JSON value</td><td>Available inside the script as <code>args</code>; defaults to <code>null</code>.</td></tr>
             <tr><td><code>foreground</code></td><td>boolean</td><td>Wait for the final value instead of returning a run ID.</td></tr>
             <tr><td><code>concurrency</code></td><td>integer 1-16</td><td>Per-run active-agent limit.</td></tr>
@@ -163,8 +163,8 @@
       </section>
       <section id="extensions">
         <h2>Extensions, reusable workflows, and roles</h2>
-        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the namespace, semantic version, descriptions, schemas, and workflow source.</p>
-        <p>The following is the core of <code>~/.pi/agent/extensions/review-loop.ts</code>. It registers a reusable developer-review loop as <code>reviewLoop.developUntilApproved</code>.</p>
+        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the semantic version, descriptions, schemas, and workflow source.</p>
+        <p>The following is the core of <code>~/.pi/agent/extensions/review-loop.ts</code>. It registers a reusable developer-review loop as <code>developUntilApproved</code>.</p>
         <pre><code class="language-typescript"><span class="tok-keyword">import</span> <span class="tok-punctuation">{</span>
   registerWorkflowExtension<span class="tok-punctuation">,</span>
   <span class="tok-keyword">type</span> JsonSchema<span class="tok-punctuation">,</span>
@@ -183,7 +183,6 @@
 <span class="tok-punctuation">}</span><span class="tok-punctuation">;</span>
 
 <span class="tok-keyword">const</span> reviewLoopExtension<span class="tok-punctuation">:</span> <span class="tok-keyword">WorkflowExtension</span> <span class="tok-punctuation">=</span> <span class="tok-punctuation">{</span>
-  <span class="tok-property">namespace</span><span class="tok-punctuation">:</span> <span class="tok-string">"reviewLoop"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Developer-review loop"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Runs developer and reviewer agents in a loop until review passes."</span><span class="tok-punctuation">,</span>
@@ -242,7 +241,7 @@
 <span class="tok-keyword">export</span> <span class="tok-keyword">default</span> <span class="tok-keyword">function</span> <span class="tok-punctuation">(</span><span class="tok-punctuation">)</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">void</span> <span class="tok-punctuation">{</span>
   <span class="tok-function">registerWorkflowExtension</span><span class="tok-punctuation">(</span>reviewLoopExtension<span class="tok-punctuation">)</span><span class="tok-punctuation">;</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>After Pi loads the extension, <code>workflow_catalog</code> exposes <code>reviewLoop.developUntilApproved</code>. Call it from workflow source, for example <code>return reviewLoop.developUntilApproved({ task: args.task, maxIterations: 5 });</code>. Registered functions receive <code>agent</code>, <code>prompt</code>, combinators, lifecycle helpers, and run metadata through their context. The catalog exposes metadata and schemas, never implementations, resolver values, or source.</p>
+        <p>After Pi loads the extension, <code>workflow_catalog</code> exposes <code>developUntilApproved</code>. Call it from workflow source, for example <code>return developUntilApproved({ task: args.task, maxIterations: 5 });</code>. Registered functions receive <code>agent</code>, <code>prompt</code>, combinators, lifecycle helpers, and run metadata through their context. The catalog exposes metadata and schemas, never implementations, resolver values, or source.</p>
         <h3>Role files</h3>
         <p>Global roles live under <code>&lt;agentDir&gt;/pi-extensible-workflows/roles/&lt;name&gt;.md</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/roles/&lt;name&gt;.md</code>; set <code>PI_CODING_AGENT_DIR</code> to change it. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
@@ -255,9 +254,9 @@ Focus on correctness and regressions.</code></pre>
         <p>When <code>role</code> is present, omit <code>model</code>, <code>thinking</code>, and <code>tools</code> from the agent call. The role body is appended to the native Pi system prompt.</p>
         <h3>Prioritized agent setup hooks</h3>
         <p><strong>Security:</strong> setup hooks are trusted extension code. They run after ordinary workflow model, tool, cwd, and role policy validation, but before the native Pi session is created. Hooks can bypass those boundaries by mutating the prompt, raw options, resolved session input, or session factory; never register untrusted code as a setup hook.</p>
-        <p>Register named hooks with an optional finite <code>priority</code>. Hooks run in ascending priority order (default <code>10</code>); equal priorities use the stable fully qualified hook name (<code>namespace.name</code>) as the tie-breaker. Each retry starts from a fresh baseline and runs every hook again. Hooks receive the workflow cancellation signal, and their asynchronous runtime is not charged against <code>timeoutMs</code>. A thrown hook error fails the agent immediately, prevents later hooks and session creation, and is not retried as a native-session failure.</p>
+        <p>Register named hooks with an optional finite <code>priority</code>. Hooks run in ascending priority order (default <code>10</code>); equal priorities use the stable hook name as the tie-breaker. Each retry starts from a fresh baseline and runs every hook again. Hooks receive the workflow cancellation signal, and their asynchronous runtime is not charged against <code>timeoutMs</code>. A thrown hook error fails the agent immediately, prevents later hooks and session creation, and is not retried as a native-session failure.</p>
         <pre><code class="language-typescript"><span class="tok-function">registerWorkflowExtension</span><span class="tok-punctuation">(</span><span class="tok-punctuation">{</span>
-  <span class="tok-property">namespace</span><span class="tok-punctuation">:</span> <span class="tok-string">"advisor"</span><span class="tok-punctuation">,</span> <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span> <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Advisor setup"</span><span class="tok-punctuation">,</span>
+<span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span> <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Advisor setup"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Adds optional advisor behavior"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">agentSetupHooks</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
     <span class="tok-property">advisor</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>

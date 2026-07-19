@@ -34,7 +34,7 @@ return agent(
 
 To pass structured input from the main agent, include `args`:
 ```json
-{ "workflow": "namespace.workflowName", "args": { "issue": 42 } }
+{ "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
 If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, registered workflows, and configured model aliases as needed for the rest of that task. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.

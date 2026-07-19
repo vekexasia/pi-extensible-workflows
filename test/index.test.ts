@@ -44,15 +44,15 @@ RunStore.prototype.saveOwnership = async function (nodes: OwnershipNodes) {
 const capabilities = {
   models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]),
 };
-const reuseExtension = { namespace: "reuseTest", version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", functions: { inspect: { description: "Inspect", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: () => "ok" } }, variables: { branch: { description: "Branch", schema: { type: "string" }, resolve: () => "main" } }, workflows: { hello: { description: "Say hello", script: `return args.name;` } } };
+const reuseExtension = { version: "1.0.0", headline: "Reusable", description: "Reusable test workflows", functions: { inspect: { description: "Inspect", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: () => "ok" } }, variables: { branch: { description: "Branch", schema: { type: "string" }, resolve: () => "main" } }, workflows: { hello: { description: "Say hello", script: `return args.name;` } } };
 const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt", tools: ["read"] });`;
 
 void test("workflow call preview summarizes inline and registered workflows safely", () => {
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
   assert.match(preview, /^workflow review\nReview code/m);
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
-  assert.equal(formatWorkflowPreview({ workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
-  assert.equal(formatWorkflowPreview({ script: "", workflow: "example.audit" }), "workflow example.audit\nRegistered workflow");
+  assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow audit\nRegistered workflow");
+  assert.equal(formatWorkflowPreview({ script: "", workflow: "audit" }), "workflow audit\nRegistered workflow");
   assert.equal(formatWorkflowPreview({ script: "not javascript", name: "review" }), "workflow review");
 });
 
@@ -106,15 +106,15 @@ void test("registers workflow_catalog only for active non-empty registries", asy
   await activeStart({}, activeContext);
   await activeStart({}, activeContext);
   assert.equal(activeTools.filter(({ name }) => name === "workflow_catalog").length, 1);
-  assert.throws(() => { registerWorkflowExtension({ namespace: "lateCatalog", version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
+  assert.throws(() => { registerWorkflowExtension({ version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
   const catalogTool = activeTools.find(({ name }) => name === "workflow_catalog");
   assert.ok(catalogTool?.execute);
   const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { functions: Array<Record<string, unknown>>; variables: Array<Record<string, unknown>>; workflows: Array<Record<string, unknown>> };
-  assert.deepEqual(catalog.functions.map(({ name, namespace }) => ({ name, namespace })), [{ name: "inspect", namespace: "reuseTest" }]);
-  assert.deepEqual(catalog.variables.map(({ name, namespace }) => ({ name, namespace })), [{ name: "branch", namespace: "reuseTest" }]);
-  assert.deepEqual(catalog.workflows.map(({ name, namespace }) => ({ name, namespace })), [{ name: "reuseTest.hello", namespace: "reuseTest" }]);
-  assert.deepEqual(Object.keys(catalog.functions[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "input", "name", "namespace", "output", "version"]);
-  assert.deepEqual(Object.keys(catalog.variables[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "name", "namespace", "schema", "version"]);
+  assert.deepEqual(catalog.functions.map(({ name }) => ({ name })), [{ name: "inspect" }]);
+  assert.deepEqual(catalog.variables.map(({ name }) => ({ name })), [{ name: "branch" }]);
+  assert.deepEqual(catalog.workflows.map(({ name }) => ({ name })), [{ name: "hello" }]);
+  assert.deepEqual(Object.keys(catalog.functions[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "input", "name", "output", "version"]);
+  assert.deepEqual(Object.keys(catalog.variables[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "name", "schema", "version"]);
   assert.doesNotMatch(JSON.stringify(catalog), /"script"|"run"|"resolve"|"source"|"main"|"ok"/);
   await activeShutdown();
 });
@@ -133,7 +133,7 @@ void test("advertises only described effective roles in the system prompt while 
   const guidance = result?.systemPrompt ?? "";
   assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
   assert.match(guidance, /`project-reviewer`: Reviews correctness/);
-  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|reuseTest|workflow_catalog/);
+  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|workflow_catalog/);
   const untrustedGuidance = handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false })?.systemPrompt ?? "";
   assert.doesNotMatch(untrustedGuidance, /project-reviewer|Reviews correctness/);
 });
@@ -311,7 +311,7 @@ void test("registered extension workflows can run by name", async () => {
   registerWorkflowExtension(reuseExtension);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
-  const result = await execute("id", { workflow: "reuseTest.hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const result = await execute("id", { workflow: "hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(result.content[0]?.text, '"Andrea"');
 });
 void test("inline workflow args cross the production tool boundary and omitted args become null", async () => {
@@ -405,15 +405,15 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
 });
 void test("workflow cards group structural scopes with stable creation order", () => {
   const run = { id: "run", workflowName: "grouped", cwd: "/repo", sessionId: "session", state: "running", agents: [
-    { id: "run:1", name: "developer", path: "run:1", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
-    { id: "run:2", name: "developer", path: "run:2", state: "running", structuralPath: ["issues", "issue-66"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
-    { id: "run:3", name: "reviewer", path: "run:3", state: "running", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
-    { id: "run:4", name: "child", path: "run:4", state: "running", parentId: "run:3", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:1", name: "developer", path: "run:1", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "developer", path: "run:2", state: "running", structuralPath: ["issues", "issue-66"], parentBreadcrumb: "developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:3", name: "reviewer", path: "run:3", state: "running", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:4", name: "child", path: "run:4", state: "running", parentId: "run:3", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
   ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
   const progress = formatWorkflowProgress(run);
   const dashboard = formatNavigatorDashboard(run, [], [{ owner: "worktree/named/issue-65", branch: "hidden", path: "/hidden", cwd: "/hidden", base: "base" }]);
-  assert.match(progress, /issues > issue-65 > reviewLoop\.developUntilApproved/);
-  assert.match(dashboard, /issues > issue-65 > reviewLoop\.developUntilApproved/);
+  assert.match(progress, /issues > issue-65 > developUntilApproved/);
+  assert.match(dashboard, /issues > issue-65 > developUntilApproved/);
   assert.doesNotMatch(dashboard, /worktree\/named|hidden|\/hidden/);
   assert.ok(progress.indexOf("#1") < progress.indexOf("#3"));
   assert.ok(progress.indexOf("#3") < progress.indexOf("#4"));
@@ -484,7 +484,7 @@ void test("TUI navigator exposes agent-scoped transcript and worktree actions", 
   const transcriptB = join(home, "transcript-b.jsonl");
   const store = new RunStore(repo, "session", runId, home);
   const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
-  await store.create({ id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "reviewLoop.developUntilApproved", worktreeOwner: "copy-owner", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 1, sessionId: "native-a", sessionFile: transcriptA, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }, { attempt: 2, sessionId: "native-b", sessionFile: transcriptB, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
+  await store.create({ id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", worktreeOwner: "copy-owner", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 1, sessionId: "native-a", sessionFile: transcriptA, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }, { attempt: 2, sessionId: "native-b", sessionFile: transcriptB, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
   const worktree = await store.worktree("copy-owner");
   const copied: string[] = [];
   const notifications: Array<{ message: string; type: string | undefined }> = [];
@@ -1720,7 +1720,7 @@ void test("workflow catalog and session_start tolerate malformed settings", asyn
     let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
     let shutdown: (() => Promise<void>) | undefined;
     workflowExtension({ registerTool(tool: { name: string }) { tools.push(tool); }, registerCommand() {}, getActiveTools: () => ["workflow"], on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; } } as never, dir);
-    registerWorkflowExtension({ namespace: "malformedCatalog", version: "1.0.0", headline: "Malformed settings", description: "Malformed settings test", workflows: { verify: { description: "Verify", script: "return true;" } } });
+    registerWorkflowExtension({ version: "1.0.0", headline: "Malformed settings", description: "Malformed settings test", workflows: { verify: { description: "Verify", script: "return true;" } } });
     assert.ok(start && shutdown);
     await start({}, { cwd: dir, sessionManager: { getSessionId: () => "malformed" } });
     assert.equal(tools.some(({ name }) => name === "workflow_catalog"), true);
@@ -1825,7 +1825,7 @@ void test("launch snapshots are detached and deeply immutable", () => {
   input.args.nested.push(2);
   input.roles.reviewer.prompt = "mutated";
   assert.deepEqual(snapshot.args, { nested: [1] });
-  assert.equal(snapshot.identityVersion, 2);
+  assert.equal(snapshot.identityVersion, 3);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.ok(Object.isFrozen(snapshot.args));
   assert.ok(Object.isFrozen(snapshot.schemas[0]));
@@ -2151,7 +2151,7 @@ void test("registers global functions and replays each call as one validated ope
   let calls = 0;
   let receivedContext: unknown;
   registry.register({
-    namespace: "git", version: "1.2.3", headline: "Git operations", description: "Orchestrate Git work",
+    version: "1.2.3", headline: "Git operations", description: "Orchestrate Git work",
     functions: {
       status: {
         description: "Read status",
@@ -2165,8 +2165,8 @@ void test("registers global functions and replays each call as one validated ope
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
   const context = { run, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
-  assert.deepEqual(await registry.invokeFunction("git", "status", { short: true }, context, "function/git/status/1", journal), { clean: true });
-  assert.deepEqual(await registry.invokeFunction("git", "status", { short: false }, context, "function/git/status/1", journal), { clean: true });
+  assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
+  assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
   assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree"]);
@@ -2177,25 +2177,27 @@ void test("freezes registries and produces a deterministic flat catalog", () => 
   const second = new WorkflowRegistry();
   assert.equal(registry.frozen, false);
   registry.register({
-    namespace: "catalog", version: "1.0.0", headline: "Catalog", description: "Catalog test",
+    version: "1.0.0", headline: "Catalog", description: "Catalog test",
     functions: { inspect: { description: "Inspect", input: { type: "object" }, output: { type: "string" }, run: () => "ok" } },
     variables: { branch: { description: "Branch", schema: { type: "string" }, resolve: () => "main" } },
     workflows: { release: { description: "Release", script: "return branch;" } },
   });
-  second.register({ namespace: "catalog", version: "1.0.0", headline: "Catalog", description: "Catalog test", workflows: { release: { description: "Release", script: "return 1;" } } });
-  assert.deepEqual(registry.catalog().functions.map(({ name, namespace }) => ({ name, namespace })), [{ name: "inspect", namespace: "catalog" }]);
-  assert.deepEqual(registry.catalog().variables.map(({ name, namespace }) => ({ name, namespace })), [{ name: "branch", namespace: "catalog" }]);
-  assert.deepEqual(registry.catalog().workflows.map(({ name }) => name), ["catalog.release"]);
+  second.register({ version: "1.0.0", headline: "Catalog", description: "Catalog test", workflows: { another: { description: "Release", script: "return 1;" } } });
+  assert.deepEqual(registry.catalog().functions.map(({ name }) => ({ name })), [{ name: "inspect" }]);
+  assert.deepEqual(registry.catalog().variables.map(({ name }) => ({ name })), [{ name: "branch" }]);
+  assert.deepEqual(registry.catalog().workflows.map(({ name }) => name), ["release"]);
+  assert.throws(() => { registry.register({ version: "1.0.0", headline: "Duplicate", description: "Duplicate", workflows: { release: { description: "Duplicate", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
   registry.freeze();
   assert.equal(registry.frozen, true);
-  assert.throws(() => { registry.register({ namespace: "late", version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
-  assert.throws(() => registry.workflow("release"), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
+  assert.throws(() => { registry.register({ version: "1.0.0", headline: "Late", description: "Late", workflows: { x: { description: "x", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
+  assert.throws(() => registry.workflow("release.check"), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
 });
-void test("registers setup hooks by priority and stable qualified name", () => {
+void test("registers setup hooks by priority and stable name", () => {
   const registry = new WorkflowRegistry();
-  registry.register({ namespace: "hooks", version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { z: { setup() {} }, a: { priority: 10, setup() {} }, early: { priority: 1, setup() {} } } });
-  assert.deepEqual(registry.agentSetupHooks().map(({ name, priority }) => ({ name, priority })), [{ name: "hooks.early", priority: 1 }, { name: "hooks.a", priority: 10 }, { name: "hooks.z", priority: 10 }]);
-  assert.throws(() => { registry.register({ namespace: "badHooks", version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { bad: { priority: Number.NaN, setup() {} } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  registry.register({ version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { z: { setup() {} }, a: { priority: 10, setup() {} }, early: { priority: 1, setup() {} } } });
+  assert.deepEqual(registry.agentSetupHooks().map(({ name, priority }) => ({ name, priority })), [{ name: "early", priority: 1 }, { name: "a", priority: 10 }, { name: "z", priority: 10 }]);
+  assert.throws(() => { registry.register({ version: "1.0.0", headline: "Duplicate", description: "Duplicate", agentSetupHooks: { early: { setup() {} } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
+  assert.throws(() => { registry.register({ version: "1.0.0", headline: "Hooks", description: "Hooks", agentSetupHooks: { bad: { priority: Number.NaN, setup() {} } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 void test("shares the registry between package imports and Pi's jiti loader", () => {
   const script = `
@@ -2206,9 +2208,9 @@ const { createJiti } = require(${JSON.stringify(join(process.cwd(), "node_module
 const native = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/src/index.js")).href)});
 const jiti = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
 const source = await jiti.import(${JSON.stringify(join(process.cwd(), "src/index.ts"))});
-native.registerWorkflowExtension({ namespace: "loaderBoundary", version: "1.0.0", headline: "Loader", description: "Loader boundary", workflows: { verify: { description: "Verify", script: "return 1;" } } });
+native.registerWorkflowExtension({ version: "1.0.0", headline: "Loader", description: "Loader boundary", workflows: { verify: { description: "Verify", script: "return 1;" } } });
 const catalog = source.workflowCatalog();
-if (catalog.workflows.length !== 1 || catalog.workflows[0]?.name !== "loaderBoundary.verify") throw new Error(JSON.stringify(catalog));
+if (catalog.workflows.length !== 1 || catalog.workflows[0]?.name !== "verify") throw new Error(JSON.stringify(catalog));
 `;
   execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
 });
@@ -2224,7 +2226,7 @@ const cwd = process.cwd();
 const agentDir = mkdtempSync(join(tmpdir(), "pi-workflow-catalog-reload-"));
 mkdirSync(join(agentDir, "extensions"));
 writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [cwd] }));
-writeFileSync(join(agentDir, "extensions", "catalog.ts"), \`import { registerWorkflowExtension } from \${JSON.stringify(join(cwd, "dist/src/index.js"))};\nconst extension = { namespace: "reloadCatalog", version: "1.0.0", headline: "Reload", description: "Reload test", functions: { ping: { description: "Ping", input: { type: "object" }, output: { type: "string" }, run: () => "pong" } } };\nexport default function() { registerWorkflowExtension(extension); }\`);
+writeFileSync(join(agentDir, "extensions", "catalog.ts"), \`import { registerWorkflowExtension } from \${JSON.stringify(join(cwd, "dist/src/index.js"))};\\nconst extension = { version: "1.0.0", headline: "Reload", description: "Reload test", functions: { ping: { description: "Ping", input: { type: "object" }, output: { type: "string" }, run: () => "pong" } } };\\nexport default function() { registerWorkflowExtension(extension); }\`);
 process.env.PI_OFFLINE = "1";
 const credentials = new InMemoryCredentialStore();
 const createRuntime = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
@@ -2302,28 +2304,26 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
 
 void test("rejects global collisions, invalid metadata, schemas, input, and output", async () => {
   const registry = new WorkflowRegistry();
-  const extension = { namespace: "demo", version: "1.0.0", headline: "Demo", description: "Demo functions", functions: { run: { description: "Run", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, output: { type: "string" }, run: () => 1 } } };
+  const extension = { version: "1.0.0", headline: "Demo", description: "Demo functions", functions: { run: { description: "Run", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, output: { type: "string" }, run: () => 1 } } };
   registry.register(extension);
-  assert.throws(() => { registry.register(extension); }, (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
-  assert.throws(() => { registry.register({ ...extension, namespace: "other" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION" && /demo\.run.*other\.run/.test(error.message));
+  assert.throws(() => { registry.register(extension); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
+  assert.throws(() => { registry.register({ version: "1.0.0", headline: "Other", description: "Other", functions: { run: extension.functions.run } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
   const crossType = new WorkflowRegistry();
   crossType.register(extension);
-  const variableExtension = { namespace: "variables", version: "1.0.0", headline: "Variables", description: "Variable globals", variables: { run: { description: "Run", schema: { type: "string" }, resolve: () => "ok" } } };
-  assert.throws(() => { crossType.register(variableExtension); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION" && /demo\.run.*variables\.run/.test(error.message));
+  const variableExtension = { version: "1.0.0", headline: "Variables", description: "Variable globals", variables: { run: { description: "Run", schema: { type: "string" }, resolve: () => "ok" } } };
+  assert.throws(() => { crossType.register(variableExtension); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
   for (const name of ["agent", "Date", "process", "extensions"]) {
     assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { [name]: extension.functions.run } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
   }
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { __pi_extensible_workflows_internal: extension.functions.run } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => { new WorkflowRegistry().register({ ...extension, namespace: undefined as never }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: undefined as never }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, workflows: { "release.check": { description: "Release", script: "return 1;" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => { new WorkflowRegistry().register({ ...extension, namespace: "bad-name" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
   const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
-  await assert.rejects(registry.invokeFunction("demo", "run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
-  await assert.rejects(registry.invokeFunction("demo", "run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(registry.invokeFunction("run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(registry.invokeFunction("run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });
 void test("presents every workflow error code as factual prose", () => {
   for (const code of ERROR_CODES) {

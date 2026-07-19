@@ -41,9 +41,9 @@
   <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"phase('inspect'); return await agent('Inspect the package');"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"target"</span><span class="tok-punctuation">:</span> <span class="tok-string">"dist"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Inline scripts require <code>name</code>. A registered workflow uses <code>workflow: "namespace.name"</code> instead of <code>script</code>:</p>
+        <p>Inline scripts require <code>name</code>. A registered workflow uses its unqualified name in <code>workflow</code> instead of <code>script</code>:</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
-  <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"git.releaseCheck"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"releaseCheck"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
         <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call.</p>

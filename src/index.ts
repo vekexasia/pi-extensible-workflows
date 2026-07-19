@@ -70,7 +70,7 @@ export interface WorkflowWorktreeCreatedEvent extends WorkflowEventBase { owner:
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: "warning"; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
-export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 2;
+export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 3;
 export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
@@ -89,7 +89,7 @@ export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { 
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowScriptDefinition { description: string; script: string }
-export interface WorkflowExtension { namespace: string; version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
+export interface WorkflowExtension { version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
 export interface WorkflowJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
 export class WorkflowError extends Error {
@@ -916,17 +916,19 @@ function validateStaticWithWorktree(call: WorkflowCall): void {
   }
 }
 
-export interface WorkflowCatalogFunction { name: string; namespace: string; version: string; headline: string; extensionDescription: string; description: string; input: JsonSchema; output: JsonSchema }
-export interface WorkflowCatalogVariable { name: string; namespace: string; version: string; headline: string; extensionDescription: string; description: string; schema: JsonSchema }
-export interface WorkflowCatalogWorkflow { name: string; namespace: string; version: string; headline: string; extensionDescription: string; description: string }
+export interface WorkflowCatalogFunction { name: string; version: string; headline: string; extensionDescription: string; description: string; input: JsonSchema; output: JsonSchema }
+export interface WorkflowCatalogVariable { name: string; version: string; headline: string; extensionDescription: string; description: string; schema: JsonSchema }
+export interface WorkflowCatalogWorkflow { name: string; version: string; headline: string; extensionDescription: string; description: string }
 export interface WorkflowCatalog { functions: readonly WorkflowCatalogFunction[]; variables: readonly WorkflowCatalogVariable[]; workflows: readonly WorkflowCatalogWorkflow[]; modelAliases?: Readonly<Record<string, string>> }
 const RESERVED_GLOBALS = new Set(["agent", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 export class WorkflowRegistry {
-  readonly #extensions = new Map<string, Readonly<WorkflowExtension>>();
+  readonly #extensions = new Set<Readonly<WorkflowExtension>>();
   readonly #globals = new Map<string, string>();
+  readonly #workflows = new Map<string, WorkflowScriptDefinition>();
+  readonly #hooks = new Map<string, RegisteredAgentSetupHook>();
   #frozen = false;
 
   get frozen(): boolean { return this.#frozen; }
@@ -934,95 +936,96 @@ export class WorkflowRegistry {
 
   register(extension: WorkflowExtension): void {
     if (this.#frozen) fail("REGISTRY_FROZEN", "Workflow extension registration is closed after session_start");
-    if (!object(extension) || Object.keys(extension).some((key) => !["namespace", "version", "headline", "description", "functions", "variables", "workflows", "agentSetupHooks"].includes(key)) || typeof extension.namespace !== "string" || typeof extension.version !== "string" || !IDENTIFIER.test(extension.namespace) || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a namespace, semantic version, headline, and description");
-    if (this.#extensions.has(extension.namespace)) fail("DUPLICATE_NAME", `Workflow extension already registered: ${extension.namespace}`);
+    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "functions", "variables", "workflows", "agentSetupHooks"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version, headline, and description");
     const functions = extension.functions ?? {};
     const variables = extension.variables ?? {};
     const workflows = extension.workflows ?? {};
     const agentSetupHooks = extension.agentSetupHooks ?? {};
     if (!object(functions) || !object(variables) || !object(workflows) || !object(agentSetupHooks) || (Object.keys(functions).length === 0 && Object.keys(variables).length === 0 && Object.keys(workflows).length === 0 && Object.keys(agentSetupHooks).length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, variables, workflows, or agent setup hooks");
     const names = [...Object.keys(functions), ...Object.keys(variables)];
-    if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", `Global name collision inside ${extension.namespace}`);
+    if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", "Global name collision inside extension");
     for (const name of names) {
-      if (!IDENTIFIER.test(name) || name.startsWith("__pi_extensible_workflows_")) fail("INVALID_METADATA", `Invalid global name: ${extension.namespace}.${name}`);
+      if (!IDENTIFIER.test(name) || name.startsWith("__pi_extensible_workflows_")) fail("INVALID_METADATA", `Invalid global name: ${name}`);
       if (RESERVED_GLOBALS.has(name)) fail("GLOBAL_COLLISION", `Global name is reserved: ${name}`);
-      const owner = this.#globals.get(name);
-      if (owner) fail("GLOBAL_COLLISION", `Global name ${name} is already owned by ${owner}; cannot register ${extension.namespace}.${name}`);
+      if (this.#globals.has(name)) fail("GLOBAL_COLLISION", `Global name is already registered: ${name}`);
     }
     for (const [name, fn] of Object.entries(functions)) {
-      if (!object(fn) || Object.keys(fn).some((key) => !["description", "input", "output", "run"].includes(key)) || typeof fn.description !== "string" || !fn.description.trim() || typeof fn.run !== "function") fail("INVALID_METADATA", `Invalid workflow function: ${extension.namespace}.${name}`);
-      validateSchema(fn.input, `${extension.namespace}.${name} input`);
-      validateSchema(fn.output, `${extension.namespace}.${name} output`);
-      if (fn.input.type !== "object") fail("INVALID_SCHEMA", `${extension.namespace}.${name} input must describe one object`);
+      if (!object(fn) || Object.keys(fn).some((key) => !["description", "input", "output", "run"].includes(key)) || typeof fn.description !== "string" || !fn.description.trim() || typeof fn.run !== "function") fail("INVALID_METADATA", `Invalid workflow function: ${name}`);
+      validateSchema(fn.input, `${name} input`);
+      validateSchema(fn.output, `${name} output`);
+      if (fn.input.type !== "object") fail("INVALID_SCHEMA", `${name} input must describe one object`);
     }
     for (const [name, variable] of Object.entries(variables)) {
-      if (!object(variable) || Object.keys(variable).some((key) => !["description", "schema", "resolve"].includes(key)) || typeof variable.description !== "string" || !variable.description.trim() || typeof variable.resolve !== "function") fail("INVALID_METADATA", `Invalid workflow variable: ${extension.namespace}.${name}`);
-      validateSchema(variable.schema, `${extension.namespace}.${name} schema`);
+      if (!object(variable) || Object.keys(variable).some((key) => !["description", "schema", "resolve"].includes(key)) || typeof variable.description !== "string" || !variable.description.trim() || typeof variable.resolve !== "function") fail("INVALID_METADATA", `Invalid workflow variable: ${name}`);
+      validateSchema(variable.schema, `${name} schema`);
     }
     for (const [name, workflow] of Object.entries(workflows)) {
-      if (!IDENTIFIER.test(name) || !object(workflow) || Object.keys(workflow).some((key) => !["description", "script"].includes(key)) || typeof workflow.description !== "string" || !workflow.description.trim() || typeof workflow.script !== "string" || !workflow.script.trim()) fail("INVALID_METADATA", `Invalid workflow script: ${extension.namespace}.${name}`);
+      if (!IDENTIFIER.test(name) || !object(workflow) || Object.keys(workflow).some((key) => !["description", "script"].includes(key)) || typeof workflow.description !== "string" || !workflow.description.trim() || typeof workflow.script !== "string" || !workflow.script.trim()) fail("INVALID_METADATA", `Invalid workflow script: ${name}`);
+      if (this.#workflows.has(name)) fail("DUPLICATE_NAME", `Reusable workflow already registered: ${name}`);
       parseWorkflow(workflow.script);
     }
     for (const [name, hook] of Object.entries(agentSetupHooks)) {
-      if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "setup"].includes(key)) || typeof hook.setup !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent setup hook: ${extension.namespace}.${name}`);
+      if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "setup"].includes(key)) || typeof hook.setup !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent setup hook: ${name}`);
+      if (this.#hooks.has(name)) fail("DUPLICATE_NAME", `Agent setup hook already registered: ${name}`);
     }
     const stored = deepFreeze({ ...extension, functions, variables, workflows, agentSetupHooks });
-    this.#extensions.set(extension.namespace, stored);
-    for (const name of names) this.#globals.set(name, `${extension.namespace}.${name}`);
+    this.#extensions.add(stored);
+    for (const name of names) this.#globals.set(name, name);
+    for (const [name, workflow] of Object.entries(workflows)) this.#workflows.set(name, workflow);
+    for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });
   }
 
   workflow(name: string): WorkflowScriptDefinition {
-    const separator = name.indexOf(".");
-    if (separator <= 0 || separator !== name.lastIndexOf(".") || !IDENTIFIER.test(name.slice(0, separator)) || !IDENTIFIER.test(name.slice(separator + 1))) fail("MISSING_WORKFLOW", `Registered workflows require a qualified namespace.name: ${name}`);
-    const workflow = this.#extensions.get(name.slice(0, separator))?.workflows?.[name.slice(separator + 1)];
+    if (!IDENTIFIER.test(name)) fail("MISSING_WORKFLOW", `Registered workflows require an unqualified name: ${name}`);
+    const workflow = this.#workflows.get(name);
     if (!workflow) fail("MISSING_WORKFLOW", `Workflow is unavailable: ${name}`);
     return workflow;
   }
 
   workflows(): Readonly<Record<string, WorkflowScriptDefinition>> {
-    return Object.freeze(Object.fromEntries([...this.#extensions].flatMap(([namespace, extension]) => Object.entries(extension.workflows ?? {}).map(([name, workflow]) => [`${namespace}.${name}`, workflow]))));
+    return Object.freeze(Object.fromEntries(this.#workflows));
   }
 
   catalog(): WorkflowCatalog {
     const functions: WorkflowCatalogFunction[] = [];
     const variables: WorkflowCatalogVariable[] = [];
     const workflows: WorkflowCatalogWorkflow[] = [];
-    for (const [namespace, extension] of this.#extensions) {
-      for (const [name, fn] of Object.entries(extension.functions ?? {})) functions.push({ name, namespace, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: fn.description, input: structuredClone(fn.input), output: structuredClone(fn.output) });
-      for (const [name, variable] of Object.entries(extension.variables ?? {})) variables.push({ name, namespace, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: variable.description, schema: structuredClone(variable.schema) });
-      for (const [name, workflow] of Object.entries(extension.workflows ?? {})) workflows.push({ name: `${namespace}.${name}`, namespace, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: workflow.description });
+    for (const extension of this.#extensions) {
+      for (const [name, fn] of Object.entries(extension.functions ?? {})) functions.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: fn.description, input: structuredClone(fn.input), output: structuredClone(fn.output) });
+      for (const [name, variable] of Object.entries(extension.variables ?? {})) variables.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: variable.description, schema: structuredClone(variable.schema) });
+      for (const [name, workflow] of Object.entries(extension.workflows ?? {})) workflows.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: workflow.description });
     }
     let aliases: Readonly<Record<string, string>> | undefined;
     try { aliases = loadSettings().modelAliases; } catch { aliases = undefined; }
-    const sort = (left: { namespace: string; name: string }, right: { namespace: string; name: string }) => left.namespace.localeCompare(right.namespace) || left.name.localeCompare(right.name);
-    return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), workflows: workflows.sort((left, right) => left.name.localeCompare(right.name)), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
+    const sort = (left: { name: string }, right: { name: string }) => left.name.localeCompare(right.name);
+    return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), workflows: workflows.sort(sort), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
   }
 
-  globals(): Readonly<Record<string, { namespace: string; name: string }>> {
-    return Object.freeze(Object.fromEntries([...this.#extensions].flatMap(([namespace, extension]) => Object.keys(extension.functions ?? {}).map((name) => [name, { namespace, name }]))));
+  globals(): Readonly<Record<string, { name: string }>> {
+    return Object.freeze(Object.fromEntries([...this.#extensions].flatMap((extension) => Object.keys(extension.functions ?? {}).map((name) => [name, { name }]))));
   }
 
-  async invokeFunction(namespace: string, name: string, input: unknown, context: Readonly<WorkflowFunctionContext>, path: string, journal: WorkflowJournal): Promise<JsonValue> {
-    const fn = this.#extensions.get(namespace)?.functions?.[name];
-    if (!fn) fail("MISSING_WORKFLOW", `Workflow function is unavailable: ${namespace}.${name}`);
-    if (!object(input) || !jsonValue(input) || !Value.Check(fn.input, input)) fail("RESULT_INVALID", `Invalid input for ${namespace}.${name}`);
+  async invokeFunction(name: string, input: unknown, context: Readonly<WorkflowFunctionContext>, path: string, journal: WorkflowJournal): Promise<JsonValue> {
+    const fn = [...this.#extensions].find((extension) => extension.functions?.[name])?.functions?.[name];
+    if (!fn) fail("MISSING_WORKFLOW", `Workflow function is unavailable: ${name}`);
+    if (!object(input) || !jsonValue(input) || !Value.Check(fn.input, input)) fail("RESULT_INVALID", `Invalid input for ${name}`);
     const replayed = journal.get(path);
     if (replayed !== undefined) {
-      if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${namespace}.${name}`);
+      if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
     const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, agent: context.agent, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
-    if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${namespace}.${name}`);
+    if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);
     return structuredClone(stored);
   }
 
-  variables(): readonly { namespace: string; name: string; variable: WorkflowVariable }[] {
-    return [...this.#extensions].flatMap(([namespace, extension]) => Object.entries(extension.variables ?? {}).map(([name, variable]) => ({ namespace, name, variable })));
+  variables(): readonly { name: string; variable: WorkflowVariable }[] {
+    return [...this.#extensions].flatMap((extension) => Object.entries(extension.variables ?? {}).map(([name, variable]) => ({ name, variable })));
   }
   agentSetupHooks(): readonly RegisteredAgentSetupHook[] {
-    return [...this.#extensions].flatMap(([namespace, extension]) => Object.entries(extension.agentSetupHooks ?? {}).map(([name, hook]) => ({ name: `${namespace}.${name}`, priority: hook.priority ?? 10, setup: hook.setup }))).sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    return [...this.#hooks.values()].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   }
 }
 type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "workflow" | "workflows" | "catalog" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
@@ -1071,7 +1074,7 @@ export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
   name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
   script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
-  workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as namespace.name" })),
+  workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as an unqualified name" })),
   args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
   foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
@@ -1207,8 +1210,8 @@ export interface AgentIdentity { structuralPath: readonly string[]; callSite: st
 export interface WorkflowBridge {
   agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
-  function?: (namespace: string, name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath?: readonly string[]) => Promise<JsonValue>;
-  functions?: Readonly<Record<string, { namespace: string; name: string }>>;
+  function?: (name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath?: readonly string[]) => Promise<JsonValue>;
+  functions?: Readonly<Record<string, { name: string }>>;
   variables?: Readonly<Record<string, JsonValue>>;
   phase?: (name: string) => void | Promise<void>;
   log?: (message: string) => void | Promise<void>;
@@ -1372,17 +1375,17 @@ const checkpoint = input => rpc("checkpoint", [input]).then(unwrap);
 const phase = name => rpc("phase", [name]);
 const log = message => rpc("log", [message]);
 const functionOccurrences = new Map();
-const functionPath = (namespace, name) => {
+const functionPath = name => {
   const inherited = inheritedAgentPath.getStore() || [];
-  const key = JSON.stringify([inherited, namespace, name]);
+  const key = JSON.stringify([inherited, name]);
   const occurrence = (functionOccurrences.get(key) || 0) + 1;
   functionOccurrences.set(key, occurrence);
-  return path("function", ...inherited, namespace, name, String(occurrence));
+  return path("function", ...inherited, name, String(occurrence));
 };
 const functions = Object.freeze(Object.fromEntries(Object.entries(config.functions || {}).map(([local, target]) => [local, (...values) => {
   if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("RESULT_INVALID", local + " requires exactly one JSON object argument");
   const inherited = inheritedAgentPath.getStore() || [];
-  const result = rpc("function", [target.namespace, target.name, values[0], functionPath(target.namespace, target.name), worktreeOwners.getStore() || null, inherited]).then(unwrap);
+  const result = rpc("function", [target.name, values[0], functionPath(target.name), worktreeOwners.getStore() || null, inherited]).then(unwrap);
   Object.defineProperty(result, "toJSON", { value() { throw workError("INVALID_METADATA", "Workflow function result is a Promise; await it before serialization"); } });
   return result;
 }])));
@@ -1561,13 +1564,13 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } });
         }
       } else if (method === "function") {
-        const worktreeOwner = values[4] === undefined || values[4] === null ? undefined : typeof values[4] === "string" && values[4] ? values[4] : fail("INTERNAL_ERROR", "function worktree scope is invalid");
-        const structuralPath = values[5] === undefined ? [] : values[5];
+        const worktreeOwner = values[3] === undefined || values[3] === null ? undefined : typeof values[3] === "string" && values[3] ? values[3] : fail("INTERNAL_ERROR", "function worktree scope is invalid");
+        const structuralPath = values[4] === undefined ? [] : values[4];
         if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim()))) fail("INTERNAL_ERROR", "function structural scope is invalid");
-        if (!bridge.function || typeof values[0] !== "string" || typeof values[1] !== "string" || !object(values[2]) || typeof values[3] !== "string") fail("INTERNAL_ERROR", "function requires an available bridge, names, object input, and path");
-        const name = values[0] + "." + values[1];
+        if (!bridge.function || typeof values[0] !== "string" || !object(values[1]) || typeof values[2] !== "string") fail("INTERNAL_ERROR", "function requires an available bridge, name, object input, and path");
+        const name = values[0];
         try {
-          const result = await bridge.function(values[0], values[1], values[2], values[3], controller.signal, worktreeOwner, structuralPath);
+          const result = await bridge.function(values[0], values[1], values[2], controller.signal, worktreeOwner, structuralPath);
           value = branded({ name, ok: true, value: result ?? null });
         } catch (error) {
           const typed = asWorkflowError(error);
@@ -1988,13 +1991,13 @@ function workflowRunContext(cwd: string, sessionId: string, runId: string, workf
 
 async function resolveWorkflowVariables(run: Readonly<WorkflowRunContext>, controller: AbortController, registry: WorkflowRegistryApi): Promise<Readonly<Record<string, JsonValue>>> {
   let first: WorkflowError | undefined;
-  const tasks = registry.variables().map(async ({ namespace, name, variable }) => {
+  const tasks = registry.variables().map(async ({ name, variable }) => {
     try {
       const result: unknown = await variable.resolve(run);
-      if (!jsonValue(result) || !Value.Check(variable.schema, result)) fail("RESULT_INVALID", `Invalid output from ${namespace}.${name}`);
+      if (!jsonValue(result) || !Value.Check(variable.schema, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
       return [name, deepFreeze(structuredClone(result))] as const;
     } catch (error) {
-      const typed = errorCode(error) ? new WorkflowError(errorCode(error) as WorkflowErrorCode, `${namespace}.${name}: ${errorText(error)}`) : new WorkflowError("INTERNAL_ERROR", `${namespace}.${name}: ${errorText(error)}`);
+      const typed = errorCode(error) ? new WorkflowError(errorCode(error) as WorkflowErrorCode, `${name}: ${errorText(error)}`) : new WorkflowError("INTERNAL_ERROR", `${name}: ${errorText(error)}`);
       if (!first) { first = typed; controller.abort(); }
       throw typed;
     }
@@ -2065,7 +2068,7 @@ function nextNamedOccurrence(counters: Map<string, number>, label: string): stri
 function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>, registry: WorkflowRegistryApi): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionWorktreeOccurrences = new Map<string, number>();
-  return { ...bridge, functions: registry.globals(), variables, function: async (namespace, name, input, path, signal, worktreeOwner, structuralPath = []) => {
+  return { ...bridge, functions: registry.globals(), variables, function: async (name, input, path, signal, worktreeOwner, structuralPath = []) => {
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
     const sideEffects: Promise<void>[] = [];
@@ -2079,7 +2082,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         const key = `${path}\0${JSON.stringify(inherited)}`;
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
         functionAgentOccurrences.set(key, occurrence);
-        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: `${namespace}.${name}`, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
+        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: name, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
       },
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
@@ -2092,7 +2095,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
       log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
     };
-    const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(namespace, name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
+    const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
     await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
