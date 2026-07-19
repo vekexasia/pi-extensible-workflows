@@ -95,7 +95,7 @@ export const SAFE_PARENT_EVAL_TOOLS = Object.freeze(["read", "grep", "find", "ba
 const EVAL_MODEL_TOKEN = "$EVAL_MODEL";
 const semantic = (description: string): readonly SemanticCriterion[] => [{ id: "intent", description }];
 const JSON_RESULT_TYPES = ["null", "boolean", "number", "integer", "string", "array", "object"] as const;
-const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"] as const;
+const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"] as const;
 const AGENT_OPTION_NAMES = ["role", "model", "thinking", "tools", "retries"] as const;
 const expectationKeys = ["firstSignificantAction", "firstTool", "firstBatchToolSequence", "parentToolSequence", "workflowCallCount", "requiredOperations", "forbiddenOperations", "requiredRoles", "minimumAgentCalls", "requireOutputSchema", "expectedResults", "agentPolicies", "requiredAgentOrder", "requiredAgentStructures", "requiredDataFlow"] as const;
 const caseKeys = ["id", "prompt", "timeoutMs", "maxCost", "expectations", "expectedWorkflowCalls", "semanticCriteria"] as const;

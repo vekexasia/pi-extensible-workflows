@@ -136,6 +136,7 @@
           <thead><tr><th>Primitive</th><th>Use</th></tr></thead>
           <tbody>
             <tr><td><code>agent(prompt, options)</code></td><td>Run one Pi agent and return its bare text or JSON value.</td></tr>
+            <tr><td><code>conversation(name, policy)</code></td><td>Create a persisted conversation handle whose sequential <code>run(prompt, turnOptions)</code> calls continue the last successful transcript.</td></tr>
             <tr><td><code>prompt(template, values)</code></td><td>Safely interpolate JSON-compatible values into a prompt.</td></tr>
             <tr><td><code>parallel(name, tasks)</code></td><td>Run keyed independent tasks concurrently.</td></tr>
             <tr><td><code>pipeline(name, items, stages)</code></td><td>Apply ordered stages to keyed items.</td></tr>
@@ -147,6 +148,7 @@
         </table></div>
         <h3>Agent options</h3>
         <p>Use <code>label</code> as an optional non-empty display name. If omitted, agents use their <code>role</code> name, or the effective model name for role-less agents. Use <code>model</code> as a configured model alias or <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
+        <p><code>conversation(name, policy)</code> freezes the agent policy, effective system prompt, cwd/worktree, and tool definitions for a run-scoped transcript. Calls to <code>handle.run(prompt, turnOptions)</code> are scheduled independently but must be sequential; <code>timeoutMs</code> and <code>retries</code> are turn-local. Failed turns do not advance the persisted head, and cold resume fails closed if the transcript or request prefix is incompatible. Existing <code>agent()</code> calls always retain fresh-session behavior.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> report = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review the implementation"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">label</span><span class="tok-punctuation">:</span> <span class="tok-string">"Implementation review"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>

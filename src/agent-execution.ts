@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
@@ -7,7 +8,7 @@ type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
 import { mergeAgentResourceExclusions, resolveModelReference, WorkflowError } from "./index.js";
-import type { RunStore } from "./persistence.js";
+import type { ConversationHead, PersistedConversation, RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
   beforeAttempt(): void;
@@ -37,6 +38,7 @@ export interface AgentExecutionOptions {
   budget?: AgentBudgetHooks;
   agentOptions?: Readonly<Record<string, JsonValue>>;
   agentIdentity?: AgentIdentity;
+  conversation?: { id: string; turn: number };
 }
 export interface AgentExecutionRoot {
   cwd: string;
@@ -73,14 +75,17 @@ export interface NativeSession {
   readonly messages: readonly AgentMessage[];
   getSessionStats(): NativeSessionStats;
   readonly systemPrompt?: string;
+  readonly model?: { provider: string; model?: string; id?: string };
   readonly agent?: { state: { tools: readonly { name: string }[] } };
+  getLeafId?: () => string | null;
+  getToolDefinitions?: () => unknown;
   subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
   prompt(text: string): Promise<void>;
   steer?(text: string): Promise<void>;
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue> }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue>; continuation?: { sessionId: string; sessionFile: string; leafId: string } }
 export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
@@ -112,8 +117,24 @@ function canonicalSourcePath(path: string): string { try { return realpathSync(p
 
 export async function createNativeAgentSession(input: SessionInput): Promise<NativeSession> {
   const agentDir = input.agentDir ?? getAgentDir();
-  const manager = input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd);
-  manager.appendSessionInfo(input.sessionLabel);
+  let manager: SessionManager;
+  if (input.continuation) {
+    try {
+      manager = SessionManager.open(input.continuation.sessionFile, input.agentDir ? join(agentDir, "sessions") : undefined, input.cwd);
+      const header = manager.getHeader();
+      if (!header || canonicalSourcePath(header.cwd) !== canonicalSourcePath(input.cwd) || manager.getSessionId() !== input.continuation.sessionId || !manager.getEntry(input.continuation.leafId)) throw new Error("Persisted transcript identity does not match the conversation head");
+      manager.branch(input.continuation.leafId);
+      const context = manager.buildSessionContext();
+      if (context.model && (context.model.provider !== input.model.provider || context.model.modelId !== input.model.model)) throw new Error("Persisted transcript model does not match the conversation policy");
+      if (input.model.thinking && context.thinkingLevel !== input.model.thinking) throw new Error("Persisted transcript thinking level does not match the conversation policy");
+    } catch (error) {
+      if (error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE") throw error;
+      throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot reopen conversation transcript: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    manager = input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd);
+    manager.appendSessionInfo(input.sessionLabel);
+  }
   const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
   const model = modelRuntime.getModel(input.model.provider, input.model.model);
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
@@ -157,8 +178,12 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
     resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
-  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, ...(settingsManager ? { settingsManager } : {}), ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
-  return session;
+  const { session, modelFallbackMessage } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, ...(settingsManager ? { settingsManager } : {}), ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
+  if (input.continuation && modelFallbackMessage) throw new WorkflowError("RESUME_INCOMPATIBLE", modelFallbackMessage);
+  return Object.assign(session, {
+    getLeafId: () => manager.getLeafId(),
+    getToolDefinitions: () => session.getAllTools().map(({ name, description, parameters, promptGuidelines }) => ({ name, description, parameters, ...(promptGuidelines ? { promptGuidelines } : {}) })),
+  }) as unknown as NativeSession;
 }
 function changedOption(options: Readonly<Record<string, JsonValue>>, baseline: Readonly<Record<string, JsonValue>>, key: string): boolean { return JSON.stringify(options[key]) !== JSON.stringify(baseline[key]); }
 function validThinking(value: unknown): value is ThinkingLevel { return typeof value === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value); }
@@ -170,7 +195,34 @@ function fallbackSetupContext(root: AgentExecutionRoot, options: AgentExecutionO
 function resourcePolicySummary(policy: AgentResourcePolicy): NonNullable<AgentSetupSummary["disabledAgentResources"]> {
   return { skills: [...policy.effective.skills], extensions: [...policy.effective.extensions], unmatchedSkills: [...policy.unmatchedSkills], unmatchedExtensions: [...policy.unmatchedExtensions] };
 }
-async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalJson(item));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonicalJson(item)]));
+  return value;
+}
+function fingerprint(value: unknown): string { return createHash("sha256").update(JSON.stringify(canonicalJson(value))).digest("hex"); }
+function promptFingerprint(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+function fixedConversationOptions(options: Readonly<Record<string, JsonValue>>): JsonValue {
+  const fixed = structuredClone(options) as Record<string, JsonValue>;
+  delete fixed.timeoutMs;
+  delete fixed.retries;
+  return fixed;
+}
+function conversationPolicy(options: AgentExecutionOptions, setup: AgentSetup): JsonValue {
+  return structuredClone({
+    model: setup.sessionInput.model,
+    tools: [...setup.sessionInput.tools],
+    cwd: setup.sessionInput.cwd,
+    role: options.role ?? null,
+    worktreeOwner: options.worktreeOwner ?? null,
+    parent: options.parent ?? null,
+    systemPromptAppend: setup.sessionInput.systemPromptAppend ?? "",
+    options: fixedConversationOptions(setup.options),
+    resourcePolicy: setup.sessionInput.resourcePolicy ? resourcePolicySummary(setup.sessionInput.resourcePolicy) : null,
+  }) as unknown as JsonValue;
+}
+function conversationFailure(message: string): WorkflowError { return new WorkflowError("RESUME_INCOMPATIBLE", message); }
+async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, continuation?: ConversationHead): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
   const baseResourcePolicy = await root.agentResourcePolicy?.();
@@ -192,6 +244,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, createSession: Sessio
   if (changedOption(setup.options, baselineOptions, "thinking") && validThinking(setup.options.thinking)) setup.sessionInput.model = { ...setup.sessionInput.model, thinking: setup.options.thinking };
   if (changedOption(setup.options, baselineOptions, "tools") && Array.isArray(setup.options.tools) && setup.options.tools.every((tool) => typeof tool === "string")) setup.sessionInput.tools = [...setup.options.tools];
   if (changedOption(setup.options, baselineOptions, "cwd") && typeof setup.options.cwd === "string") setup.sessionInput.cwd = setup.options.cwd;
+  if (continuation) setup.sessionInput.continuation = { sessionId: continuation.sessionId, sessionFile: continuation.sessionFile, leafId: continuation.leafId };
   const model = setup.sessionInput.model;
   const summary: AgentSetupSummary = { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { disabledAgentResources: resourcePolicySummary(setup.sessionInput.resourcePolicy) } : {}) };
   return { setup, summary };
@@ -243,7 +296,16 @@ export class WorkflowAgentExecutor {
       if (options.cwd) throw new WorkflowError("INVALID_METADATA", "Only child agents or worktree scopes may provide a cwd");
       cwd = this.root.cwd;
     }
+    let conversationRecord: PersistedConversation | undefined;
+    if (options.conversation) {
+      const store = this.root.runStore;
+      if (!store) throw conversationFailure("Conversation persistence is unavailable");
+      try { conversationRecord = await store.conversation(options.conversation.id); } catch (error) { throw conversationFailure(`Cannot load conversation state: ${error instanceof Error ? error.message : String(error)}`); }
+      if (!Number.isInteger(options.conversation.turn) || options.conversation.turn < 1) throw conversationFailure("Conversation turn must be a positive integer");
+      if (conversationRecord ? conversationRecord.head.turn + 1 !== options.conversation.turn : options.conversation.turn !== 1) throw conversationFailure(`Conversation turn ${String(options.conversation.turn)} does not continue its persisted head`);
+    }
     const attempts: AgentAttempt[] = [];
+    let conversationBaseline: { policy: JsonValue; toolDefinitionsSha256: string; systemPrompt?: string; systemPromptSha256?: string } | undefined;
     const maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options.budget?.beforeAttempt();
@@ -255,6 +317,10 @@ export class WorkflowAgentExecutor {
       let setupFailed = false;
       let budgetError: WorkflowError | undefined;
       let turnStarted = false;
+      let conversationSystemPrompt = "";
+      let conversationToolDefinitionsSha256 = "";
+      let conversationMismatch: WorkflowError | undefined;
+      const conversationMismatchError = () => conversationMismatch ? new WorkflowError("RESUME_INCOMPATIBLE", conversationMismatch.message) : undefined;
       const hasSchemaResult = () => schemaResult !== undefined;
       const resultTool = options.schema ? {
         name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: Type.Unsafe(options.schema),
@@ -284,7 +350,7 @@ export class WorkflowAgentExecutor {
       };
       try {
         setupFailed = true;
-        const prepared = await prepareAgentSetup(this.root, this.createSession, task, options, resolved, cwd, attempt, executionSignal, customTools, resultTool);
+        const prepared = await prepareAgentSetup(this.root, this.createSession, task, options, resolved, cwd, attempt, executionSignal, customTools, resultTool, conversationRecord?.head);
         setup = prepared.setup;
         setupSummary = prepared.summary;
         setupFailed = false;
@@ -292,14 +358,47 @@ export class WorkflowAgentExecutor {
         const started = Date.now();
         session = await setup.createSession(setup.sessionInput);
         if (setup.sessionInput.resourcePolicy) setupSummary = { ...setupSummary, disabledAgentResources: resourcePolicySummary(setup.sessionInput.resourcePolicy) };
+        if (options.conversation) {
+          conversationSystemPrompt = session.systemPrompt ?? "";
+          conversationToolDefinitionsSha256 = fingerprint(session.getToolDefinitions?.() ?? session.agent?.state.tools ?? []);
+          const currentPolicy = conversationPolicy(options, setup);
+          if (conversationRecord) {
+            if (session.sessionId !== conversationRecord.head.sessionId || requiredFile(session.sessionFile) !== conversationRecord.head.sessionFile) throw conversationFailure("Conversation transcript identity changed");
+            if (!session.getLeafId || session.getLeafId() !== conversationRecord.head.leafId) throw conversationFailure("Conversation transcript leaf identity changed");
+            if (fingerprint(currentPolicy) !== fingerprint(conversationRecord.policy)) throw conversationFailure("Conversation execution policy changed");
+            if (!session.subscribe && (promptFingerprint(conversationSystemPrompt) !== conversationRecord.head.systemPromptSha256 || conversationSystemPrompt !== conversationRecord.head.systemPrompt)) throw conversationFailure("Conversation system prompt changed");
+            if (conversationToolDefinitionsSha256 !== conversationRecord.head.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
+          } else if (conversationBaseline) {
+            if (fingerprint(currentPolicy) !== fingerprint(conversationBaseline.policy)) throw conversationFailure("Conversation execution policy changed");
+            if (conversationToolDefinitionsSha256 !== conversationBaseline.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
+          } else {
+            conversationBaseline = { policy: currentPolicy, toolDefinitionsSha256: conversationToolDefinitionsSha256 };
+          }
+          if (!session.subscribe) {
+            const expectedPrompt = conversationRecord?.head.systemPrompt ?? conversationBaseline?.systemPrompt;
+            const expectedDigest = conversationRecord?.head.systemPromptSha256 ?? conversationBaseline?.systemPromptSha256;
+            if (expectedPrompt !== undefined && expectedDigest !== undefined && (promptFingerprint(conversationSystemPrompt) !== expectedDigest || expectedPrompt !== conversationSystemPrompt)) throw conversationFailure("Conversation system prompt changed");
+            if (!conversationRecord && conversationBaseline && conversationBaseline.systemPrompt === undefined) conversationBaseline = { ...conversationBaseline, systemPrompt: conversationSystemPrompt, systemPromptSha256: promptFingerprint(conversationSystemPrompt) };
+          }
+          if (conversationRecord && (!session.model || session.model.provider !== setup.sessionInput.model.provider || (session.model.model ?? session.model.id) !== setup.sessionInput.model.model)) throw conversationFailure("Conversation model changed");
+        }
         const includeAttemptSetup = Boolean(this.root.agentSetupHooks?.length || setup.sessionInput.resourcePolicy);
         await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), ...(includeAttemptSetup ? { setup: setupSummary } : {}) });
         const activeSession = session;
         unsubscribe = activeSession.subscribe?.((event) => {
-          if (event.type === "agent_start" && session?.systemPrompt !== undefined && this.root.runStore) {
-            systemPromptTurn += 1;
-            const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
-            systemPromptWrite = systemPromptWrite.then(() => this.root.runStore?.recordSystemPrompt(entry)).then(() => undefined).catch((error: unknown) => { systemPromptWriteError ??= error; });
+          if (event.type === "agent_start" && session?.systemPrompt !== undefined) {
+            if (options.conversation) {
+              conversationSystemPrompt = session.systemPrompt;
+              const expectedPrompt = conversationRecord?.head.systemPrompt ?? conversationBaseline?.systemPrompt;
+              const expectedDigest = conversationRecord?.head.systemPromptSha256 ?? conversationBaseline?.systemPromptSha256;
+              if (expectedPrompt !== undefined && expectedDigest !== undefined && (promptFingerprint(conversationSystemPrompt) !== expectedDigest || expectedPrompt !== conversationSystemPrompt)) { conversationMismatch = conversationFailure("Conversation system prompt changed"); void session.abort?.(); }
+              if (!conversationRecord && conversationBaseline && conversationBaseline.systemPrompt === undefined) conversationBaseline = { ...conversationBaseline, systemPrompt: conversationSystemPrompt, systemPromptSha256: promptFingerprint(conversationSystemPrompt) };
+            }
+            if (this.root.runStore) {
+              systemPromptTurn += 1;
+              const entry = { sessionId: session.sessionId, attempt, turn: systemPromptTurn, prompt: session.systemPrompt };
+              systemPromptWrite = systemPromptWrite.then(() => this.root.runStore?.recordSystemPrompt(entry)).then(() => undefined).catch((error: unknown) => { systemPromptWriteError ??= error; });
+            }
           }
           if (event.type === "message_start" && event.message.role === "assistant") {
             if (!turnStarted) { try { options.budget?.beforeTurn(); turnStarted = true; } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
@@ -329,6 +428,7 @@ export class WorkflowAgentExecutor {
         options.budget?.beforeTurn();
         turnStarted = true;
         await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
+        if (conversationMismatch) throw conversationMismatch;
         { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
@@ -339,6 +439,8 @@ export class WorkflowAgentExecutor {
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
+        const mismatch = conversationMismatchError();
+        if (mismatch) throw mismatch;
         const value = options.schema ? schemaResult as JsonValue : text(session.messages);
         if (options.worktreeOwner) await this.root.runStore?.snapshotWorktree(options.worktreeOwner);
         report(true);
@@ -346,12 +448,19 @@ export class WorkflowAgentExecutor {
         await flushSystemPrompts();
         unsubscribe?.();
         const attemptAccounting = accounting(session.getSessionStats());
+        const leafId = session.getLeafId?.() ?? undefined;
+        if (options.conversation) {
+          if (!leafId) throw conversationFailure("Conversation transcript has no persisted leaf");
+          const store = this.root.runStore;
+          if (!store) throw conversationFailure("Conversation persistence is unavailable");
+          await store.saveConversation({ id: options.conversation.id, policy: conversationPolicy(options, setup), head: { turn: options.conversation.turn, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), leafId, systemPrompt: conversationSystemPrompt, systemPromptSha256: promptFingerprint(conversationSystemPrompt), toolDefinitionsSha256: conversationToolDefinitionsSha256 } });
+        }
         const includeCompletedSetup = Boolean(this.root.agentSetupHooks?.length || setup.sessionInput.resourcePolicy);
         attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(includeCompletedSetup ? { setup: setupSummary } : {}) });
         session.dispose();
         return { value, attempts, cwd: setupSummary.cwd };
       } catch (error) {
-        const typed = budgetError ?? (error instanceof WorkflowError ? error : new WorkflowError(executionSignal?.aborted && setupFailed ? "CANCELLED" : "AGENT_FAILED", error instanceof Error ? error.message : String(error)));
+        const typed = budgetError ?? conversationMismatch ?? (error instanceof WorkflowError ? error : new WorkflowError(executionSignal?.aborted && setupFailed ? "CANCELLED" : "AGENT_FAILED", error instanceof Error ? error.message : String(error)));
         if (session) {
           report(true);
           await progress;
@@ -364,7 +473,7 @@ export class WorkflowAgentExecutor {
           session.dispose();
         }
         if (options.worktreeOwner && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner).catch(() => undefined);
-        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED") throw Object.assign(typed, { attempts });
+        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED" || typed.code === "RESUME_INCOMPATIBLE") throw Object.assign(typed, { attempts });
         beforeRetry?.();
       }
     }
@@ -387,6 +496,7 @@ export interface ScheduledAgentOptions {
   timeoutMs?: number | null;
   agentOptions?: Readonly<Record<string, JsonValue>>;
   agentIdentity?: AgentIdentity;
+  conversation?: { id: string; turn: number };
 }
 
 export type ScheduledAgentResult =

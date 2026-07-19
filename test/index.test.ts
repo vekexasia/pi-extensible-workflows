@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -2045,6 +2045,25 @@ void test("direct workflow agents use call-site and occurrence identity", async 
   assert.equal(firstIdentity.occurrence, 1);
   assert.equal(secondIdentity.occurrence, 2);
   assert.notEqual(firstIdentity.callSite, thirdIdentity.callSite);
+});
+void test("conversation handles retain deterministic turn identity while ordinary agents stay fresh", async () => {
+  const calls: Array<{ prompt: string; identity: AgentIdentity; options: Readonly<Record<string, JsonValue>> }> = [];
+  await runWorkflow(`const developer = conversation("developer", { model: "openai/gpt" }); return [await developer.run("first"), await agent("fresh"), await developer.run("second", { timeoutMs: 10 })];`, null, { agent: async (prompt, options, _signal, identity) => { calls.push({ prompt, options, identity }); return prompt; } }).result;
+  const [first, fresh, second] = calls;
+  assert.ok(first && fresh && second);
+  assert.deepEqual([first.prompt, fresh.prompt, second.prompt], ["first", "fresh", "second"]);
+  assert.equal(first.identity.callSite, second.identity.callSite);
+  assert.equal(first.identity.occurrence, 1);
+  assert.equal(second.identity.occurrence, 1);
+  assert.deepEqual([first.identity.conversation, fresh.identity.conversation, second.identity.conversation], [{ name: "developer", turn: 1 }, undefined, { name: "developer", turn: 2 }]);
+  assert.equal(first.options.model, "openai/gpt");
+  assert.equal(second.options.timeoutMs, 10);
+});
+void test("conversation failures do not consume the next turn and overlapping runs fail", async () => {
+  const identities: Array<{ turn: number | undefined }> = [];
+  const result = await runWorkflow(`const handle = conversation("developer"); const first = handle.run("fail"); let overlap; try { await handle.run("overlap"); } catch (error) { overlap = error.code; } let firstCode; try { await first; } catch (error) { firstCode = error.code; } return [firstCode, overlap, await handle.run("retry")];`, null, { agent: async (prompt, _options, _signal, identity) => { identities.push({ turn: identity.conversation?.turn }); if (prompt === "fail") throw Object.assign(new Error("failed"), { code: "AGENT_FAILED" }); return prompt; } }).result;
+  assert.deepEqual(result, ["AGENT_FAILED", "RESUME_INCOMPATIBLE", "retry"]);
+  assert.deepEqual(identities, [{ turn: 1 }, { turn: 1 }]);
 });
 
 void test("withWorktree returns bare values and propagates one owner through parallel and pipeline", async () => {

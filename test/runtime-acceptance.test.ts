@@ -305,6 +305,46 @@ void test("production Pi seam installs child tools and registers native steering
   assert.ok(steer); await steer("redirect"); assert.deepEqual(received, ["redirect"]);
 });
 
+void test("production conversation turns reopen transcript and advance persisted head", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-conversation-acceptance-"));
+  const inputs: SessionInput[] = [];
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    const continued = input.continuation !== undefined;
+    let leafId = input.continuation?.leafId ?? "root";
+    return {
+      sessionId: "conversation-session",
+      sessionFile: "/sessions/conversation.jsonl",
+      model: { provider: "openai", model: "gpt" },
+      messages: [{ role: "assistant", content: [{ type: "text", text: continued ? "second" : "first" }] }],
+      getSessionStats: sessionStats,
+      systemPrompt: "stable conversation prompt",
+      getLeafId: () => leafId,
+      getToolDefinitions: () => [],
+      prompt: async () => { leafId = continued ? "leaf-2" : "leaf-1"; },
+      steer: async () => {},
+      dispose() {},
+    };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown; runId: string } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "conversation-acceptance", script: "const handle = conversation('developer'); return [await handle.run('first'), await handle.run('second')];", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(result.details.value, ["first", "second"]);
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs[0]?.continuation, undefined);
+  assert.deepEqual(inputs[1]?.continuation, { sessionId: "conversation-session", sessionFile: "/sessions/conversation.jsonl", leafId: "leaf-1" });
+  const store = new RunStore(home, "session", result.details.runId, home);
+  const artifact = JSON.parse(readFileSync(store.conversationPath(), "utf8")) as { conversations: Record<string, { head: { turn: number; leafId: string } }> };
+  const conversations = Object.values(artifact.conversations);
+  assert.equal(conversations.length, 1);
+  const conversation = conversations[0];
+  assert.ok(conversation);
+  assert.equal(conversation.head.turn, 2);
+  assert.equal(conversation.head.leafId, "leaf-2");
+});
+
 void test("concurrency-1 cancellation and nested containment retain accounting and retry separation", async () => {
   const started: string[] = [];
   let release!: () => void;
