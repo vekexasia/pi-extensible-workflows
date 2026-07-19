@@ -4,7 +4,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
+type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
 import { mergeAgentResourceExclusions, resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
@@ -103,6 +103,11 @@ function hasToolCall(message: unknown): boolean {
 function latestAssistantHasToolCall(messages: readonly AgentMessage[]): boolean {
   const message = [...messages].reverse().find((item) => item.role === "assistant");
   return hasToolCall(message);
+}
+
+function throwIfTerminalAssistantError(session: NativeSession): void {
+  const message = [...session.messages].reverse().find((item) => item.role === "assistant");
+  if (message?.stopReason === "error") throw new WorkflowError("AGENT_FAILED", message.errorMessage ?? "Native Pi assistant ended with a terminal provider error");
 }
 
 function accounting(stats: NativeSessionStats): AgentAccounting {
@@ -329,13 +334,16 @@ export class WorkflowAgentExecutor {
         options.budget?.beforeTurn();
         turnStarted = true;
         await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
+        throwIfTerminalAssistantError(session);
         { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
           accepted = true;
           try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+          throwIfTerminalAssistantError(session);
           if (!hasSchemaResult()) {
             try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+            throwIfTerminalAssistantError(session);
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
