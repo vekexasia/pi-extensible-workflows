@@ -133,6 +133,16 @@ void test("persists exact effective system prompts as private run artifacts", as
   assert.deepEqual(saved, prompts.map((prompt, index) => ({ sessionId: "native-a", attempt: 1, turn: index + 1, sha256: createHash("sha256").update(prompt).digest("hex"), prompt })));
   assert.equal(statSync(store.systemPromptPath()).mode & 0o777, 0o600);
 });
+void test("persists conversation heads and rejects non-sequential continuation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-conversations-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const head = { turn: 1, sessionId: "native-a", sessionFile: "/pi/sessions/native-a.jsonl", leafId: "leaf-1", systemPrompt: "SYSTEM", systemPromptSha256: createHash("sha256").update("SYSTEM").digest("hex"), toolDefinitionsSha256: "tools" };
+  await store.saveConversation({ id: "developer", policy: { model: "openai/gpt", tools: ["read"] }, head });
+  assert.deepEqual(await new RunStore(cwd, "session-a", "run-a", home).conversation("developer"), { id: "developer", policy: { model: "openai/gpt", tools: ["read"] }, head });
+  await assert.rejects(store.saveConversation({ id: "developer", policy: { model: "openai/gpt", tools: ["read"] }, head: { ...head, turn: 3, leafId: "leaf-3" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+});
 void test("serializes concurrent state updates without losing fields", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-state-"));
   const cwd = join(home, "project");
