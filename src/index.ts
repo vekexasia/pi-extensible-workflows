@@ -1634,7 +1634,7 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
 type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
 
 type AgentGroup = { label: string; entries: readonly { agent: AgentRecord; index: number; depth: number }[] };
-function agentGroupKey(agent: AgentRecord): string { return JSON.stringify(agent.structuralPath ?? []); }
+function agentGroupKey(agent: AgentRecord): string { return JSON.stringify([agent.structuralPath ?? [], agent.parentBreadcrumb ?? null]); }
 function agentGroupLabel(agents: readonly AgentRecord[]): string {
   const structural = agents[0]?.structuralPath ?? [];
   const breadcrumbs = [...new Set(agents.map((agent) => agent.parentBreadcrumb).filter((value): value is string => Boolean(value)))];
