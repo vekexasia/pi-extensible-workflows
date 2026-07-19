@@ -474,6 +474,15 @@ void test("workflow cards group structural scopes with stable creation order", (
   assert.ok(progress.indexOf("#3") < progress.indexOf("#2"));
   assert.match(progress, /#4 ◇ child/);
 });
+void test("workflow progress keeps top-level agents separate from review-loop groups", () => {
+  const run = { id: "run", workflowName: "mixed", cwd: "/repo", sessionId: "session", state: "running", agents: [
+    { id: "run:1", name: "scout", path: "run:1", state: "completed", structuralPath: [], model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "developer", path: "run:2", state: "running", structuralPath: [], parentBreadcrumb: "reviewLoop.developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const progress = formatWorkflowProgress(run);
+  assert.match(progress, / {2}Agents\n {4}#1 ✓ scout \[completed\]/);
+  assert.match(progress, / {2}reviewLoop\.developUntilApproved\n {4}#2 ◇ developer \[running\]/);
+});
 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-"));
