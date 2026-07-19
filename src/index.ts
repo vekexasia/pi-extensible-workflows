@@ -2197,6 +2197,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   type BudgetDecisionResult = { state: "running" | "budget_exhausted"; approved: boolean };
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; budgetResolvers: Map<string, (result: BudgetDecisionResult) => void>; update?: (result: WorkflowToolUpdate) => void }>();
   const conversationLocks = new Set<string>();
+  const terminalRunStates = new Map<string, "completed" | "failed" | "stopped">();
   let sessionLease: SessionLease | undefined;
   let sessionLeasePromise: Promise<SessionLease> | undefined;
   const ensureSessionLease = async (cwd: string, sessionId: string) => {
@@ -2301,6 +2302,20 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     await eventPublisher.agentStates(run.store, run.metadata, previousAgents, runState.agents);
     run.update?.(workflowToolUpdate(runState));
   });
+  type WorkflowStopResult = { runId: string; state: RunState | "unknown"; stopped: boolean; reason?: "unknown_run" | "already_terminal" };
+  const stopWorkflowRun = async (runId: string): Promise<WorkflowStopResult> => {
+    const run = runs.get(runId);
+    const terminalState = terminalRunStates.get(runId);
+    if (!run) return terminalState ? { runId, state: terminalState, stopped: false, reason: "already_terminal" } : { runId, state: "unknown", stopped: false, reason: "unknown_run" };
+    const state = run.lifecycle.state;
+    if (state === "completed" || state === "failed" || state === "stopped") return { runId, state, stopped: false, reason: "already_terminal" };
+    await run.lifecycle.terminal("stopped");
+    run.abortController.abort();
+    run.execution?.cancel();
+    await scheduler.cancelRun(run.store.runId);
+    await scheduler.flush();
+    return { runId, state: "stopped", stopped: true };
+  };
   const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
     const run = runs.get(runId);
     if (!run) return false;
@@ -2390,6 +2405,20 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       }
     },
   });
+  pi.registerTool({
+    name: "workflow_stop",
+    label: "Workflow Stop",
+    description: "Stop an active workflow run by ID",
+    parameters: Type.Object({ runId: Type.String() }, { additionalProperties: false }),
+    async execute(_id, params) {
+      try {
+        const result = await stopWorkflowRun(params.runId);
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+      } catch (error) {
+        throw mainAgentError(error);
+      }
+    },
+  });
   let catalogRegistered = false;
   let sessionStarted = false;
   const registerCatalog = () => {
@@ -2408,7 +2437,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   };
   const refreshPausedRunAliases = async (run: NonNullable<ReturnType<typeof runs.get>>, context?: { model: { provider: string; id: string } | undefined; modelRegistry: { getAll?: () => Array<{ provider: string; id: string }>; getAvailable?: () => Array<{ provider: string; id: string }> } | undefined }) => {
     const loaded = await run.store.load();
-    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_catalog"));
+    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
     const settingsPath = workflowSettingsPath();
@@ -2436,7 +2465,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
     const missingRole = loaded.snapshot.agentTypes.find((role) => !loaded.snapshot.roles?.[role]);
     if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
-    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_catalog"));
+    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
     const settingsPath = workflowSettingsPath();
@@ -2592,7 +2621,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       let loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> };
       try { loaded = await store.load(); } catch { if (!await store.isComplete()) await store.delete(true).catch(() => undefined); continue; }
-      if (["completed", "failed", "stopped"].includes(loaded.run.state)) continue;
+      if (loaded.run.state === "completed" || loaded.run.state === "failed" || loaded.run.state === "stopped") { terminalRunStates.set(runId, loaded.run.state); continue; }
       if (loaded.run.state !== "interrupted" && loaded.run.state !== "budget_exhausted") {
         const previousState = loaded.run.state;
         await store.updateState((current) => ["completed", "failed", "stopped", "interrupted", "budget_exhausted"].includes(current.state) ? current : { ...current, state: "interrupted" });
@@ -2656,7 +2685,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const knownModels = new Set((modelRegistry?.getAll?.() ?? modelRegistry?.getAvailable?.() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       knownModels.add(rootModelName);
       const availableModels = knownModels;
-      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_catalog");
+      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_stop" && name !== "workflow_catalog");
       const trustedProject = projectTrusted(ctx);
       if (typeof ctx.cwd === "string") resolveAgentResourcePolicy(ctx.cwd, trustedProject, settingsPath);
       const validated = validateWorkflowLaunchWithRegistry(params, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
@@ -2826,7 +2855,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           if (action === "delete" && stored) {
             if (!["completed", "failed", "stopped"].includes(stored.loaded.run.state)) { ctx.ui.notify("Stop the workflow before deleting it.", "warning"); return keepContext ? "dashboard" : "done"; }
             if (!await ctx.ui.confirm("Delete workflow?", `Delete ${stored.loaded.run.workflowName} (${stored.store.runId}) and all owned artifacts? This cannot be undone.`)) return keepContext ? "dashboard" : "done";
-            await stored.store.delete(true); runs.delete(stored.store.runId); ctx.ui.notify(`Deleted workflow ${stored.store.runId}.`, "info"); return keepContext ? "picker" : "done";
+            await stored.store.delete(true); runs.delete(stored.store.runId); terminalRunStates.delete(stored.store.runId); ctx.ui.notify(`Deleted workflow ${stored.store.runId}.`, "info"); return keepContext ? "picker" : "done";
           }
           if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return keepContext ? "dashboard" : "done"; }
           if (action === "resume" && run) {
@@ -2855,7 +2884,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             const workflowName = stored?.loaded.run.workflowName ?? run.metadata.name;
             if (keepContext && !await ctx.ui.confirm("Stop workflow?", `Stop workflow ${workflowName} (${run.store.runId})? This cannot be undone.`)) return "dashboard";
             if (keepContext) status(`Stopping workflow ${workflowName}...`);
-            await run.lifecycle.terminal("stopped"); run.abortController.abort(); run.execution?.cancel(); await scheduler.cancelRun(run.store.runId); await scheduler.flush();
+            await stopWorkflowRun(run.store.runId);
             if (keepContext) status(`Workflow ${run.store.runId} stopped.`);
             ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return keepContext ? "dashboard" : "done";
           }
@@ -2954,7 +2983,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           if (runChoice === "Delete all completed") {
             if (!await ctx.ui.confirm("Delete completed runs?", "Delete all completed workflow runs and their artifacts? This cannot be undone.")) continue;
             for (const entry of sorted) {
-              if (entry.loaded.run.state === "completed") { await entry.store.delete(true); runs.delete(entry.store.runId); }
+              if (entry.loaded.run.state === "completed") { await entry.store.delete(true); runs.delete(entry.store.runId); terminalRunStates.delete(entry.store.runId); }
             }
             ctx.ui.notify("Deleted all completed workflow runs.", "info"); stores = await loadStores(); continue;
           }

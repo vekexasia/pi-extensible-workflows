@@ -78,11 +78,12 @@
       </section>
       <section id="tool-api">
         <h2>Tool API</h2>
-        <p>The extension registers three tools and one command:</p>
+        <p>The extension registers four tools and one command:</p>
         <ul>
           <li><code>workflow</code> runs an inline or registered deterministic JavaScript workflow.</li>
           <li><code>workflow_resume</code> resumes a budget-exhausted run with an optional budget patch.</li>
           <li><code>workflow_respond</code> approves or rejects a pending checkpoint or budget decision.</li>
+          <li><code>workflow_stop</code> stops an active workflow run by ID.</li>
           <li><code>/workflow</code> lists and controls runs in the current Pi session.</li>
         </ul>
         <h3><code>workflow</code> parameters</h3>
@@ -106,6 +107,9 @@
   <span class="tok-property">"approved"</span><span class="tok-punctuation">:</span> <span class="tok-boolean">true</span>
 <span class="tok-punctuation">}</span></code></pre>
         <p>Use <code>name</code> instead of <code>proposalId</code> for checkpoint decisions. A budget relaxation proposal remains pending until this tool approves or rejects its exact proposal ID.</p>
+        <h3><code>workflow_stop</code> parameters</h3>
+        <pre><code class="language-json"><span class="tok-punctuation">{</span> <span class="tok-property">"runId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"..."</span> <span class="tok-punctuation">}</span></code></pre>
+        <p>Stopping cancels the workflow, descendant agents, and scheduler work before persisting <code>state: "stopped"</code>. The result reports <code>stopped: true</code> on success, <code>unknown_run</code> for an unavailable or differently owned run, and <code>already_terminal</code> for a completed, failed, or stopped run.</p>
         <h3><code>workflow_resume</code> parameters</h3>
         <pre><code class="language-json"><span class="tok-punctuation">{</span> <span class="tok-property">"runId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"..."</span><span class="tok-punctuation">,</span> <span class="tok-property">"budget"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"tokens"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"hard"</span><span class="tok-punctuation">:</span> <span class="tok-number">120000</span> <span class="tok-punctuation">}</span> <span class="tok-punctuation">}</span> <span class="tok-punctuation">}</span></code></pre>
         <p>Background workflow calls return a run ID immediately. Completion or failure is delivered as one follow-up. Foreground calls return the workflow value inline.</p>
