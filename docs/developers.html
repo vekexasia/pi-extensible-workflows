@@ -164,33 +164,85 @@
       <section id="extensions">
         <h2>Extensions, reusable workflows, and roles</h2>
         <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the namespace, semantic version, descriptions, schemas, and workflow source.</p>
-        <pre><code class="language-typescript"><span class="tok-keyword">import</span> <span class="tok-punctuation">{</span> registerWorkflowExtension <span class="tok-punctuation">}</span> <span class="tok-keyword">from</span> <span class="tok-string">"pi-extensible-workflows"</span>;
-<span class="tok-keyword">const</span> reviewExtension <span class="tok-punctuation">=</span> <span class="tok-punctuation">{</span>
-  <span class="tok-property">namespace</span><span class="tok-punctuation">:</span> <span class="tok-string">"review"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review helpers"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Reusable review primitives"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">functions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
-    <span class="tok-property">review</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
-      <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review one focus"</span><span class="tok-punctuation">,</span>
-      <span class="tok-property">input</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"object"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-      <span class="tok-property">output</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">type</span><span class="tok-punctuation">:</span> <span class="tok-string">"string"</span> <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-      <span class="tok-function">async run</span>(input<span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> agent<span class="tok-punctuation">,</span> prompt <span class="tok-punctuation">}</span>) <span class="tok-punctuation">{</span>
-        <span class="tok-keyword">return</span> agent(prompt(<span class="tok-string">"Review {focus}"</span><span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span> <span class="tok-property">focus</span><span class="tok-punctuation">:</span> input.focus <span class="tok-punctuation">}</span>));
-      <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-    <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-  <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">workflows</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
-    <span class="tok-property">release</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
-      <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Review release readiness"</span><span class="tok-punctuation">,</span>
-      <span class="tok-property">script</span><span class="tok-punctuation">:</span> <span class="tok-string">`return review({ focus: "release readiness" });`</span><span class="tok-punctuation">,</span>
-    <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-  <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
-<span class="tok-punctuation">}</span>;
-<span class="tok-keyword">export default function</span> <span class="tok-function">extension</span>() <span class="tok-punctuation">{</span>
-  registerWorkflowExtension(reviewExtension);
-<span class="tok-punctuation">}</span></code></pre>
-        <p>Call the registered workflow as <code>{ "workflow": "review.release" }</code>. Registered scripts call functions and read variables directly. Registered functions receive <code>agent</code>, <code>prompt</code>, the combinators, lifecycle helpers, and run metadata through their context. When available, <code>workflow_catalog</code> exposes flat metadata without implementations, resolvers, values, or source, plus configured model alias names and concrete targets without availability probing; call it once and reuse exposed functions instead of recreating them.</p>
+        <p>The following is the core of <code>~/.pi/agent/extensions/review-loop.ts</code>. It registers a reusable developer-review loop as <code>reviewLoop.developUntilApproved</code>.</p>
+        <pre><code class="language-typescript">import {
+  registerWorkflowExtension,
+  type JsonSchema,
+  type JsonValue,
+  type WorkflowExtension,
+} from "pi-extensible-workflows";
+
+const reviewSchema: JsonSchema = {
+  type: "object",
+  properties: {
+    pass: { type: "boolean" },
+    findings: { type: "array", items: { type: "string" } },
+  },
+  required: ["pass", "findings"],
+  additionalProperties: false,
+};
+
+const reviewLoopExtension: WorkflowExtension = {
+  namespace: "reviewLoop",
+  version: "1.0.0",
+  headline: "Developer-review loop",
+  description: "Runs developer and reviewer agents in a loop until review passes.",
+  functions: {
+    developUntilApproved: {
+      description: "Run developer and reviewer agents until review passes or the iteration limit is reached",
+      input: {
+        type: "object",
+        properties: {
+          task: { type: "string" },
+          maxIterations: { type: "integer", minimum: 1 },
+        },
+        required: ["task"],
+        additionalProperties: false,
+      },
+      output: {
+        type: "object",
+        properties: {
+          pass: { type: "boolean" },
+          iterations: { type: "integer" },
+          devResult: {},
+          review: { type: "object" },
+        },
+        required: ["pass", "iterations", "devResult", "review"],
+        additionalProperties: false,
+      },
+      async run(input, { agent, prompt }) {
+        const { task, maxIterations = 5 } = input as {
+          task: string;
+          maxIterations?: number;
+        };
+        let devResult: JsonValue = null;
+        let review: JsonValue = { pass: false, findings: [] };
+
+        for (let iterations = 1; iterations &lt;= maxIterations; iterations += 1) {
+          const devPrompt = iterations === 1
+            ? prompt("Implement this task:\n\n{task}", { task })
+            : prompt("Address the review findings.\n\nTask:\n{task}\n\nReview:\n{review}", { task, review });
+          devResult = await agent(devPrompt, { role: "developer" });
+          review = await agent(
+            prompt("Review the implementation. Set pass=true only when complete.\n\nTask:\n{task}\n\nDeveloper result:\n{devResult}", { task, devResult }),
+            { role: "reviewer", outputSchema: reviewSchema },
+          );
+
+          if ((review as { pass: boolean }).pass) {
+            return { pass: true, iterations, devResult, review };
+          }
+        }
+
+        return { pass: false, iterations: maxIterations, devResult, review };
+      },
+    },
+  },
+};
+
+export default function (): void {
+  registerWorkflowExtension(reviewLoopExtension);
+}</code></pre>
+        <p>After Pi loads the extension, <code>workflow_catalog</code> exposes <code>reviewLoop.developUntilApproved</code>. Call it from workflow source, for example <code>return reviewLoop.developUntilApproved({ task: args.task, maxIterations: 5 });</code>. Registered functions receive <code>agent</code>, <code>prompt</code>, combinators, lifecycle helpers, and run metadata through their context. The catalog exposes metadata and schemas, never implementations, resolver values, or source.</p>
         <h3>Role files</h3>
         <p>Global roles live under <code>&lt;agentDir&gt;/pi-extensible-workflows/roles/&lt;name&gt;.md</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/roles/&lt;name&gt;.md</code>; set <code>PI_CODING_AGENT_DIR</code> to change it. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
