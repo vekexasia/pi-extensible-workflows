@@ -1593,7 +1593,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): stri
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
   if (run.phase) lines.push(`  Phase: ${run.phase}`);
-  lines.push(...formatBudgetStatus(run).map((line) => `  ${line}`));
+  lines.push(...formatCompactBudgetStatus(run).map((line) => `  ${line}`));
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
   lines.push(...renderGroupedAgents(run.agents, ({ agent, index, depth }, grouped) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
@@ -1644,6 +1644,11 @@ export function formatBudgetStatus(run: Pick<PersistedRun, "budget" | "budgetVer
   const events = run.budgetEvents ?? [];
   if (events.length) lines.push(`  events: ${events.map((event) => `${event.type}@v${String(event.budgetVersion)}`).join(", ")}`);
   return lines;
+}
+
+function formatCompactBudgetStatus(run: Pick<PersistedRun, "budget" | "budgetVersion" | "usage" | "budgetEvents">): string[] {
+  if (!Object.values(run.budget ?? {}).some((limits) => limits.soft !== undefined || limits.hard !== undefined)) return [];
+  return formatBudgetStatus(run);
 }
 
 const ATTENTION_ORDER: Record<string, number> = { awaiting_input: 0, budget_exhausted: 1, running: 2, pausing: 3, paused: 4, interrupted: 5, failed: 6, queued: 7, stopped: 8, completed: 9 };
@@ -1702,7 +1707,7 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   const glyph = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? "⠦" : run.state === "awaiting_input" ? "●" : "◆";
   const header = `${glyph} ${run.workflowName}`;
   const meta = [run.state, run.phase ? `phase: ${run.phase}` : "", `${String(done)}/${String(run.agents.length)} agents`, hasAccounting ? formatAccounting(totalAccounting) : "", totalAccounting.cost > 0 ? `$${totalAccounting.cost.toFixed(2)}` : ""].filter(Boolean).join(" · ");
-  const lines = [header, meta, ...formatBudgetStatus(run)];
+  const lines = [header, meta, ...formatCompactBudgetStatus(run)];
   if (run.error) lines.push(`Error: ${run.error.code}: ${run.error.message}`);
   if (run.events?.length) lines.push(...run.events.map((event) => `Warning: ${event.message}`));
   lines.push("");
@@ -1738,7 +1743,7 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
     `Status: ${run.state}`,
     `Phase: ${run.phase ?? "(none)"}`,
     `Launch cwd: ${run.cwd}`,
-    ...formatBudgetStatus(run),
+    ...formatCompactBudgetStatus(run),
     `Launch models: ${snapshot.models.join(", ") || "(none)"}`,
   ];
   if (run.error) lines.push(`Run error: ${run.error.code}: ${run.error.message}`);

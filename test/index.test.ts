@@ -195,6 +195,24 @@ void test("navigator renders effective agent policy separately from launch metad
   assert.match(dashboard, /role=reviewer/);
   assert.doesNotMatch(dashboard, /Launch models/);
 });
+void test("compact TUI hides budgets without effective limits", () => {
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "render" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const render = (budget: unknown): string => {
+    const run = { id: "run", workflowName: "render", cwd: "/repo", sessionId: "session", state: "running", agents: [], nativeSessions: [], ...(budget === undefined ? {} : { budget }) } as Parameters<typeof formatWorkflowProgress>[0];
+    return [formatWorkflowProgress(run), formatNavigatorDashboard(run, [], []), formatNavigatorRun({ run, snapshot }, [], [])].join("\n");
+  };
+  for (const budget of [undefined, {}, { tokens: {} }]) assert.doesNotMatch(render(budget), /Budget|unlimited|tokens|costUsd|durationMs|agentLaunches/);
+  const partial = render({ tokens: { hard: 10 } });
+  assert.match(partial, /Budget version/);
+  assert.match(partial, /tokens:/);
+  assert.doesNotMatch(partial, /costUsd:|durationMs:|agentLaunches:/);
+  const fullBudget = { tokens: { soft: 1, hard: 2 }, costUsd: { soft: 1, hard: 2 }, durationMs: { soft: 1, hard: 2 }, agentLaunches: { soft: 1, hard: 2 } };
+  const full = render(fullBudget);
+  for (const dimension of ["tokens", "costUsd", "durationMs", "agentLaunches"]) assert.match(full, new RegExp(`${dimension}:`));
+  const removed = mergeBudget(fullBudget, { tokens: null, costUsd: null, durationMs: null, agentLaunches: null });
+  assert.deepEqual(removed, {});
+  assert.doesNotMatch(render(removed), /Budget|unlimited|tokens|costUsd|durationMs|agentLaunches/);
+});
 void test("navigator uses persisted labels and model fallbacks across views", () => {
   const run = { id: "run", workflowName: "labels", cwd: "/repo", sessionId: "session", state: "running", agents: [
     { id: "run:1", name: "stale-name", label: "explicit label", path: "run:1", state: "running", model: { provider: "provider", model: "worker" }, tools: [], attempts: 1 },
