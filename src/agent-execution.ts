@@ -1,10 +1,11 @@
-import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { createAgentSession, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
-import type { AgentIdentity, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
+import type { AgentIdentity, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
 import { resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
@@ -52,6 +53,7 @@ export interface AgentExecutionRoot {
   runStore?: RunStore;
   providerPause?: () => Promise<void>;
   agentSetupHooks?: readonly RegisteredAgentSetupHook[];
+  agentResourcePolicy?: () => AgentResourcePolicy | Promise<AgentResourcePolicy>;
   runContext?: Readonly<WorkflowRunContext>;
 }
 export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
@@ -78,7 +80,7 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; options?: Record<string, JsonValue> }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue> }
 export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
@@ -106,6 +108,7 @@ function latestAssistantHasToolCall(messages: readonly AgentMessage[]): boolean 
 function accounting(stats: NativeSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
+function canonicalSourcePath(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
 
 export async function createNativeAgentSession(input: SessionInput): Promise<NativeSession> {
   const agentDir = input.agentDir ?? getAgentDir();
@@ -116,9 +119,45 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
   if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
-  const resourceLoader = input.systemPromptAppend || input.extensionFactories?.length ? new DefaultResourceLoader({ cwd: input.cwd, agentDir, ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) }) : undefined;
-  if (resourceLoader) await resourceLoader.reload();
-  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
+  let settingsManager: SettingsManager | undefined;
+  let resourceLoader: DefaultResourceLoader | undefined;
+  const policy = input.resourcePolicy;
+  if (policy) {
+    settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: false });
+    settingsManager.setProjectTrusted(policy.projectTrusted);
+    const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
+    const resolved = await packageManager.resolve();
+    const disabledExtensions = new Set(policy.effective.extensions);
+    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalSourcePath(path)).filter((path) => !disabledExtensions.has(canonicalSourcePath(path))))];
+    const skillPaths = [...new Set(resolved.skills.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => path))];
+    const updateSkillMatches = (skills: readonly { name: string }[]) => {
+      const names = new Set(skills.map(({ name }) => name));
+      Object.assign(policy, { unmatchedSkills: policy.effective.skills.filter((name) => !names.has(name)) });
+    };
+    const disabledSkills = new Set(policy.effective.skills);
+    resourceLoader = new DefaultResourceLoader({
+      cwd: input.cwd,
+      agentDir,
+      settingsManager,
+      noExtensions: true,
+      additionalExtensionPaths: extensionPaths,
+      noSkills: true,
+      additionalSkillPaths: skillPaths,
+      ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}),
+      skillsOverride: (base) => {
+        updateSkillMatches(base.skills);
+        return { ...base, skills: base.skills.filter(({ name }) => !disabledSkills.has(name)) };
+      },
+      ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}),
+    });
+    await resourceLoader.reload();
+    const discoveredExtensions = new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalSourcePath(path)));
+    Object.assign(policy, { unmatchedExtensions: policy.effective.extensions.filter((path) => !discoveredExtensions.has(canonicalSourcePath(path))) });
+  } else if (input.systemPromptAppend || input.extensionFactories?.length) {
+    resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
+    await resourceLoader.reload();
+  }
+  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, ...(settingsManager ? { settingsManager } : {}), ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(resourceLoader ? { resourceLoader } : {}), sessionManager: manager });
   return session;
 }
 function changedOption(options: Readonly<Record<string, JsonValue>>, baseline: Readonly<Record<string, JsonValue>>, key: string): boolean { return JSON.stringify(options[key]) !== JSON.stringify(baseline[key]); }
@@ -128,10 +167,14 @@ function fallbackSetupContext(root: AgentExecutionRoot, options: AgentExecutionO
   const run = root.runContext ?? Object.freeze({ cwd: root.cwd, sessionId: "", runId: "", workflow: Object.freeze({ name: options.workflowName }), args: null, signal });
   return { run, identity: Object.freeze({ ...identity, structuralPath: Object.freeze([...identity.structuralPath]) }) };
 }
+function resourcePolicySummary(policy: AgentResourcePolicy): NonNullable<AgentSetupSummary["disabledAgentResources"]> {
+  return { skills: [...policy.effective.skills], extensions: [...policy.effective.extensions], unmatchedSkills: [...policy.unmatchedSkills], unmatchedExtensions: [...policy.unmatchedExtensions] };
+}
 async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
-  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), systemPromptAppend: resolved.systemPromptAppend, options: structuredClone(baselineOptions) };
+  const resourcePolicy = await root.agentResourcePolicy?.();
+  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
   const setup: AgentSetup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, createSession };
   const base = fallbackSetupContext(root, options, setupSignal);
   const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal });
@@ -148,7 +191,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, createSession: Sessio
   if (changedOption(setup.options, baselineOptions, "tools") && Array.isArray(setup.options.tools) && setup.options.tools.every((tool) => typeof tool === "string")) setup.sessionInput.tools = [...setup.options.tools];
   if (changedOption(setup.options, baselineOptions, "cwd") && typeof setup.options.cwd === "string") setup.sessionInput.cwd = setup.options.cwd;
   const model = setup.sessionInput.model;
-  const summary: AgentSetupSummary = { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd };
+  const summary: AgentSetupSummary = { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { disabledAgentResources: resourcePolicySummary(setup.sessionInput.resourcePolicy) } : {}) };
   return { setup, summary };
 }
 
@@ -246,7 +289,9 @@ export class WorkflowAgentExecutor {
         if (executionSignal?.aborted) throw new WorkflowError("CANCELLED", "Agent cancelled");
         const started = Date.now();
         session = await setup.createSession(setup.sessionInput);
-        await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
+        if (setup.sessionInput.resourcePolicy) setupSummary = { ...setupSummary, disabledAgentResources: resourcePolicySummary(setup.sessionInput.resourcePolicy) };
+        const includeAttemptSetup = Boolean(this.root.agentSetupHooks?.length || setup.sessionInput.resourcePolicy);
+        await options.onAttempt?.({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), ...(includeAttemptSetup ? { setup: setupSummary } : {}) });
         const activeSession = session;
         unsubscribe = activeSession.subscribe?.((event) => {
           if (event.type === "agent_start" && session?.systemPrompt !== undefined && this.root.runStore) {
@@ -299,7 +344,8 @@ export class WorkflowAgentExecutor {
         await flushSystemPrompts();
         unsubscribe?.();
         const attemptAccounting = accounting(session.getSessionStats());
-        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length ? { setup: setupSummary } : {}) });
+        const includeCompletedSetup = Boolean(this.root.agentSetupHooks?.length || setup.sessionInput.resourcePolicy);
+        attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), result: value, accounting: attemptAccounting, ...(includeCompletedSetup ? { setup: setupSummary } : {}) });
         session.dispose();
         return { value, attempts, cwd: setupSummary.cwd };
       } catch (error) {
@@ -311,7 +357,8 @@ export class WorkflowAgentExecutor {
           unsubscribe?.();
           const attemptAccounting = accounting(session.getSessionStats());
           if (!budgetError && typed.code !== "BUDGET_EXHAUSTED") { try { options.budget?.afterTurn(attemptAccounting, true); } catch (budgetFailure) { budgetError ??= budgetFailure instanceof WorkflowError ? budgetFailure : new WorkflowError("BUDGET_EXHAUSTED", budgetFailure instanceof Error ? budgetFailure.message : String(budgetFailure)); } }
-          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting, ...(this.root.agentSetupHooks?.length && setupSummary ? { setup: setupSummary } : {}) });
+          const includeFailedSetup = Boolean(this.root.agentSetupHooks?.length || setup?.sessionInput.resourcePolicy);
+          attempts.push({ attempt, sessionId: session.sessionId, sessionFile: requiredFile(session.sessionFile), error: { code: typed.code, message: typed.message }, accounting: attemptAccounting, ...(includeFailedSetup && setupSummary ? { setup: setupSummary } : {}) });
           session.dispose();
         }
         if (options.worktreeOwner && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner).catch(() => undefined);

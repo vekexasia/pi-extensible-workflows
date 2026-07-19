@@ -14,13 +14,17 @@ import {
   DEFAULT_SETTINGS,
   loadSettings,
   parseModelReference,
+  resolveAgentResourcePolicy,
   resolveModelReference,
   parseRoleMarkdown,
   preflight,
   registeredWorkflowDefinitions,
   workflowRoleDirectories,
+  workflowProjectSettingsPath,
   workflowSettingsPath,
   WorkflowError,
+  type AgentResourceExclusions,
+  type AgentResourcePolicy,
   type WorkflowScriptDefinition,
   type WorkflowSettings,
 } from "./index.js";
@@ -37,6 +41,8 @@ export interface DoctorPiState {
   knownModels: readonly string[];
   availableModels: readonly string[];
   extensionErrors: readonly { path?: string; message: string }[];
+  extensions?: readonly string[];
+  skills?: readonly string[];
   workflows: Readonly<Record<string, WorkflowScriptDefinition>>;
 }
 export interface DoctorReport {
@@ -48,6 +54,7 @@ export interface DoctorReport {
   activeTools: readonly string[];
   roles: readonly DoctorRole[];
   workflows: readonly DoctorWorkflow[];
+  resourcePolicy: AgentResourcePolicy;
   diagnostics: readonly DoctorDiagnostic[];
 }
 export interface DoctorOptions {
@@ -108,7 +115,7 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
       agentDir,
       settingsManager,
       modelRuntime,
-      resourceLoaderOptions: { noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true },
+      resourceLoaderOptions: { noPromptTemplates: true, noThemes: true, noContextFiles: true },
       resourceLoaderReloadOptions: { resolveProjectTrust: async () => trusted },
     });
     const allModels = services.modelRuntime.getModels();
@@ -118,11 +125,14 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
     const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory(), model });
     const activeTools = session.agent.state.tools.map(({ name }) => name).filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_catalog");
     const extensions = services.resourceLoader.getExtensions();
+    const skills = services.resourceLoader.getSkills().skills;
     return {
       trust: { required, trusted, source },
       activeTools,
       knownModels: allModels.map(({ provider, id }) => `${provider}/${id}`),
       availableModels: availableModels.map(({ provider, id }) => `${provider}/${id}`),
+      extensions: extensions.extensions.map(({ resolvedPath }) => resolvedPath),
+      skills: skills.map(({ name }) => name),
       extensionErrors: [
         ...extensions.errors.map(({ path, error }) => ({ path, message: error })),
         ...services.diagnostics.filter(({ type }) => type === "error").map(({ message }) => ({ message })),
@@ -148,7 +158,10 @@ function roleFilesFrom(dirs: readonly string[]): string[] {
 function diagnostic(severity: DoctorSeverity, code: string, message: string, source?: string, hint?: string): DoctorDiagnostic {
   return { severity, code, message, ...(source ? { source } : {}), ...(hint ? { hint } : {}) };
 }
-
+function emptyResourcePolicy(globalSettingsPath: string, cwd: string, projectTrusted: boolean): AgentResourcePolicy {
+  const empty: AgentResourceExclusions = { skills: [], extensions: [] };
+  return { globalSettingsPath, projectSettingsPath: workflowProjectSettingsPath(cwd), projectTrusted, global: empty, project: empty, effective: empty, unmatchedSkills: [], unmatchedExtensions: [] };
+}
 function validateModel(value: string, known: ReadonlySet<string>, available: ReadonlySet<string>, source: string, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, settingsPath: string): void {
   try {
     const parsed = resolveModelReference(value, aliases, known, settingsPath);
@@ -178,7 +191,14 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
 class DoctorModelSet extends Set<string> {
   override has(value: string): boolean { parseModelReference(value); return true; }
 }
-
+function matchResourcePolicy(policy: AgentResourcePolicy, pi: DoctorPiState): AgentResourcePolicy {
+  const extensions = new Set((pi.extensions ?? []).map(canonical));
+  const skills = new Set(pi.skills ?? []);
+  return { ...policy, unmatchedSkills: policy.effective.skills.filter((name) => !skills.has(name)), unmatchedExtensions: policy.effective.extensions.filter((path) => !extensions.has(canonical(path))) };
+}
+function resourcePolicySource(policy: AgentResourcePolicy, kind: keyof AgentResourceExclusions, selector: string): string {
+  return policy.project[kind].includes(selector) && !policy.global[kind].includes(selector) ? policy.projectSettingsPath : policy.globalSettingsPath;
+}
 export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const cwd = canonical(options.cwd ?? process.cwd());
   const agentDir = canonical(options.agentDir ?? getAgentDir());
@@ -197,6 +217,16 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   if (options.activeTools) pi = { ...pi, activeTools: options.activeTools.filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_catalog") };
   if (pi.trust.required && !pi.trust.trusted) diagnostics.push(diagnostic("warning", "PROJECT_UNTRUSTED", "Pi project resources are inactive because the project is not trusted", cwd, "Open this project in Pi, choose Trust, then rerun doctor."));
   for (const error of pi.extensionErrors) diagnostics.push(diagnostic("error", "EXTENSION_LOAD", error.message, error.path, "Fix or disable the failing Pi extension."));
+  let resourcePolicy: AgentResourcePolicy;
+  try {
+    resourcePolicy = matchResourcePolicy(resolveAgentResourcePolicy(cwd, pi.trust.trusted, settingsPath), pi);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === settingsPath)) diagnostics.push(diagnostic("error", "SETTINGS_INVALID", message, message.includes(".json") ? message.match(/(?:settings: )?([^ )]+\.json)/)?.[1] : undefined, "Fix or remove the invalid workflow settings file."));
+    resourcePolicy = emptyResourcePolicy(settingsPath, cwd, pi.trust.trusted);
+  }
+  for (const skill of resourcePolicy.unmatchedSkills) diagnostics.push(diagnostic("warning", "AGENT_RESOURCE_UNMATCHED", `Disabled skill selector currently matches no discovered skill: ${skill}`, `${resourcePolicySource(resourcePolicy, "skills", skill)}.disabledAgentResources.skills`));
+  for (const extension of resourcePolicy.unmatchedExtensions) diagnostics.push(diagnostic("warning", "AGENT_RESOURCE_UNMATCHED", `Disabled extension selector currently matches no discovered extension source: ${extension}`, `${resourcePolicySource(resourcePolicy, "extensions", extension)}.disabledAgentResources.extensions`));
 
   const activeTools = new Set(pi.activeTools);
   const knownModels = new Set(pi.knownModels);
@@ -251,7 +281,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const severityOrder: Record<DoctorSeverity, number> = { error: 0, warning: 1 };
   diagnostics.sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity] || (left.source ?? "").localeCompare(right.source ?? "") || left.code.localeCompare(right.code) || left.message.localeCompare(right.message));
   roles.sort((left, right) => left.name.localeCompare(right.name) || left.scope.localeCompare(right.scope));
-  return { cwd, agentDir, settingsPath, settings, trust: pi.trust, activeTools: [...activeTools].sort(), roles, workflows, diagnostics };
+  return { cwd, agentDir, settingsPath, settings, trust: pi.trust, activeTools: [...activeTools].sort(), roles, workflows, resourcePolicy, diagnostics };
 }
 
 function count(report: DoctorReport, severity: DoctorSeverity): number { return report.diagnostics.filter((item) => item.severity === severity).length; }
@@ -270,6 +300,18 @@ export function formatDoctorReport(report: DoctorReport): string {
     "",
     "## Trust/resources",
     `- [${report.trust.trusted ? "ok" : "warning"}] ${report.trust.source}`,
+    "",
+    "## Agent resource exclusions",
+    `- Global settings: \`${report.resourcePolicy.globalSettingsPath}\``,
+    `- Global skills: ${report.resourcePolicy.global.skills.join(", ") || "(none)"}`,
+    `- Global extensions: ${report.resourcePolicy.global.extensions.join(", ") || "(none)"}`,
+    `- Project settings: \`${report.resourcePolicy.projectSettingsPath}\` (${report.resourcePolicy.projectTrusted ? "trusted" : "ignored: project untrusted"})`,
+    `- Project skills: ${report.resourcePolicy.project.skills.join(", ") || "(none)"}`,
+    `- Project extensions: ${report.resourcePolicy.project.extensions.join(", ") || "(none)"}`,
+    `- Effective skills: ${report.resourcePolicy.effective.skills.join(", ") || "(none)"}`,
+    `- Effective extensions: ${report.resourcePolicy.effective.extensions.join(", ") || "(none)"}`,
+    `- Unmatched skills: ${report.resourcePolicy.unmatchedSkills.join(", ") || "(none)"}`,
+    `- Unmatched extensions: ${report.resourcePolicy.unmatchedExtensions.join(", ") || "(none)"}`,
     "",
     "## Active tools",
     ...(report.activeTools.length ? report.activeTools.map((tool) => `- \`${tool}\``) : ["- None resolved"]),

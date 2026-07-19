@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -1348,6 +1348,36 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   writeFileSync(path, JSON.stringify({ surprise: true }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
 });
+void test("merges trusted agent resource exclusions and ignores untrusted project selectors", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resources-"));
+  const home = join(root, "home");
+  const cwd = join(root, "project");
+  const globalPath = join(home, ".pi", "agent", "pi-extensible-workflows", "settings.json");
+  const projectPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
+  const extension = join(home, "interactive-only.ts");
+  mkdirSync(join(home, ".pi", "agent", "pi-extensible-workflows"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(globalPath, JSON.stringify({ concurrency: 4, modelAliases: { reviewer: "openai/gpt" }, disabledAgentResources: { skills: [" learning-opportunities", "learning-opportunities"], extensions: ["~/interactive-only.ts", `file://${extension}`] } }));
+  writeFileSync(projectPath, JSON.stringify({ disabledAgentResources: { skills: ["project-only", "learning-opportunities"], extensions: ["../../../home/interactive-only.ts", "../project-only.ts"] } }));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const trusted = resolveAgentResourcePolicy(cwd, true, globalPath);
+    assert.deepEqual(trusted.effective.skills, ["learning-opportunities", "project-only"]);
+    assert.deepEqual(trusted.effective.extensions, [extension, join(cwd, ".pi", "project-only.ts")]);
+    assert.equal(loadSettings(globalPath).modelAliases?.reviewer, "openai/gpt");
+    const untrusted = resolveAgentResourcePolicy(cwd, false, globalPath);
+    assert.deepEqual(untrusted.effective.skills, ["learning-opportunities"]);
+    assert.deepEqual(untrusted.effective.extensions, [extension]);
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+  }
+});
+void test("reports resource exclusion validation at the selector path", () => {
+  const path = join(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resources-invalid-")), "settings.json");
+  writeFileSync(path, JSON.stringify({ disabledAgentResources: { skills: [""] } }));
+  assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS" && error.message.includes(`${path}.disabledAgentResources.skills[0]`));
+});
 void test("validates and resolves portable model aliases", () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-aliases-"));
   const path = join(dir, "settings.json");
@@ -1442,7 +1472,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   const oldAliases = { reviewer: "old/model" };
   const newAliases = { reviewer: "new/model" };
-  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: oldAliases }));
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: oldAliases, disabledAgentResources: { skills: ["old-skill"], extensions: [join(agentDir, "old.ts")] } }));
   const script = `const replayed = await agent("replayed", { model: "reviewer" }); const pending = await agent("pending", { model: "reviewer", label: "pending", retries: 1 }); const fresh = await agent("fresh", { model: "reviewer" }); return { replayed, pending, fresh };`;
   const replayPaths: string[] = [];
   await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPaths.push(structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`)); return "original"; } }).result;
@@ -1451,7 +1481,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
   await store.complete(replayPaths[0] as string, "replayed");
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: newAliases }));
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: newAliases, disabledAgentResources: { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] } }));
   const inputs: SessionInput[] = [];
   let failedPending = false;
   const createSession = async (input: SessionInput): Promise<NativeSession> => {
@@ -1480,7 +1510,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     assert.equal(loaded.run.state, "completed");
     assert.equal(inputs.length, 3);
     assert.deepEqual(inputs.map(({ model }) => ({ provider: model.provider, model: model.model })), [{ provider: "new", model: "model" }, { provider: "new", model: "model" }, { provider: "new", model: "model" }]);
-    assert.equal(loaded.run.agents.find((agent) => agent.name === "pending")?.attempts, 2);
+    assert.deepEqual(inputs.map(({ resourcePolicy }) => resourcePolicy?.effective), [{ skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }]);
     assert.deepEqual(loaded.snapshot.modelAliases, newAliases);
     assert.deepEqual(loaded.run.events, [{ type: "warning", message: "Model alias mappings changed on resume: reviewer: old/model -> new/model" }]);
     assert.match(formatNavigatorRun(loaded, [], []), /Model alias mappings changed on resume/);
