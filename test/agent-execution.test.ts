@@ -12,6 +12,7 @@ import type { RunStore } from "../src/persistence.js";
 const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, availableModels: new Set(["openai/gpt", "anthropic/opus", "google/gemini"]), tools: new Set(["read", "grep", "find", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", model: "anthropic/opus", thinking: "high", tools: ["read"] }, scout: { prompt: "Inspect broadly", model: "google/gemini", thinking: "low", tools: ["read", "grep"] } } };
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: { total: 0.25 } };
 function assistant(text: string) { return { role: "assistant", content: [{ type: "text", text }], usage }; }
+function terminalAssistant(errorMessage: string) { return { ...assistant(""), stopReason: "error", errorMessage }; }
 function sessionStats(cost = usage.cost.total) { return { tokens: { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, total: usage.input + usage.output + usage.cacheRead + usage.cacheWrite }, cost }; }
 
 void test("resolves explicit capabilities without widening least privilege", () => {
@@ -193,6 +194,55 @@ void test("keeps workflow_result present, delays acceptance, and allows one repa
   assert.equal(calls.length, 3);
   assert.match(calls[1]?.prompt ?? "", /Submit the final result/);
   assert.match(calls[2]?.prompt ?? "", /Repair/);
+});
+
+void test("fails native terminal provider errors before structured finalization", async () => {
+  const errorMessage = "OAuth refresh failed for anthropic";
+  const messages = [terminalAssistant(errorMessage)];
+  const prompts: string[] = [];
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "terminal", sessionFile: "/sessions/terminal.jsonl", messages, getSessionStats: sessionStats, async prompt(prompt) { prompts.push(prompt); }, dispose() {} }));
+  let attempts: readonly { sessionFile: string; error?: { code: string; message: string } }[] | undefined;
+  await assert.rejects(executor.execute("structured", { label: "schema", workflowName: "flow", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } }), (error: unknown) => {
+    if (!(error instanceof WorkflowError)) return false;
+    attempts = (error as WorkflowError & { attempts?: typeof attempts }).attempts;
+    return error.code === "AGENT_FAILED" && error.message === errorMessage;
+  });
+  assert.equal(prompts.length, 1);
+  assert.equal(attempts?.[0]?.sessionFile, "/sessions/terminal.jsonl");
+  const failedAttempt = attempts[0];
+  assert.ok(failedAttempt);
+  assert.deepEqual(failedAttempt.error, { code: "AGENT_FAILED", message: errorMessage });
+});
+
+void test("fails terminal provider errors during finalization without repair", async () => {
+  const errorMessage = "OAuth refresh failed during finalization";
+  const messages = [assistant("ready")];
+  const prompts: string[] = [];
+  let promptCount = 0;
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "finalization-terminal", sessionFile: "/sessions/finalization-terminal.jsonl", messages, getSessionStats: sessionStats, async prompt(prompt) { prompts.push(prompt); promptCount += 1; if (promptCount === 2) messages.push(terminalAssistant(errorMessage)); }, dispose() {} }));
+  await assert.rejects(executor.execute("structured", { label: "schema", workflowName: "flow", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } }), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED" && error.message === errorMessage);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1] ?? "", /Submit the final result/);
+  assert.doesNotMatch(prompts.join("\n"), /Repair/);
+});
+
+void test("retries native terminal errors as fresh workflow attempts", async () => {
+  const errorMessage = "OAuth refresh failed for retry";
+  const promptsByAttempt: string[][] = [];
+  let created = 0;
+  const executor = new WorkflowAgentExecutor(root, async ({ resultTool }) => {
+    const attempt = ++created;
+    const prompts: string[] = [];
+    promptsByAttempt.push(prompts);
+    const messages = attempt === 1 ? [terminalAssistant(errorMessage)] : [assistant("ready")];
+    return { sessionId: `terminal-retry-${String(attempt)}`, sessionFile: `/sessions/terminal-retry-${String(attempt)}.jsonl`, messages, getSessionStats: sessionStats, async prompt(prompt) { prompts.push(prompt); if (attempt === 2 && prompt.includes("Submit the final result")) { assert.ok(resultTool); await resultTool.execute("id", { answer: 42 }, new AbortController().signal, () => {}, {} as never); } }, dispose() {} };
+  });
+  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", retries: 1, schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
+  assert.deepEqual(result.value, { answer: 42 });
+  assert.deepEqual(promptsByAttempt.map((prompts) => prompts.length), [1, 2]);
+  assert.deepEqual(result.attempts.map(({ sessionId }) => sessionId), ["terminal-retry-1", "terminal-retry-2"]);
+  assert.deepEqual(result.attempts[0]?.error, { code: "AGENT_FAILED", message: errorMessage });
+  assert.deepEqual(result.attempts[1]?.result, { answer: 42 });
 });
 
 void test("retries in fresh persisted sessions and reports terminal attempt history", async () => {
