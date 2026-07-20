@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -158,10 +159,28 @@ export function structuralPath(...names: string[]): string {
   return names.map((name) => encodeURIComponent(name)).join("/");
 }
 
-async function atomicJson(path: string, value: unknown): Promise<void> {
+export function atomicWriteFile(path: string, content: string): Promise<void>;
+export function atomicWriteFile(path: string, content: string, sync: true): void;
+export function atomicWriteFile(path: string, content: string, sync = false): Promise<void> | void {
   const temporary = `${path}.${String(process.pid)}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
+  if (sync) {
+    try {
+      writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600 });
+      renameSync(temporary, path);
+    } catch (error) {
+      try { rmSync(temporary, { force: true }); } catch { /* Preserve the original write error. */ }
+      throw error;
+    }
+    return;
+  }
+  return writeFile(temporary, content, { encoding: "utf8", mode: 0o600 }).then(() => rename(temporary, path)).catch(async (error: unknown) => {
+    try { await rm(temporary, { force: true }); } catch { /* Preserve the original write error. */ }
+    throw error;
+  });
+}
+
+async function atomicJson(path: string, value: unknown): Promise<void> {
+  await atomicWriteFile(path, `${JSON.stringify(value)}\n`);
 }
 
 async function json<T>(path: string): Promise<T> { return JSON.parse(await readFile(path, "utf8")) as T; }
@@ -245,7 +264,7 @@ export class RunStore {
   }
 
   async appendEvent(event: WorkflowRunEvent): Promise<void> {
-    await this.updateState((run) => ({ ...run, events: [...(run.events ?? []), ...(run.events?.some((current) => current.message === event.message) ? [] : [event])] }));
+    await this.updateState((run) => ({ ...run, events: [...(run.events ?? []), ...(run.events?.some((current) => current.type === event.type && current.message === event.message) ? [] : [event])] }));
   }
 
   async saveOwnership(nodes: readonly PersistedOwnershipNode[]): Promise<void> {

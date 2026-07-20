@@ -156,6 +156,16 @@ void test("serializes concurrent state updates without losing fields", async () 
   assert.equal(saved.phase, "review");
   assert.deepEqual(saved.error, { code: "AGENT_FAILED", message: "boom" });
 });
+void test("deduplicates run events by type and message", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-event-dedup-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  await store.appendEvent({ type: "warning", message: "same message" });
+  await store.appendEvent({ type: "info", message: "same message" });
+  await store.appendEvent({ type: "warning", message: "same message" });
+  assert.deepEqual((await store.load()).run.events, [{ type: "warning", message: "same message" }, { type: "info", message: "same message" }]);
+});
 
 void test("cold reload restores persisted ownership for cascading cancellation", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-ownership-"));

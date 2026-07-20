@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { fork, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +12,7 @@ import { Value } from "typebox/value";
 import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
 import { transcriptLines } from "./session-inspector.js";
-import { acquireSessionLease, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
+import { acquireSessionLease, atomicWriteFile, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
@@ -72,7 +72,7 @@ export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelS
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; setup?: AgentSetupSummary }
 export interface WorkflowWorktreeCreatedEvent extends WorkflowEventBase { owner: string; branch: string; path: string; base: string }
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
-export interface WorkflowRunEvent { type: "warning"; message: string }
+export interface WorkflowRunEvent { type: string; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 3;
 export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
@@ -499,9 +499,7 @@ export function saveModelAliases(path = workflowSettingsPath(), aliases: Readonl
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
   mkdirSync(dirname(path), { recursive: true });
-  const temporary = `${path}.${String(process.pid)}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify({ ...parsed, modelAliases: normalized }, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  atomicWriteFile(path, `${JSON.stringify({ ...parsed, modelAliases: normalized }, null, 2)}\n`, true);
 }
 
 export function parseRoleMarkdown(content: string, strict = false, rolePath?: string): AgentDefinition {
