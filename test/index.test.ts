@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
+import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
@@ -417,6 +418,50 @@ void test("streams foreground workflow progress into its tool card", async () =>
   assert.ok(updates.some(({ details }) => details.run.phase === "work"));
   assert.equal(updates.at(-1)?.details.run.state, "completed");
   assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
+});
+
+void test("foreground workflow reports parallel agent activities together", { timeout: 5000 }, async () => {
+  type Update = { details: { run: { agents: Array<{ activity?: { kind: string; text: string } }> } } };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-parallel-progress-"));
+  let session = 0;
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => { release = resolve; });
+  const createSession = async (): Promise<NativeSession> => {
+    const id = ++session;
+    const toolName = id === 1 ? "read" : "grep";
+    let listener: ((event: AgentSessionEvent) => void) | undefined;
+    return {
+      sessionId: `parallel-${String(id)}`, sessionFile: `/sessions/parallel-${String(id)}.jsonl`,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+      getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+      subscribe(candidate) { listener = candidate; return () => {}; },
+      async prompt() {
+        listener?.({ type: "tool_execution_start", toolCallId: `call-${String(id)}`, toolName, args: {} });
+        await hold;
+        listener?.({ type: "tool_execution_end", toolCallId: `call-${String(id)}`, toolName, result: {}, isError: false });
+      },
+      steer: async () => {},
+      dispose() {},
+    };
+  };
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read", "grep"], on() {} } as never, home, async () => {}, createSession);
+  const tool = tools.find(({ name }) => name === "workflow");
+  assert.ok(tool);
+  const seen = new Set<string>();
+  let combined = false;
+  let resolveReported!: () => void;
+  const reported = new Promise<void>((resolve) => { resolveReported = resolve; });
+  const execution = tool.execute("id", { name: "parallel-progress", script: `return Promise.all([agent("one", {label:"first"}), agent("two", {label:"second"})]);`, foreground: true }, new AbortController().signal, (update: Update) => {
+    const activities = update.details.run.agents.flatMap(({ activity }) => activity?.kind === "tool" ? [activity.text] : []);
+    for (const activity of activities) seen.add(activity);
+    if (activities.length === 2) combined = true;
+    if (seen.has("read") && seen.has("grep")) resolveReported();
+  }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  await reported;
+  release();
+  await execution;
+  assert.equal(combined, true);
 });
 
 void test("workflow progress keeps each agent to one line with latest tool", () => {

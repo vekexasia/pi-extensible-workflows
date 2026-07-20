@@ -2237,6 +2237,24 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   });
   type BudgetDecisionResult = { state: "running" | "budget_exhausted"; approved: boolean };
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; budgetResolvers: Map<string, (result: BudgetDecisionResult) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const liveActivities = new Map<string, Map<string, AgentActivity>>();
+  const setLiveActivity = (runId: string, agentId: string, activity?: AgentActivity) => {
+    const activities = liveActivities.get(runId);
+    if (activity) {
+      if (activities) activities.set(agentId, activity);
+      else liveActivities.set(runId, new Map([[agentId, activity]]));
+    } else {
+      activities?.delete(agentId);
+      if (activities?.size === 0) liveActivities.delete(runId);
+    }
+  };
+  const withLiveActivities = (run: PersistedRun): PersistedRun => {
+    const activities = liveActivities.get(run.id);
+    return activities?.size ? { ...run, agents: run.agents.map((agent) => {
+      const activity = activities.get(agent.id);
+      return activity ? { ...agent, activity } : agent;
+    }) } : run;
+  };
   const conversationLocks = new Set<string>();
   const terminalRunStates = new Map<string, "completed" | "failed" | "stopped">();
   let sessionLease: SessionLease | undefined;
@@ -2272,7 +2290,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       return nextRun;
     });
     await eventPublisher.runState(store, metadata, previous, next, reason);
-    runs.get(store.runId)?.update?.(workflowToolUpdate(persisted));
+    runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(persisted)));
   });
   const scheduler = new FairAgentScheduler(async ({ id, runId, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
@@ -2289,7 +2307,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           runState = { ...loaded.run, ...run.budget.snapshot(), agents: loaded.run.agents.map((agent) => agent.id === id ? { ...agent, accounting: progress.accounting, toolCalls: progress.toolCalls, activity: progress.activity } : agent) };
         }
         if (!runState.agents.some((agent) => agent.id === id)) return;
-        run.update?.(workflowToolUpdate(runState));
+        setLiveActivity(runId, id, progress.activity);
+        run.update?.(workflowToolUpdate(withLiveActivities(runState)));
       };
       const onAttempt = async (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile" | "setup">) => {
         await scheduler.flush();
@@ -2300,7 +2319,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const active = (await run.store.load()).run;
         await eventPublisher.agentStates(run.store, run.metadata, before.agents, active.agents);
         const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot() }));
-        run.update?.(workflowToolUpdate(persisted));
+        run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       };
       const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}), ...(options.conversation ? { conversation: options.conversation } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
       const before = (await run.store.load()).run;
@@ -2308,7 +2327,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const completed = (await run.store.load()).run;
       await eventPublisher.agentStates(run.store, run.metadata, before.agents, completed.agents);
       const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot() }));
-      run.update?.(workflowToolUpdate(persisted));
+      setLiveActivity(runId, id);
+      run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       return result.value;
     } catch (error) {
       const attempts = (error as WorkflowError & { attempts?: readonly AgentAttempt[] }).attempts;
@@ -2319,7 +2339,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await eventPublisher.agentStates(run.store, run.metadata, before.agents, failed.agents);
       }
       const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot() }));
-      run.update?.(workflowToolUpdate(persisted));
+      setLiveActivity(runId, id);
+      run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       throw error;
     }
   }, 16, async (runId, ownership) => {
@@ -2341,7 +2362,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       return { ...current, agents };
     });
     await eventPublisher.agentStates(run.store, run.metadata, previousAgents, runState.agents);
-    run.update?.(workflowToolUpdate(runState));
+    run.update?.(workflowToolUpdate(withLiveActivities(runState)));
   });
   type WorkflowStopResult = { runId: string; state: RunState | "unknown"; stopped: boolean; reason?: "unknown_run" | "already_terminal" };
   const stopWorkflowRun = async (runId: string): Promise<WorkflowStopResult> => {
