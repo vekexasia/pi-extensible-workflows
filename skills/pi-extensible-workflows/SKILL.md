@@ -104,7 +104,7 @@ Registered extension functions receive `withWorktree` in their context, so they 
 - Preserve item metadata in workflow code between pipeline stages instead of requiring agents to echo it through `outputSchema`.
 - Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
-- Add `budget` only when the run needs aggregate token, cost, duration, or launch limits; each dimension accepts optional `soft` and `hard` values. Soft crossings request wrap-up, while hard exhaustion blocks further budgeted work.
+- Add `budget` only when the run needs aggregate limits. The only valid dimension names are exactly `tokens`, `costUsd`, `durationMs`, and `agentLaunches` (never `cost`, `duration`, `launches`, or other shorthand). Each dimension is `{ soft?: number, hard?: number }`; `soft` must be less than `hard`.
 - A `budget_exhausted` run is resumable through `workflow_resume`. Omitted patch values stay unchanged, explicit `null` removes a limit, and any relaxation requires an exact human-approved proposal through `workflow_respond`.
 - `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
