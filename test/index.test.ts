@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue, type WorkflowFunctionContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -2294,13 +2294,38 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { run, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run, invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
+});
+void test("registered function context.invoke validates nested calls and replays completed children", async () => {
+  const registry = new WorkflowRegistry();
+  let leafCalls = 0;
+  registry.register({
+    version: "1.0.0", headline: "Composition", description: "Composition test",
+    functions: {
+      leaf: { description: "Leaf", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, run(input) { leafCalls += 1; return { value: `leaf:${input.value as string}` }; } },
+      outer: { description: "Outer", input: { type: "object", properties: { value: { type: "string" }, fail: { type: "boolean" } }, required: ["value"], additionalProperties: false }, output: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, async run(input, context) { const result = await context.invoke("leaf", { value: input.value as string }); if (input.fail === true) throw new WorkflowError("AGENT_FAILED", "outer failed"); return result; } },
+    },
+  });
+  const saved = new Map<string, JsonValue>();
+  const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
+  const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
+  const parentPath = "function/outer/1";
+  const occurrences = new Map<string, number>();
+  const context: WorkflowFunctionContext = { run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
+  assert.equal(leafCalls, 1);
+  occurrences.clear();
+  await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
+  assert.equal(leafCalls, 1);
+  assert.deepEqual(saved.get("function/nested/leaf/1"), { value: "leaf:one" });
+  await assert.rejects(context.invoke("leaf", { value: 1 }), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(context.invoke("missing", {}), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
 });
 void test("freezes registries and produces a deterministic flat catalog", () => {
   const registry = new WorkflowRegistry();
@@ -2451,7 +2476,7 @@ void test("rejects global collisions, invalid metadata, schemas, input, and outp
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
-  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(registry.invokeFunction("run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });

@@ -92,7 +92,11 @@ const results = await parallel("implementation", {
 });
 ```
 
-Registered extension functions receive `withWorktree` in their context, so they may create a shared scope internally. Their public inputs and outputs must remain JSON; callbacks cannot cross the extension-function boundary.
+Registered extension functions receive `withWorktree` in their context, so they may create a shared scope internally. They can compose other registered functions without importing their source:
+```ts
+const report = await context.invoke("reviewRepository", { focus: "security" });
+```
+Their public inputs and outputs must remain JSON; callbacks cannot cross the extension-function boundary.
 
 ## Rules
 

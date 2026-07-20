@@ -87,7 +87,10 @@ export interface WorkflowOrchestrationContext {
   log: (message: string) => void;
 }
 export interface WorkflowRunContext { cwd: string; sessionId: string; runId: string; workflow: Readonly<WorkflowMetadata>; args: JsonValue; signal: AbortSignal }
-export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { run: Readonly<WorkflowRunContext> }
+export interface WorkflowFunctionContext extends WorkflowOrchestrationContext {
+  run: Readonly<WorkflowRunContext>;
+  invoke: (name: string, input: Readonly<Record<string, JsonValue>>) => Promise<JsonValue>;
+}
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowScriptDefinition { description: string; script: string }
@@ -1021,7 +1024,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, agent: context.agent, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, invoke: context.invoke, agent: context.agent, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);
@@ -2118,16 +2121,26 @@ function nextNamedOccurrence(counters: Map<string, number>, label: string): stri
   return count === 1 ? label : `${label}#${String(count)}`;
 }
 
-
 function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>, registry: WorkflowRegistryApi): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionWorktreeOccurrences = new Map<string, number>();
-  return { ...bridge, functions: registry.globals(), variables, function: async (name, input, path, signal, worktreeOwner, structuralPath = []) => {
+  const functionInvokeOccurrences = new Map<string, number>();
+  const invokeFunction = async (name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath: readonly string[] = [], breadcrumb?: string): Promise<JsonValue> => {
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
     const sideEffects: Promise<void>[] = [];
+    const functionBreadcrumb = breadcrumb ?? name;
     const context: WorkflowFunctionContext = {
       run: runContext,
+      invoke: async (targetName, targetInput) => {
+        const inherited = inheritedHostAgentPath.getStore() ?? structuralPath;
+        const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
+        const key = JSON.stringify([path, inherited, targetName]);
+        const occurrence = (functionInvokeOccurrences.get(key) ?? 0) + 1;
+        functionInvokeOccurrences.set(key, occurrence);
+        const nestedPath = operationPath("function", "nested", path, ...inherited, targetName, `occurrence:${String(occurrence)}`);
+        return invokeFunction(targetName, targetInput, nestedPath, signal, scopedWorktreeOwner, inherited, `${functionBreadcrumb} > ${targetName}`);
+      },
       agent: async (...args: readonly unknown[]) => {
         if (!bridge.agent || typeof args[0] !== "string") fail("AGENT_FAILED", "No agent bridge is available");
         const options = validateAgentOptions(args[1] === undefined ? {} : args[1]);
@@ -2136,7 +2149,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
         const key = `${path}\0${JSON.stringify(inherited)}`;
         const occurrence = (functionAgentOccurrences.get(key) ?? 0) + 1;
         functionAgentOccurrences.set(key, occurrence);
-        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: name, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
+        return bridge.agent(args[0], options, signal, { structuralPath: [...inherited], callSite: `function:${path}`, occurrence, parentBreadcrumb: functionBreadcrumb, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) });
       },
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
@@ -2153,7 +2166,8 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
     await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
-  } };
+  };
+  return { ...bridge, functions: registry.globals(), variables, function: invokeFunction };
 }
 
 function projectTrusted(ctx: unknown): boolean {

@@ -563,6 +563,8 @@ void test("shared worktree scopes persist one owner across production agents and
     functions: {
       inherited: { description: "Use the inherited scope", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.parallel("function-agents", { left: () => context.agent("function-left"), right: () => context.agent("function-right") }); } },
       scoped: { description: "Use a named scope", input: { type: "object" }, output: { type: "string" }, async run(_input, context) { return context.withWorktree("shared", async () => context.agent("function-scoped")); } },
+      middle: { description: "Compose one nested function", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.invoke("inherited", {}); } },
+      composed: { description: "Compose nested functions", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.parallel("nested-functions", { left: () => context.invoke("middle", {}), right: () => context.invoke("middle", {}) }); } },
     },
   };
   const inputs: SessionInput[] = [];
@@ -596,7 +598,7 @@ void test("shared worktree scopes persist one owner across production agents and
   registerWorkflowExtension(extension);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const script = `const values = await withWorktree("shared", async () => parallel("top", { retry: () => agent("retry", { retries: 1 }), direct: () => agent("direct"), inherited: () => inherited({}), scoped: () => scoped({}) })); return { values, outside: await agent("outside") };`;
+  const script = `const values = await withWorktree("shared", async () => parallel("top", { retry: () => agent("retry", { retries: 1 }), direct: () => agent("direct"), inherited: () => inherited({}), scoped: () => scoped({}), composed: () => composed({}) })); return { values, outside: await agent("outside") };`;
   const started = await workflow.execute("id", { name: "shared-worktree", script }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   const runId = started.details.runId;
   const store = new RunStore(cwd, "session", runId, home);
@@ -605,11 +607,12 @@ void test("shared worktree scopes persist one owner across production agents and
   assert.equal(loaded.run.state, "completed", JSON.stringify(loaded.run.error));
   const worktrees = await store.worktrees();
   assert.equal(worktrees.length, 1);
-  assert.equal(loaded.run.agents.filter((agent) => agent.state === "completed").length, 7);
+  assert.equal(loaded.run.agents.filter((agent) => agent.state === "completed").length, 11);
+  assert.equal(loaded.run.agents.filter((agent) => agent.parentBreadcrumb === "composed > middle > inherited").length, 4);
   assert.equal(loaded.run.agents.find((agent) => agent.attempts === 2)?.attempts, 2);
   const owners = (await store.loadOwnership()).map(({ options }) => options.worktreeOwner).filter((owner): owner is string => typeof owner === "string");
   assert.equal(new Set(owners).size, 1);
-  assert.equal(owners.length, 6);
+  assert.equal(owners.length, 10);
   const sharedCwds = new Set(inputs.slice(0, -1).map(({ cwd: inputCwd }) => inputCwd));
   assert.equal(sharedCwds.size, 1);
   assert.equal(inputs.at(-1)?.cwd, cwd);
