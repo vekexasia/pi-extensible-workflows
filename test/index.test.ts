@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -80,6 +80,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.match(readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8"), /If `workflow_catalog` is available, call it once before creating the first workflow for a task/);
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(tool.execute("id", { name: "legacy", script: "return true", maxAgentLaunches: 1 }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 void test("probes optional Pi host capabilities while preserving model registry fallbacks", async () => {
@@ -153,41 +154,6 @@ void test("advertises only described effective roles in the system prompt while 
   assert.doesNotMatch(untrustedGuidance, /project-reviewer|Reviews correctness/);
 });
 
-void test("background workflows emit compatible lifecycle events", async () => {
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
-  const events: Array<{ channel: string; data: Record<string, unknown> }> = [];
-  let completed!: () => void;
-  const done = new Promise<void>((resolve) => { completed = resolve; });
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-events-"));
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data: data as Record<string, unknown> }); if (channel === WORKFLOW_ASYNC_COMPLETE_EVENT) completed(); } } } as never, home);
-  const execute = tools.find(({ name }) => name === "workflow")?.execute;
-  assert.ok(execute);
-  const result = await execute("id", { name: "events", script: `return true;` }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  await done;
-  const runId = (JSON.parse(result.content[0]?.text ?? "{}") as { runId?: string }).runId;
-  assert.ok(runId);
-  const stored = new RunStore(home, "session", runId, home);
-  assert.equal(JSON.parse(readFileSync(join(stored.directory, "result.json"), "utf8")), true);
-  const started = events.find(({ channel }) => channel === WORKFLOW_ASYNC_STARTED_EVENT)?.data;
-  assert.deepEqual({ id: started?.id, runId: started?.runId, pid: started?.pid, sessionId: started?.sessionId, asyncDir: started?.asyncDir, agent: started?.agent }, { id: runId, runId, pid: process.pid, sessionId: "session", asyncDir: stored.directory, agent: "events" });
-  const complete = events.find(({ channel }) => channel === WORKFLOW_ASYNC_COMPLETE_EVENT)?.data;
-  assert.deepEqual({ id: complete?.id, runId: complete?.runId, sessionId: complete?.sessionId, asyncDir: complete?.asyncDir, success: complete?.success, state: complete?.state }, { id: runId, runId, sessionId: "session", asyncDir: stored.directory, success: true, state: "complete" });
-  assert.deepEqual(events.map(({ channel }) => channel), [WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_ASYNC_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_ASYNC_COMPLETE_EVENT]);
-});
-void test("background workflow failures preserve the legacy completion event", async () => {
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
-  let complete!: (data: Record<string, unknown>) => void;
-  const completed = new Promise<Record<string, unknown>>((resolve) => { complete = resolve; });
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-legacy-failure-"));
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { if (channel === WORKFLOW_ASYNC_COMPLETE_EVENT) complete(data as Record<string, unknown>); } } } as never, home);
-  const execute = tools.find(({ name }) => name === "workflow")?.execute;
-  assert.ok(execute);
-  const result = await execute("id", { name: "legacy-failure", script: "throw new Error('SECRET');" }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  const event = await completed;
-  const runId = (JSON.parse(result.content[0]?.text ?? "{}") as { runId?: string }).runId;
-  assert.ok(runId);
-  assert.deepEqual({ id: event.id, runId: event.runId, success: event.success, state: event.state, error: event.error }, { id: runId, runId, success: false, state: "failed", error: "Workflow execution failed (INTERNAL_ERROR)" });
-});
 void test("foreground lifecycle events are redacted and throwing listeners cannot stop execution", async () => {
   const events: Array<{ channel: string; data: unknown }> = [];
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lifecycle-events-"));

@@ -99,6 +99,13 @@ void test("doctor preflights every registered workflow", async () => {
   assert.ok(report.diagnostics.some(({ code, message }) => code === "WORKFLOW_UNKNOWN_TOOL" && /cat/.test(message)));
   assert.ok(report.diagnostics.some(({ code }) => code === "WORKFLOW_INVALID_SYNTAX"));
 });
+void test("doctor skips model availability during workflow preflight but preserves warnings", async () => {
+  const paths = fixture();
+  const workflows = { "test.unavailable": { description: "unavailable model", script: `agent("x",{model:"openai/gpt"});` } };
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ availableModels: [], workflows }) }));
+  assert.equal(report.workflows.find(({ name }) => name === "test.unavailable")?.valid, true);
+  assert.ok(report.diagnostics.some(({ code, message, source }) => code === "MODEL_UNAVAILABLE" && source === "test.unavailable" && /openai\/gpt/.test(message)));
+});
 
 void test("doctor respects untrusted projects and does not mutate fixtures", async () => {
   const paths = fixture();

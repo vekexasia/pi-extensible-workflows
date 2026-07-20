@@ -13,7 +13,6 @@ import {
 import {
   DEFAULT_SETTINGS,
   loadSettings,
-  parseModelReference,
   resolveAgentResourcePolicy,
   resolveModelReference,
   parseRoleMarkdown,
@@ -188,9 +187,6 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
   return definition;
 }
 
-class DoctorModelSet extends Set<string> {
-  override has(value: string): boolean { parseModelReference(value); return true; }
-}
 function matchResourcePolicy(policy: AgentResourcePolicy, pi: DoctorPiState): AgentResourcePolicy {
   const extensions = new Set((pi.extensions ?? []).map(canonical));
   const skills = new Set(pi.skills ?? []);
@@ -262,12 +258,13 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     let valid = true;
     try {
       const checked = preflight(workflow.script, {
-        models: new DoctorModelSet(pi.knownModels),
+        models: new Set(pi.knownModels),
         tools: activeTools,
         agentTypes: new Set(definitions.keys()),
         modelAliases: aliases,
         knownModels,
         settingsPath,
+        skipModelAvailability: true,
       }, [], { name, description: workflow.description });
       for (const model of checked.referenced.models) if (!knownModels.has(model) || !availableModels.has(model)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${model}`, name));
     } catch (error) {
