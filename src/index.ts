@@ -17,6 +17,8 @@ import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./pers
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
+export const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"] as const;
+export type WorkflowCallKind = (typeof WORKFLOW_CALL_KINDS)[number];
 export const WORKFLOW_ASYNC_STARTED_EVENT = "workflow:async-started";
 export const WORKFLOW_ASYNC_COMPLETE_EVENT = "workflow:async-complete";
 export const WORKFLOW_RUN_STARTED_EVENT = "workflow:run-started";
@@ -234,6 +236,7 @@ export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ conc
 
 function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
 function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
+export { object as isObject };
 function nonNegativeInteger(value: unknown): value is number { return Number.isInteger(value) && (value as number) >= 0; }
 function nonNegativeFinite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 export function validateBudget(value: unknown): WorkflowBudget | undefined {
@@ -613,15 +616,25 @@ type WorkflowCall = acorn.CallExpression & { callee: acorn.Identifier };
 function astNode(value: unknown): value is acorn.AnyNode {
   return typeof value === "object" && value !== null && "type" in value && typeof value.type === "string";
 }
+function astChildren(node: acorn.AnyNode): acorn.AnyNode[] {
+  const children: acorn.AnyNode[] = [];
+  for (const value of Object.values(node) as unknown[]) {
+    if (Array.isArray(value)) {
+      for (const child of value) if (astNode(child)) children.push(child);
+    } else if (astNode(value)) children.push(value);
+  }
+  return children;
+}
+function workflowCallKind(node: acorn.AnyNode): WorkflowCallKind | undefined {
+  if (node.type !== "CallExpression" || node.callee.type !== "Identifier") return undefined;
+  const kind = node.callee.name as WorkflowCallKind;
+  return WORKFLOW_CALL_KINDS.includes(kind) ? kind : undefined;
+}
 function workflowCalls(program: acorn.Program): WorkflowCall[] {
   const calls: WorkflowCall[] = [];
   const visit = (node: acorn.AnyNode): void => {
-    if (node.type === "CallExpression" && node.callee.type === "Identifier" && ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"].includes(node.callee.name)) calls.push(node as WorkflowCall);
-    for (const value of Object.values(node) as unknown[]) {
-      if (Array.isArray(value)) {
-        for (const child of value as unknown[]) if (astNode(child)) visit(child);
-      } else if (astNode(value)) visit(value);
-    }
+    if (workflowCallKind(node)) calls.push(node as WorkflowCall);
+    for (const child of astChildren(node)) visit(child);
   };
   visit(program);
   return calls.sort((left, right) => left.start - right.start);
@@ -638,9 +651,9 @@ function workflowCallsWithStructure(program: acorn.Program): Array<{ call: Workf
       const key = node.key.type === "Identifier" ? node.key.name : node.key.type === "Literal" ? String(node.key.value) : undefined;
       if (scope?.key === null && key) current = { ...current, structure: [...current.structure.slice(0, -1), { ...scope, key }] };
     }
-    if (node.type === "CallExpression" && node.callee.type === "Identifier" && ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"].includes(node.callee.name)) {
+    const operation = workflowCallKind(node);
+    if (operation) {
       const call = node as WorkflowCall;
-      const operation = call.callee.name as StaticWorkflowCall["kind"];
       const execution = operation === "parallel" ? "parallel" : operation === "pipeline" ? "sequential" : current.execution;
       calls.push({ call, execution, structure: current.structure });
       for (const [index, argument] of call.arguments.entries()) {
@@ -650,16 +663,11 @@ function workflowCallsWithStructure(program: acorn.Program): Array<{ call: Workf
       }
       return;
     }
-    for (const value of Object.values(node) as unknown[]) {
-      if (Array.isArray(value)) {
-        for (const child of value as unknown[]) if (astNode(child)) visit(child, current);
-      } else if (astNode(value)) visit(value, current);
-    }
+    for (const child of astChildren(node)) visit(child, current);
   };
   visit(program, { execution: "sequential", structure: [] });
   return calls.sort((left, right) => left.call.start - right.call.start);
 }
-
 function validateDirectPrimitiveReferences(program: acorn.AnyNode, name: string): void {
   const visit = (node: acorn.AnyNode, parent?: acorn.AnyNode): void => {
     if (node.type === "Identifier" && node.name === name) {
@@ -667,18 +675,13 @@ function validateDirectPrimitiveReferences(program: acorn.AnyNode, name: string)
       const propertyKey = parent?.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand;
       if (!directCall && !propertyKey) fail("INVALID_METADATA", `${name} calls must use a direct ${name}(...) call; aliases and indirect calls are unsupported`);
     }
-    for (const value of Object.values(node) as unknown[]) {
-      if (Array.isArray(value)) {
-        for (const child of value as unknown[]) if (astNode(child)) visit(child, node);
-      } else if (astNode(value)) visit(value, node);
-    }
+    for (const child of astChildren(node)) visit(child, node);
   };
   visit(program);
 }
-
 function hasIdentifier(node: acorn.AnyNode, name: string): boolean {
   if (node.type === "Identifier" && node.name === name) return true;
-  return Object.values(node).some((value) => Array.isArray(value) ? value.some((child) => astNode(child) && hasIdentifier(child, name)) : astNode(value) && hasIdentifier(value, name));
+  return astChildren(node).some((child) => hasIdentifier(child, name));
 }
 
 const INTERNAL_AGENT_NAME = "__pi_extensible_workflows_agent";
@@ -854,7 +857,7 @@ function staticValue(node: acorn.AnyNode | undefined): StaticValue {
 }
 
 export interface StaticWorkflowCall {
-  kind: "agent" | "conversation" | "parallel" | "pipeline" | "checkpoint" | "phase" | "withWorktree";
+  kind: WorkflowCallKind;
   start: number;
   end: number;
   name: string | null;

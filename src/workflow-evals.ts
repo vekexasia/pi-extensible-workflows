@@ -8,7 +8,7 @@ import { Value } from "typebox/value";
 import { getAgentDir, parseFrontmatter, SessionManager } from "@earendil-works/pi-coding-agent";
 import { CAPTURE_ERROR_PREFIX, CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 export { resolveWorkflowSkillPath } from "./eval-capture-extension.js";
-import { ERROR_CODES, inspectWorkflowScript, loadAgentDefinitions, runWorkflow, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "./index.js";
+import { ERROR_CODES, inspectWorkflowScript, isObject, loadAgentDefinitions, runWorkflow, WORKFLOW_CALL_KINDS, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "./index.js";
 
 export type SignificantAction = { kind: "tool"; name: string } | { kind: "text" } | { kind: "thinking" };
 export type SequenceExpectation = readonly string[] | { equals?: readonly string[]; startsWith?: readonly string[] };
@@ -95,7 +95,6 @@ export const SAFE_PARENT_EVAL_TOOLS = Object.freeze(["read", "grep", "find", "ba
 const EVAL_MODEL_TOKEN = "$EVAL_MODEL";
 const semantic = (description: string): readonly SemanticCriterion[] => [{ id: "intent", description }];
 const JSON_RESULT_TYPES = ["null", "boolean", "number", "integer", "string", "array", "object"] as const;
-const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree"] as const;
 const AGENT_OPTION_NAMES = ["role", "model", "thinking", "tools", "retries"] as const;
 const expectationKeys = ["firstSignificantAction", "firstTool", "firstBatchToolSequence", "parentToolSequence", "workflowCallCount", "requiredOperations", "forbiddenOperations", "requiredRoles", "minimumAgentCalls", "requireOutputSchema", "expectedResults", "agentPolicies", "requiredAgentOrder", "requiredAgentStructures", "requiredDataFlow"] as const;
 const caseKeys = ["id", "prompt", "timeoutMs", "maxCost", "expectations", "expectedWorkflowCalls", "semanticCriteria"] as const;
@@ -130,7 +129,6 @@ export function loadWorkflowEvalCases(directory = evalCasesDirectory()): readonl
 export const INITIAL_WORKFLOW_EVAL_CASES: readonly WorkflowEvalCase[] = loadWorkflowEvalCases();
 
 
-function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function isJson(value: unknown): value is JsonValue { if (value === null || typeof value === "string" || typeof value === "boolean") return true; if (typeof value === "number") return Number.isFinite(value); if (Array.isArray(value)) return value.every(isJson); return isObject(value) && Object.values(value).every(isJson); }
 function asJsonObject(value: unknown): Readonly<Record<string, JsonValue>> | undefined { return isObject(value) && Object.values(value).every(isJson) ? value as Readonly<Record<string, JsonValue>> : undefined; }
 function jsonType(value: JsonValue): JsonResultType { if (value === null) return "null"; if (Array.isArray(value)) return "array"; if (typeof value === "number") return Number.isInteger(value) ? "integer" : "number"; if (typeof value === "object") return "object"; if (typeof value === "string") return "string"; if (typeof value === "boolean") return "boolean"; return "null"; }
@@ -646,21 +644,20 @@ function seedEvalProject(cwd: string, home: string, model: string): void {
     if (frontmatterEnd >= 0) writeFileSync(path, `${content.slice(0, frontmatterEnd).replace(/^model:.*$/m, `model: ${model}`)}${content.slice(frontmatterEnd)}`);
   }
 }
-
+export function findSessionFile(directory: string, sessionId: string): string | undefined {
+  if (!existsSync(directory)) return undefined;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) { const found = findSessionFile(path, sessionId); if (found) return found; }
+    else if (entry.name.endsWith(".jsonl")) {
+      try { const header = JSON.parse(readFileSync(path, "utf8").split("\n")[0] ?? "{}") as unknown; if (isObject(header) && header.id === sessionId) return path; } catch { /* Ignore incomplete sessions. */ }
+    }
+  }
+  return undefined;
+}
 async function findParentSession(cwd: string, sessionDir: string, sessionId: string): Promise<string | undefined> {
   try { const sessions = await SessionManager.list(cwd, sessionDir); const found = sessions.find((session) => session.id === sessionId); if (found) return found.path; } catch { /* Fall through to the JSONL scan. */ }
-  const visit = (directory: string): string | undefined => {
-    if (!existsSync(directory)) return undefined;
-    for (const entry of readdirSync(directory, { withFileTypes: true })) {
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) { const found = visit(path); if (found) return found; }
-      else if (entry.name.endsWith(".jsonl")) {
-        try { const header = JSON.parse(readFileSync(path, "utf8").split("\n")[0] ?? "{}") as unknown; if (isObject(header) && header.id === sessionId) return path; } catch { /* Ignore incomplete files. */ }
-      }
-    }
-    return undefined;
-  };
-  return visit(sessionDir);
+  return findSessionFile(sessionDir, sessionId);
 }
 
 function emptyAccounting(cost = 0): EvalAccounting { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost, models: [] }; }

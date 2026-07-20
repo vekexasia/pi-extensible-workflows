@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { inspectWorkflowScript, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
-import { assertEvalScriptSafe, captureEvalCase, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, loadWorkflowEvalCases, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
+import { assertEvalScriptSafe, captureEvalCase, captureValidationReports, evalExpectationErrors, extractCapturedWorkflows, extractParentOracle, findSessionFile, formatEvalSummary, INITIAL_WORKFLOW_EVAL_CASES, loadWorkflowEvalCases, matchesJsonResult, matchesJsonSchema, matchesOutputSchema, parseSemanticJudge, replayExpectationErrors, replayWorkflowScript, resolveWorkflowSkillPath, selectStaticCandidate, staticExpectationResults, runIsolatedProcess, runWorkflowEvals, type ParentOracle } from "../src/workflow-evals.js";
 
 const schema = { type: "object", properties: { answer: { type: "number" }, label: { type: "string" } }, required: ["answer", "label"], additionalProperties: false };
 void test("defines the cheap initial evaluation matrix", () => {
@@ -13,6 +13,20 @@ void test("defines the cheap initial evaluation matrix", () => {
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.every(({ timeoutMs, maxCost }) => timeoutMs === undefined && maxCost > 0), true);
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.slice(1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
   assert.match(resolveWorkflowSkillPath(), /skills\/pi-extensible-workflows\/SKILL\.md$/);
+});
+void test("finds matching session JSONL files recursively", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-files-"));
+  try {
+    const nested = join(root, "nested");
+    mkdirSync(nested);
+    writeFileSync(join(root, "incomplete.jsonl"), "{");
+    const match = join(nested, "session.jsonl");
+    writeFileSync(match, `${JSON.stringify({ id: "target" })}\n`);
+    assert.equal(findSessionFile(root, "target"), match);
+    assert.equal(findSessionFile(root, "missing"), undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 void test("loads YAML cases in deterministic filename order and preserves model tokens", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-cases-"));
