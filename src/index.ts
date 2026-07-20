@@ -2176,7 +2176,54 @@ function projectTrusted(ctx: unknown): boolean {
   const check = object(ctx) ? ctx.isProjectTrusted : undefined;
   return typeof check === "function" ? Boolean(Reflect.apply(check, ctx, [])) : true;
 }
-
+type PiHostCapabilities = { registerEntryRenderer?: ExtensionAPI["registerEntryRenderer"]; events?: WorkflowEventSink };
+function isEntryRenderer(value: unknown): value is NonNullable<PiHostCapabilities["registerEntryRenderer"]> { return typeof value === "function"; }
+function isWorkflowEventSink(value: unknown): value is WorkflowEventSink { return object(value) && typeof value.emit === "function"; }
+function piHostCapabilities(pi: unknown): PiHostCapabilities {
+  if (!object(pi)) return {};
+  const registerEntryRenderer = pi.registerEntryRenderer;
+  const events = pi.events;
+  return { ...(isEntryRenderer(registerEntryRenderer) ? { registerEntryRenderer } : {}), ...(isWorkflowEventSink(events) ? { events } : {}) };
+}
+type ContextHostCapabilities = { modelRegistry?: ModelRegistryCapability };
+type ModelSummary = { provider: string; id: string };
+type ModelRegistryGetter = () => readonly ModelSummary[];
+type ModelRegistryCapability = { getAll?: ModelRegistryGetter; getAvailable?: ModelRegistryGetter };
+function isModelRegistryGetter(value: unknown): value is ModelRegistryGetter { return typeof value === "function"; }
+function contextHostCapabilities(ctx: unknown): ContextHostCapabilities {
+  if (!object(ctx) || !object(ctx.modelRegistry)) return {};
+  const registry = ctx.modelRegistry;
+  const getAll = registry.getAll;
+  const getAvailable = registry.getAvailable;
+  return { modelRegistry: { ...(isModelRegistryGetter(getAll) ? { getAll: () => getAll.call(registry) } : {}), ...(isModelRegistryGetter(getAvailable) ? { getAvailable: () => getAvailable.call(registry) } : {}) } };
+}
+type UiSelect = (title: string, options: string[]) => Promise<string | undefined>;
+type UiInput = (title: string, placeholder?: string) => Promise<string | undefined>;
+type UiSetStatus = (key: string, text?: string) => void;
+type UiHostCapabilities = { select?: UiSelect; input?: UiInput; setStatus?: UiSetStatus };
+function isUiSelect(value: unknown): value is UiSelect { return typeof value === "function"; }
+function isUiInput(value: unknown): value is UiInput { return typeof value === "function"; }
+function isUiSetStatus(value: unknown): value is UiSetStatus { return typeof value === "function"; }
+function uiHostCapabilities(ui: unknown): UiHostCapabilities | undefined {
+  if (!object(ui)) return undefined;
+  const select = ui.select;
+  const input = ui.input;
+  const setStatus = ui.setStatus;
+  return { ...(isUiSelect(select) ? { select } : {}), ...(isUiInput(input) ? { input } : {}), ...(isUiSetStatus(setStatus) ? { setStatus } : {}) };
+}
+type TuiHostCapabilities = { terminal?: { rows?: unknown } };
+function tuiHostCapabilities(tui: unknown): TuiHostCapabilities {
+  if (!object(tui) || !object(tui.terminal)) return {};
+  return { terminal: { ...(tui.terminal.rows === undefined ? {} : { rows: tui.terminal.rows }) } };
+}
+function tuiRows(tui: unknown): number { const rows = tuiHostCapabilities(tui).terminal?.rows; return typeof rows === "number" && Number.isFinite(rows) ? rows : 24; }
+type KeybindingsHostCapabilities = { getKeys?: (name: string) => readonly string[] };
+function isKeybindingGetter(value: unknown): value is NonNullable<KeybindingsHostCapabilities["getKeys"]> { return typeof value === "function"; }
+function keybindingsHostCapabilities(keybindings: unknown): KeybindingsHostCapabilities {
+  if (!object(keybindings) || !isKeybindingGetter(keybindings.getKeys)) return {};
+  return { getKeys: keybindings.getKeys };
+}
+function keybindingKeys(keybindings: unknown, name: string): readonly string[] | undefined { const getKeys = keybindingsHostCapabilities(keybindings).getKeys; return typeof getKeys === "function" ? getKeys.call(keybindings, name) : undefined; }
 function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
   switch (value) {
     case "off": case "minimal": case "low": case "medium": case "high": case "xhigh": case "max": return value;
@@ -2187,7 +2234,7 @@ function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
 export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard, createSession: SessionFactory = createNativeAgentSession) {
   beginWorkflowExtensionLoading();
   const registry = loadingRegistry();
-  const registerEntryRenderer = (pi as unknown as Partial<Pick<ExtensionAPI, "registerEntryRenderer">>).registerEntryRenderer;
+  const registerEntryRenderer = piHostCapabilities(pi).registerEntryRenderer;
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
     return textBlock(data ? `Workflow ${data.workflowName}: ${data.message}` : "");
@@ -2197,7 +2244,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     try { pi.appendEntry<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, { workflowName, message: utf8Prefix(message, DELIVERY_LIMIT_BYTES) }); }
     finally { await lifecycle.leave(); }
   };
-  const eventPublisher = new WorkflowEventPublisher((pi as unknown as { events?: WorkflowEventSink }).events);
+  const eventPublisher = new WorkflowEventPublisher(piHostCapabilities(pi).events);
   pi.on("resources_discover", () => {
     if (!pi.getActiveTools().includes("workflow")) return;
     const extensionDir = dirname(fileURLToPath(import.meta.url));
@@ -2651,7 +2698,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
     }
-    const resumeSelect = (ctx.ui as unknown as { select?: (prompt: string, options: string[]) => Promise<string | undefined> } | undefined)?.select;
+    const resumeSelect = uiHostCapabilities(ctx.ui)?.select;
     if (ctx.hasUI && resumeSelect) {
       const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
       if (interrupted.length > 0) {
@@ -2691,7 +2738,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const budget = validateBudget(params.budget);
       const rootModel: ModelSpec = { provider: ctx.model.provider, model: ctx.model.id, thinking: pi.getThinkingLevel() };
       const rootModelName = `${rootModel.provider}/${rootModel.model}`;
-      const modelRegistry = (ctx as unknown as { modelRegistry?: { getAll?: () => Array<{ provider: string; id: string }>; getAvailable?: () => Array<{ provider: string; id: string }> } }).modelRegistry;
+      const modelRegistry = contextHostCapabilities(ctx).modelRegistry;
       const knownModels = new Set((modelRegistry?.getAll?.() ?? modelRegistry?.getAvailable?.() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       knownModels.add(rootModelName);
       const availableModels = knownModels;
@@ -2843,7 +2890,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       let stores = await loadStores();
       const usage = "Usage: /workflow [doctor|model-aliases], or /workflow pause|resume|stop|approve|reject|delete <run-id> [checkpoint or proposal-id]. Use workflow_resume for budget patches."
       const setWorkflowStatus = (text: string | undefined) => {
-        const setStatus = (ctx.ui as unknown as { setStatus?: (key: string, text?: string) => void }).setStatus;
+        const setStatus = uiHostCapabilities(ctx.ui)?.setStatus;
         setStatus?.call(ctx.ui, "workflow-stop", text);
       };
       const runAction = async (actionCommand: string, keepContext: boolean, status: (text: string | undefined) => void = setWorkflowStatus): Promise<"dashboard" | "picker" | "done"> => {
@@ -2884,7 +2931,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             return keepContext ? "dashboard" : "done";
           }
           if (action === "adjust" && run?.lifecycle.state === "budget_exhausted") {
-            const input = await (ctx.ui as unknown as { input?: (title: string, placeholder?: string) => Promise<string | undefined> }).input?.("Budget patch (JSON)", "{\"tokens\":{\"hard\":null}}" );
+            const input = await uiHostCapabilities(ctx.ui)?.input?.call(ctx.ui, "Budget patch (JSON)", "{\"tokens\":{\"hard\":null}}" );
             if (input === undefined) return keepContext ? "dashboard" : "done";
             const result = await resumeWorkflowRun(run.store.runId, JSON.parse(input));
             ctx.ui.notify(result.state === "running" ? `Resumed workflow ${run.store.runId}.` : `Budget adjustment for ${run.store.runId} is awaiting approval.`, result.state === "running" ? "info" : "warning");
@@ -2911,7 +2958,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       };
       const manageAliases = async (): Promise<void> => {
         const settingsPath = workflowSettingsPath();
-        const modelRegistry = (ctx as unknown as { modelRegistry?: { getAvailable?: () => Array<{ provider: string; id: string }> } }).modelRegistry;
+        const modelRegistry = contextHostCapabilities(ctx).modelRegistry;
         const available = () => [...new Set((modelRegistry?.getAvailable?.() ?? []).map((model) => `${model.provider}/${model.id}`))].sort();
         const selectTarget = async (): Promise<string | undefined> => {
           const models = available();
@@ -3017,7 +3064,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
                 let offset = 0;
                 let renderedLines: string[] = [];
-                const viewport = () => Math.max(1, (((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24) - 3);
+                const viewport = () => Math.max(1, tuiRows(tui) - 3);
                 const move = (delta: number) => { offset = Math.max(0, Math.min(Math.max(0, renderedLines.length - viewport()), offset + delta)); };
                 return {
                   render(width: number) {
@@ -3138,11 +3185,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   let disposed = false;
                   let stopRequested = false;
                   let stopStatus: string | undefined;
-                  const terminalRows = () => Math.max(1, ((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24);
+                  const terminalRows = () => Math.max(1, tuiRows(tui));
                   const keyLabels: Record<string, string> = { up: "↑", down: "↓", pageUp: "pgup", pageDown: "pgdn", escape: "esc" };
                   const keyLabel = (binding: string, fallback: string) => {
-                    const getKeys = (keybindings as unknown as { getKeys?: (name: string) => readonly string[] }).getKeys;
-                    const keys = getKeys?.call(keybindings, binding);
+                    const keys = keybindingKeys(keybindings, binding);
                     return keys?.length ? keys.map((key) => keyLabels[key] ?? key).join("/") : fallback;
                   };
                   const dashboardLayout = () => {
@@ -3236,7 +3282,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 const highlighted = highlightCode(view.script, "javascript");
                 let offset = 0;
                 let renderedLines: string[] = [];
-                const viewport = () => Math.max(1, (((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24) - 3);
+                const viewport = () => Math.max(1, tuiRows(tui) - 3);
                 const move = (delta: number) => {
                   const maxOffset = Math.max(0, renderedLines.length - viewport());
                   offset = Math.max(0, Math.min(maxOffset, offset + delta));
@@ -3290,7 +3336,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 let offset = 0;
                 let renderedLines: string[] = [];
                 const layout = () => {
-                  const rows = Math.max(1, (((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows) ?? 24));
+                  const rows = Math.max(1, tuiRows(tui));
                   const compactControls = rows < 4;
                   const titleRows = rows >= 5 ? 1 : 0;
                   const hintRows = rows >= 8 ? 1 : 0;

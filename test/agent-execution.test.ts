@@ -520,6 +520,23 @@ void test("nested role policy conflicts fail before scheduler spawn", async () =
   scheduler.cancel(parent.id);
   await parent.result;
 });
+void test("child tool validates raw input and preserves extension options", async () => {
+  const scheduler = new FairAgentScheduler(async () => "done", 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read"] });
+  const agentTool = scheduler.toolsFor(parent.id)[0];
+  assert.ok(agentTool);
+  for (const params of [{ prompt: "child", label: "child", thinking: "invalid" }, { prompt: "child", label: "child", providerOptions: () => undefined }]) {
+    await assert.rejects(agentTool.execute("call", params, undefined, undefined, {} as never), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  }
+  assert.equal(scheduler.snapshot().length, 1);
+  const response = await agentTool.execute("call", { prompt: "child", label: "child", providerOptions: { temperature: 0.2 }, timeoutMs: null }, undefined, undefined, {} as never);
+  const childId = (response.details as { id: string }).id;
+  const child = scheduler.snapshot().find(({ id }) => id === childId);
+  assert.deepEqual(child?.options.agentOptions, { label: "child", providerOptions: { temperature: 0.2 }, timeoutMs: null });
+  scheduler.cancel(parent.id);
+  await parent.result;
+});
 
 void test("nested agent roles resolve tools before scheduler spawn", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
