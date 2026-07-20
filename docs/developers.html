@@ -78,12 +78,13 @@
       </section>
       <section id="tool-api">
         <h2>Tool API</h2>
-        <p>The extension registers four tools and one command:</p>
+        <p>The extension registers these core tools and one command:</p>
         <ul>
           <li><code>workflow</code> runs an inline or registered deterministic JavaScript workflow.</li>
           <li><code>workflow_resume</code> resumes a budget-exhausted run with an optional budget patch.</li>
           <li><code>workflow_respond</code> approves or rejects a pending checkpoint or budget decision.</li>
           <li><code>workflow_stop</code> stops an active workflow run by ID.</li>
+          <li><code>workflow_catalog</code> lists registered workflow functions, variables, reusable workflows, and model aliases; it is registered only when the active registry has one of these entries.</li>
           <li><code>/workflow</code> lists and controls runs in the current Pi session.</li>
         </ul>
         <h3><code>workflow</code> parameters</h3>
@@ -321,12 +322,9 @@ Focus on correctness and regressions.</code></pre>
             <tr><td><code>WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT</code></td><td>After a checkpoint is persisted as <code>awaiting</code>, <code>approved</code>, or <code>rejected</code>.</td></tr>
             <tr><td><code>WORKFLOW_BUDGET_EVENT</code></td><td>After each newly persisted budget event is recorded.</td></tr>
             <tr><td><code>WORKFLOW_WORKTREE_CREATED_EVENT</code></td><td>Once after a new worktree is persisted for an owner.</td></tr>
-            <tr><td><code>WORKFLOW_ASYNC_STARTED_EVENT</code></td><td>For a background run, immediately after <code>WORKFLOW_RUN_STARTED_EVENT</code>.</td></tr>
-            <tr><td><code>WORKFLOW_ASYNC_COMPLETE_EVENT</code></td><td>For a background run, when it completes or ends in <code>failed</code>, <code>stopped</code>, <code>interrupted</code>, or <code>budget_exhausted</code>.</td></tr>
           </tbody>
         </table></div>
         <pre><code class="language-typescript">pi<span class="tok-punctuation">.</span>events<span class="tok-punctuation">.</span><span class="tok-function">on</span><span class="tok-punctuation">(</span>WORKFLOW_RUN_COMPLETED_EVENT<span class="tok-punctuation">,</span> <span class="tok-punctuation">(</span>event<span class="tok-punctuation">:</span> <span class="tok-keyword">WorkflowRunCompletedEvent</span><span class="tok-punctuation">)</span> <span class="tok-punctuation">=&gt;</span> console<span class="tok-punctuation">.</span><span class="tok-function">log</span><span class="tok-punctuation">(</span>event<span class="tok-punctuation">.</span>runId<span class="tok-punctuation">,</span> event<span class="tok-punctuation">.</span>resultPath<span class="tok-punctuation">)</span><span class="tok-punctuation">)</span><span class="tok-punctuation">;</span></code></pre>
-        <p><code>WORKFLOW_ASYNC_STARTED_EVENT</code> and <code>WORKFLOW_ASYNC_COMPLETE_EVENT</code> remain legacy background-run compatibility events and are derived from the same persisted transitions.</p>
       </section>
       <section id="operations">
         <h2>Operations and debugging</h2>
@@ -337,6 +335,7 @@ Focus on correctness and regressions.</code></pre>
         <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered workflows. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script.</p>
         <h3><code>/workflow</code> controls</h3>
         <pre><code class="language-text">/workflow doctor
+/workflow model-aliases
 /workflow pause &lt;run-id&gt;
 /workflow resume &lt;run-id&gt;
 /workflow stop &lt;run-id&gt;
