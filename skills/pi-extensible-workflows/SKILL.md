@@ -109,7 +109,7 @@ Their public inputs and outputs must remain JSON; callbacks cannot cross the ext
 - Repeated work uses a JavaScript loop; each direct `agent(...)` call receives deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
 - Add `budget` only when the run needs aggregate limits. The only valid dimension names are exactly `tokens`, `costUsd`, `durationMs`, and `agentLaunches` (never `cost`, `duration`, `launches`, or other shorthand). Each dimension is `{ soft?: number, hard?: number }`; `soft` must be less than `hard`.
-- A `budget_exhausted` run is resumable through `workflow_resume`. Omitted patch values stay unchanged, explicit `null` removes a limit, and any relaxation requires an exact human-approved proposal through `workflow_respond`.
+- A `budget_exhausted` run is resumable through `workflow_resume`: omitted patch values stay unchanged, explicit `null` removes a limit, and tightening resumes directly. A relaxation persists the exact proposal and returns immediately with `{ state: "awaiting_approval", proposalId }`; `workflow_respond` must answer that exact ID, with rejection leaving the run `budget_exhausted` and approval applying the budget and cold-resuming it.
 - `parallel()` and `pipeline()` return keyed bare values. Await results before use.
 - Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings stay literal.
 - Use `outputSchema` only when another phase must compare, aggregate, or validate the result. Never add it to a final agent whose prose is returned directly. Keep only fields the consumer needs, and avoid repeating the same evidence in multiple schemas.

@@ -110,6 +110,12 @@ export interface WorkflowFailureAgent {
   sessionId?: string;
   sessionFile?: string;
 }
+export interface WorkflowSiblingAgent {
+  id: string;
+  label?: string;
+  role?: string;
+  structuralPath: readonly string[];
+}
 export interface WorkflowFailureDiagnostics {
   runId: string;
   workflowName: string;
@@ -117,6 +123,7 @@ export interface WorkflowFailureDiagnostics {
   failedAt: string | null;
   error: WorkflowErrorShape;
   failedAgent?: WorkflowFailureAgent;
+  completedSiblingAgents?: readonly WorkflowSiblingAgent[];
   completedSiblingPaths: readonly (readonly string[])[];
   artifacts: { runDirectory: string; statePath: string; journalPath: string };
 }
@@ -1966,12 +1973,21 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
       ...(value.failedAgent.sessionId ? { sessionId: utf8Prefix(value.failedAgent.sessionId, 256) } : {}),
       ...(value.failedAgent.sessionFile ? { sessionFile: utf8Prefix(value.failedAgent.sessionFile, 1024) } : {}),
     } } : {}),
+    completedSiblingAgents: (value.completedSiblingAgents ?? []).slice(0, 16).map((agent) => ({
+      id: utf8Prefix(agent.id, 128),
+      ...(agent.label ? { label: utf8Prefix(agent.label, 128) } : {}),
+      ...(agent.role ? { role: utf8Prefix(agent.role, 128) } : {}),
+      structuralPath: agent.structuralPath.slice(0, 8).map((part) => utf8Prefix(part, 128)),
+    })),
     completedSiblingPaths: value.completedSiblingPaths.slice(0, 16).map((path) => path.slice(0, 8).map((part) => utf8Prefix(part, 128))),
     artifacts: { runDirectory: utf8Prefix(value.artifacts.runDirectory, 1024), statePath: utf8Prefix(value.artifacts.statePath, 1024), journalPath: utf8Prefix(value.artifacts.journalPath, 1024) },
   };
   const size = () => Buffer.byteLength(JSON.stringify(bounded));
   while (size() > DIAGNOSTIC_LIMIT_BYTES) {
-    if (bounded.completedSiblingPaths.length) { bounded = { ...bounded, completedSiblingPaths: bounded.completedSiblingPaths.slice(0, -1) }; continue; }
+    if (bounded.completedSiblingAgents?.length || bounded.completedSiblingPaths.length) {
+      bounded = { ...bounded, completedSiblingAgents: bounded.completedSiblingAgents?.slice(0, -1) ?? [], completedSiblingPaths: bounded.completedSiblingPaths.slice(0, -1) };
+      continue;
+    }
     if (bounded.failedAgent?.sessionFile) { const failedAgent = { ...bounded.failedAgent }; delete failedAgent.sessionFile; bounded = { ...bounded, failedAgent }; continue; }
     if (bounded.failedAgent?.sessionId) { const failedAgent = { ...bounded.failedAgent }; delete failedAgent.sessionId; bounded = { ...bounded, failedAgent }; continue; }
     if (Buffer.byteLength(bounded.artifacts.runDirectory) > 256) { bounded = { ...bounded, artifacts: { ...bounded.artifacts, runDirectory: utf8Prefix(bounded.artifacts.runDirectory, 256) } }; continue; }
@@ -2004,22 +2020,29 @@ function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMet
     ...(failedAttempt?.sessionId ? { sessionId: failedAttempt.sessionId } : {}),
     ...(failedAttempt?.sessionFile ? { sessionFile: failedAttempt.sessionFile } : {}),
   } satisfies WorkflowFailureAgent : undefined;
-  const completedSiblingPaths = run.agents.filter((agent) => {
+  const completedSiblingAgents = run.agents.filter((agent) => {
     if (agent.state !== "completed" || agent.id === failedAgentRecord?.id) return false;
     return failedAgentRecord?.parentId === undefined ? agent.parentId === undefined : agent.parentId === failedAgentRecord.parentId;
-  }).map((agent) => [...(agent.structuralPath ?? [])]);
+  }).map((agent) => ({
+    id: agent.id,
+    ...(agent.label ?? agent.name ? { label: agent.label ?? agent.name } : {}),
+    ...(agent.role ? { role: agent.role } : {}),
+    structuralPath: [...(agent.structuralPath ?? [])],
+  } satisfies WorkflowSiblingAgent));
+  const completedSiblingPaths = completedSiblingAgents.map((agent) => [...agent.structuralPath]);
   return boundedWorkflowFailureDiagnostics({
     runId: run.id, workflowName: metadata.name, state: run.state, failedAt,
     error: { code: errorCode(error) ?? "INTERNAL_ERROR", message: errorText(error) || "The workflow failed without an error message." },
-    ...(failedAgent ? { failedAgent } : {}), completedSiblingPaths,
+    ...(failedAgent ? { failedAgent } : {}), completedSiblingAgents, completedSiblingPaths,
     artifacts: { runDirectory: store.directory, statePath: join(store.directory, "state.json"), journalPath: join(store.directory, "journal.json") },
   });
 }
 
 export function formatWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string {
   const failedAgent = diagnostic.failedAgent ? `${diagnostic.failedAgent.label ?? diagnostic.failedAgent.id}${diagnostic.failedAgent.role ? ` role=${diagnostic.failedAgent.role}` : ""} attempt=${String(diagnostic.failedAgent.attempt)} path=${diagnostic.failedAgent.structuralPath.join(" > ") || "(root)"}${diagnostic.failedAgent.sessionFile ? ` session=${diagnostic.failedAgent.sessionFile}` : ""}` : "(not persisted)";
-  const siblings = diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
-  return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling paths: ${siblings}`, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
+  const siblingAgents = diagnostic.completedSiblingAgents;
+  const siblings = siblingAgents ? siblingAgents.map((agent) => `${agent.label ?? agent.id}${agent.role ? ` role=${agent.role}` : ""} path=${agent.structuralPath.join(" > ") || "(root)"}`).join(", ") || "(none)" : diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
+  return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling ${siblingAgents ? "agents" : "paths"}: ${siblings}`, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
 }
 
 function serializeWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string { return JSON.stringify(diagnostic); }
@@ -2349,7 +2372,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     return skillPath ? { skillPaths: [skillPath] } : undefined;
   });
   type BudgetDecisionResult = { state: "running" | "budget_exhausted"; approved: boolean };
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; budgetResolvers: Map<string, (result: BudgetDecisionResult) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
   const pendingFailureDiagnostics = new Map<string, WorkflowFailureDiagnostics>();
   pi.on("tool_result", (event) => {
     if (event.toolName !== "workflow" || !event.isError) return;
@@ -2523,8 +2546,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (!request) return undefined;
     await appendBudgetDecisionEvent(run, request, approved ? "adjustment_approved" : "adjustment_rejected");
     const result = await applyBudgetDecision(request, approved);
-    run.budgetResolvers.get(proposalId)?.(result);
-    run.budgetResolvers.delete(proposalId);
     if (!silent) deliver(pi, `Workflow ${run.metadata.name} budget adjustment ${proposalId}: ${approved ? "Approved" : "Rejected"}.`);
     return result;
   };
@@ -2766,11 +2787,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (budgetRelaxed(currentBudget, nextBudget)) {
       const proposalId = randomUUID();
       const request: BudgetApprovalRequest = { kind: "budget", proposalId, runId, consumed: usage, previous: currentBudget ?? {}, proposed: nextBudget ?? {}, budgetVersion: loaded.run.budgetVersion ?? 1 };
-      const decision = new Promise<BudgetDecisionResult>((resolve) => { run.budgetResolvers.set(proposalId, resolve); });
-      try { await run.store.requestWorkflowDecision(request); await appendBudgetDecisionEvent(run, request, "adjustment_requested"); } catch (error) { run.budgetResolvers.delete(proposalId); throw error; }
+      await run.store.requestWorkflowDecision(request);
+      await appendBudgetDecisionEvent(run, request, "adjustment_requested");
       deliver(pi, budgetDecisionDelivery(run.metadata, request));
-      const decisionResult = await decision;
-      return { state: decisionResult.state };
+      return { state: "awaiting_approval", proposalId };
     }
     const changed = JSON.stringify(currentBudget ?? {}) !== JSON.stringify(nextBudget ?? {});
     if (changed) {
@@ -2819,7 +2839,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, loaded.run.state, budgetRuntime, loaded.snapshot.metadata);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController: new AbortController(), projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), budgetResolvers: new Map() });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController: new AbortController(), projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map() });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -2894,7 +2914,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(ctx.cwd, projectTrusted(ctx)), runContext }, createSession);
-      runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), budgetResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
+      runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
       const execution = runWorkflow(script, args, withWorkflowFunctions({ agent: async (prompt, options, agentSignal, identity) => {
