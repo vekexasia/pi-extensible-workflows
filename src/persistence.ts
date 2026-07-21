@@ -564,7 +564,7 @@ export class RunStore {
   }
   async worktreeState(owner: string): Promise<WorkflowWorktreeState> {
     try {
-      const record = await this.validateWorktree(owner);
+      const record = await this.worktree(owner);
       const [head, status] = await Promise.all([git(record.cwd, ["rev-parse", "HEAD"]), git(record.cwd, ["status", "--porcelain=v1"])]);
       const name = worktreeName(record.owner);
       return { ...(name === undefined ? {} : { name }), path: record.path, branch: record.branch, base: record.base, head: head.trim(), dirty: status.trim() !== "" };

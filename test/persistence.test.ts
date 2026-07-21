@@ -94,16 +94,16 @@ void test("worktreeState reads fresh Git state from validated named and unnamed 
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const namedOwner = "worktree/named/issue-83";
-  const named = await store.worktree(namedOwner);
   const clean = await store.worktreeState(namedOwner);
+  const named = await store.validateWorktree(namedOwner);
   assert.deepEqual(clean, { name: "issue-83", path: named.path, branch: named.branch, base: named.base, head: named.base, dirty: false });
   writeFileSync(join(named.cwd, "untracked.txt"), "untracked");
   const dirty = await store.worktreeState(namedOwner);
   assert.equal(dirty.head, named.base);
   assert.equal(dirty.dirty, true);
   const unnamedOwner = "worktree/unnamed/scope";
-  const unnamed = await store.worktree(unnamedOwner);
   const unnamedState = await store.worktreeState(unnamedOwner);
+  const unnamed = await store.validateWorktree(unnamedOwner);
   assert.equal(unnamedState.name, undefined);
   assert.equal(unnamedState.path, unnamed.path);
   assert.equal(unnamedState.branch, unnamed.branch);
