@@ -2550,6 +2550,14 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.match(diagnostic.artifacts.journalPath, /journal\.json$/);
   assert.ok(Buffer.byteLength(result.content[0]?.text ?? "") <= 4096);
   assert.doesNotMatch(result.content[0]?.text ?? "", /�/);
+  await assert.rejects(tool.execute("empty-workflow-call", { name: "empty-diagnostic", script: "throw new Error('');", foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const emptyPatched = await toolResultHandler({ type: "tool_result", toolName: "workflow", toolCallId: "empty-workflow-call", input: {}, content: [{ type: "text", text: "old" }], details: {}, isError: true }, {});
+  assert.ok(emptyPatched);
+  const emptyResult = emptyPatched as { content: Array<{ text: string }>; details: Record<string, unknown>; isError: boolean };
+  const emptyDiagnostic = JSON.parse(emptyResult.content[0]?.text ?? "null") as { error: { message: string } };
+  assert.deepEqual(emptyResult.details, emptyDiagnostic);
+  assert.equal(emptyResult.isError, true);
+  assert.equal(emptyDiagnostic.error.message, "The workflow failed without an error message.");
 });
 void test("background failures and workflow responses deliver prose to the main agent", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
