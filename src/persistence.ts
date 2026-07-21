@@ -437,7 +437,7 @@ export class RunStore {
     return records.map((record) => {
       if (!record || typeof record !== "object") throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree binding is invalid");
       const candidate = record as Partial<BorrowedWorktreeBinding>;
-      if (typeof candidate.name !== "string" || !candidate.name.trim() || typeof candidate.sourceRunId !== "string" || !candidate.sourceRunId || typeof candidate.owner !== "string" || candidate.owner !== this.namedWorktreeOwner(candidate.name)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree binding is invalid");
+      if (typeof candidate.name !== "string" || !candidate.name.trim() || candidate.name !== candidate.name.trim() || typeof candidate.sourceRunId !== "string" || !candidate.sourceRunId || typeof candidate.owner !== "string" || candidate.owner !== this.namedWorktreeOwner(candidate.name)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree binding is invalid");
       if (seen.has(candidate.name)) throw new WorkflowError("WORKTREE_FAILED", `Duplicate borrowed worktree binding for ${candidate.name}`);
       seen.add(candidate.name);
       return { name: candidate.name, sourceRunId: candidate.sourceRunId, owner: candidate.owner };
@@ -679,8 +679,8 @@ export class RunStore {
     const bindings = await this.borrowedWorktreeRecords();
     const boundOwners = new Set(bindings.map((binding) => binding.owner));
     const owned = await Promise.all(records.filter((record) => !boundOwners.has(record.owner)).map(async (record) => { try { return await this.validateWorktree(record.owner); } catch { return undefined; } }));
-    const borrowed = await Promise.all(bindings.map(async (binding) => { try { return (await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference; } catch { return undefined; } }));
-    return [...owned.filter((record): record is WorktreeReference => record !== undefined), ...borrowed.filter((record): record is WorktreeReference => record !== undefined)];
+    const borrowed = await Promise.all(bindings.map(async (binding) => (await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference));
+    return [...owned.filter((record): record is WorktreeReference => record !== undefined), ...borrowed];
   }
 
   async changedWorktrees(): Promise<readonly WorktreeReference[]> {

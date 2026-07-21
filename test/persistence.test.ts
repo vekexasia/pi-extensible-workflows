@@ -312,9 +312,12 @@ void test("reuses named worktrees through durable follow-up bindings without del
   assert.deepEqual(await second.worktree(owner), original);
   assert.equal(existsSync(original.path), true);
   await second.validateBorrowedWorktrees();
+  writeFileSync(join(first.directory, "borrowed-worktrees.json"), JSON.stringify([{ name: " banana ", sourceRunId: "source", owner }]));
+  await assert.rejects(first.validateBorrowedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   await first.delete(true);
   assert.equal(existsSync(original.path), true);
   await source.delete(true);
+  await assert.rejects(second.worktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   await assert.rejects(second.validateBorrowedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   await second.delete(true);
 });
