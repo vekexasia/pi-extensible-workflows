@@ -546,6 +546,34 @@ void test("parent registry survives nested agent session lifecycle", async () =>
   assert.equal(listed.functions.some(({ name }) => name === "afterNested"), true);
   registerAcceptanceExtension();
 });
+void test("registered function context exposes host-derived worktree state", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-state-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown } }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  registerWorkflowExtension({
+    version: "1.0.0", headline: "Worktree state", description: "Worktree state acceptance",
+    functions: {
+      readState: { description: "Read state", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.withWorktree("registered", async () => context.worktreeState()); } },
+    },
+  });
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("id", { name: "worktree-state", script: "return readState({});", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const state = result.details.value as { name?: string; path: string; branch: string; base: string; head: string; dirty: boolean };
+  assert.equal(state.name, "registered");
+  assert.match(state.path, /worktrees/);
+  assert.match(state.branch, /pi-extensible-workflows/);
+  assert.equal(state.head, state.base);
+  assert.equal(state.dirty, false);
+});
 
 void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-"));

@@ -149,6 +149,7 @@
             <tr><td><code>log(message)</code></td><td>Add a TUI-only transcript entry, capped at 4 KB.</td></tr>
             <tr><td><code>checkpoint(input)</code></td><td>Wait for an approval or rejection.</td></tr>
             <tr><td><code>withWorktree(callback)</code> or <code>withWorktree(name, callback)</code></td><td>Create one shared or separately named worktree scope lazily.</td></tr>
+            <tr><td><code>worktreeState()</code></td><td>Read fresh host-derived Git state inside the current worktree scope.</td></tr>
           </tbody>
         </table></div>
         <h3>Agent options</h3>
@@ -298,6 +299,16 @@ Focus on correctness and regressions.</code></pre>
 <span class="tok-keyword">if</span> (decision !== <span class="tok-string">"approved"</span>) <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">approved</span><span class="tok-punctuation">:</span> <span class="tok-boolean">false</span> <span class="tok-punctuation">}</span>;</code></pre>
         <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Sandboxed workflow scripts receive <code>"approved"</code> or <code>"rejected"</code> from direct <code>checkpoint()</code>; registered workflow functions receive a boolean from <code>WorkflowOrchestrationContext.checkpoint</code>. Responses are journaled and replay after cold recovery.</p>
         <p>Use <code>withWorktree(name, callback)</code> for canonical worktree scopes: put collaborating top-level agents in one named callback, or put each independent parallel branch in its own named callback. The runtime creates deterministic owned branches and worktrees lazily; the caller branch is unchanged, children and retries reuse the enclosing scope, and recovery preserves the existing ownership and cleanup behavior.</p>
+        <p><code>worktreeState()</code> is available only inside an active worktree scope. It returns the host-derived <code>name</code> (for named scopes), <code>path</code>, <code>branch</code>, <code>base</code>, current <code>head</code>, and <code>dirty</code> state. The first read creates the validated worktree lazily; later reads are fresh, read-only Git inspection. Read it after awaited development, not in a parallel sibling, or it can race the developer.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> results = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"issues"</span>, <span class="tok-punctuation">{</span>
+  issue81: () <span class="tok-punctuation">=&gt;</span> <span class="tok-function">withWorktree</span>(<span class="tok-string">"issue-81"</span>, <span class="tok-keyword">async</span> () <span class="tok-punctuation">=&gt;</span> <span class="tok-punctuation">{</span>
+    <span class="tok-keyword">const</span> devResult = <span class="tok-keyword">await</span> <span class="tok-function">developUntilApproved</span>(<span class="tok-punctuation">{</span> task: <span class="tok-string">"Resolve issue #81"</span> <span class="tok-punctuation">}</span>);
+    <span class="tok-keyword">const</span> worktree = <span class="tok-keyword">await</span> <span class="tok-function">worktreeState</span>();
+    <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> devResult, worktree <span class="tok-punctuation">}</span>;
+  <span class="tok-punctuation">}</span>),
+<span class="tok-punctuation">}</span>);
+<span class="tok-keyword">return</span> <span class="tok-function">agent</span>(<span class="tok-function">prompt</span>(<span class="tok-string">"Merge these verified worktrees: {results}"</span>, <span class="tok-punctuation">{</span> results <span class="tok-punctuation">}</span>));</code></pre>
+        <p>Registered functions use the same scoped operation as <code>context.worktreeState()</code>.</p>
         <h3 id="agent-observability">Agent grouping and drilldown</h3>
         <p>The live workflow card and <code>/workflow</code> group agents by their structural workflow path and include registered-function context as a breadcrumb. Groups remain stable as later agents start, creation order is preserved inside each group, and actual parent-child agents remain nested.</p>
         <p>The navigator's agent picker opens contextual actions for the selected agent: view or copy its transcript, copy its agent ID, and, when it owns a worktree, copy that branch or worktree path. Worktree ownership IDs and per-worktree copy actions are not exposed in the top-level run menu.</p>

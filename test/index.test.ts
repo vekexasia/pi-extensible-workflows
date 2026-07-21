@@ -2265,6 +2265,18 @@ void test("withWorktree returns bare values and propagates one owner through par
   assert.ok(scoped[0]?.worktreeOwner);
   assert.equal(identities.find(({ prompt }) => prompt === "outside")?.worktreeOwner, undefined);
 });
+void test("worktreeState reads only the active scope and rejects indirect or argument calls", async () => {
+  const owners: string[] = [];
+  const bridge = { worktreeState: async (owner: string) => { owners.push(owner); return { ...(owner === "worktree/named/shared" ? { name: "shared" } : {}), path: `/worktrees/${String(owners.length)}`, branch: "branch", base: "base", head: `head-${String(owners.length)}`, dirty: owners.length === 2 }; } };
+  assert.deepEqual(await runWorkflow(`return await withWorktree("shared", async () => worktreeState());`, null, bridge).result, { name: "shared", path: "/worktrees/1", branch: "branch", base: "base", head: "head-1", dirty: false });
+  assert.deepEqual(await runWorkflow(`return await withWorktree(async () => worktreeState());`, null, bridge).result, { path: "/worktrees/2", branch: "branch", base: "base", head: "head-2", dirty: true });
+  assert.equal(owners[0], "worktree/named/shared");
+  assert.match(owners[1] ?? "", /^worktree\/unnamed\/callsite%3A\d+%3A\d+\/occurrence%3A1$/);
+  await assert.rejects(runWorkflow(`return worktreeState();`, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(runWorkflow(`const alias = worktreeState; return withWorktree("shared", async () => alias());`, null, bridge).result, /direct worktreeState.*aliases.*unsupported/i);
+  await assert.rejects(runWorkflow(`return await withWorktree("shared", async () => worktreeState("path"));`, null, bridge).result, /does not accept arguments/i);
+  assert.throws(() => preflight(`worktreeState("path")`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+});
 
 void test("withWorktree validates calls, keeps empty scopes empty, and replays unnamed identity", async () => {
   const emptyOwners: string[] = [];
@@ -2392,12 +2404,12 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { run, invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run, invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree", "worktreeState"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
 });
 void test("registered function context.invoke validates nested calls and replays completed children", async () => {
@@ -2415,7 +2427,7 @@ void test("registered function context.invoke validates nested calls and replays
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
   const parentPath = "function/outer/1";
   const occurrences = new Map<string, number>();
-  const context: WorkflowFunctionContext = { run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
   assert.equal(leafCalls, 1);
   occurrences.clear();
@@ -2574,7 +2586,7 @@ void test("rejects global collisions, invalid metadata, schemas, input, and outp
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
-  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(registry.invokeFunction("run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });

@@ -81,6 +81,34 @@ void test("reclaims an orphaned worktree transaction before retrying", async () 
   const records = JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")) as Array<{ owner: string }>;
   assert.equal(records[0]?.owner, "agent");
 });
+void test("worktreeState reads fresh Git state from validated named and unnamed worktrees", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-state-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const namedOwner = "worktree/named/issue-83";
+  const named = await store.worktree(namedOwner);
+  const clean = await store.worktreeState(namedOwner);
+  assert.deepEqual(clean, { name: "issue-83", path: named.path, branch: named.branch, base: named.base, head: named.base, dirty: false });
+  writeFileSync(join(named.cwd, "untracked.txt"), "untracked");
+  const dirty = await store.worktreeState(namedOwner);
+  assert.equal(dirty.head, named.base);
+  assert.equal(dirty.dirty, true);
+  const unnamedOwner = "worktree/unnamed/scope";
+  const unnamed = await store.worktree(unnamedOwner);
+  const unnamedState = await store.worktreeState(unnamedOwner);
+  assert.equal(unnamedState.name, undefined);
+  assert.equal(unnamedState.path, unnamed.path);
+  assert.equal(unnamedState.branch, unnamed.branch);
+  assert.equal(unnamedState.base, unnamed.base);
+});
 void test("stores exact cwd and Pi session snapshots atomically and rejects cross-session loading", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-store-"));
   const cwd = join(home, "same-name");
