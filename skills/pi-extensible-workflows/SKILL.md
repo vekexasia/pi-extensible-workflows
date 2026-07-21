@@ -37,7 +37,7 @@ To pass structured input from the main agent, include `args`:
 { "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue`; omitted `args` is `null`.
-Use `workflow_stop` with the exact run ID to stop an active background run from the current Pi session.
+Use `workflow_stop` with the exact run ID to stop an active background run from the current Pi session. A foreground workflow result keeps its value and also exposes the completed `runId`; background launches return it immediately. Pass a terminal `parentRunId` to reuse matching explicitly named `withWorktree` scopes from that run; unnamed scopes and missing names remain new worktrees.
 If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, registered workflows, and configured model aliases as needed for the rest of that task. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.
 
 Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.

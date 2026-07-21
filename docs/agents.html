@@ -46,7 +46,7 @@
   <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"releaseCheck"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call.</p>
+        <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call; the model-visible foreground result also reports its completed <code>runId</code>. Pass <code>parentRunId</code> with a terminal run ID to reuse matching explicitly named <code>withWorktree</code> scopes from that run. The source must be in the same project and Pi session; unmatched names create ordinary worktrees.</p>
       </section>
       <section id="script-contract">
         <h2>Script and argument contract</h2>
@@ -63,7 +63,8 @@
         <h3>Development</h3>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"implement-feature"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"return await withWorktree('implementation', async () =&gt; parallel('implementation', { code: () =&gt; agent('Implement the feature'), tests: () =&gt; agent('Add integration tests') }));"</span>
+  <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"return await withWorktree('implementation', async () =&gt; parallel('implementation', { code: () =&gt; agent('Implement the feature'), tests: () =&gt; agent('Add integration tests') }));"</span><span class="tok-punctuation">,</span>
+  <span class="tok-property">"parentRunId"</span><span class="tok-punctuation">:</span> <span class="tok-string">"previous-terminal-run-id"</span>
 <span class="tok-punctuation">}</span></code></pre>
         <h3>Review</h3>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> reports = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"review"</span>, <span class="tok-punctuation">{</span>
