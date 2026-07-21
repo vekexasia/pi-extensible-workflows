@@ -2506,6 +2506,51 @@ void test("foreground workflow failures preserve codes while returning main-agen
   await assert.rejects(tool.execute("id", { name: "custom", script: "throw new Error('The release was rejected by the approval gate.');", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The release was rejected by the approval gate.");
   await assert.rejects(tool.execute("id", { name: "value", script: "throw 'plain thrown value';", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The workflow encountered an internal error: plain thrown value.");
 });
+void test("foreground failures patch finalized tool results with bounded diagnostics", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  type ToolResultHandler = (event: object, ctx: object) => Promise<{ content?: readonly object[]; details?: unknown; isError?: boolean } | undefined> | { content?: readonly object[]; details?: unknown; isError?: boolean } | undefined;
+  const tools: Tool[] = [];
+  let toolResultHandler: ToolResultHandler | undefined;
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-failure-diagnostics-"));
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: `diagnostic-${input.sessionLabel}`, sessionFile: `/sessions/${input.sessionLabel}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    async prompt() { if (input.sessionLabel.includes(":bad:")) throw new Error(`provider failed ${"😀".repeat(5000)}`); },
+    steer: async () => {},
+    dispose() {},
+  });
+  workflowExtension({
+    registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {},
+    on(name: string, handler: unknown) { if (name === "tool_result") toolResultHandler = handler as ToolResultHandler; },
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"],
+  } as never, home, async () => {}, createSession);
+  const tool = tools.find(({ name }) => name === "workflow");
+  assert.ok(tool && toolResultHandler);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(tool.execute("workflow-call", { name: "diagnostics", script: `return parallel("reviewers", { good: () => agent("good", {label:"good"}), bad: () => agent("bad", {label:"bad"}) });`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const patched = await toolResultHandler({ type: "tool_result", toolName: "workflow", toolCallId: "workflow-call", input: {}, content: [{ type: "text", text: "old" }], details: {}, isError: true }, {});
+  assert.ok(patched);
+  const result = patched as { content: Array<{ text: string }>; details: Record<string, unknown>; isError: boolean };
+  const diagnostic = JSON.parse(result.content[0]?.text ?? "null") as { runId: string; workflowName: string; state: string; failedAt: string | null; error: { code: string; message: string }; failedAgent?: { role?: string; structuralPath: string[]; attempt: number; sessionFile?: string }; completedSiblingPaths: string[][]; artifacts: { statePath: string; journalPath: string } };
+  assert.deepEqual(result.details, diagnostic);
+  assert.equal(result.isError, true);
+  assert.equal(diagnostic.workflowName, "diagnostics");
+  assert.equal(diagnostic.state, "failed");
+  assert.match(diagnostic.failedAt ?? "", /bad/);
+  assert.equal(diagnostic.error.code, "AGENT_FAILED");
+  assert.match(diagnostic.error.message, /provider failed/);
+  assert.ok(diagnostic.failedAgent);
+  assert.equal(diagnostic.failedAgent.role, undefined);
+  assert.deepEqual(diagnostic.failedAgent.structuralPath, ["reviewers", "bad"]);
+  assert.equal(diagnostic.failedAgent.attempt, 1);
+  assert.match(diagnostic.failedAgent.sessionFile ?? "", /diagnostics:bad:attempt-1/);
+  assert.deepEqual(diagnostic.completedSiblingPaths, [["reviewers", "good"]]);
+  assert.match(diagnostic.artifacts.statePath, /state\.json$/);
+  assert.match(diagnostic.artifacts.journalPath, /journal\.json$/);
+  assert.ok(Buffer.byteLength(result.content[0]?.text ?? "") <= 4096);
+  assert.doesNotMatch(result.content[0]?.text ?? "", /�/);
+});
 void test("background failures and workflow responses deliver prose to the main agent", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
   const tools: Tool[] = [];
@@ -2517,10 +2562,12 @@ void test("background failures and workflow responses deliver prose to the main 
   const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   await tool.execute("id", { name: "custom-background", script: "throw Object.assign(new Error('The approval gate rejected the release.'), {code:'ENOSPC'});" }, new AbortController().signal, undefined, context);
   await tool.execute("id", { name: "value-background", script: "throw 'background value';" }, new AbortController().signal, undefined, context);
-  for (let attempt = 0; attempt < 100 && delivered.filter((message) => message.includes("failed:")).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.ok(delivered.some((message) => message.includes("The approval gate rejected the release.")));
-  assert.ok(delivered.some((message) => message.includes("background value")));
-  assert.ok(delivered.filter((message) => message.includes("failed:")).every((message) => !ERROR_CODES.some((code) => message.includes(code))));
+  for (let attempt = 0; attempt < 100 && delivered.filter((message) => message.includes("failure diagnostics:")).length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  const diagnostics = delivered.filter((message) => message.includes("failure diagnostics:")).map((message) => JSON.parse(message.slice(message.indexOf("{"))) as { runId: string; state: string; error: { code: string; message: string } });
+  assert.equal(diagnostics.length, 2);
+  assert.ok(diagnostics.some(({ error }) => error.message.includes("The approval gate rejected the release.")));
+  assert.ok(diagnostics.some(({ error }) => error.message.includes("background value")));
+  assert.ok(diagnostics.every(({ runId, state, error }) => runId && state === "failed" && ERROR_CODES.includes(error.code as (typeof ERROR_CODES)[number])));
 });
 void test("workflow_respond keeps asynchronous failures on the prose delivery path", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
@@ -2540,7 +2587,15 @@ void test("workflow_respond keeps asynchronous failures on the prose delivery pa
   assert.equal(response.details?.accepted, true);
   for (let attempt = 0; attempt < 100 && !delivered.some((message) => message.includes("The release was rejected after approval.")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(delivered.some((message) => message.includes("The release was rejected after approval.")));
-  assert.ok(delivered.every((message) => !message.includes("INTERNAL_ERROR")));
+  const diagnosticMessage = delivered.find((message) => message.includes("failure diagnostics:"));
+  assert.ok(diagnosticMessage);
+  const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as { runId: string; state: string; error: { code: string; message: string }; artifacts: { statePath: string; journalPath: string } };
+  assert.equal(diagnostic.runId, runId);
+  assert.equal(diagnostic.state, "failed");
+  assert.equal(diagnostic.error.code, "INTERNAL_ERROR");
+  assert.equal(diagnostic.error.message, "The release was rejected after approval.");
+  assert.match(diagnostic.artifacts.statePath, /state\.json$/);
+  assert.match(diagnostic.artifacts.journalPath, /journal\.json$/);
 });
 
 type BudgetMessage = { role: string; content: unknown; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };

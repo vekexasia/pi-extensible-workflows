@@ -101,6 +101,28 @@ export class WorkflowError extends Error {
   constructor(public readonly code: WorkflowErrorCode, message: string) { super(message); this.name = "WorkflowError"; }
 }
 
+export interface WorkflowFailureAgent {
+  id: string;
+  label?: string;
+  role?: string;
+  structuralPath: readonly string[];
+  attempt: number;
+  sessionId?: string;
+  sessionFile?: string;
+}
+export interface WorkflowFailureDiagnostics {
+  runId: string;
+  workflowName: string;
+  state: RunState;
+  failedAt: string | null;
+  error: WorkflowErrorShape;
+  failedAgent?: WorkflowFailureAgent;
+  completedSiblingPaths: readonly (readonly string[])[];
+  artifacts: { runDirectory: string; statePath: string; journalPath: string };
+}
+
+const WORKFLOW_FAILURE_DIAGNOSTICS = Symbol("workflowFailureDiagnostics");
+
 const WORKFLOW_AUTHORED_ERROR = Symbol("workflowAuthoredError");
 type WorkerErrorShape = WorkflowErrorShape & { authored?: boolean; failedAt?: string };
 
@@ -1926,12 +1948,93 @@ function utf8Prefix(value: string, maxBytes: number): string {
   while (end < bytes.length && end > 0 && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
   return bytes.subarray(0, end).toString("utf8");
 }
+const DIAGNOSTIC_LIMIT_BYTES = DELIVERY_LIMIT_BYTES - 512;
+function failureDiagnosticsFrom(error: unknown): WorkflowFailureDiagnostics | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  return (error as { [WORKFLOW_FAILURE_DIAGNOSTICS]?: WorkflowFailureDiagnostics })[WORKFLOW_FAILURE_DIAGNOSTICS];
+}
 
+function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): WorkflowFailureDiagnostics {
+  let bounded: WorkflowFailureDiagnostics = {
+    runId: utf8Prefix(value.runId, 128),
+    workflowName: utf8Prefix(value.workflowName, 256),
+    state: value.state,
+    failedAt: value.failedAt === null ? null : utf8Prefix(value.failedAt, 1024),
+    error: { code: value.error.code, message: utf8Prefix(value.error.message, 1024) },
+    ...(value.failedAgent ? { failedAgent: {
+      id: utf8Prefix(value.failedAgent.id, 128),
+      ...(value.failedAgent.label ? { label: utf8Prefix(value.failedAgent.label, 128) } : {}),
+      ...(value.failedAgent.role ? { role: utf8Prefix(value.failedAgent.role, 128) } : {}),
+      structuralPath: value.failedAgent.structuralPath.slice(0, 8).map((part) => utf8Prefix(part, 128)),
+      attempt: value.failedAgent.attempt,
+      ...(value.failedAgent.sessionId ? { sessionId: utf8Prefix(value.failedAgent.sessionId, 256) } : {}),
+      ...(value.failedAgent.sessionFile ? { sessionFile: utf8Prefix(value.failedAgent.sessionFile, 1024) } : {}),
+    } } : {}),
+    completedSiblingPaths: value.completedSiblingPaths.slice(0, 16).map((path) => path.slice(0, 8).map((part) => utf8Prefix(part, 128))),
+    artifacts: { runDirectory: utf8Prefix(value.artifacts.runDirectory, 1024), statePath: utf8Prefix(value.artifacts.statePath, 1024), journalPath: utf8Prefix(value.artifacts.journalPath, 1024) },
+  };
+  const size = () => Buffer.byteLength(JSON.stringify(bounded));
+  while (size() > DIAGNOSTIC_LIMIT_BYTES) {
+    if (bounded.completedSiblingPaths.length) { bounded = { ...bounded, completedSiblingPaths: bounded.completedSiblingPaths.slice(0, -1) }; continue; }
+    if (bounded.failedAgent?.sessionFile) { const failedAgent = { ...bounded.failedAgent }; delete failedAgent.sessionFile; bounded = { ...bounded, failedAgent }; continue; }
+    if (bounded.failedAgent?.sessionId) { const failedAgent = { ...bounded.failedAgent }; delete failedAgent.sessionId; bounded = { ...bounded, failedAgent }; continue; }
+    if (Buffer.byteLength(bounded.artifacts.runDirectory) > 256) { bounded = { ...bounded, artifacts: { ...bounded.artifacts, runDirectory: utf8Prefix(bounded.artifacts.runDirectory, 256) } }; continue; }
+    if (Buffer.byteLength(bounded.error.message) > 256) { bounded = { ...bounded, error: { ...bounded.error, message: utf8Prefix(bounded.error.message, 256) } }; continue; }
+    if (bounded.failedAt !== null && Buffer.byteLength(bounded.failedAt) > 256) { bounded = { ...bounded, failedAt: utf8Prefix(bounded.failedAt, 256) }; continue; }
+    if (bounded.failedAgent && bounded.failedAgent.structuralPath.length > 4) { bounded = { ...bounded, failedAgent: { ...bounded.failedAgent, structuralPath: bounded.failedAgent.structuralPath.slice(0, 4) } }; continue; }
+    if (bounded.failedAgent?.structuralPath.some((part) => Buffer.byteLength(part) > 64)) { bounded = { ...bounded, failedAgent: { ...bounded.failedAgent, structuralPath: bounded.failedAgent.structuralPath.map((part) => utf8Prefix(part, 64)) } }; continue; }
+    if (Buffer.byteLength(bounded.artifacts.statePath) > 512 || Buffer.byteLength(bounded.artifacts.journalPath) > 512) { bounded = { ...bounded, artifacts: { ...bounded.artifacts, statePath: utf8Prefix(bounded.artifacts.statePath, 512), journalPath: utf8Prefix(bounded.artifacts.journalPath, 512) } }; continue; }
+    if (Buffer.byteLength(bounded.workflowName) > 128) { bounded = { ...bounded, workflowName: utf8Prefix(bounded.workflowName, 128) }; continue; }
+    break;
+  }
+  return bounded;
+}
+
+function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMetadata, error: unknown, run: PersistedRun): WorkflowFailureDiagnostics {
+  const rawFailedAt = error && typeof error === "object" ? (error as { failedAt?: unknown }).failedAt : undefined;
+  const failedAt = typeof rawFailedAt === "string" && rawFailedAt ? rawFailedAt : null;
+  const failedAgents = run.agents.filter((agent) => agent.state === "failed");
+  const failedAgentRecord = failedAgents.find((agent) => {
+    if (failedAt === null) return false;
+    try { return failedAt.includes(`${operationPath("agent", ...(agent.structuralPath ?? []))}/`); } catch { return false; }
+  }) ?? failedAgents.at(-1);
+  const failedAttempt = failedAgentRecord ? [...(failedAgentRecord.attemptDetails ?? [])].reverse().find((attempt) => attempt.error) ?? failedAgentRecord.attemptDetails?.at(-1) : undefined;
+  const failedAgent = failedAgentRecord ? {
+    id: failedAgentRecord.id,
+    ...(failedAgentRecord.label ?? failedAgentRecord.name ? { label: failedAgentRecord.label ?? failedAgentRecord.name } : {}),
+    ...(failedAgentRecord.role ? { role: failedAgentRecord.role } : {}),
+    structuralPath: [...(failedAgentRecord.structuralPath ?? [])],
+    attempt: Math.max(1, failedAttempt?.attempt ?? failedAgentRecord.attempts),
+    ...(failedAttempt?.sessionId ? { sessionId: failedAttempt.sessionId } : {}),
+    ...(failedAttempt?.sessionFile ? { sessionFile: failedAttempt.sessionFile } : {}),
+  } satisfies WorkflowFailureAgent : undefined;
+  const completedSiblingPaths = run.agents.filter((agent) => {
+    if (agent.state !== "completed" || agent.id === failedAgentRecord?.id) return false;
+    return failedAgentRecord?.parentId === undefined ? agent.parentId === undefined : agent.parentId === failedAgentRecord.parentId;
+  }).map((agent) => [...(agent.structuralPath ?? [])]);
+  return boundedWorkflowFailureDiagnostics({
+    runId: run.id, workflowName: metadata.name, state: run.state, failedAt,
+    error: { code: errorCode(error) ?? "INTERNAL_ERROR", message: errorText(error) || "The workflow failed without an error message." },
+    ...(failedAgent ? { failedAgent } : {}), completedSiblingPaths,
+    artifacts: { runDirectory: store.directory, statePath: join(store.directory, "state.json"), journalPath: join(store.directory, "journal.json") },
+  });
+}
+
+export function formatWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string {
+  const failedAgent = diagnostic.failedAgent ? `${diagnostic.failedAgent.label ?? diagnostic.failedAgent.id}${diagnostic.failedAgent.role ? ` role=${diagnostic.failedAgent.role}` : ""} attempt=${String(diagnostic.failedAgent.attempt)} path=${diagnostic.failedAgent.structuralPath.join(" > ") || "(root)"}${diagnostic.failedAgent.sessionFile ? ` session=${diagnostic.failedAgent.sessionFile}` : ""}` : "(not persisted)";
+  const siblings = diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
+  return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling paths: ${siblings}`, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
+}
+
+function serializeWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string { return JSON.stringify(diagnostic); }
+function isWorkflowFailureDiagnostics(value: unknown): value is WorkflowFailureDiagnostics {
+  return object(value) && typeof value.runId === "string" && typeof value.workflowName === "string" && typeof value.state === "string" && "failedAt" in value && object(value.error) && object(value.artifacts);
+}
 function deliver(pi: ExtensionAPI, content: string): void {
   pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
 }
-function deliverFailure(pi: ExtensionAPI, name: string, error: unknown): void {
-  deliver(pi, `Workflow ${name} failed: ${formatWorkflowFailure(error)}`);
+function deliverFailure(pi: ExtensionAPI, diagnostic: WorkflowFailureDiagnostics): void {
+  deliver(pi, `Workflow ${utf8Prefix(diagnostic.workflowName, 128)} failure diagnostics: ${serializeWorkflowFailureDiagnostics(diagnostic)}`);
 }
 
 type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -2251,6 +2354,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   });
   type BudgetDecisionResult = { state: "running" | "budget_exhausted"; approved: boolean };
   const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; budgetResolvers: Map<string, (result: BudgetDecisionResult) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const pendingFailureDiagnostics = new Map<string, WorkflowFailureDiagnostics>();
+  pi.on("tool_result", (event) => {
+    if (event.toolName !== "workflow" || !event.isError) return;
+    const diagnostic = pendingFailureDiagnostics.get(event.toolCallId);
+    if (!diagnostic) return;
+    pendingFailureDiagnostics.delete(event.toolCallId);
+    return { content: [{ type: "text" as const, text: serializeWorkflowFailureDiagnostics(diagnostic) }], details: diagnostic, isError: true };
+  });
   const liveActivities = new Map<string, Map<string, AgentActivity>>();
   const setLiveActivity = (runId: string, agentId: string, activity?: AgentActivity) => {
     const activities = liveActivities.get(runId);
@@ -2630,7 +2741,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const state = run.lifecycle.state === "stopped" || run.lifecycle.state === "interrupted" || run.lifecycle.state === "budget_exhausted" ? run.lifecycle.state : "failed";
       await eventPublisher.runFailed(run.store, run.metadata, typed, state);
       run.update?.(workflowToolUpdate(persisted));
-      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) deliverFailure(pi, run.metadata.name, error);
+      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) deliverFailure(pi, createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted));
     });
     void completion;
   };
@@ -2748,7 +2859,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     description: WORKFLOW_TOOL_DESCRIPTION,
     promptSnippet: WORKFLOW_TOOL_PROMPT_SNIPPET,
     parameters: WORKFLOW_TOOL_PARAMETERS,
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
       const settingsPath = workflowSettingsPath();
       const defaults = loadSettings(settingsPath);
@@ -2850,16 +2961,23 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await scheduler.flush();
         const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error));
         if (!["stopped", "interrupted", "budget_exhausted"].includes(lifecycle.state)) await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
-        await persistRunState(store, checked.metadata, (current) => ({ ...current, ...budgetRuntime.snapshot(), error: { code: typed.code, message: typed.message } }));
+        const persisted = await persistRunState(store, checked.metadata, (current) => ({ ...current, ...budgetRuntime.snapshot(), error: { code: typed.code, message: typed.message } }));
         const state = lifecycle.state === "stopped" || lifecycle.state === "interrupted" || lifecycle.state === "budget_exhausted" ? lifecycle.state : "failed";
         await eventPublisher.runFailed(store, checked.metadata, typed, state);
+        const diagnostic = createWorkflowFailureDiagnostics(store, checked.metadata, typed, persisted);
+        Object.defineProperty(typed, WORKFLOW_FAILURE_DIAGNOSTICS, { value: diagnostic });
+        if (params.foreground) pendingFailureDiagnostics.set(toolCallId, diagnostic);
         throw typed;
       });
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).completion = finish;
       if (background) {
         void finish.then(async ({ value, resultPath }) => {
           deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
-        }, (error: unknown) => { deliverFailure(pi, checked.metadata.name, error); });
+        }, (error: unknown) => {
+          const diagnostic = failureDiagnosticsFrom(error);
+          if (diagnostic) deliverFailure(pi, diagnostic);
+          else deliver(pi, `Workflow ${checked.metadata.name} failed: ${formatWorkflowFailure(error)}`);
+        });
         return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` } };
       }
       const { value } = await finish;
@@ -2873,18 +2991,20 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       return textBlock(formatWorkflowPreview(args));
     },
     renderResult(result, { isPartial }, _theme, context) {
-      const details = result.details as { run?: PersistedRun; value?: JsonValue; preview?: string } | undefined;
+      const details = result.details;
+      if (isWorkflowFailureDiagnostics(details)) return textBlock(formatWorkflowFailureDiagnostics(details));
+      const runDetails = details as { run?: PersistedRun; value?: JsonValue; preview?: string } | undefined;
       const state = context.state as { workflowSpinner?: ReturnType<typeof setInterval> };
-      if (details?.run && isPartial && details.run.state === "running" && !state.workflowSpinner) {
+      if (runDetails?.run && isPartial && runDetails.run.state === "running" && !state.workflowSpinner) {
         state.workflowSpinner = setInterval(context.invalidate, 80);
         state.workflowSpinner.unref();
-      } else if ((!isPartial || details?.run?.state !== "running") && state.workflowSpinner) {
+      } else if ((!isPartial || runDetails?.run?.state !== "running") && state.workflowSpinner) {
         clearInterval(state.workflowSpinner);
         delete state.workflowSpinner;
       }
-      if (details?.run) return workflowProgressBlock(details.run);
+      if (runDetails?.run) return workflowProgressBlock(runDetails.run);
       const content = result.content[0];
-      return textBlock(isPartial ? "Workflow starting..." : details?.preview ?? (content?.type === "text" ? content.text : "Workflow finished"));
+      return textBlock(isPartial ? "Workflow starting..." : runDetails?.preview ?? (content?.type === "text" ? content.text : "Workflow finished"));
     },
   });
   pi.registerCommand("workflow", {
