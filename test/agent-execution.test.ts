@@ -213,6 +213,17 @@ void test("fails native terminal provider errors before structured finalization"
   assert.ok(failedAttempt);
   assert.deepEqual(failedAttempt.error, { code: "AGENT_FAILED", message: errorMessage });
 });
+void test("falls back when a terminal provider error omits errorMessage", async () => {
+  const messages = [{ ...assistant(""), stopReason: "error" }];
+  const executor = new WorkflowAgentExecutor(root, async () => ({ sessionId: "terminal-without-message", sessionFile: "/sessions/terminal-without-message.jsonl", messages, getSessionStats: sessionStats, async prompt() {}, dispose() {} }));
+  let attempts: readonly { error?: { code: string; message: string } }[] | undefined;
+  await assert.rejects(executor.execute("work", { label: "worker", workflowName: "flow" }), (error: unknown) => {
+    if (!(error instanceof WorkflowError)) return false;
+    attempts = (error as WorkflowError & { attempts?: typeof attempts }).attempts;
+    return error.code === "AGENT_FAILED" && error.message === "Native Pi assistant ended with a terminal provider error";
+  });
+  assert.deepEqual(attempts?.[0]?.error, { code: "AGENT_FAILED", message: "Native Pi assistant ended with a terminal provider error" });
+});
 
 void test("fails terminal provider errors during finalization without repair", async () => {
   const errorMessage = "OAuth refresh failed during finalization";

@@ -730,7 +730,7 @@ void test("restart recovers every persisted nonterminal run state", async () => 
     assert.equal(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), `run-${String(index)}`);
   }
 });
-void test("cold-resumed failures deliver custom errors as prose while persistence keeps codes", async () => {
+void test("cold-resumed failures deliver structured diagnostics while persistence keeps codes", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-recovery-failure-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
@@ -748,6 +748,13 @@ void test("cold-resumed failures deliver custom errors as prose while persistenc
   const loaded = await store.load();
   assert.equal(loaded.run.state, "failed");
   assert.deepEqual(loaded.run.error, { code: "INTERNAL_ERROR", message });
-  assert.ok(messages.some((value) => value.includes(message)));
-  assert.ok(messages.every((value) => !value.includes("INTERNAL_ERROR")));
+  const diagnosticMessage = messages.find((value) => value.includes("failure diagnostics:"));
+  assert.ok(diagnosticMessage);
+  const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as { runId: string; state: string; error: { code: string; message: string }; artifacts: { statePath: string; journalPath: string } };
+  assert.equal(diagnostic.runId, "run-a");
+  assert.equal(diagnostic.state, "failed");
+  assert.equal(diagnostic.error.code, "INTERNAL_ERROR");
+  assert.equal(diagnostic.error.message, message);
+  assert.match(diagnostic.artifacts.statePath, /state\.json$/);
+  assert.match(diagnostic.artifacts.journalPath, /journal\.json$/);
 });
