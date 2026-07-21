@@ -3328,7 +3328,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     tui.requestRender();
                   },
                 };
-              });
+              }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } });
               continue;
             }
             if (actionChoice === "View transcript") {
@@ -3398,7 +3398,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     tui.requestRender();
                   },
                 };
-              });
+              }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } });
               if (decision) {
                 const accepted = await answerCheckpoint(store.runId, checkpoint.name, decision === "Approve", true);
                 if (!accepted) ctx.ui.notify("Checkpoint is not awaiting a response.", "warning");
