@@ -23,7 +23,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
       return 0;
     } catch (error) { write(`Error: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
   }
-  write("Usage: pi-extensible-workflows doctor | inspect [session-id]\n");
+  write("Usage: pi-extensible-workflows doctor | inspect [session-id] | transcript <session-file>\n");
   return 1;
 }
 

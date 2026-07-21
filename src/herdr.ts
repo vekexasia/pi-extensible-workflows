@@ -61,7 +61,7 @@ export async function openHerdrPane(request: HerdrPaneRequest, runner: HerdrComm
   if (!request.cwd) throw new Error("Pane actions require a working directory.");
   if ((request.action === "inspect" && !request.sessionId) || (request.action !== "inspect" && !request.original)) throw new Error("Pane action is missing its session source.");
   const layout = paneLayout(json(await runner(["pane", "layout", "--pane", targetPane])), targetPane);
-  const direction = layout.width >= layout.height ? "right" : "down";
+  const direction = layout.width > layout.height ? "right" : "down";
   const paneId = splitPaneId(json(await runner(["pane", "split", targetPane, "--direction", direction, "--no-focus"])));
   try {
     await runner(["pane", "run", paneId, commandFor(request)]);

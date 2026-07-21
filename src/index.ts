@@ -3557,7 +3557,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   const running = !SETTLED_AGENT_STATES.has(selected.state);
                   if (action === "Fork as Pi session in pane" && running && !await ctx.ui.confirm("Fork running attempt?", "This attempt is still running. The snapshot may end mid-turn and will not receive later updates. It opens read-only to avoid concurrent changes to the workflow agent's working directory. Continue?")) continue;
                   try {
-                    await openHerdrPane({ action: action === "Open transcript in pane" ? "transcript" : "fork", cwd: attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(action === "Fork as Pi session in pane" && running ? { readOnly: true } : {}) });
+                    await openHerdrPane({ action: action === "Open transcript in pane" ? "transcript" : "fork", cwd: worktree?.cwd ?? attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(action === "Fork as Pi session in pane" && running ? { readOnly: true } : {}) });
                     ctx.ui.notify(`${action === "Open transcript in pane" ? "Opened transcript" : "Forked Pi session"} in pane.`, "info");
                   } catch (error) {
                     ctx.ui.notify(`Cannot ${action === "Open transcript in pane" ? "open transcript" : "fork Pi session"} in pane: ${error instanceof Error ? error.message : String(error)}`, "warning");
