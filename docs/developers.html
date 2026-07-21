@@ -331,8 +331,9 @@ Focus on correctness and regressions.</code></pre>
         <h3>Doctor and inspector</h3>
         <pre><code class="language-shell"><span class="tok-command">npx</span> pi-extensible-workflows doctor
 <span class="tok-command">npx</span> pi-extensible-workflows inspect [session-id]
+<span class="tok-command">npx</span> pi-extensible-workflows transcript &lt;session-file&gt;
 <span class="tok-command">npm</span> run inspect -- [session-id]</code></pre>
-        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered workflows. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script.</p>
+        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered workflows. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
         <h3><code>/workflow</code> controls</h3>
         <pre><code class="language-text">/workflow doctor
 /workflow model-aliases
@@ -342,7 +343,7 @@ Focus on correctness and regressions.</code></pre>
 /workflow approve &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow reject &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
 /workflow delete &lt;run-id&gt;</code></pre>
-        <p>The navigator discovers only runs from the exact current cwd and Pi session. It exposes <code>Model aliases</code> even when no runs exist, groups agents by structural scope with agent-specific transcript and worktree actions, and shows budget status and adjustment controls only when relevant. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
+        <p>The navigator discovers only runs from the exact current cwd and Pi session. It exposes <code>Model aliases</code> even when no runs exist, groups agents by structural scope with agent-specific transcript and worktree actions, and shows budget status and adjustment controls only when relevant. In a Herdr-managed session, it can open the aggregate inspector, read-only transcripts, and Pi forks in a pane targeted by <code>HERDR_PANE_ID</code>; running forks require confirmation and use read-only tools. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
         <p>Invocation options override settings defaults, and the session-wide active-agent ceiling is 16. Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>CONFIG_ERROR</code>, <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, settings, or script issue before retrying.</p>
       </section>
       <section id="evaluation">

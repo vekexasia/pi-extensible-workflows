@@ -53,6 +53,10 @@ export function transcriptLines(entries: readonly SessionEntry[]): string[] {
   });
 }
 
+export function transcriptFileLines(path: string): string[] {
+  return transcriptLines(SessionManager.open(path).buildContextEntries());
+}
+
 function mergedModels(groups: readonly (readonly ModelUsage[])[]): ModelUsage[] {
   const totals = new Map<string, number>();
   for (const group of groups) for (const item of group) totals.set(item.model, (totals.get(item.model) ?? 0) + item.cost);
