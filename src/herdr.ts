@@ -43,7 +43,7 @@ function splitPaneId(value: unknown): string {
 }
 
 function commandFor(request: HerdrPaneRequest): string {
-  const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
+  const cliPath = fileURLToPath(new URL("./cli.js", import.meta.resolve("pi-extensible-workflows")));
   const environment = ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR"].flatMap((name) => process.env[name] === undefined ? [] : [`${name}=${shellQuote(process.env[name] ?? "")}`]);
   const command = request.action === "inspect"
     ? [shellQuote(process.execPath), shellQuote(cliPath), "inspect", shellQuote(request.sessionId ?? "")]

@@ -25,6 +25,7 @@ void test("targets the declared Herdr pane, chooses geometry, and escapes pane c
     assert.match(command, /PI_CODING_AGENT_SESSION_DIR='\/tmp\/session'\\''s dir'/);
     assert.match(command, /pi --fork '\/tmp\/original'\\''s\.jsonl' --tools 'read,grep,find,ls'/);
     assert.doesNotMatch(command, /npx/);
+    assert.match(herdrPaneCommand({ action: "transcript", cwd: "/tmp/work", original: "/tmp/transcript.jsonl" }), /\/dist\/src\/cli\.js' transcript/);
 
     const calls: string[][] = [];
     const runner = async (args: readonly string[]): Promise<string> => {
