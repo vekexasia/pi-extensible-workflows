@@ -92,6 +92,7 @@ void test("probes optional Pi host capabilities while preserving model registry 
   assert.ok(tool);
   const result = await tool.execute("id", { name: "capabilities", script: "return true;", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }] }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(result.content[0]?.text, "true");
+  assert.match(result.content[1]?.text ?? "", /^Workflow run ID: [0-9a-f-]+$/);
 });
 void test("registers workflow_catalog only for active non-empty registries", async () => {
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

@@ -256,6 +256,41 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", first.branch], { stdio: "ignore" }));
 });
 
+void test("reuses named worktrees through durable follow-up bindings without deleting borrowed checkouts", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-borrowed-worktree-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const owner = structuralPath("worktree", "named", "banana");
+  const source = new RunStore(repo, "session-a", "source", home);
+  await source.create({ ...run(repo), id: "source", state: "completed" }, snapshot);
+  const original = await source.worktree(owner);
+  const first = new RunStore(repo, "session-a", "follow-up", home);
+  await first.create({ ...run(repo), id: "follow-up", parentRunId: "source", state: "completed" }, snapshot);
+  const reused = await first.worktree(owner);
+  assert.deepEqual(reused, original);
+  assert.equal(await first.ownsWorktree(owner), false);
+  assert.deepEqual(await first.borrowedWorktrees(), [{ name: "banana", sourceRunId: "source", owner }]);
+  const missing = await first.worktree(structuralPath("worktree", "named", "apple"));
+  assert.notEqual(missing.path, original.path);
+  assert.equal(await first.ownsWorktree(structuralPath("worktree", "named", "apple")), true);
+  const second = new RunStore(repo, "session-a", "second-follow-up", home);
+  await second.create({ ...run(repo), id: "second-follow-up", parentRunId: "follow-up", state: "completed" }, snapshot);
+  assert.deepEqual(await second.worktree(owner), original);
+  assert.equal(existsSync(original.path), true);
+  await second.validateBorrowedWorktrees();
+  await first.delete(true);
+  assert.equal(existsSync(original.path), true);
+  await source.delete(true);
+  await assert.rejects(second.validateBorrowedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  await second.delete(true);
+});
+
 void test("preserves a pre-existing deterministic branch when creation fails", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-branch-collision-"));
   const repo = join(home, "repo");

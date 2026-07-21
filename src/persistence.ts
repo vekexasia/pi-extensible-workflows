@@ -26,6 +26,7 @@ export type PendingWorkflowDecision = BudgetApprovalRequest
 export type PersistedOwnershipNode = OwnershipRecord
 type Journal = { completed: Record<string, CompletedOperation>; awaiting?: Record<string, AwaitingCheckpoint>; decisions?: Record<string, PendingWorkflowDecision> };
 export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
+export interface BorrowedWorktreeBinding { name: string; sourceRunId: string; owner: string }
 
 const execute = promisify(execFile);
 const gitIdentity = {
@@ -191,12 +192,13 @@ export class RunStore {
   // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
   private stateWrite: Promise<void> = Promise.resolve();
   private worktreeWrite: Promise<void> = Promise.resolve();
+  private borrowedWorktreeWrite: Promise<void> = Promise.resolve();
   private snapshotWrite: Promise<void> = Promise.resolve();
   private launchSnapshotWrite: Promise<void> = Promise.resolve();
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptWrite: Promise<void> = Promise.resolve();
   private conversationWrite: Promise<void> = Promise.resolve();
-  constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, home = homedir()) {
+  constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
   }
@@ -212,6 +214,7 @@ export class RunStore {
       await atomicJson(join(temporary, "journal.json"), { completed: {}, awaiting: {}, decisions: {} });
       await atomicJson(join(temporary, "ownership.json"), []);
       await atomicJson(join(temporary, "worktrees.json"), []);
+      await atomicJson(join(temporary, "borrowed-worktrees.json"), []);
       await atomicJson(join(temporary, "state.json"), run);
       await atomicJson(join(temporary, "system-prompts.json"), { version: 1, entries: [] });
       await atomicJson(join(temporary, "conversations.json"), { version: 1, conversations: {} });
@@ -392,6 +395,24 @@ export class RunStore {
     return join(this.directory, `worktree-${key}.creating`);
   }
 
+  private namedWorktreeOwner(name: string): string {
+    if (!name.trim()) throw new WorkflowError("WORKTREE_FAILED", "Named worktree names must be non-empty");
+    return structuralPath("worktree", "named", name.trim());
+  }
+
+  private worktreeName(owner: string): string | undefined {
+    const prefix = `${structuralPath("worktree", "named")}/`;
+    if (!owner.startsWith(prefix)) return undefined;
+    const encoded = owner.slice(prefix.length);
+    if (!encoded || encoded.includes("/")) return undefined;
+    try {
+      const name = decodeURIComponent(encoded);
+      return name.trim() ? name : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private structuralWorktree(owner: string, record: unknown): WorktreeReference {
     if (!record || typeof record !== "object") throw new Error(`Invalid worktree record for ${owner}`);
     const candidate = record as Partial<WorktreeReference>;
@@ -400,6 +421,103 @@ export class RunStore {
     const relativeCwd = typeof candidate.path === "string" && typeof candidate.cwd === "string" ? relative(candidate.path, candidate.cwd) : "..";
     if (candidate.owner !== owner || typeof candidate.path !== "string" || typeof candidate.branch !== "string" || typeof candidate.cwd !== "string" || typeof candidate.base !== "string" || resolve(candidate.path) !== expected.path || candidate.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
     return candidate as WorktreeReference;
+  }
+
+  private async borrowedWorktreeRecords(wait = true): Promise<readonly BorrowedWorktreeBinding[]> {
+    if (wait) await this.borrowedWorktreeWrite;
+    const records = await json<unknown[]>(join(this.directory, "borrowed-worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+    if (!Array.isArray(records)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree bindings are invalid");
+    const seen = new Set<string>();
+    return records.map((record) => {
+      if (!record || typeof record !== "object") throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree binding is invalid");
+      const candidate = record as Partial<BorrowedWorktreeBinding>;
+      if (typeof candidate.name !== "string" || !candidate.name.trim() || typeof candidate.sourceRunId !== "string" || !candidate.sourceRunId || typeof candidate.owner !== "string" || candidate.owner !== this.namedWorktreeOwner(candidate.name)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree binding is invalid");
+      if (seen.has(candidate.name)) throw new WorkflowError("WORKTREE_FAILED", `Duplicate borrowed worktree binding for ${candidate.name}`);
+      seen.add(candidate.name);
+      return { name: candidate.name, sourceRunId: candidate.sourceRunId, owner: candidate.owner };
+    });
+  }
+
+  async borrowedWorktrees(): Promise<readonly BorrowedWorktreeBinding[]> { return this.borrowedWorktreeRecords(); }
+
+  private async borrowedWorktree(name: string): Promise<BorrowedWorktreeBinding | undefined> {
+    return (await this.borrowedWorktreeRecords()).find((binding) => binding.name === name);
+  }
+
+  private async sourceRun(sourceRunId: string): Promise<RunStore> {
+    if (!sourceRunId || sourceRunId === this.runId) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree source run is invalid");
+    const source = new RunStore(this.cwd, this.sessionId, sourceRunId, this.home);
+    try {
+      const loaded = await source.load();
+      if (!["completed", "failed", "stopped"].includes(loaded.run.state)) throw new Error(`Source run ${sourceRunId} is not terminal`);
+      return source;
+    } catch (error) {
+      if (error instanceof WorkflowError && error.code === "WORKTREE_FAILED") throw error;
+      throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async validateParentRun(parentRunId: string): Promise<void> { await this.sourceRun(parentRunId); }
+
+  private async ownedWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
+    const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+    const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
+    if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`);
+    const record = this.structuralWorktree(owner, matches[0]);
+    if (cwd !== undefined && resolve(cwd) !== resolve(record.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
+    await access(record.cwd);
+    return record;
+  }
+
+  private async resolveBorrowedWorktree(binding: BorrowedWorktreeBinding, seen: Set<string>): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string }> {
+    try {
+      const source = await this.sourceRun(binding.sourceRunId);
+      const resolved = await source.findNamedWorktree(binding.name, seen);
+      if (!resolved) throw new Error(`Missing named worktree ${binding.name} in source run ${binding.sourceRunId}`);
+      if (resolved.owner !== binding.owner) throw new Error(`Borrowed worktree binding does not match source owner for ${binding.name}`);
+      return resolved;
+    } catch (error) {
+      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async findNamedWorktree(name: string, seen: Set<string> = new Set()): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string } | undefined> {
+    const owner = this.namedWorktreeOwner(name);
+    if (seen.has(this.runId)) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree bindings contain a cycle");
+    const nextSeen = new Set(seen);
+    nextSeen.add(this.runId);
+    const binding = await this.borrowedWorktree(name);
+    if (binding) return this.resolveBorrowedWorktree(binding, nextSeen);
+    const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+    const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
+    if (matches.length === 0) return undefined;
+    try {
+      const reference = await this.ownedWorktree(owner);
+      return { reference, sourceRunId: this.runId, owner };
+    } catch (error) {
+      throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async resolveNamedWorktree(name: string, seen: Set<string> = new Set()): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string }> {
+    const resolved = await this.findNamedWorktree(name, seen);
+    if (!resolved) throw new WorkflowError("WORKTREE_FAILED", `Missing named worktree ${name}`);
+    return resolved;
+  }
+
+  async validateBorrowedWorktrees(): Promise<void> {
+    try {
+      const loaded = await this.load();
+      if (loaded.run.parentRunId !== undefined) await this.validateParentRun(loaded.run.parentRunId);
+      for (const binding of await this.borrowedWorktreeRecords()) await this.resolveBorrowedWorktree(binding, new Set([this.runId]));
+    } catch (error) {
+      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async ownsWorktree(owner: string): Promise<boolean> {
+    const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+    return records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner).length === 1;
   }
 
   private async cleanupMarker(markerPath: string): Promise<void> {
@@ -426,13 +544,14 @@ export class RunStore {
   async validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
     try {
       await this.load();
-      const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
-      const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
-      if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`);
-      const record = this.structuralWorktree(owner, matches[0]);
-      if (cwd !== undefined && resolve(cwd) !== resolve(record.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
-      await access(record.cwd);
-      return record;
+      const name = this.worktreeName(owner);
+      const binding = name ? await this.borrowedWorktree(name) : undefined;
+      if (binding) {
+        const resolved = await this.resolveBorrowedWorktree(binding, new Set([this.runId]));
+        if (cwd !== undefined && resolve(cwd) !== resolve(resolved.reference.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
+        return resolved.reference;
+      }
+      return await this.ownedWorktree(owner, cwd);
     } catch (error) {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
     }
@@ -440,9 +559,19 @@ export class RunStore {
 
   async worktree(owner: string): Promise<WorktreeReference> {
     const write = this.worktreeWrite.then(async () => {
-      await this.load();
+      const loaded = await this.load();
       const recordsPath = join(this.directory, "worktrees.json");
       let records = await json<WorktreeReference[]>(recordsPath).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
+      const name = this.worktreeName(owner);
+      const binding = name ? await this.borrowedWorktree(name) : undefined;
+      if (binding) return (await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference;
+      if (name && loaded.run.parentRunId !== undefined) {
+        const resolved = await this.resolveNamedWorktreeFromParent(name, loaded.run.parentRunId);
+        if (resolved) {
+          await this.bindBorrowedWorktree({ name, sourceRunId: resolved.sourceRunId, owner: resolved.owner });
+          return resolved.reference;
+        }
+      }
       const existing = records.find((record) => record.owner === owner);
       if (existing) return this.validateWorktree(owner);
       const { path, branch } = this.expectedWorktree(owner);
@@ -488,6 +617,25 @@ export class RunStore {
     return write;
   }
 
+  private async resolveNamedWorktreeFromParent(name: string, parentRunId: string): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string } | undefined> {
+    const source = await this.sourceRun(parentRunId);
+    return source.findNamedWorktree(name, new Set([this.runId]));
+  }
+
+  private async bindBorrowedWorktree(binding: BorrowedWorktreeBinding): Promise<void> {
+    const write = this.borrowedWorktreeWrite.then(async () => {
+      const records = [...await this.borrowedWorktreeRecords(false)];
+      const existing = records.find((candidate) => candidate.name === binding.name);
+      if (existing) {
+        if (JSON.stringify(existing) !== JSON.stringify(binding)) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree binding for ${binding.name} changed`);
+        return;
+      }
+      records.push(binding);
+      await atomicJson(join(this.directory, "borrowed-worktrees.json"), records);
+    });
+    this.borrowedWorktreeWrite = write.then(() => undefined, () => undefined);
+    await write;
+  }
   async snapshotWorktree(owner: string): Promise<string> {
     try {
       const write = this.snapshotWrite.then(async () => {
@@ -510,11 +658,13 @@ export class RunStore {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
     }
   }
-
   async worktrees(): Promise<readonly WorktreeReference[]> {
     const records = await json<WorktreeReference[]>(join(this.directory, "worktrees.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; });
-    const validated = await Promise.all(records.map(async (record) => { try { return await this.validateWorktree(record.owner); } catch { return undefined; } }));
-    return validated.filter((record): record is WorktreeReference => record !== undefined);
+    const bindings = await this.borrowedWorktreeRecords();
+    const boundOwners = new Set(bindings.map((binding) => binding.owner));
+    const owned = await Promise.all(records.filter((record) => !boundOwners.has(record.owner)).map(async (record) => { try { return await this.validateWorktree(record.owner); } catch { return undefined; } }));
+    const borrowed = await Promise.all(bindings.map(async (binding) => { try { return (await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference; } catch { return undefined; } }));
+    return [...owned.filter((record): record is WorktreeReference => record !== undefined), ...borrowed.filter((record): record is WorktreeReference => record !== undefined)];
   }
 
   async changedWorktrees(): Promise<readonly WorktreeReference[]> {
