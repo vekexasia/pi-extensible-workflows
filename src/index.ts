@@ -1846,13 +1846,9 @@ export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonl
   const render = ({ agent, depth }: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? "⠦" : "○";
     const breadcrumb = grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId);
-    const setup = agent.attemptDetails?.at(-1)?.setup;
-    const thinking = setup?.model.thinking ?? agent.model.thinking;
-    const model = `${setup?.model.provider ?? agent.model.provider}/${setup?.model.model ?? agent.model.model}${thinking ? `:${thinking}` : ""}`;
-    const policy = [`model=${model}`, agent.requestedModel ? `requested=${agent.requestedModel}` : "", `tools=${(setup?.tools ?? agent.tools).join(",") || "(none)"}`, agent.role ? `role=${agent.role}` : ""];
     const tokens = agent.accounting ? formatAccounting(agent.accounting) : "";
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
-    const result = [`${indent}${icon} ${breadcrumb} · ${agent.state} · ${policy.filter(Boolean).join(" · ")}${tokens ? ` · ${tokens}` : ""}`];
+    const result = [`${indent}${icon} ${breadcrumb} · ${agent.state}${tokens ? ` · ${tokens}` : ""}`];
     if (agent.state === "failed" && agent.attemptDetails?.length) {
       const last = agent.attemptDetails[agent.attemptDetails.length - 1];
       if (last?.error) result.push(`${indent}  error: ${last.error.code}: ${last.error.message}`);
