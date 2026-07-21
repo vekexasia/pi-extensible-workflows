@@ -1659,18 +1659,20 @@ function agentWorktree(identity: AgentIdentity): { worktreeOwner?: string } {
   return identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {};
 }
 function shellProcessKill(child: ChildProcess): void {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM");
-    else child.kill("SIGTERM");
-  } catch { /* The process may already have exited. */ }
-  setTimeout(() => {
+  let forceKill: ReturnType<typeof setTimeout> | undefined;
+  const killProcessTree = (signal: "SIGTERM" | "SIGKILL") => {
     try {
-      if (!child.killed) {
-        if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
-        else child.kill("SIGKILL");
-      }
+      if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
+      else if (child.pid && process.platform === "win32") {
+        const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+        killer.unref();
+      } else child.kill(signal);
     } catch { /* The process may already have exited. */ }
-  }, 1000).unref();
+  };
+  child.once("close", () => { if (forceKill) clearTimeout(forceKill); });
+  killProcessTree("SIGTERM");
+  forceKill = setTimeout(() => { forceKill = undefined; killProcessTree("SIGKILL"); }, 1000);
+  forceKill.unref();
 }
 function executeShellCommand(command: string, options: ShellOptions, signal: AbortSignal, cwd = process.cwd()): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
