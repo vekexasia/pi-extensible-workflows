@@ -136,11 +136,12 @@
       </section>
       <section id="dsl">
         <h2>Workflow DSL</h2>
-        <p>Workflow source is plain sandboxed JavaScript. It has no imports, filesystem, network, process, timer, or dynamic-code globals. The deterministic primitives are:</p>
+        <p>Workflow source is plain sandboxed JavaScript. It has no imports, filesystem, network, timer, or dynamic-code globals, and no direct access to the host process. The trusted host-mediated <code>shell()</code> primitive is the explicit exception for command execution:</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Primitive</th><th>Use</th></tr></thead>
           <tbody>
             <tr><td><code>agent(prompt, options)</code></td><td>Run one Pi agent and return its bare text or JSON value.</td></tr>
+            <tr><td><code>shell(command, options)</code></td><td>Run a platform-shell command and return its exit code, stdout, and stderr.</td></tr>
             <tr><td><code>conversation(name, options)</code></td><td>Create a persisted conversation handle whose sequential <code>run(prompt, turnOptions)</code> calls continue the last successful transcript.</td></tr>
             <tr><td><code>prompt(template, values)</code></td><td>Safely interpolate JSON-compatible values into a prompt.</td></tr>
             <tr><td><code>parallel(name, tasks)</code></td><td>Run keyed independent tasks concurrently.</td></tr>
@@ -151,6 +152,16 @@
             <tr><td><code>withWorktree(callback)</code> or <code>withWorktree(name, callback)</code></td><td>Create one shared or separately named worktree scope lazily.</td></tr>
           </tbody>
         </table></div>
+        <p><code>shell(command, options)</code> inherits the workflow cwd, or the active <code>withWorktree()</code> cwd. Options are <code>timeoutMs</code> and string-valued environment overrides merged over the host environment. A nonzero exit is a result, not a workflow failure; launch failures and timeouts use <code>SHELL_FAILED</code>. Output is not shell-truncated, but a result that exceeds the 10 MB RPC boundary fails with <code>RPC_LIMIT_EXCEEDED</code>.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">return</span> <span class="tok-keyword">await</span> <span class="tok-function">withWorktree</span>(<span class="tok-string">"fix-tests"</span><span class="tok-punctuation">,</span> <span class="tok-keyword">async</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-punctuation">{</span>
+  <span class="tok-keyword">for</span> (<span class="tok-keyword">let</span> attempt = <span class="tok-number">1</span><span class="tok-punctuation">;</span> attempt <span class="tok-keyword">&lt;=</span> <span class="tok-number">5</span><span class="tok-punctuation">;</span> attempt <span class="tok-keyword">+=</span> <span class="tok-number">1</span>) <span class="tok-punctuation">{</span>
+    <span class="tok-keyword">const</span> tests = <span class="tok-keyword">await</span> <span class="tok-function">shell</span>(<span class="tok-string">"yarn test"</span><span class="tok-punctuation">);</span>
+    <span class="tok-keyword">if</span> (tests.exitCode === <span class="tok-number">0</span>) <span class="tok-keyword">return</span> tests<span class="tok-punctuation">;</span>
+    <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Fix the test failures:\n\n"</span> + (tests.stderr || tests.stdout)<span class="tok-punctuation">);</span>
+  <span class="tok-punctuation">}</span>
+  <span class="tok-keyword">return</span> <span class="tok-function">shell</span>(<span class="tok-string">"yarn test"</span>)<span class="tok-punctuation">;</span>
+<span class="tok-punctuation">}</span>);</code></pre>
+        <p>Completed shell results are journaled only after process exit and RPC validation, so cold resume replays them without rerunning the command. A host crash after a command performs side effects but before its result is journaled can run it again; use <code>shell()</code> primarily for verification and bounded command gates, not exactly-once mutations.</p>
         <h3>Agent options</h3>
         <p>Use <code>label</code> as an optional non-empty display name. If omitted, agents use their <code>role</code> name, or the effective model name for role-less agents. Use <code>model</code> as a configured model alias or <code>provider/model</code>, optionally with a thinking suffix such as <code>:high</code>. Other options are <code>thinking</code>, <code>role</code>, <code>tools</code>, <code>outputSchema</code>, <code>retries</code>, <code>timeoutMs</code>, and the canonical <code>withWorktree(name, callback)</code> scope. A role owns its model, thinking, and tools policy, so do not combine <code>role</code> with those three overrides.</p>
         <p><code>conversation(name, options)</code> accepts the same agent options as <code>agent(prompt, options)</code> and freezes the resolved agent execution policy, effective system prompt, cwd/worktree, and tool definitions for a run-scoped transcript. Calls to <code>handle.run(prompt, turnOptions)</code> are scheduled independently but must be sequential; <code>timeoutMs</code> and <code>retries</code> are turn-local. Failed turns do not advance the persisted head, and cold resume fails closed if the transcript or request prefix is incompatible. Existing <code>agent()</code> calls always retain fresh-session behavior.</p>

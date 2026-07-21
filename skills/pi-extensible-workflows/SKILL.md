@@ -40,7 +40,20 @@ Inside the workflow, read `args.issue`; omitted `args` is `null`.
 Use `workflow_stop` with the exact run ID to stop an active background run from the current Pi session.
 If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use the returned global functions, variables, registered workflows, and configured model aliases as needed for the rest of that task. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.
 
-Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools.
+Pass downstream only needed results. Workflow JavaScript has no imports, filesystem, network, process, or timers; delegate such work to agents with the required tools. `shell(command, options)` is the explicit trusted host RPC for deterministic command gates. It inherits the workflow or active worktree cwd, merges string-valued `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, while launch failures and timeouts fail with `SHELL_FAILED`.
+
+Use a bounded verification loop when objective command output controls the gate:
+```js
+return withWorktree("fix-tests", async () => {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    const tests = await shell("yarn test", { env: { CI: "1" } });
+    if (tests.exitCode === 0) return tests;
+    await agent(prompt("Fix these failures:\n\n{output}", { output: tests.stderr || tests.stdout }));
+  }
+  return shell("yarn test", { env: { CI: "1" } });
+});
+```
+Shell results are journaled only after process exit and RPC validation. A host crash after command side effects but before journaling can rerun the command on resume, so use `shell()` primarily for verification and bounded command gates rather than exactly-once mutations.
 
 ## `agent()` options
 
