@@ -10,7 +10,7 @@ import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
+import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
 import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, atomicWriteFile, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
@@ -2372,7 +2372,28 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     return skillPath ? { skillPaths: [skillPath] } : undefined;
   });
   type BudgetDecisionResult = { state: "running" | "budget_exhausted"; approved: boolean };
-  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  const runs = new Map<string, { executor: WorkflowAgentExecutor; store: RunStore; metadata: WorkflowMetadata; model: ModelSpec; lifecycle: RunLifecycle; budget: WorkflowBudgetRuntime; abortController: AbortController; projectTrusted: () => boolean; providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>; execution?: WorkflowExecution; completion?: Promise<unknown>; checkpointResolvers: Map<string, (value: boolean) => void>; update?: (result: WorkflowToolUpdate) => void }>();
+  let providerRecoveryQueue = Promise.resolve();
+  const enqueueProviderRecovery = <T>(task: () => Promise<T>): Promise<T> => { const next = providerRecoveryQueue.then(task, task); providerRecoveryQueue = next.then(() => undefined, () => undefined); return next; };
+  const createProviderErrorRecovery = (host: unknown, fallbackModels: ReadonlySet<string>, abort: () => void) => {
+    if (!object(host) || host.mode !== "tui" || host.hasUI !== true) return undefined;
+    const ui = object(host.ui) ? host.ui : undefined;
+    const select = uiHostCapabilities(ui)?.select;
+    if (!select) return undefined;
+    const hostModels = contextHostCapabilities(host).modelRegistry;
+    const choose = (title: string, options: string[]) => select.call(ui, title, options);
+    return (failure: AgentProviderFailure): Promise<AgentProviderRecovery> => enqueueProviderRecovery(async () => {
+      const action = await choose(`Subagent "${failure.label}" failed\nCurrent provider/model: ${failure.provider}/${failure.model}\nProvider error: ${failure.error}\nChoose what to do`, ["Retry", "Change model", "Abort workflow"]);
+      if (action === "Retry") return "retry";
+      if (action === "Change model") {
+        const available = hostModels?.getAvailable?.().map((model) => `${model.provider}/${model.id}`) ?? [...fallbackModels];
+        const selected = await choose(`Available models for subagent "${failure.label}"`, [...new Set(available)].sort());
+        if (selected) return { model: selected };
+      }
+      abort();
+      return "abort";
+    });
+  };
   const pendingFailureDiagnostics = new Map<string, WorkflowFailureDiagnostics>();
   pi.on("tool_result", (event) => {
     if (event.toolName !== "workflow" || !event.isError) return;
@@ -2465,7 +2486,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot() }));
         run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}), ...(options.conversation ? { conversation: options.conversation } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}), ...(options.conversation ? { conversation: options.conversation } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
       const before = (await run.store.load()).run;
       await persistAgentAttempts(run.store, id, result.attempts);
       const completed = (await run.store.load()).run;
@@ -2839,7 +2860,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, loaded.run.state, budgetRuntime, loaded.snapshot.metadata);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController: new AbortController(), projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map() });
+      const abortController = new AbortController();
+      const providerErrorRecovery = createProviderErrorRecovery(ctx, new Set(loaded.snapshot.models), () => { abortController.abort(); });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -2913,8 +2936,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const lifecycle = lifecycleFor(store, "running", budgetRuntime, checked.metadata);
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
+      const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
       const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(ctx.cwd, projectTrusted(ctx)), runContext }, createSession);
-      runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
+      runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
       const execution = runWorkflow(script, args, withWorkflowFunctions({ agent: async (prompt, options, agentSignal, identity) => {
@@ -3587,6 +3611,6 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 export { acquireSessionLease, projectStorageKey, RunStore, runsDirectory, SessionLease, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, ConversationHead, NativeSessionReference, PendingWorkflowDecision, PersistedConversation, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentSetup, AgentSetupContext, AgentSetupHook, AgentToolCallProgress, RegisteredAgentSetupHook, SessionInput } from "./agent-execution.js";
+export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentProviderFailure, AgentProviderRecovery, AgentSetup, AgentSetupContext, AgentSetupHook, AgentToolCallProgress, RegisteredAgentSetupHook, SessionInput } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
 export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";

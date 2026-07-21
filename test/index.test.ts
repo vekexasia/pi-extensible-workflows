@@ -216,6 +216,106 @@ void test("orchestration lifecycle events cover phase, worktree, retry, checkpoi
   assert.ok(channels.indexOf(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT) < channels.indexOf(WORKFLOW_RUN_COMPLETED_EVENT));
   assert.doesNotMatch(JSON.stringify(events), /PROMPT_SECRET|RESULT_SECRET|ARG_SECRET|CHECKPOINT_SECRET|CONTEXT_SECRET/);
 });
+void test("TUI terminal provider recovery shows factual failure and retries without a recommendation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-retry-"));
+  let sessions = 0;
+  const prompts: Array<{ title: string; options: string[] }> = [];
+  let shutdown: (() => Promise<void>) | undefined;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    const attempt = ++sessions;
+    const terminal = { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "AUTH_FAILED" };
+    return { sessionId: `recovery-retry-${String(attempt)}`, sessionFile: `/sessions/recovery-retry-${String(attempt)}.jsonl`, model: { provider: input.model.provider, model: input.model.model }, messages: [attempt === 1 ? terminal : { role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd: home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" }, ui: { select: async (title: string, options: string[]) => { prompts.push({ title, options }); return "Retry"; } } };
+  try {
+    const result = await workflow.execute("id", { name: "provider-recovery-retry", script: "return await agent('work', {label:'worker', retries:2});", foreground: true }, new AbortController().signal, undefined, context) as { details?: { value?: unknown } };
+    assert.equal(result.details?.value, "done");
+    assert.equal(sessions, 2);
+    assert.deepEqual(prompts, [{ title: "Subagent \"worker\" failed\nCurrent provider/model: openai/gpt\nProvider error: AUTH_FAILED\nChoose what to do", options: ["Retry", "Change model", "Abort workflow"] }]);
+    assert.doesNotMatch(prompts[0]?.title ?? "", /recommend/i);
+  } finally {
+    await shutdown?.();
+  }
+});
+void test("TUI terminal provider recovery changes model before a fresh attempt", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-model-"));
+  let sessions = 0;
+  const prompts: Array<{ title: string; options: string[] }> = [];
+  const inputs: SessionInput[] = [];
+  let shutdown: (() => Promise<void>) | undefined;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    const attempt = ++sessions;
+    return { sessionId: `recovery-model-${String(attempt)}`, sessionFile: `/sessions/recovery-model-${String(attempt)}.jsonl`, model: { provider: input.model.provider, model: input.model.model }, messages: [attempt === 1 ? { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" } : { role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  let selectCalls = 0;
+  const context = { cwd: home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" }, ui: { select: async (title: string, options: string[]) => { prompts.push({ title, options }); selectCalls += 1; return selectCalls === 1 ? "Change model" : "anthropic/opus"; } } };
+  try {
+    const result = await workflow.execute("id", { name: "provider-recovery-model", script: "return await agent('work', {label:'worker'});", foreground: true }, new AbortController().signal, undefined, context) as { details?: { value?: unknown } };
+    assert.equal(result.details?.value, "done");
+    assert.equal(sessions, 2);
+    assert.deepEqual(inputs.map(({ model }) => `${model.provider}/${model.model}`), ["openai/gpt", "anthropic/opus"]);
+    assert.deepEqual(prompts[0]?.options, ["Retry", "Change model", "Abort workflow"]);
+    assert.deepEqual(prompts[1]?.options, ["anthropic/opus", "openai/gpt"]);
+  } finally {
+    await shutdown?.();
+  }
+});
+void test("TUI provider recovery aborts the workflow even when workflow code catches the agent failure", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-abort-"));
+  let shutdown: (() => Promise<void>) | undefined;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({ sessionId: "recovery-abort", sessionFile: "/sessions/recovery-abort.jsonl", model: { provider: input.model.provider, model: input.model.model }, messages: [{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "PROVIDER_FAILED" }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd: home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { select: async () => "Abort workflow" } };
+  try {
+    await assert.rejects(workflow.execute("id", { name: "provider-recovery-abort", script: "try { await agent('work', {label:'worker'}); } catch {} return 'continued';", foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+    const runIds = await listRunIds(home, "session", home);
+    assert.equal(runIds.length, 1);
+    const runId = runIds[0];
+    assert.ok(runId);
+    assert.equal((await new RunStore(home, "session", runId, home).load()).run.state, "stopped");
+  } finally {
+    await shutdown?.();
+  }
+});
+void test("TUI terminal provider recovery changes model for a conversation and continues its persisted context", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-conversation-"));
+  let sessions = 0;
+  const inputs: SessionInput[] = [];
+  let shutdown: (() => Promise<void>) | undefined;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    inputs.push(input);
+    const attempt = ++sessions;
+    let leafId = input.allowModelChange ? "model-change-leaf" : input.continuation?.leafId ?? "leaf-1";
+    const messages = [attempt === 2 ? { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" } : { role: "assistant", content: [{ type: "text", text: attempt === 1 ? "first" : attempt === 3 ? "second" : "third" }] }];
+    return { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", model: { provider: input.model.provider, model: input.model.model }, messages, getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), systemPrompt: "stable", getLeafId: () => leafId, prompt: async () => { if (attempt === 3) leafId = "leaf-2"; if (attempt === 4) leafId = "leaf-3"; }, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  let selectCalls = 0;
+  const context = { cwd: home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" }, ui: { select: async () => { selectCalls += 1; return selectCalls === 1 ? "Change model" : "anthropic/opus"; } } };
+  try {
+    const result = await workflow.execute("id", { name: "provider-recovery-conversation", script: "const handle = conversation('developer', {model:'openai/gpt'}); return [await handle.run('first'), await handle.run('second'), await handle.run('third')];", foreground: true }, new AbortController().signal, undefined, context) as { details?: { value?: unknown } };
+    assert.deepEqual(result.details?.value, ["first", "second", "third"]);
+    assert.equal(sessions, 4);
+    assert.deepEqual(inputs.map(({ model, continuation, allowModelChange }) => ({ model: `${model.provider}/${model.model}`, thinking: model.thinking, continuation, allowModelChange })), [{ model: "openai/gpt", thinking: "medium", continuation: undefined, allowModelChange: undefined }, { model: "openai/gpt", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-1" }, allowModelChange: undefined }, { model: "anthropic/opus", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-1" }, allowModelChange: true }, { model: "anthropic/opus", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-2" }, allowModelChange: undefined }]);
+  } finally {
+    await shutdown?.();
+  }
+});
 void test("budget exhaustion emits a budget event and state change, not run failure", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-events-"));
   const events: string[] = [];

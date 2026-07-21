@@ -17,6 +17,8 @@ export interface AgentBudgetHooks {
   instruction(): string | undefined;
 }
 export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[]; disabledAgentResources?: AgentResourceExclusions }
+export interface AgentProviderFailure { label: string; provider: string; model: string; error: string }
+export type AgentProviderRecovery = "retry" | "abort" | { model: string };
 export interface AgentExecutionOptions {
   label: string;
   workflowName: string;
@@ -26,6 +28,8 @@ export interface AgentExecutionOptions {
   thinking?: ThinkingLevel;
   onProgress?: (progress: AgentProgress) => void | Promise<void>;
   onAttempt?: (attempt: Pick<AgentAttempt, "attempt" | "sessionId" | "sessionFile" | "setup">) => void | Promise<void>;
+  providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
+  modelOverride?: ModelSpec;
   tools?: readonly string[];
   effectiveTools?: readonly string[];
   role?: string;
@@ -85,7 +89,7 @@ export interface NativeSession {
   abort?(): Promise<void>;
   dispose(): void;
 }
-export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue>; continuation?: { sessionId: string; sessionFile: string; leafId: string } }
+export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue>; continuation?: { sessionId: string; sessionFile: string; leafId: string }; allowModelChange?: boolean }
 export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
@@ -110,9 +114,22 @@ function latestAssistantHasToolCall(messages: readonly AgentMessage[]): boolean 
   return hasToolCall(message);
 }
 
-function throwIfTerminalAssistantError(session: NativeSession): void {
+type TerminalProviderError = { provider: string; model: string; error: string };
+function throwIfTerminalAssistantError(session: NativeSession, fallbackModel: ModelSpec): void {
   const message = [...session.messages].reverse().find((item) => item.role === "assistant");
-  if (message?.stopReason === "error") throw new WorkflowError("AGENT_FAILED", message.errorMessage ?? "Native Pi assistant ended with a terminal provider error");
+  if (message?.stopReason !== "error") return;
+  const provider = session.model?.provider ?? fallbackModel.provider;
+  const model = session.model?.model ?? session.model?.id ?? fallbackModel.model;
+  const error = message.errorMessage ?? "Native Pi assistant ended with a terminal provider error";
+  const failure = new WorkflowError("AGENT_FAILED", error);
+  Object.defineProperty(failure, "terminalProviderError", { value: { provider, model, error }, configurable: true });
+  throw failure;
+}
+function terminalProviderError(error: WorkflowError): TerminalProviderError | undefined {
+  const value = (error as WorkflowError & { terminalProviderError?: unknown }).terminalProviderError;
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Partial<TerminalProviderError>;
+  return typeof candidate.provider === "string" && typeof candidate.model === "string" && typeof candidate.error === "string" ? { provider: candidate.provider, model: candidate.model, error: candidate.error } : undefined;
 }
 
 function accounting(stats: NativeSessionStats): AgentAccounting {
@@ -130,7 +147,10 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
       if (!header || canonicalSourcePath(header.cwd) !== canonicalSourcePath(input.cwd) || manager.getSessionId() !== input.continuation.sessionId || !manager.getEntry(input.continuation.leafId)) throw new Error("Persisted transcript identity does not match the conversation head");
       manager.branch(input.continuation.leafId);
       const context = manager.buildSessionContext();
-      if (context.model && (context.model.provider !== input.model.provider || context.model.modelId !== input.model.model)) throw new Error("Persisted transcript model does not match the conversation execution policy");
+      if (context.model && (context.model.provider !== input.model.provider || context.model.modelId !== input.model.model)) {
+        if (!input.allowModelChange) throw new Error("Persisted transcript model does not match the conversation execution policy");
+        manager.appendModelChange(input.model.provider, input.model.model);
+      }
       if (input.model.thinking && context.thinkingLevel !== input.model.thinking) throw new Error("Persisted transcript thinking level does not match the conversation execution policy");
     } catch (error) {
       if (error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE") throw error;
@@ -262,6 +282,21 @@ function conversationExecutionPolicy(options: AgentExecutionOptions, setup: Agen
     resourcePolicy: setup.sessionInput.resourcePolicy ? resourcePolicySummary(setup.sessionInput.resourcePolicy) : null,
   }) as unknown as JsonValue;
 }
+function conversationPolicyMatches(expected: JsonValue, current: JsonValue, allowModelChange: boolean): boolean {
+  if (fingerprint(expected) === fingerprint(current)) return true;
+  if (!allowModelChange || !expected || typeof expected !== "object" || Array.isArray(expected) || !current || typeof current !== "object" || Array.isArray(current)) return false;
+  const expectedModel = conversationPolicyModel(expected);
+  const currentModel = conversationPolicyModel(current);
+  if (!expectedModel || !currentModel) return false;
+  return fingerprint(expected) === fingerprint({ ...current, model: { ...currentModel, provider: expectedModel.provider, model: expectedModel.model } });
+}
+function conversationPolicyModel(policy: JsonValue): ModelSpec | undefined {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return undefined;
+  const model = policy.model;
+  if (!model || typeof model !== "object" || Array.isArray(model) || typeof model.provider !== "string" || typeof model.model !== "string") return undefined;
+  const thinking = typeof model.thinking === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(model.thinking) ? model.thinking as ModelSpec["thinking"] : undefined;
+  return thinking === undefined ? { provider: model.provider, model: model.model } : { provider: model.provider, model: model.model, thinking };
+}
 function conversationFailure(message: string): WorkflowError { return new WorkflowError("RESUME_INCOMPATIBLE", message); }
 async function prepareAgentSetup(root: AgentExecutionRoot, createSession: SessionFactory, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPromptAppend: string }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, continuation?: ConversationHead): Promise<{ setup: AgentSetup; summary: AgentSetupSummary }> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
@@ -307,7 +342,7 @@ export class WorkflowAgentExecutor {
     const hasAlias = requestedModel !== undefined && Object.prototype.hasOwnProperty.call(this.root.modelAliases ?? {}, requestedModel);
     if (requestedModel !== undefined && this.root.blockedAliases?.has(requestedModel) && !hasAlias) { const target = this.root.blockedAliasTargets?.[requestedModel]; throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${target ? ` resolved to ${target}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`); }
     const aliasThinking = requestedModel !== undefined && hasAlias ? resolveModelReference(requestedModel, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath).thinking : undefined;
-    const model = parseModel(requestedModel, this.root.model, options.thinking ?? (aliasThinking === undefined ? definition?.thinking : undefined), this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
+    const model = options.modelOverride ?? parseModel(requestedModel, this.root.model, options.thinking ?? (aliasThinking === undefined ? definition?.thinking : undefined), this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
     const availableModels = this.root.knownModels ?? this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
     if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model${requestedModel ? ` ${requestedModel} resolved to ${modelCapability(model)}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
     return { model, ...(hasAlias ? { requestedModel } : {}), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
@@ -317,7 +352,8 @@ export class WorkflowAgentExecutor {
     const executionSignal = signal ?? this.root.runContext?.signal;
     if (!Number.isInteger(options.retries ?? 0) || (options.retries ?? 0) < 0) throw new WorkflowError("INVALID_METADATA", "retries must be a non-negative integer");
     if (options.timeoutMs !== undefined && options.timeoutMs !== null && (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0)) throw new WorkflowError("INVALID_METADATA", "timeoutMs must be null or a positive integer");
-    const resolved = this.resolve(options);
+    let resolved = this.resolve(options);
+    let recoveryModel: ModelSpec | undefined;
     let cwd: string;
     if (options.parent) {
       if (!options.cwd) throw new WorkflowError("INVALID_METADATA", "Child agents require their parent cwd");
@@ -342,13 +378,18 @@ export class WorkflowAgentExecutor {
       const store = this.root.runStore;
       if (!store) throw conversationFailure("Conversation persistence is unavailable");
       try { conversationRecord = await store.conversation(options.conversation.id); } catch (error) { throw conversationFailure(`Cannot load conversation state: ${error instanceof Error ? error.message : String(error)}`); }
+      if (conversationRecord) {
+        const model = conversationPolicyModel(conversationRecord.policy);
+        if (model) resolved = this.resolve({ ...options, modelOverride: model });
+      }
       if (!Number.isInteger(options.conversation.turn) || options.conversation.turn < 1) throw conversationFailure("Conversation turn must be a positive integer");
       if (conversationRecord ? conversationRecord.head.turn + 1 !== options.conversation.turn : options.conversation.turn !== 1) throw conversationFailure(`Conversation turn ${String(options.conversation.turn)} does not continue its persisted head`);
     }
     const attempts: AgentAttempt[] = [];
     let conversationBaseline: { executionPolicy: JsonValue; toolDefinitionsSha256: string; systemPrompt?: string; systemPromptSha256?: string } | undefined;
-    const maxAttempts = (options.retries ?? 0) + 1;
+    let maxAttempts = (options.retries ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (recoveryModel) resolved = this.resolve({ ...options, modelOverride: recoveryModel });
       options.budget?.beforeAttempt();
       let accepted = false;
       let schemaResult: JsonValue | undefined;
@@ -396,6 +437,7 @@ export class WorkflowAgentExecutor {
         setupSummary = prepared.summary;
         setupFailed = false;
         if (executionSignal?.aborted) throw new WorkflowError("CANCELLED", "Agent cancelled");
+        if (recoveryModel && conversationRecord) setup.sessionInput.allowModelChange = true;
         const started = Date.now();
         session = await setup.createSession(setup.sessionInput);
         if (setup.sessionInput.resourcePolicy) setupSummary = { ...setupSummary, disabledAgentResources: resourcePolicySummary(setup.sessionInput.resourcePolicy) };
@@ -405,12 +447,12 @@ export class WorkflowAgentExecutor {
           const currentExecutionPolicy = conversationExecutionPolicy(options, setup);
           if (conversationRecord) {
             if (session.sessionId !== conversationRecord.head.sessionId || requiredFile(session.sessionFile) !== conversationRecord.head.sessionFile) throw conversationFailure("Conversation transcript identity changed");
-            if (!session.getLeafId || session.getLeafId() !== conversationRecord.head.leafId) throw conversationFailure("Conversation transcript leaf identity changed");
-            if (fingerprint(currentExecutionPolicy) !== fingerprint(conversationRecord.policy)) throw conversationFailure("Conversation execution policy changed");
+            if (!session.getLeafId || (!recoveryModel && session.getLeafId() !== conversationRecord.head.leafId)) throw conversationFailure("Conversation transcript leaf identity changed");
+            if (!conversationPolicyMatches(conversationRecord.policy, currentExecutionPolicy, Boolean(recoveryModel))) throw conversationFailure("Conversation execution policy changed");
             if (!session.subscribe && (promptFingerprint(conversationSystemPrompt) !== conversationRecord.head.systemPromptSha256 || conversationSystemPrompt !== conversationRecord.head.systemPrompt)) throw conversationFailure("Conversation system prompt changed");
             if (conversationToolDefinitionsSha256 !== conversationRecord.head.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
           } else if (conversationBaseline) {
-            if (fingerprint(currentExecutionPolicy) !== fingerprint(conversationBaseline.executionPolicy)) throw conversationFailure("Conversation execution policy changed");
+            if (!conversationPolicyMatches(conversationBaseline.executionPolicy, currentExecutionPolicy, Boolean(recoveryModel))) throw conversationFailure("Conversation execution policy changed");
             if (conversationToolDefinitionsSha256 !== conversationBaseline.toolDefinitionsSha256) throw conversationFailure("Conversation tool definitions changed");
           } else {
             conversationBaseline = { executionPolicy: currentExecutionPolicy, toolDefinitionsSha256: conversationToolDefinitionsSha256 };
@@ -470,16 +512,16 @@ export class WorkflowAgentExecutor {
         turnStarted = true;
         await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
         if (conversationMismatch) throw conversationMismatch;
-        throwIfTerminalAssistantError(session);
+        throwIfTerminalAssistantError(session, setup.sessionInput.model);
         { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
           accepted = true;
           try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
-          throwIfTerminalAssistantError(session);
+          throwIfTerminalAssistantError(session, setup.sessionInput.model);
           if (!hasSchemaResult()) {
             try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
-            throwIfTerminalAssistantError(session);
+            throwIfTerminalAssistantError(session, setup.sessionInput.model);
           }
           if (schemaResult === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
         }
@@ -517,6 +559,22 @@ export class WorkflowAgentExecutor {
           session.dispose();
         }
         if (options.worktreeOwner && typed.code !== "WORKTREE_FAILED") await this.root.runStore?.snapshotWorktree(options.worktreeOwner).catch(() => undefined);
+        const terminal = terminalProviderError(typed);
+        if (terminal && options.providerErrorRecovery) {
+          let recovery: AgentProviderRecovery;
+          try { recovery = await options.providerErrorRecovery({ label: options.label, ...terminal }); } catch { throw Object.assign(typed, { attempts }); }
+          if (recovery === "retry" || typeof recovery === "object" && typeof recovery.model === "string") {
+            if (typeof recovery === "object") {
+              try {
+                const selected = resolveModelReference(recovery.model, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
+                recoveryModel = selected.thinking === undefined && resolved.model.thinking ? { ...selected, thinking: resolved.model.thinking } : selected;
+              } catch { throw Object.assign(typed, { attempts }); }
+            }
+            maxAttempts += 1;
+            beforeRetry?.();
+            continue;
+          }
+        }
         if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED" || typed.code === "RESUME_INCOMPATIBLE") throw Object.assign(typed, { attempts });
         beforeRetry?.();
       }
