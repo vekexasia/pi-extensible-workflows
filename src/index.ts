@@ -11,6 +11,7 @@ import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
+import { herdrPaneId, openHerdrPane } from "./herdr.js";
 import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, atomicWriteFile, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
@@ -3237,9 +3238,18 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const labels = navigatorRunLabels(sorted);
           const terminalStates = new Set(["completed", "failed", "stopped"]);
           const hasCompleted = sorted.some(({ loaded: { run } }) => run.state === "completed");
-          const pickerOptions = [...labels, "Model aliases", "Close", ...(hasCompleted ? ["Delete all completed"] : [])];
+          const pickerOptions = [...labels, ...(herdrPaneId() ? ["Inspect session in pane"] : []), "Model aliases", "Close", ...(hasCompleted ? ["Delete all completed"] : [])];
           const runChoice = await ctx.ui.select("Workflows\n", pickerOptions);
           if (!runChoice || runChoice === "Close") return;
+          if (runChoice === "Inspect session in pane") {
+            try {
+              await openHerdrPane({ action: "inspect", cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() });
+              ctx.ui.notify("Opened session inspector in pane.", "info");
+            } catch (error) {
+              ctx.ui.notify(`Cannot open session inspector in pane: ${error instanceof Error ? error.message : String(error)}`, "warning");
+            }
+            continue;
+          }
           if (runChoice === "Model aliases") { await manageAliases(); stores = await loadStores(); continue; }
           if (runChoice === "Delete all completed") {
             if (!await ctx.ui.confirm("Delete completed runs?", "Delete all completed workflow runs and their artifacts? This cannot be undone.")) continue;
@@ -3332,7 +3342,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               addCopy("Copy run path", store.directory, "run path");
               addCopy("Copy run ID", store.runId, "run ID");
             }
-            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, transcripts, script: loaded.snapshot.script, agents: loaded.run.agents, worktrees };
+            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, transcripts, script: loaded.snapshot.script, agents: loaded.run.agents, worktrees, cwd: loaded.run.cwd };
           };
           const selectAgent = async (dashboard: Awaited<ReturnType<typeof loadDashboard>>): Promise<void> => {
             const byId = new Map(dashboard.agents.map((agent) => [agent.id, agent]));
@@ -3353,7 +3363,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             const attempts = [...(selected.attemptDetails ?? [])].sort((left, right) => left.attempt - right.attempt);
             const worktree = selected.worktreeOwner ? dashboard.worktrees.find((candidate) => candidate.owner === selected.worktreeOwner) : undefined;
             const actions = [
-              ...(attempts.length ? ["View transcript", "Copy transcript path"] : []),
+              ...(attempts.length ? ["View transcript", "Copy transcript path", ...(herdrPaneId() ? ["Open transcript in pane", "Fork as Pi session in pane"] : [])] : []),
               ...(worktree ? ["Copy branch", "Copy worktree path"] : []),
               "Copy agent ID",
               "Back",
@@ -3370,11 +3380,21 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               if (action === "Copy agent ID") { await copyArtifact(selected.id, "agent ID"); continue; }
               if (action === "Copy branch" && worktree) { await copyArtifact(worktree.branch, "branch"); continue; }
               if (action === "Copy worktree path" && worktree) { await copyArtifact(worktree.path, "worktree path"); continue; }
-              if (action === "View transcript" || action === "Copy transcript path") {
+              if (action === "View transcript" || action === "Copy transcript path" || action === "Open transcript in pane" || action === "Fork as Pi session in pane") {
                 const attempt = await chooseAttempt();
                 if (!attempt) continue;
                 if (action === "Copy transcript path") await copyArtifact(attempt.sessionFile, "transcript path");
-                else await openTranscript(attempt.sessionFile);
+                else if (action === "View transcript") await openTranscript(attempt.sessionFile);
+                else {
+                  const running = !SETTLED_AGENT_STATES.has(selected.state);
+                  if (action === "Fork as Pi session in pane" && running && !await ctx.ui.confirm("Fork running attempt?", "This attempt is still running. The snapshot may end mid-turn and will not receive later updates. It opens read-only to avoid concurrent changes to the workflow agent's working directory. Continue?")) continue;
+                  try {
+                    await openHerdrPane({ action: action === "Open transcript in pane" ? "transcript" : "fork", cwd: attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(action === "Fork as Pi session in pane" && running ? { readOnly: true } : {}) });
+                    ctx.ui.notify(`${action === "Open transcript in pane" ? "Opened transcript" : "Forked Pi session"} in pane.`, "info");
+                  } catch (error) {
+                    ctx.ui.notify(`Cannot ${action === "Open transcript in pane" ? "open transcript" : "fork Pi session"} in pane: ${error instanceof Error ? error.message : String(error)}`, "warning");
+                  }
+                }
               }
             }
           };

@@ -61,9 +61,10 @@ Global workflow settings live at `~/.pi/agent/pi-extensible-workflows/settings.j
 ```sh
 npx pi-extensible-workflows doctor
 npx pi-extensible-workflows inspect [session-id]
+npx pi-extensible-workflows transcript <session-file>
 ```
 
-`doctor` validates the installation and active Pi resources. `inspect` opens a read-only terminal view of persisted workflow runs.
+`doctor` validates the installation and active Pi resources. `inspect` opens a read-only terminal view of persisted workflow runs. `transcript` renders a session transcript to stdout.
 
 ## Development
 
