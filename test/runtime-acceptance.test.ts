@@ -176,10 +176,9 @@ void test("cold resume persists effective role, fallback, nested, retry, and exp
   }
   const dashboard = formatNavigatorDashboard(loaded.run, [], []);
   const detail = formatNavigatorRun(loaded, [], []);
-  assert.match(dashboard, /root-provider\/root-model:medium/);
-  assert.match(dashboard, /role=reviewer/);
-  assert.match(dashboard, /tools=agent,read/);
+  assert.match(dashboard, /root-model/);
   assert.match(dashboard, /root-model > nested-role/);
+  assert.doesNotMatch(dashboard, /model=|requested=|tools=|role=/);
   assert.match(dashboard, /API inspection/);
   assert.doesNotMatch(dashboard, /role=custom/);
   assert.match(detail, /nested-role .*model=role-provider\/role-model:high role=reviewer tools=read/);

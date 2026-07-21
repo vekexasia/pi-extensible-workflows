@@ -362,12 +362,11 @@ void test("inline workflow args cross the production tool boundary and omitted a
   const omitted = await execute("id", { name: "without-args", script: "return args;", foreground: true }, new AbortController().signal, undefined, context);
   assert.equal(omitted.content[0]?.text, "null");
 });
-void test("navigator renders effective agent policy separately from launch metadata", () => {
+void test("navigator keeps agent rows compact while preserving identity and state", () => {
   const run = { id: "run", workflowName: "policy", cwd: "/repo", sessionId: "session", state: "running", agents: [{ id: "run:1", name: "review", path: "run:1", state: "running", role: "reviewer", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"], attempts: 1 }], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
   const dashboard = formatNavigatorDashboard(run, [], []);
-  assert.match(dashboard, /model=anthropic\/opus:high/);
-  assert.match(dashboard, /tools=read,grep/);
-  assert.match(dashboard, /role=reviewer/);
+  assert.match(dashboard, /⠦ review · running/);
+  assert.doesNotMatch(dashboard, /model=|requested=|tools=|role=/);
   assert.doesNotMatch(dashboard, /Launch models/);
 });
 void test("compact TUI hides budgets without effective limits", () => {
@@ -1071,9 +1070,8 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /37 tok/);
   assert.match(dashB, /reasoning/);
   assert.doesNotMatch(dashB, /checking source/);
-  assert.match(dashB, /model=openai\/gpt:high/);
-  assert.match(dashB, /role=reviewer/);
-  assert.match(dashB, /tools=read/);
+  assert.match(dashB, /⠦ root > child · running · 37 tok/);
+  assert.doesNotMatch(dashB, /model=|requested=|tools=|role=/);
   assert.doesNotMatch(dashB, /cache read|transcript attempt/);
 
   const dashC = formatNavigatorDashboard((await storeC.load()).run, [], []);
