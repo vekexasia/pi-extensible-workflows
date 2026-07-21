@@ -44,6 +44,15 @@ void test("targets the declared Herdr pane, chooses geometry, and escapes pane c
     assert.equal(runCall[0], "pane");
     assert.equal(runCall[1], "run");
     assert.equal(runCall[2], "opaque:new-pane");
+    const equalRunner = async (args: readonly string[]): Promise<string> => {
+      if (args[1] === "layout") return JSON.stringify({ result: { layout: { panes: [{ pane_id: "declared-pane", rect: { width: 80, height: 80 } }] } } });
+      if (args[1] === "split") return JSON.stringify({ result: { pane: { pane_id: "equal:new-pane" } } });
+      return "";
+    };
+    const equalCalls: string[][] = [];
+    const recordingEqualRunner = async (args: readonly string[]): Promise<string> => { equalCalls.push([...args]); return equalRunner(args); };
+    await openHerdrPane({ action: "transcript", cwd: "/tmp/work", original: "/tmp/transcript.jsonl" }, recordingEqualRunner);
+    assert.deepEqual(equalCalls[1], ["pane", "split", "declared-pane", "--direction", "down", "--no-focus"]);
 
     const failingCalls: string[][] = [];
     const failingRunner = async (args: readonly string[]): Promise<string> => {
