@@ -2386,6 +2386,38 @@ void test("worker enforces 10 MB boundaries on individual and final JSON values"
   await assert.rejects(rendered.result, (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
   assert.equal(called, false);
 });
+void test("shell calls use deterministic identity, preserve nonzero results, and validate the DSL boundary", async () => {
+  const identities: Array<{ callSite: string; occurrence: number; structuralPath: readonly string[] }> = [];
+  const run = runWorkflow(`for (let index = 0; index < 2; index += 1) { const result = await shell(index === 0 ? "ok" : "failed", { timeoutMs: 50, env: { CI: "1" } }); if (result.exitCode !== 0) return result; } return await parallel("checks", { one: () => shell("one"), two: () => shell("two") });`, null, {
+    shell: async (command, options, signal, identity) => {
+      assert.equal(signal.aborted, false);
+      assert.deepEqual(options, command === "ok" || command === "failed" ? { timeoutMs: 50, env: { CI: "1" } } : {});
+      identities.push({ callSite: identity.callSite, occurrence: identity.occurrence, structuralPath: identity.structuralPath });
+      return command === "failed" ? { exitCode: 7, stdout: "out", stderr: "err" } : { exitCode: 0, stdout: command, stderr: "" };
+    },
+  });
+  const result = await run.result;
+  assert.deepEqual(result, { exitCode: 7, stdout: "out", stderr: "err" });
+  assert.equal(identities.length, 2);
+  const [firstIdentity, secondIdentity] = identities;
+  assert.ok(firstIdentity && secondIdentity);
+  assert.equal(firstIdentity.occurrence, 1);
+  assert.equal(firstIdentity.callSite, secondIdentity.callSite);
+  assert.throws(() => preflight("const alias = shell; return alias(\"x\");", capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  const [shellCall] = inspectWorkflowScript("return shell(\"x\");");
+  assert.ok(shellCall);
+  assert.equal(shellCall.kind, "shell");
+});
+void test("production shell executes in the workflow cwd with merged environment", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-cwd-"));
+  const result = await workflow.execute("id", { name: "shell", script: "return await shell(\"node -e \\\"process.stdout.write(process.env.SHELL_TEST);process.stderr.write('err');process.exit(3)\\\"\", { env: { SHELL_TEST: \"yes\" } });", foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), { exitCode: 3, stdout: "yes", stderr: "err" });
+});
 
 void test("registers global functions and replays each call as one validated operation", async () => {
   const registry = new WorkflowRegistry();
@@ -2405,12 +2437,12 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { run, invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run, invoke: async () => null, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "withWorktree", "worktreeState"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "shell", "withWorktree", "worktreeState"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
 });
 void test("registered function context.invoke validates nested calls and replays completed children", async () => {
@@ -2428,7 +2460,7 @@ void test("registered function context.invoke validates nested calls and replays
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
   const parentPath = "function/outer/1";
   const occurrences = new Map<string, number>();
-  const context: WorkflowFunctionContext = { run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { run, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
   assert.equal(leafCalls, 1);
   occurrences.clear();
@@ -2587,7 +2619,7 @@ void test("rejects global collisions, invalid metadata, schemas, input, and outp
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, version: "v1" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { new WorkflowRegistry().register({ ...extension, functions: { run: { ...extension.functions.run, description: "", input: { type: "string" } } } }); }, WorkflowError);
   const journal = { get: () => undefined, put: () => {} };
-  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { run: Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal }), invoke: async () => null, agent: async () => null, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => null, pipeline: async () => null, withWorktree: async () => null, worktreeState: async () => ({ path: "/repo", branch: "main", base: "base", head: "head", dirty: false }), checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("run", { value: 1 }, context, "bad-input", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(registry.invokeFunction("run", { value: "x" }, context, "bad-output", journal), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });

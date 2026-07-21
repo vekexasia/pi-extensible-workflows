@@ -593,7 +593,7 @@ function semanticJudgePrompt(evalCase: WorkflowEvalCase, calls: readonly Capture
   const roles = loadAgentDefinitions(cwd, join(home, ".pi", "agent"));
   const usedRoles = new Set(calls.flatMap(({ script }) => { try { return script ? inspectWorkflowScript(script).flatMap((call) => call.kind === "agent" && call.role ? [call.role] : []) : []; } catch { return []; } }));
   const roleText = [...usedRoles].map((role) => `${role}: ${roles[role]?.description ?? "no description"}`).join("\n") || "none";
-  const docs = "agent(prompt, options) delegates; parallel(name, tasks) runs independent tasks concurrently; pipeline(name, items, stages) applies ordered stages; prompt(template, data) carries values into prompts. A role owns model/thinking/tools policy.";
+  const docs = "agent(prompt, options) delegates; shell(command, options) runs a deterministic host command and returns exitCode/stdout/stderr; parallel(name, tasks) runs independent tasks concurrently; pipeline(name, items, stages) applies ordered stages; prompt(template, data) carries values into prompts. A role owns model/thinking/tools policy.";
   return `Judge whether the captured workflow design satisfies each criterion. Do not execute it. Return only JSON: {"criteria":[{"id":"criterion id","pass":true,"evidence":"specific script evidence"}]}.\n\nOriginal request:\n${evalCase.prompt}\n\nCriteria:\n${JSON.stringify(evalCase.semanticCriteria ?? [])}\n\nDSL:\n${docs}\n\nRelevant roles:\n${roleText}\n\nCaptured workflow script(s):\n${calls.map((call, index) => `--- ${String(index)} ---\n${call.script ?? "<missing>"}`).join("\n")}`;
 }
 
