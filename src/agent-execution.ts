@@ -391,7 +391,6 @@ export class WorkflowAgentExecutor {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (recoveryModel) resolved = this.resolve({ ...options, modelOverride: recoveryModel });
       options.budget?.beforeAttempt();
-      const accepted = options.schema !== undefined;
       let schemaResult: JsonValue | undefined;
       let session: NativeSession | undefined;
       let setup: AgentSetup | undefined;
@@ -407,7 +406,6 @@ export class WorkflowAgentExecutor {
       const resultTool = options.schema ? {
         name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: Type.Unsafe(options.schema),
         async execute(_id: string, value: unknown) {
-          if (!accepted) return { content: [{ type: "text" as const, text: "Result acceptance is not enabled yet." }], details: {}, isError: true };
           if (!Value.Check(options.schema as object, value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
           if (schemaResult !== undefined) return { content: [{ type: "text" as const, text: "Result has already been accepted." }], details: {}, isError: true };
           schemaResult = structuredClone(value) as JsonValue;

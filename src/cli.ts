@@ -22,7 +22,6 @@ function object(value: unknown): value is Record<string, unknown> { return typeo
 function has(value: object, key: string): boolean { return Object.prototype.hasOwnProperty.call(value, key); }
 function clone(value: unknown): JsonValue { return structuredClone(value) as JsonValue; }
 function kebabCase(value: string): string { return value.replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1-$2").replace(/[_\s]+/g, "-").toLowerCase(); }
-export { kebabCase as camelToKebab };
 
 function scalarType(schema: unknown): CliScalar | undefined {
   if (!object(schema) || typeof schema.type !== "string") return undefined;
@@ -170,7 +169,7 @@ type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => voi
 
 type HeadlessWorkflowTool = { execute: (toolCallId: string, params: Record<string, JsonValue>, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, context: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> };
 type ShutdownHandler = (event: unknown, context: unknown) => Promise<void> | void;
-type WorkflowRuntime = { catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; extensions: ReturnType<Awaited<ReturnType<typeof createAgentSessionServices>>["resourceLoader"]["getExtensions"]>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
+type WorkflowRuntime = { catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
 
 async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: ShutdownHandler[] = []): Promise<WorkflowRuntime> {
   const cwd = options.cwd ?? process.cwd();
@@ -227,7 +226,7 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
   workflowExtension(headlessPi as never, homedir(), undefined, undefined, agentDir);
   const workflowTool = tools.find((tool) => object(tool) && tool.name === "workflow") as HeadlessWorkflowTool | undefined;
   if (!workflowTool) throw new Error("The workflow runtime could not be initialized");
-  return { catalog: workflowCatalog(), services, extensions, workflowTool, shutdownHandlers };
+  return { catalog: workflowCatalog(), services, workflowTool, shutdownHandlers };
 }
 
 function availableModelInfo(services: WorkflowRuntime["services"], available = false): { provider: string; id: string }[] {
@@ -349,17 +348,9 @@ async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): 
     if (!fn) throw new Error(`Unknown workflow function: ${name}`);
     if (help) { options.write(formatWorkflowCliHelp(fn)); return 0; }
     const input = parseWorkflowCliArgs(fn.input, args.slice(1));
-    const controller = new AbortController();
-    if (options.signal?.aborted) controller.abort();
-    const onAbort = () => { controller.abort(); };
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-    try {
-      const value = await invokeWorkflow(fn, input, runtime, { ...options, signal: controller.signal }, context);
-      options.write(`${JSON.stringify(value)}\n`);
-      return 0;
-    } finally {
-      options.signal?.removeEventListener("abort", onAbort);
-    }
+    const value = await invokeWorkflow(fn, input, runtime, options, context);
+    options.write(`${JSON.stringify(value)}\n`);
+    return 0;
   });
 }
 

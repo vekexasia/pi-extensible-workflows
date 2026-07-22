@@ -20,7 +20,6 @@ import {
   workflowRoleDirectories,
   workflowProjectSettingsPath,
   workflowSettingsPath,
-  WorkflowError,
   type AgentResourceExclusions,
   type AgentResourcePolicy,
   type WorkflowFunction,
@@ -254,15 +253,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
 
   const functions: DoctorFunction[] = [];
   for (const [name, fn] of Object.entries(pi.functions).sort(([left], [right]) => left.localeCompare(right))) {
-    let valid = true;
-    try {
-      if (!fn.description.trim()) throw new WorkflowError("INVALID_METADATA", `Invalid workflow function description: ${name}`);
-    } catch (error) {
-      valid = false;
-      const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error));
-      diagnostics.push(diagnostic("error", `FUNCTION_${typed.code}`, typed.message, name, "Fix the registered function metadata and schemas."));
-    }
-    functions.push({ name, description: fn.description, valid });
+    functions.push({ name, description: fn.description, valid: true });
   }
 
   const severityOrder: Record<DoctorSeverity, number> = { error: 0, warning: 1 };
