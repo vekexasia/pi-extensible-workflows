@@ -639,6 +639,23 @@ void test("cancelRun waits for active agents to terminate", async () => {
   assert.equal(terminated, true);
   assert.equal((await agent.result).ok, false);
 });
+void test("removeRun evicts only settled scheduler state", async () => {
+  let release!: () => void;
+  const scheduler = new FairAgentScheduler(async () => { await new Promise<void>((resolve) => { release = resolve; }); return "done"; }, 1);
+  scheduler.addRun("run", 1);
+  const agent = scheduler.spawn("run", "active", { label: "active", cwd: "/repo", tools: [] });
+  await Promise.resolve();
+  assert.throws(() => { scheduler.removeRun("run"); }, /Cannot remove active scheduler run/);
+  release();
+  assert.equal((await agent.result).ok, true);
+  scheduler.removeRun("run");
+  assert.deepEqual(scheduler.snapshot(), []);
+  assert.throws(() => scheduler.spawn("run", "missing", { label: "missing", cwd: "/repo", tools: [] }), /Unknown scheduler run/);
+  scheduler.addRun("run", 1);
+  const replacement = scheduler.spawn("run", "replacement", { label: "replacement", cwd: "/repo", tools: [] });
+  release();
+  assert.equal((await replacement.result).ok, true);
+});
 void test("refreshes resource exclusions for every fresh attempt and inspects the effective policy", async () => {
   let policyCalls = 0;
   let sessions = 0;

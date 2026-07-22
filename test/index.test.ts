@@ -382,7 +382,8 @@ void test("workflow_stop reports unknown and terminal runs and persists cancella
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
   const workflow = tools.find(({ name }) => name === "workflow");
   const stop = tools.find(({ name }) => name === "workflow_stop");
-  assert.ok(workflow && stop);
+  const resume = tools.find(({ name }) => name === "workflow_resume");
+  assert.ok(workflow && stop && resume);
   const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   const result = (await stop.execute("id", { runId: "missing" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(result.content[0].text), { runId: "missing", state: "unknown", stopped: false, reason: "unknown_run" });
@@ -394,10 +395,16 @@ void test("workflow_stop reports unknown and terminal runs and persists cancella
   assert.equal((await foreignStore.load()).run.state, "running");
   const terminalStore = new RunStore(home, "session", "terminal", home);
   await terminalStore.create({ id: "terminal", workflowName: "terminal", cwd: home, sessionId: "session", state: "completed", agents: [], nativeSessions: [] }, snapshot);
+  const exhaustedStore = new RunStore(home, "session", "exhausted", home);
+  await exhaustedStore.create({ id: "exhausted", workflowName: "exhausted", cwd: home, sessionId: "session", state: "budget_exhausted", agents: [], nativeSessions: [] }, snapshot);
   assert.ok(start);
   await start({}, context);
   const terminalResult = (await stop.execute("id", { runId: "terminal" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(terminalResult.content[0].text), { runId: "terminal", state: "completed", stopped: false, reason: "already_terminal" });
+  const stoppedExhausted = (await stop.execute("id", { runId: "exhausted" })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(stoppedExhausted.content[0].text), { runId: "exhausted", state: "stopped", stopped: true });
+  assert.equal((await exhaustedStore.load()).run.state, "stopped");
+  await assert.rejects(resume.execute("id", { runId: "exhausted" }), /Unknown workflow run/);
   const running = await workflow.execute("id", { name: "active-stop", script: "return await agent('wait');" }, new AbortController().signal, undefined, context) as { content: [{ text: string }] };
   const activeRunId = (JSON.parse(running.content[0].text) as { runId: string }).runId;
   await started;
@@ -407,6 +414,8 @@ void test("workflow_stop reports unknown and terminal runs and persists cancella
   const persisted = await activeStore.load();
   assert.equal(persisted.run.state, "stopped");
   assert.deepEqual(persisted.run.agents.map(({ state }) => state), ["cancelled"]);
+  const stoppedAgain = (await stop.execute("id", { runId: activeRunId })) as { content: [{ text: string }] };
+  assert.deepEqual(JSON.parse(stoppedAgain.content[0].text), { runId: activeRunId, state: "stopped", stopped: false, reason: "already_terminal" });
 });
 void test("session recovery emits interruption as state change only", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-interruption-events-"));

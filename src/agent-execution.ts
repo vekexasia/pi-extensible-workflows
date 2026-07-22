@@ -736,6 +736,22 @@ export class FairAgentScheduler {
     if (nodes.every(({ restored }) => restored)) run.logical = 0;
   }
 
+  removeRun(runId: string): void {
+    const run = this.#runs.get(runId);
+    if (!run) return;
+    const nodes = [...this.#nodes.values()].filter((node) => node.runId === runId);
+    if (run.active > 0 || nodes.some(({ state }) => !["completed", "failed", "cancelled"].includes(state))) throw new WorkflowError("INTERNAL_ERROR", `Cannot remove active scheduler run: ${runId}`);
+    for (const { id } of nodes) this.#nodes.delete(id);
+    this.#runs.delete(runId);
+    const index = this.#runOrder.indexOf(runId);
+    if (index >= 0) {
+      this.#runOrder.splice(index, 1);
+      if (index < this.#cursor) this.#cursor -= 1;
+      if (this.#cursor >= this.#runOrder.length) this.#cursor = 0;
+    }
+    this.#dispatch();
+  }
+
   toolsFor(parentId: string, resolveTools?: (role: string | undefined, tools: readonly string[] | undefined, model: string | undefined, inheritedTools: readonly string[], thinking: ThinkingLevel | undefined) => readonly string[]): ToolDefinition[] {
     const parent = this.#node(parentId);
     if (!parent.options.tools.includes("agent")) return [];
@@ -832,6 +848,7 @@ export class FairAgentScheduler {
     if (["completed", "failed", "cancelled"].includes(node.state)) return;
     const heldPermit = node.state === "running" || node.state === "retrying";
     node.state = result.ok ? "completed" : result.error.code === "CANCELLED" ? "cancelled" : "failed";
+    Reflect.deleteProperty(node, "steer");
     this.#persist(node.runId);
     if (heldPermit) this.#release(node.runId);
     for (const childId of node.children) { const child = this.#nodes.get(childId); if (child && !child.collected) this.#cancelTree(child); }

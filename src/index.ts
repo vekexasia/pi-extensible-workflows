@@ -2233,6 +2233,12 @@ class WorkflowEventPublisher {
 
   constructor(private readonly sink: WorkflowEventSink | undefined) {}
 
+  removeRun(runId: string): void {
+    this.#queues.delete(runId);
+    this.#budgetEvents.delete(runId);
+    this.#worktrees.delete(runId);
+  }
+
   seedBudget(runId: string, events: readonly BudgetEvent[] | undefined): void {
     const seen = this.#budgetEvents.get(runId) ?? new Set<string>();
     for (const event of events ?? []) seen.add(this.budgetKey(event));
@@ -2742,6 +2748,19 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     await eventPublisher.agentStates(run.store, run.metadata, previousAgents, runState.agents);
     run.update?.(workflowToolUpdate(withLiveActivities(runState)));
   });
+  const cleanupTerminalRun = async (runId: string): Promise<void> => {
+    const run = runs.get(runId);
+    if (!run || !["completed", "failed", "stopped"].includes(run.lifecycle.state)) return;
+    await scheduler.cancelRun(runId);
+    await scheduler.flush();
+    if (runs.get(runId) !== run) return;
+    scheduler.removeRun(runId);
+    terminalRunStates.set(runId, run.lifecycle.state as "completed" | "failed" | "stopped");
+    run.checkpointResolvers.clear();
+    liveActivities.delete(runId);
+    eventPublisher.removeRun(runId);
+    runs.delete(runId);
+  };
   type WorkflowStopResult = { runId: string; state: RunState | "unknown"; stopped: boolean; reason?: "unknown_run" | "already_terminal" };
   const stopWorkflowRun = async (runId: string): Promise<WorkflowStopResult> => {
     const run = runs.get(runId);
@@ -2754,6 +2773,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     run.execution?.cancel();
     await scheduler.cancelRun(run.store.runId);
     await scheduler.flush();
+    await cleanupTerminalRun(runId);
     return { runId, state: "stopped", stopped: true };
   };
   const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
@@ -2934,6 +2954,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     catch (error) {
       const typed = asWorkflowError(error);
       if (!["completed", "failed", "stopped"].includes(run.lifecycle.state)) { await run.lifecycle.terminal("failed", typed.code).catch(() => undefined); const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, error: { code: typed.code, message: typed.message } })); await eventPublisher.runFailed(run.store, run.metadata, typed, run.lifecycle.state === "interrupted" ? "interrupted" : "failed"); run.update?.(workflowToolUpdate(persisted)); }
+      await cleanupTerminalRun(run.store.runId);
       throw typed;
     }
     await scheduler.cancelRun(run.store.runId);
@@ -2994,7 +3015,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       await eventPublisher.runFailed(run.store, run.metadata, typed, state);
       run.update?.(workflowToolUpdate(persisted));
       if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) deliverFailure(pi, createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted));
-    });
+    }).finally(() => cleanupTerminalRun(run.store.runId));
+    run.completion = completion;
     void completion;
   };
   const applyBudgetDecision = async (request: BudgetApprovalRequest, approved: boolean): Promise<BudgetDecisionResult> => {
@@ -3225,9 +3247,10 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         if (params.foreground) pendingFailureDiagnostics.set(toolCallId, diagnostic);
         throw typed;
       });
-      (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).completion = finish;
+      const completion = finish.finally(() => cleanupTerminalRun(runId));
+      (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).completion = completion;
       if (background) {
-        void finish.then(async ({ value, resultPath }) => {
+        void completion.then(async ({ value, resultPath }) => {
           deliver(pi, completionDelivery(checked.metadata.name, value, resultPath, await store.changedWorktrees()));
         }, (error: unknown) => {
           const diagnostic = failureDiagnosticsFrom(error);
@@ -3236,7 +3259,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         });
         return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` } };
       }
-      const { value } = await finish;
+      const { value } = await completion;
       const run = (await store.load()).run;
       return { content: [{ type: "text" as const, text: JSON.stringify(value) }, { type: "text" as const, text: `Workflow run ID: ${runId}` }], details: { runId, value, run } };
       } catch (error) {
