@@ -179,21 +179,58 @@ void test("uses cumulative session stats after compaction for progress, budget, 
   assert.deepEqual(result.attempts[0]?.accounting, expected);
 });
 
-void test("keeps workflow_result present, delays acceptance, and allows one repair", async () => {
-  const responses: Array<unknown> = [{ answer: 7 }, { wrong: true }, { answer: 9 }];
+void test("keeps workflow_result present, validates invalid values, and allows one repair", async () => {
+  const responses: Array<unknown> = [{ wrong: true }, { wrong: true }, { answer: 9 }];
   const calls: Array<{ prompt: string; result: unknown }> = [];
+  const toolResults: unknown[] = [];
   const executor = new WorkflowAgentExecutor(root, async ({ resultTool }) => {
     assert.ok(resultTool);
     return { sessionId: "schema", sessionFile: "/sessions/schema.jsonl", messages: [assistant("ignored")], getSessionStats: sessionStats, async prompt(prompt) {
       const result = responses.shift();
-      if (result !== undefined) { calls.push({ prompt, result }); await resultTool.execute("id", result, new AbortController().signal, () => {}, {} as never); }
+      if (result !== undefined) { calls.push({ prompt, result }); toolResults.push(await resultTool.execute("id", result, new AbortController().signal, () => {}, {} as never)); }
     }, dispose() {} };
   });
   const result = await executor.execute("structured", { label: "schema", workflowName: "flow", role: "reviewer", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
   assert.deepEqual(result.value, { answer: 9 });
   assert.equal(calls.length, 3);
+  assert.equal((toolResults[0] as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(toolResults[0]), /Result does not match the required schema/);
+  assert.equal((toolResults[1] as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(toolResults[1]), /Result does not match the required schema/);
   assert.match(calls[1]?.prompt ?? "", /Submit the final result/);
   assert.match(calls[2]?.prompt ?? "", /Repair/);
+});
+
+void test("accepts workflow_result before agent_end without repair or overwrite", async () => {
+  let listener: ((event: AgentSessionEvent) => void) | undefined;
+  let prompts = 0;
+  let aborts = 0;
+  const executor = new WorkflowAgentExecutor(root, async ({ resultTool }) => {
+    assert.ok(resultTool);
+    const message = { role: "assistant", content: [{ type: "toolCall", id: "early", name: "workflow_result", arguments: { answer: 7 } }] };
+    return {
+      sessionId: "early-schema", sessionFile: "/sessions/early-schema.jsonl", messages: [assistant("ignored")], getSessionStats: sessionStats,
+      subscribe(next) { listener = next; return () => { listener = undefined; }; },
+      async prompt() {
+        prompts += 1;
+        listener?.({ type: "message_start", message } as unknown as AgentSessionEvent);
+        listener?.({ type: "tool_execution_start", toolCallId: "early", toolName: "workflow_result", args: { answer: 7 } });
+        const accepted = await resultTool.execute("early", { answer: 7 }, new AbortController().signal, () => {}, {} as never);
+        assert.equal((accepted as unknown as { isError?: boolean }).isError, undefined);
+        const duplicate = await resultTool.execute("duplicate", { answer: 9 }, new AbortController().signal, () => {}, {} as never);
+        assert.equal((duplicate as unknown as { isError?: boolean }).isError, true);
+        listener?.({ type: "tool_execution_end", toolCallId: "early", toolName: "workflow_result", result: accepted, isError: false });
+        listener?.({ type: "message_end", message } as unknown as AgentSessionEvent);
+        listener?.({ type: "agent_end" } as AgentSessionEvent);
+      },
+      async abort() { aborts += 1; },
+      dispose() {},
+    };
+  });
+  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
+  assert.deepEqual(result.value, { answer: 7 });
+  assert.equal(prompts, 1);
+  assert.equal(aborts, 1);
 });
 
 void test("fails native terminal provider errors before structured finalization", async () => {
