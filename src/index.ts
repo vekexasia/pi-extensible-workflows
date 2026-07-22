@@ -990,6 +990,10 @@ function validateStaticWithWorktree(call: WorkflowCall): void {
 export interface WorkflowCatalogFunction { name: string; version: string; headline: string; extensionDescription: string; description: string; input: JsonSchema; output: JsonSchema }
 export interface WorkflowCatalogVariable { name: string; version: string; headline: string; extensionDescription: string; description: string; schema: JsonSchema }
 export interface WorkflowCatalog { functions: readonly WorkflowCatalogFunction[]; variables: readonly WorkflowCatalogVariable[]; modelAliases?: Readonly<Record<string, string>> }
+export interface WorkflowCatalogIndexFunction { name: string; description: string; input: JsonSchema }
+export interface WorkflowCatalogIndexVariable { name: string; description: string; schema: JsonSchema }
+export interface WorkflowCatalogIndex { functions: readonly WorkflowCatalogIndexFunction[]; variables: readonly WorkflowCatalogIndexVariable[]; modelAliases?: Readonly<Record<string, string>> }
+export interface WorkflowCatalogError { error: { code: "NOT_FOUND"; name: string; message: string } }
 const RESERVED_GLOBALS = new Set(["agent", "conversation", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "worktreeState", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -1062,6 +1066,22 @@ export class WorkflowRegistry {
     return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
   }
 
+  catalogIndex(): WorkflowCatalogIndex {
+    const catalog = this.catalog();
+    return deepFreeze({
+      functions: catalog.functions.map(({ name, description, input }) => ({ name, description, input: structuredClone(input) })),
+      variables: catalog.variables.map(({ name, description, schema }) => ({ name, description, schema: structuredClone(schema) })),
+      ...(catalog.modelAliases ? { modelAliases: structuredClone(catalog.modelAliases) } : {}),
+    });
+  }
+
+  catalogDetail(name: string): WorkflowCatalogFunction | WorkflowCatalogVariable | WorkflowCatalogError {
+    const catalog = this.catalog();
+    const entry = catalog.functions.find((candidate) => candidate.name === name) ?? catalog.variables.find((candidate) => candidate.name === name);
+    if (entry) return entry;
+    return deepFreeze({ error: { code: "NOT_FOUND", name, message: `No registered workflow function or variable is available: ${name}` } });
+  }
+
   globals(): Readonly<Record<string, { name: string }>> {
     return Object.freeze(Object.fromEntries([...this.#extensions].flatMap((extension) => Object.keys(extension.functions ?? {}).map((name) => [name, { name }]))));
   }
@@ -1088,7 +1108,7 @@ export class WorkflowRegistry {
     return [...this.#hooks.values()].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   }
 }
-type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "catalog" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
+type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -1100,6 +1120,8 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     function: (name) => registry.function(name),
     functions: () => registry.functions(),
     catalog: () => registry.catalog(),
+    catalogIndex: () => registry.catalogIndex(),
+    catalogDetail: (name) => registry.catalogDetail(name),
     globals: () => registry.globals(),
     invokeFunction: (...args) => registry.invokeFunction(...args),
     variables: () => registry.variables(),
@@ -1119,6 +1141,8 @@ function loadingRegistry(): WorkflowRegistryApi { return workflowRegistryHost().
 beginWorkflowExtensionLoading();
 export function registerWorkflowExtension(extension: WorkflowExtension): void { loadingRegistry().register(extension); }
 export function workflowCatalog(): WorkflowCatalog { return loadingRegistry().catalog(); }
+export function workflowCatalogIndex(): WorkflowCatalogIndex { return loadingRegistry().catalogIndex(); }
+export function workflowCatalogDetail(name: string): WorkflowCatalogFunction | WorkflowCatalogVariable | WorkflowCatalogError { return loadingRegistry().catalogDetail(name); }
 export function registeredWorkflowFunctions(): Readonly<Record<string, WorkflowFunction>> { return loadingRegistry().functions(); }
 
 
@@ -2891,9 +2915,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     pi.registerTool({
       name: "workflow_catalog",
       label: "Workflow Catalog",
-      description: "List reusable workflow functions, variables, and model aliases",
-      parameters: Type.Object({}, { additionalProperties: false }),
-      async execute() { return { content: [{ type: "text" as const, text: JSON.stringify(registry.catalog()) }], details: {} }; }
+      description: "List reusable workflow functions, variables, and model aliases, or load one entry in full",
+      parameters: Type.Object({ name: Type.Optional(Type.String({ description: "Registered function or variable name for full detail" })) }, { additionalProperties: false }),
+      async execute(_id, params = {}) {
+        const result = params.name === undefined ? registry.catalogIndex() : registry.catalogDetail(params.name);
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result };
+      }
     });
     catalogRegistered = true;
   };
