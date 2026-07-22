@@ -2807,12 +2807,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (!silent) deliver(pi, `Workflow ${run.metadata.name} budget adjustment ${proposalId}: ${approved ? "Approved" : "Rejected"}.`);
     return result;
   };
-  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }) => {
+  const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless = false) => {
     const checkpointCounters = new Map<string, number>();
     return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
       const input = validateCheckpoint(raw);
       const label = nextNamedOccurrence(checkpointCounters, input.name);
       const path = operationPath("checkpoint", label);
+      if (headless) fail("RESUME_INCOMPATIBLE", "Headless CLI checkpoints are unsupported");
       if (foreground && !ui?.select) fail("RESUME_INCOMPATIBLE", "Foreground checkpoints require UI");
       const alreadyAwaiting = (await store.awaitingCheckpoints()).some((checkpoint) => checkpoint.path === path);
       const replayed = await store.awaitCheckpoint({ ...input, name: label, path });
@@ -3141,6 +3142,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     parameters: WORKFLOW_TOOL_PARAMETERS,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
+      const headless = object(ctx) && ctx.headless === true;
       const settingsPath = workflowSettingsPath();
       const defaults = loadSettings(settingsPath);
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
@@ -3222,7 +3224,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { if (conversationLock) conversationLocks.delete(conversationLock); await lifecycle.leave(); }
-      }, worktreeState: async (owner) => readWorktreeState(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined), phase: async (phase) => {
+      }, worktreeState: async (owner) => readWorktreeState(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: async (phase) => {
         await lifecycle.enter();
         try {
           let previousPhase: string | undefined;

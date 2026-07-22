@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
-import { runCli } from "../src/cli.js";
+import { formatWorkflowCliHelp, parseWorkflowCliArgs, runCli } from "../src/cli.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   return {
@@ -158,4 +158,12 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   const linkedOutput = execFileSync(bin, ["doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root }, encoding: "utf8" });
   assert.match(linkedOutput, /^# pi-extensible-workflows doctor/m);
   assert.equal(existsSync(join(paths.root, ".pi", "agent", "auth.json")), false);
+});
+void test("CLI workflow arguments follow registered schemas", () => {
+  const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, verbose: { type: "boolean", default: false }, tags: { type: "array", items: { type: "string" } } }, required: ["issue"], additionalProperties: false };
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["123", "--verbose", "--tags", "one", "--tags=two"]), { issue: 123, verbose: true, tags: ["one", "two"] });
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["--input", "{\"issue\":7}"]), { issue: 7 });
+  assert.throws(() => parseWorkflowCliArgs(schema, ["not-an-integer"]), /Invalid integer/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["123", "--unknown"]), /Unknown option/);
+  assert.match(formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } }), /Issue number/);
 });
