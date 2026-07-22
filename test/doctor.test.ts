@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { formatWorkflowCliHelp, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { registerWorkflowExtension, type JsonValue, type WorkflowExtension } from "../src/index.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   return {
@@ -34,6 +36,30 @@ async function withHome<T>(home: string, action: () => Promise<T>): Promise<T> {
   process.env.HOME = home;
   try { return await action(); }
   finally { if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous; }
+}
+
+const cliExtension: WorkflowExtension = {
+  version: "1.0.0",
+  headline: "CLI test workflows",
+  description: "Workflows for CLI acceptance tests",
+  functions: {
+    cliEcho: {
+      description: "Echo a CLI issue",
+      input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
+      output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
+      run: (input) => ({ issue: input.issue as JsonValue }),
+    },
+  },
+};
+registerWorkflowExtension(cliExtension);
+
+function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, functionDefinition: string, args: readonly string[], abort = false): { status: number | null; stdout: string; stderr: string } {
+  const script = join(paths.root, "isolated-cli.mjs");
+  const indexUrl = pathToFileURL(join(process.cwd(), "dist", "src", "index.js")).href;
+  const cliUrl = pathToFileURL(join(process.cwd(), "dist", "src", "cli.js")).href;
+  writeFileSync(script, [`import { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};`, `import { runCli } from ${JSON.stringify(cliUrl)};`, `registerWorkflowExtension({ version: "1.0.0", headline: "Isolated CLI", description: "Isolated CLI test", functions: { ${functionDefinition} } });`, "const controller = new AbortController();", abort ? "setImmediate(() => controller.abort());" : "", `const exit = await runCli(${JSON.stringify(args)}, { cwd: ${JSON.stringify(paths.cwd)}, agentDir: ${JSON.stringify(paths.agentDir)}, signal: controller.signal, stderr: (text) => process.stderr.write(text) });`, "process.exitCode = exit;"].join("\n"));
+  const result = spawnSync(process.execPath, [script], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" } });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
@@ -166,4 +192,76 @@ void test("CLI workflow arguments follow registered schemas", () => {
   assert.throws(() => parseWorkflowCliArgs(schema, ["not-an-integer"]), /Invalid integer/);
   assert.throws(() => parseWorkflowCliArgs(schema, ["123", "--unknown"]), /Unknown option/);
   assert.match(formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } }), /Issue number/);
+});
+
+void test("exported launchers are executable and delegate unchanged arguments", async () => {
+  const paths = fixture();
+  let output = "";
+  let warning = "";
+  await withHome(paths.root, () => runCli(["export", "cliEcho"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { warning += text; } }, (text) => { output += text; }));
+  const destination = join(paths.root, ".local", "bin", "cli-echo");
+  assert.equal(lstatSync(destination).isSymbolicLink(), false);
+  assert.equal(readFileSync(destination, "utf8"), "#!/bin/sh\nexec pi-extensible-workflows run 'cliEcho' \"$@\"\n");
+  assert.match(output, /Exported .*cli-echo/);
+  assert.match(warning, /not in PATH/);
+
+  const fakeBin = join(paths.root, "fake-bin");
+  const runner = join(fakeBin, "pi-extensible-workflows");
+  const capture = join(paths.root, "launcher-args.json");
+  mkdirSync(fakeBin, { recursive: true });
+  writeFileSync(runner, "#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(process.env.CAPTURE, JSON.stringify(process.argv.slice(2)));\n");
+  chmodSync(runner, 0o755);
+  execFileSync(destination, ["value with spaces", "--quoted", "a'b"], { env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, CAPTURE: capture }, encoding: "utf8" });
+  assert.deepEqual(JSON.parse(readFileSync(capture, "utf8")), ["run", "cliEcho", "value with spaces", "--quoted", "a'b"]);
+});
+
+void test("export refuses existing files and replaces them only with --force", async () => {
+  const paths = fixture();
+  const destination = join(paths.root, "bin", "cli-echo");
+  mkdirSync(join(paths.root, "bin"), { recursive: true });
+  writeFileSync(destination, "keep me\n");
+  let error = "";
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
+  assert.equal(readFileSync(destination, "utf8"), "keep me\n");
+  assert.match(error, /use --force/);
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
+  assert.match(readFileSync(destination, "utf8"), /^#!\/bin\/sh\n/);
+
+  const target = join(paths.root, "bin", "target");
+  const link = join(paths.root, "bin", "cli-link");
+  writeFileSync(target, "keep target\n");
+  symlinkSync(target, link);
+  assert.equal(await runCli(["export", "cliEcho", "--output", link], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(target, "utf8"), "keep target\n");
+  assert.equal(await runCli(["export", "cliEcho", "--output", link, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
+  assert.equal(lstatSync(link).isSymbolicLink(), false);
+  assert.equal(readFileSync(target, "utf8"), "keep target\n");
+});
+
+void test("CLI progress stays on stderr and the final result stays on stdout", async () => {
+  const paths = fixture();
+  let stdout = "";
+  let stderr = "";
+  const exit = await runCli(["run", "cliEcho", "7"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { stderr += text; } }, (text) => { stdout += text; });
+  assert.equal(exit, 0);
+  assert.equal(stdout, '{"issue":7}\n');
+  assert.match(stderr, /Workflow: cliEcho/);
+  assert.equal(stderr.includes("\u001b["), false);
+});
+
+void test("CLI cancellation aborts the workflow and exits non-zero", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliCancel: { description: "Wait for cancellation", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: (_input, context) => new Promise((resolve, reject) => { const cancel = () => reject(new Error("cancel observed")); if (context.run.signal.aborted) cancel(); else context.run.signal.addEventListener("abort", cancel, { once: true }); }) }`, ["run", "cliCancel"], true);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /cancelled/i);
+});
+
+void test("headless CLI checkpoints fail explicitly", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliCheckpoint: { description: "Reach an unsupported checkpoint", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "approval", prompt: "Approve?", context: null }) }`, ["run", "cliCheckpoint"]);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Headless CLI checkpoints are unsupported/);
 });
