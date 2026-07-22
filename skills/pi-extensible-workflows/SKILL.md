@@ -74,6 +74,19 @@ Extensions may define additional JSON-compatible agent option keys such as `advi
 
 Agent calls are unnamed. Direct `agent(...)` calls receive hidden source call-site identity; JavaScript aliases for workflow calls are unsupported. Calls from one source call site must not race outside `parallel` or `pipeline`, whose structural keys keep replay deterministic.
 
+## Persistent conversations
+
+Use `conversation(name, options)` when several agent turns should share a persisted transcript and build on one another. Unlike independent `agent(prompt, options)` calls, the returned handle continues from the last successful turn:
+
+```js
+const handle = conversation("developer", { role: "developer" });
+const findings = await handle.run("Inspect the implementation.");
+const fix = await handle.run("Now propose the smallest fix.");
+return { findings, fix };
+```
+
+Await each `handle.run(prompt, turnOptions)` call before starting the next one; conversation turns must be sequential and cannot overlap. Conversation creation accepts the same execution-policy options as `agent()`. `timeoutMs` and `retries` passed to `run()` are turn-local, so a failed turn does not advance the persisted conversation head.
+
 ## Shared worktree scope
 
 Use `withWorktree(callback)` or `withWorktree(name, callback)` when top-level agents should collaborate in one worktree:
