@@ -5,7 +5,7 @@ import { access, link, mkdir, open, readFile, readdir, rename, rm, stat, writeFi
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { promisify } from "node:util";
-import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord, WorkflowRunEvent, WorkflowWorktreeState } from "./index.js";
+import type { BudgetApprovalRequest, JsonValue, LaunchSnapshot, RunRecord, WorkflowRunEvent } from "./index.js";
 import type { OwnershipRecord } from "./agent-execution.js";
 import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
@@ -559,16 +559,6 @@ export class RunStore {
         return resolved.reference;
       }
       return await this.ownedWorktree(owner, cwd);
-    } catch (error) {
-      throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
-    }
-  }
-  async worktreeState(owner: string): Promise<WorkflowWorktreeState> {
-    try {
-      const record = await this.worktree(owner);
-      const [head, status] = await Promise.all([git(record.cwd, ["rev-parse", "HEAD"]), git(record.cwd, ["status", "--porcelain=v1"])]);
-      const name = this.worktreeName(record.owner);
-      return { ...(name === undefined ? {} : { name }), path: record.path, branch: record.branch, base: record.base, head: head.trim(), dirty: status.trim() !== "" };
     } catch (error) {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
     }

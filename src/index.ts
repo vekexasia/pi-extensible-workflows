@@ -18,7 +18,7 @@ import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./pers
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
-export const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "worktreeState", "shell"] as const;
+export const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
 export type WorkflowCallKind = (typeof WORKFLOW_CALL_KINDS)[number];
 export const WORKFLOW_RUN_STARTED_EVENT = "workflow:run-started";
 export const WORKFLOW_RUN_RESUMED_EVENT = "workflow:run-resumed";
@@ -73,11 +73,10 @@ export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelS
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; setup?: AgentSetupSummary }
 export interface WorkflowWorktreeCreatedEvent extends WorkflowEventBase { owner: string; branch: string; path: string; base: string }
 export interface WorkflowWorktreeReference { readonly path: string; readonly branch: string }
-export interface WorkflowWorktreeState { [key: string]: JsonValue; name?: string; path: string; branch: string; base: string; head: string; dirty: boolean }
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: string; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
-export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 3;
+export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 4;
 export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline" | "function"; functionName?: string; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
@@ -91,7 +90,6 @@ export interface WorkflowOrchestrationContext {
     (callback: WorkflowWorktreeCallback): Promise<JsonValue>;
     (name: string, callback: WorkflowWorktreeCallback): Promise<JsonValue>;
   };
-  worktreeState: () => Promise<WorkflowWorktreeState>;
   checkpoint: (...args: readonly unknown[]) => Promise<boolean>;
   phase: (name: string) => void;
   log: (message: string) => void;
@@ -726,7 +724,6 @@ function hasIdentifier(node: acorn.AnyNode, name: string): boolean {
 const INTERNAL_AGENT_NAME = "__pi_extensible_workflows_agent";
 const INTERNAL_CONVERSATION_NAME = "__pi_extensible_workflows_conversation";
 const INTERNAL_WORKTREE_NAME = "__pi_extensible_workflows_withWorktree";
-const INTERNAL_WORKTREE_STATE_NAME = "__pi_extensible_workflows_worktreeState";
 const INTERNAL_SHELL_NAME = "__pi_extensible_workflows_shell";
 
 function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
@@ -746,16 +743,14 @@ function instrumentWorkflow(script: string): string {
   if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
   if (hasIdentifier(program, INTERNAL_CONVERSATION_NAME)) fail("INVALID_METADATA", `${INTERNAL_CONVERSATION_NAME} is reserved for workflow conversation instrumentation`);
   if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
-  if (hasIdentifier(program, INTERNAL_WORKTREE_STATE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_STATE_NAME} is reserved for workflow worktreeState instrumentation`);
   if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
-  const calls = workflowCalls(program).filter((call) => ["agent", "conversation", "withWorktree", "worktreeState", "shell"].includes(call.callee.name));
+  const calls = workflowCalls(program).filter((call) => ["agent", "conversation", "withWorktree", "shell"].includes(call.callee.name));
   const edits = calls.flatMap((call) => {
     const callSite = `${String(call.start)}:${String(call.end)}`;
-    const isState = call.callee.name === "worktreeState";
     const hiddenArgument = call.arguments.length === 0 || callHasTrailingComma(body, call) ? "" : ", ";
     return [
-      { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "conversation" ? INTERNAL_CONVERSATION_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : call.callee.name === "worktreeState" ? INTERNAL_WORKTREE_STATE_NAME : INTERNAL_SHELL_NAME },
-      { start: call.end - 1, end: call.end - 1, text: isState ? "" : `${hiddenArgument}${JSON.stringify(callSite)}` },
+      { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "conversation" ? INTERNAL_CONVERSATION_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME },
+      { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` },
     ];
   }).sort((left, right) => right.start - left.start);
   let instrumented = body;
@@ -999,7 +994,7 @@ export interface WorkflowCatalogIndexFunction { name: string; description: strin
 export interface WorkflowCatalogIndexVariable { name: string; description: string; schema: JsonSchema }
 export interface WorkflowCatalogIndex { functions: readonly WorkflowCatalogIndexFunction[]; variables: readonly WorkflowCatalogIndexVariable[]; modelAliases?: Readonly<Record<string, string>> }
 export interface WorkflowCatalogError { error: { code: "NOT_FOUND"; name: string; message: string } }
-const RESERVED_GLOBALS = new Set(["agent", "conversation", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "worktreeState", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
+const RESERVED_GLOBALS = new Set(["agent", "conversation", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
@@ -1099,7 +1094,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, invoke: context.invoke, agent: context.agent, shell: context.shell, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, worktreeState: context.worktreeState, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, invoke: context.invoke, agent: context.agent, shell: context.shell, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);
@@ -1189,10 +1184,8 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
   if (hasIdentifier(program, INTERNAL_CONVERSATION_NAME)) fail("INVALID_METADATA", `${INTERNAL_CONVERSATION_NAME} is reserved for workflow conversation instrumentation`);
   if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
-  if (hasIdentifier(program, INTERNAL_WORKTREE_STATE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_STATE_NAME} is reserved for workflow worktreeState instrumentation`);
   if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
   validateDirectPrimitiveReferences(program, "withWorktree");
-  validateDirectPrimitiveReferences(program, "worktreeState");
   validateDirectPrimitiveReferences(program, "conversation");
   validateDirectPrimitiveReferences(program, "shell");
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
@@ -1205,7 +1198,6 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
       validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
     }
     if (operation === "withWorktree") validateStaticWithWorktree(call);
-    if (operation === "worktreeState" && call.arguments.length !== 0) fail("INVALID_METADATA", "worktreeState does not accept arguments");
     if (operation === "shell") validateStaticShellOptions(call);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
     if (operation === "checkpoint" && stableName(call.arguments[0]) === false) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
@@ -1331,7 +1323,7 @@ export interface WorkflowBridge {
   shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>;
   checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>;
   function?: (name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath?: readonly string[]) => Promise<JsonValue>;
-  worktreeState?: (owner: string, signal: AbortSignal) => Promise<WorkflowWorktreeState>;
+  worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>;
   functions?: Readonly<Record<string, { name: string }>>;
   variables?: Readonly<Record<string, JsonValue>>;
   phase?: (name: string) => void | Promise<void>;
@@ -1408,11 +1400,9 @@ const shellOccurrences = new Map();
 const conversationOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
 const worktreeOccurrences = new Map();
-const internalWorktreeState = (...values) => { if (values.length !== 0) throw workError("INVALID_METADATA", "worktreeState does not accept arguments"); const owner = worktreeOwners.getStore(); if (!owner) throw workError("INVALID_METADATA", "worktreeState() requires an active withWorktree() scope"); return rpc("worktreeState", [owner]); };
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
 const rejectShell = () => { throw workError("INVALID_METADATA", "Workflow shell calls must use a direct shell(...) call; aliases and indirect calls are unsupported"); };
 const rejectWorktree = () => { throw workError("INVALID_METADATA", "withWorktree calls must use a direct withWorktree(...) call; aliases and indirect calls are unsupported"); };
-const rejectWorktreeState = () => { throw workError("INVALID_METADATA", "worktreeState calls must use a direct worktreeState() call; aliases and indirect calls are unsupported"); };
 const internalWithWorktree = async (...values) => {
   const callSite = values.pop();
   if (typeof callSite !== "string") throw workError("INTERNAL_ERROR", "Missing withWorktree call-site identity");
@@ -1430,10 +1420,9 @@ const internalWithWorktree = async (...values) => {
     worktreeOccurrences.set(occurrenceKey, occurrence);
     owner = path("worktree", "unnamed", ...inherited, "callsite:" + callSite, "occurrence:" + String(occurrence));
   }
-  const state = await rpc("worktreeState", [owner]);
-  if (!state || typeof state !== "object" || typeof state.path !== "string" || typeof state.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
-  const reference = Object.freeze({ path: state.path, branch: state.branch });
-  return await worktreeOwners.run(owner, () => callback(reference));
+  const reference = await rpc("worktree", [owner]);
+  if (!reference || typeof reference !== "object" || typeof reference.path !== "string" || typeof reference.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
+  return await worktreeOwners.run(owner, () => callback(Object.freeze({ path: reference.path, branch: reference.branch })));
 };
 const internalConversation = (...values) => {
   const callSite = values.pop();
@@ -1638,13 +1627,13 @@ const pipeline = async (operationName, items, stages) => {
   return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, conversation: internalConversation, shell, withWorktree: rejectWorktree, worktreeState: rejectWorktreeState, prompt, checkpoint, parallel, pipeline, phase, log, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, conversation: internalConversation, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const [name, value] of Object.entries(config.variables || {})) Object.defineProperty(sandbox, name, { value: freeze(value), writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = config.script;
-Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_conversation,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_worktreeState,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalConversation, internalWithWorktree, internalWorktreeState, internalShell))
+Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_conversation,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalConversation, internalWithWorktree, internalShell))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: workerError(error) }))
   .finally(() => clearInterval(heartbeat));
@@ -1865,9 +1854,9 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
           value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } });
         }
-      } else if (method === "worktreeState") {
-        if (!bridge.worktreeState || typeof values[0] !== "string" || !values[0]) fail("INTERNAL_ERROR", "worktreeState requires an active host bridge and scope");
-        value = await bridge.worktreeState(values[0], controller.signal);
+      } else if (method === "worktree") {
+        if (!bridge.worktree || typeof values[0] !== "string" || !values[0]) fail("INTERNAL_ERROR", "worktree requires an active host bridge and scope");
+        value = await bridge.worktree(values[0], controller.signal);
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
         await bridge.phase?.(values[0]);
@@ -2353,11 +2342,11 @@ function namedRecord(value: unknown, kind: string): Array<[string, unknown]> {
   if (!object(value)) fail("INVALID_METADATA", `${kind} must be a record`);
   return Object.entries(value);
 }
-function publicWorktreeReference(state: WorkflowWorktreeState): Readonly<WorkflowWorktreeReference> {
-  if (!object(state) || typeof state.path !== "string" || typeof state.branch !== "string") fail("WORKTREE_FAILED", "Worktree reference is invalid");
-  return Object.freeze({ path: state.path, branch: state.branch });
+function publicWorktreeReference(reference: WorkflowWorktreeReference): Readonly<WorkflowWorktreeReference> {
+  if (!object(reference) || typeof reference.path !== "string" || typeof reference.branch !== "string") fail("WORKTREE_FAILED", "Worktree reference is invalid");
+  return Object.freeze({ path: reference.path, branch: reference.branch });
 }
-async function hostWithWorktree(args: readonly unknown[], identity: string, occurrences: Map<string, number>, resolveState: ((owner: string, signal: AbortSignal) => Promise<WorkflowWorktreeState>) | undefined, signal: AbortSignal): Promise<JsonValue> {
+async function hostWithWorktree(args: readonly unknown[], identity: string, occurrences: Map<string, number>, resolveWorktree: ((owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>) | undefined, signal: AbortSignal): Promise<JsonValue> {
   if (args.length !== 1 && args.length !== 2) fail("INVALID_METADATA", "withWorktree requires a callback or a name and callback");
   const callback = args[args.length - 1];
   if (typeof callback !== "function") fail("INVALID_METADATA", "withWorktree callback must be a function");
@@ -2372,8 +2361,8 @@ async function hostWithWorktree(args: readonly unknown[], identity: string, occu
     occurrences.set(key, occurrence);
     owner = operationPath("worktree", "unnamed", "function", identity, ...structuralPath, `occurrence:${String(occurrence)}`);
   }
-  if (!resolveState) fail("WORKTREE_FAILED", "No worktree state bridge is available");
-  const reference = publicWorktreeReference(await resolveState(owner, signal));
+  if (!resolveWorktree) fail("WORKTREE_FAILED", "No worktree bridge is available");
+  const reference = publicWorktreeReference(await resolveWorktree(owner, signal));
   return inheritedHostWorktreeOwner.run(owner, async () => await (callback as (reference: Readonly<WorkflowWorktreeReference>) => unknown)(reference)) as Promise<JsonValue>;
 }
 function workflowRunContext(cwd: string, sessionId: string, runId: string, workflow: WorkflowMetadata, args: JsonValue, signal: AbortSignal): Readonly<WorkflowRunContext> {
@@ -2500,13 +2489,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
       pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
-      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences, bridge.worktreeState, signal),
-      worktreeState: () => {
-        const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
-        if (!scopedWorktreeOwner) fail("INVALID_METADATA", "worktreeState() requires an active withWorktree() scope");
-        if (!bridge.worktreeState) fail("WORKTREE_FAILED", "No worktree state bridge is available");
-        return bridge.worktreeState(scopedWorktreeOwner, signal);
-      },
+      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences, bridge.worktree, signal),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);
@@ -2689,13 +2672,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (!existing && await store.ownsWorktree(owner)) await eventPublisher.worktree(store, metadata, worktree);
     return worktree;
   };
-  const readWorktreeState = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<WorkflowWorktreeState> => {
+  const resolveWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<Readonly<WorkflowWorktreeReference>> => {
     const run = runs.get(store.runId);
     if (!run) fail("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
     await run.lifecycle.enter();
     try {
-      await persistWorktree(store, metadata, owner);
-      return await store.worktreeState(owner);
+      const worktree = await persistWorktree(store, metadata, owner);
+      return { path: worktree.path, branch: worktree.branch };
     } finally { await run.lifecycle.leave(); }
   };
   const shellForRun = async (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity): Promise<ShellResult> => {
@@ -3046,7 +3029,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await run.store.complete(path, outcome.value);
         return outcome.value;
       } finally { if (conversationLock) conversationLocks.delete(conversationLock); await run.lifecycle.leave(); }
-      }, worktreeState: async (owner) => readWorktreeState(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { let previousPhase: string | undefined; const persisted = await persistRunState(run.store, run.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; }); await eventPublisher.phase(run.store, run.metadata, previousPhase, phase); runs.get(run.store.runId)?.update?.(workflowToolUpdate(persisted)); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
+      }, worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { let previousPhase: string | undefined; const persisted = await persistRunState(run.store, run.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; }); await eventPublisher.phase(run.store, run.metadata, previousPhase, phase); runs.get(run.store.runId)?.update?.(workflowToolUpdate(persisted)); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
     run.execution = execution;
     const completion = execution.result.then(async (value) => {
       await scheduler.flush();
@@ -3267,7 +3250,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { if (conversationLock) conversationLocks.delete(conversationLock); await lifecycle.leave(); }
-      }, worktreeState: async (owner) => readWorktreeState(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: async (phase) => {
+      }, worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: async (phase) => {
         await lifecycle.enter();
         try {
           let previousPhase: string | undefined;

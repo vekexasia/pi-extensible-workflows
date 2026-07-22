@@ -251,7 +251,7 @@ void test("cold resume replays completed agents by hidden structural identity", 
   execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
   const script = `return withWorktree("recovery", async () => agent("must replay"));`;
   let replayPath = "";
-  assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; }, worktreeState: async () => ({ path: "/worktrees/recovery", branch: "recovery-branch", base: "base", head: "base", dirty: false }) }).result, "original");
+  assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; }, worktree: async () => ({ path: "/worktrees/recovery", branch: "recovery-branch" }) }).result, "original");
   assert.ok(replayPath);
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
@@ -572,7 +572,7 @@ void test("parent registry survives nested agent session lifecycle", async () =>
   registerAcceptanceExtension();
 });
 void test("registered function context exposes callback worktree references", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-state-"));
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-reference-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd, { recursive: true });
   execFileSync("git", ["init", "-q", cwd]);
@@ -587,22 +587,16 @@ void test("registered function context exposes callback worktree references", as
     version: "1.0.0", headline: "Worktree reference", description: "Worktree reference acceptance",
     functions: {
       readReference: { description: "Read reference", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { let frozen = false; const reference = await context.withWorktree("registered", async (value) => { frozen = Object.isFrozen(value); return { path: value.path, branch: value.branch }; }); return { reference, frozen }; } },
-      readState: { description: "Read legacy state", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.withWorktree("registered", async () => context.worktreeState()); } },
     },
   });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const result = await workflow.execute("id", { name: "worktree-reference", script: "return { reference: await readReference({}), state: await readState({}) };", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  const value = result.details.value as { reference: { reference: { path: string; branch: string }; frozen: boolean }; state: { name?: string; path: string; branch: string; base: string; head: string; dirty: boolean } };
-  assert.match(value.reference.reference.path, /worktrees/);
-  assert.match(value.reference.reference.branch, /pi-extensible-workflows/);
-  assert.deepEqual(Object.keys(value.reference.reference), ["path", "branch"]);
-  assert.equal(value.reference.frozen, true);
-  assert.equal(value.state.name, "registered");
-  assert.equal(value.state.path, value.reference.reference.path);
-  assert.equal(value.state.branch, value.reference.reference.branch);
-  assert.equal(value.state.head, value.state.base);
-  assert.equal(value.state.dirty, false);
+  const result = await workflow.execute("id", { name: "worktree-reference", script: "return readReference({});", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const value = result.details.value as { reference: { path: string; branch: string }; frozen: boolean };
+  assert.match(value.reference.path, /worktrees/);
+  assert.match(value.reference.branch, /pi-extensible-workflows/);
+  assert.deepEqual(Object.keys(value.reference), ["path", "branch"]);
+  assert.equal(value.frozen, true);
 });
 
 void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {

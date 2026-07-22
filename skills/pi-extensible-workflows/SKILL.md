@@ -77,8 +77,6 @@ const result = await withWorktree("issue", async ({ path, branch }) => {
 ```
 Entering the scope materializes its worktree before the callback. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
-The legacy `worktreeState()` API remains available only inside an active scope. It returns fresh host-derived Git state including `name`, `path`, `branch`, `base`, `head`, and `dirty`; prefer the callback reference for agent-facing workflow code. Registered extension functions use `context.withWorktree((reference) => ...)` and may use `context.worktreeState()` for legacy compatibility.
-
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:
 ```js
 const results = await parallel("implementation", {

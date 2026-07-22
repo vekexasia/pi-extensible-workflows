@@ -485,7 +485,7 @@ export async function replayWorkflowScript(script: string, args: JsonValue = nul
         return `fake:${prompt}`;
       } finally { active -= 1; }
     },
-    worktreeState: async () => ({ path: "/worktrees/eval", branch: "eval-branch", base: "base", head: "base", dirty: false }),
+    worktree: async () => ({ path: "/worktrees/eval", branch: "eval-branch" }),
     phase: (name) => { phases.push(name); },
     log: (message) => { logs.push(message); },
   }, signal);
