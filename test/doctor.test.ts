@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
-import { runCli } from "../src/cli.js";
+import { formatWorkflowCliHelp, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { registerWorkflowExtension, type JsonValue, type WorkflowExtension } from "../src/index.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   return {
@@ -26,6 +28,7 @@ function fixture(): { root: string; cwd: string; agentDir: string; settingsPath:
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "test" } }));
   return { root, cwd, agentDir, settingsPath: join(root, "missing-settings.json") };
 }
 
@@ -34,6 +37,30 @@ async function withHome<T>(home: string, action: () => Promise<T>): Promise<T> {
   process.env.HOME = home;
   try { return await action(); }
   finally { if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous; }
+}
+
+const cliExtension: WorkflowExtension = {
+  version: "1.0.0",
+  headline: "CLI test workflows",
+  description: "Workflows for CLI acceptance tests",
+  functions: {
+    cliEcho: {
+      description: "Echo a CLI issue",
+      input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
+      output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
+      run: (input) => ({ issue: input.issue as JsonValue }),
+    },
+  },
+};
+function registerCliExtension(): void { registerWorkflowExtension(cliExtension); }
+
+function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, functionDefinition: string, args: readonly string[], abort = false): { status: number | null; stdout: string; stderr: string } {
+  const script = join(paths.root, "isolated-cli.mjs");
+  const indexUrl = pathToFileURL(join(process.cwd(), "dist", "src", "index.js")).href;
+  const cliUrl = pathToFileURL(join(process.cwd(), "dist", "src", "cli.js")).href;
+  writeFileSync(script, [`import { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};`, `import { runCli } from ${JSON.stringify(cliUrl)};`, `registerWorkflowExtension({ version: "1.0.0", headline: "Isolated CLI", description: "Isolated CLI test", functions: { ${functionDefinition} } });`, "const controller = new AbortController();", abort ? "setImmediate(() => controller.abort());" : "", `const exit = await runCli(${JSON.stringify(args)}, { cwd: ${JSON.stringify(paths.cwd)}, agentDir: ${JSON.stringify(paths.agentDir)}, signal: controller.signal, stderr: (text) => process.stderr.write(text) });`, "process.exitCode = exit;"].join("\n"));
+  const result = spawnSync(process.execPath, [script], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" } });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
 void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
@@ -158,4 +185,160 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   const linkedOutput = execFileSync(bin, ["doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root }, encoding: "utf8" });
   assert.match(linkedOutput, /^# pi-extensible-workflows doctor/m);
   assert.equal(existsSync(join(paths.root, ".pi", "agent", "auth.json")), false);
+});
+void test("CLI workflow arguments cover schema types, defaults, enums, and missing values", () => {
+  const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, label: { type: "string" }, ratio: { type: "number" }, mode: { type: "string", enum: ["fast", "safe"] }, verbose: { type: "boolean", default: false }, format: { type: "string", default: "plain" }, tags: { type: "array", items: { type: "string" } }, scores: { type: "array", items: { type: "number" } } }, required: ["issue"], additionalProperties: false };
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["123", "--label", "hello", "--ratio=1.5", "--mode", "fast", "--tags", "one", "--tags=two", "--scores", "2.5", "--scores=3"]), { issue: 123, label: "hello", ratio: 1.5, mode: "fast", verbose: false, format: "plain", tags: ["one", "two"], scores: [2.5, 3] });
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["--input", "{\"issue\":7}"]), { issue: 7 });
+  assert.throws(() => parseWorkflowCliArgs(schema, []), /Missing required argument: issue/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--label"]), /Missing value for --label/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--ratio", "--mode", "fast"]), /Missing value for --ratio/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--mode", "slow", "1"]), /Invalid value for enum/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["not-an-integer"]), /Invalid integer/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["1", "--unknown"]), /Unknown option/);
+  assert.match(formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } }), /Issue number/);
+});
+
+void test("exported launchers are executable and delegate unchanged arguments", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let output = "";
+  let warning = "";
+  await withHome(paths.root, () => runCli(["export", "cliEcho"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { warning += text; } }, (text) => { output += text; }));
+  const destination = join(paths.root, ".local", "bin", "cli-echo");
+  assert.equal(lstatSync(destination).isSymbolicLink(), false);
+  assert.equal(readFileSync(destination, "utf8"), "#!/bin/sh\nexec pi-extensible-workflows run 'cliEcho' \"$@\"\n");
+  assert.match(output, /Exported .*cli-echo/);
+  assert.match(warning, /not in PATH/);
+
+  const fakeBin = join(paths.root, "fake-bin");
+  const runner = join(fakeBin, "pi-extensible-workflows");
+  const capture = join(paths.root, "launcher-args.json");
+  mkdirSync(fakeBin, { recursive: true });
+  writeFileSync(runner, "#!/usr/bin/env node\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(process.env.CAPTURE, JSON.stringify(process.argv.slice(2)));\n");
+  chmodSync(runner, 0o755);
+  execFileSync(destination, ["value with spaces", "--quoted", "a'b"], { env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, CAPTURE: capture }, encoding: "utf8" });
+  assert.deepEqual(JSON.parse(readFileSync(capture, "utf8")), ["run", "cliEcho", "value with spaces", "--quoted", "a'b"]);
+  const indexUrl = pathToFileURL(join(process.cwd(), "dist", "src", "index.js")).href;
+  const cliUrl = pathToFileURL(join(process.cwd(), "dist", "src", "cli.js")).href;
+  writeFileSync(runner, `#!/usr/bin/env node\nimport { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};\nimport { runCli } from ${JSON.stringify(cliUrl)};\nregisterWorkflowExtension({ version: "1.0.0", headline: "Real runner", description: "Real runner", functions: { cliEcho: { description: "Echo", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) } } });\nprocess.exitCode = await runCli(process.argv.slice(2), { stderr: (text) => process.stderr.write(text) });\n`);
+  chmodSync(runner, 0o755);
+  const realOutput = execFileSync(destination, ["7"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1", PATH: `${fakeBin}:${process.env.PATH ?? ""}` }, encoding: "utf8" });
+  assert.equal(realOutput, '{"issue":7}\n');
+});
+
+void test("export refuses existing files and replaces them only with --force", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  const destination = join(paths.root, "bin", "cli-echo");
+  mkdirSync(join(paths.root, "bin"), { recursive: true });
+  writeFileSync(destination, "keep me\n");
+  let error = "";
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
+  assert.equal(readFileSync(destination, "utf8"), "keep me\n");
+  assert.match(error, /use --force/);
+  registerCliExtension();
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
+  assert.match(readFileSync(destination, "utf8"), /^#!\/bin\/sh\n/);
+  registerCliExtension();
+
+  const target = join(paths.root, "bin", "target");
+  const link = join(paths.root, "bin", "cli-link");
+  writeFileSync(target, "keep target\n");
+  symlinkSync(target, link);
+  assert.equal(await runCli(["export", "cliEcho", "--output", link], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(target, "utf8"), "keep target\n");
+  registerCliExtension();
+  assert.equal(await runCli(["export", "cliEcho", "--output", link, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
+  assert.equal(lstatSync(link).isSymbolicLink(), false);
+  assert.equal(readFileSync(target, "utf8"), "keep target\n");
+  const directory = join(paths.root, "bin", "destination-directory");
+  mkdirSync(directory);
+  registerCliExtension();
+  assert.equal(await runCli(["export", "cliEcho", "--output", directory, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 1);
+  assert.equal(lstatSync(directory).isDirectory(), true);
+});
+void test("CLI validates registered function output schemas", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliBadOutput: { description: "Return an invalid result", input: { type: "object", additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: () => ({ issue: "not an integer" }) }`, ["run", "cliBadOutput"]);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Invalid output from cliBadOutput|invalid output/i);
+});
+
+void test("CLI progress stays on stderr and the final result stays on stdout", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let stdout = "";
+  let stderr = "";
+  const exit = await runCli(["run", "cliEcho", "7"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { stderr += text; } }, (text) => { stdout += text; });
+  assert.equal(exit, 0);
+  assert.equal(stdout, '{"issue":7}\n');
+  assert.match(stderr, /Workflow: cliEcho/);
+  assert.equal(stderr.includes("\u001b["), false);
+});
+void test("CLI TTY progress repaints and respects terminal width", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let stdout = "";
+  let stderr = "";
+  const previousColumns = process.stderr.columns;
+  Object.defineProperty(process.stderr, "columns", { configurable: true, value: 20 });
+  try {
+    assert.equal(await runCli(["run", "cliEcho", "7"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, (text) => { stdout += text; }), 0);
+  } finally {
+    Object.defineProperty(process.stderr, "columns", { configurable: true, value: previousColumns });
+  }
+  assert.equal(stdout, '{"issue":7}\n');
+  assert.ok(stderr.includes("\u001b[?25l"));
+  assert.ok(stderr.includes("\u001b[1A"));
+  assert.match(stderr, /…/);
+});
+void test("headless CLI trust overrides are honored without leaking into workflow arguments", () => {
+  const paths = fixture();
+  const approved = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["run", "--approve", "cliTrust", "7"]);
+  assert.equal(approved.status, 0);
+  assert.equal(approved.stdout, '{"issue":7}\n');
+  const unapproved = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["run", "--no-approve", "cliTrust", "7"]);
+  assert.equal(unapproved.status, 0);
+  assert.equal(unapproved.stdout, '{"issue":7}\n');
+  const conflict = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: () => true }`, ["run", "--approve", "--no-approve", "cliTrust"]);
+  assert.equal(conflict.status, 1);
+  assert.match(conflict.stderr, /cannot be combined/);
+});
+
+void test("CLI cancellation aborts the workflow and exits non-zero", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliCancel: { description: "Wait for cancellation", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: (_input, context) => new Promise((resolve, reject) => { const cancel = () => reject(new Error("cancel observed")); if (context.run.signal.aborted) cancel(); else context.run.signal.addEventListener("abort", cancel, { once: true }); }) }`, ["run", "cliCancel"], true);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /cancelled/i);
+});
+
+void test("headless CLI checkpoints fail explicitly", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliCheckpoint: { description: "Reach an unsupported checkpoint", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: (_input, context) => context.checkpoint({ name: "approval", prompt: "Approve?", context: null }) }`, ["run", "cliCheckpoint"]);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Headless CLI checkpoints are unsupported/);
+});
+void test("headless runtime cleanup runs for non-execution CLI paths", async () => {
+  const paths = fixture();
+  const options = { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {}, write: () => {} };
+  registerCliExtension();
+  assert.equal(await runCli(["run", "cliEcho", "--help"], options), 0);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["run", "cliEcho"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["run", "missing"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["export", "cliEcho", "--help"], options), 0);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["export", "missing"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  const destination = join(paths.root, "existing");
+  writeFileSync(destination, "keep\n");
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
 });

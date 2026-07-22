@@ -88,7 +88,6 @@ const results = await withWorktree("implementation", async () => parallel("imple
 ```
 The callback result is unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
-The callback result is unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 Inside an active `withWorktree()` scope, `worktreeState()` returns fresh host-derived Git state: `name` (for named scopes), `path`, `branch`, `base`, `head`, and `dirty`. Read it after awaited development rather than from a racing parallel sibling. Registered extension functions use the equivalent scoped operation through `context.worktreeState()`.
 
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:

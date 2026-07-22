@@ -227,7 +227,7 @@ export class TestHarness {
   /** Wait for text to appear in the pane. */
   async waitFor(match: string, timeoutMs = 10_000): Promise<void> {
     if (!this.paneId) throw new Error("Not launched");
-    herdr("wait", "output", this.paneId, "--match", match, "--timeout", String(timeoutMs));
+    herdr("wait", "output", this.paneId, "--source", "recent-unwrapped", "--match", match, "--timeout", String(timeoutMs));
   }
 
   /** Read recent pane content (plain text, soft-wraps joined). */

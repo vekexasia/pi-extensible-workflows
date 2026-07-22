@@ -62,9 +62,11 @@ Global workflow settings live at `~/.pi/agent/pi-extensible-workflows/settings.j
 npx pi-extensible-workflows doctor
 npx pi-extensible-workflows inspect [session-id]
 npx pi-extensible-workflows transcript <session-file>
+npx pi-extensible-workflows run <workflow-name> [workflow arguments]
+npx pi-extensible-workflows export <workflow-name> [--name <command>] [--output <path>] [--force]
 ```
 
-`doctor` validates the installation and active Pi resources. `inspect` opens a read-only terminal view of persisted workflow runs. `transcript` renders a session transcript to stdout.
+`doctor` validates the installation and active Pi resources. `inspect` opens a read-only terminal view of persisted workflow runs. `transcript` renders a session transcript to stdout. `run` derives flat CLI arguments and help from a registered function's input schema. Use `--input '<json>'` for nested or otherwise complex inputs. It executes in the current working directory, writes the final JSON result to stdout, and writes progress and errors to stderr. `export` creates an executable POSIX launcher in `~/.local/bin` by default.
 
 ## Development
 
