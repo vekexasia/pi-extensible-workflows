@@ -2418,6 +2418,20 @@ void test("production shell executes in the workflow cwd with merged environment
   const result = await workflow.execute("id", { name: "shell", script: "return await shell(\"node -e \\\"process.stdout.write(process.env.SHELL_TEST);process.stderr.write('err');process.exit(3)\\\"\", { env: { SHELL_TEST: \"yes\" } });", foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.deepEqual(JSON.parse(result.content[0]?.text ?? "null"), { exitCode: 3, stdout: "yes", stderr: "err" });
 });
+void test("production shell does not journal results that exceed the complete RPC boundary", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-boundary-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on() {} } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-boundary-cwd-"));
+  const command = `node -e "process.stdout.write('x'.repeat(${String(RPC_LIMIT_BYTES - 80)}))"`;
+  await assert.rejects(workflow.execute("id", { name: "shell-boundary", script: `return await shell(${JSON.stringify(command)});`, foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "RPC_LIMIT_EXCEEDED");
+  const [runId] = await listRunIds(cwd, "session", home);
+  assert.ok(runId);
+  const journal = JSON.parse(readFileSync(join(new RunStore(cwd, "session", runId, home).directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
+  assert.deepEqual(journal.completed, {});
+});
 
 void test("registers global functions and replays each call as one validated operation", async () => {
   const registry = new WorkflowRegistry();
