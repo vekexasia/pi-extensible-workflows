@@ -28,6 +28,7 @@ function fixture(): { root: string; cwd: string; agentDir: string; settingsPath:
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
   mkdirSync(join(agentDir, "agents"), { recursive: true });
   mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(agentDir, "auth.json"), JSON.stringify({ openai: { type: "api_key", key: "test" } }));
   return { root, cwd, agentDir, settingsPath: join(root, "missing-settings.json") };
 }
 

@@ -4,7 +4,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import workflowExtension, { formatWorkflowProgress, workflowCatalog, type JsonSchema, type JsonValue } from "./index.js";
@@ -220,7 +220,7 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
     sendMessage() {},
     events: { emit() {} },
   };
-  workflowExtension(headlessPi as never, agentDir, undefined, undefined, agentDir);
+  workflowExtension(headlessPi as never, homedir(), undefined, undefined, agentDir);
   const workflowTool = tools.find((tool) => object(tool) && tool.name === "workflow") as HeadlessWorkflowTool | undefined;
   if (!workflowTool) throw new Error("The workflow runtime could not be initialized");
   return { catalog: workflowCatalog(), services, extensions, workflowTool, shutdownHandlers };
@@ -230,12 +230,15 @@ function availableModelInfo(services: WorkflowRuntime["services"], available = f
   const models = available ? services.modelRuntime.getAvailableSnapshot() : services.modelRuntime.getModels();
   return models.map(({ provider, id }) => ({ provider, id }));
 }
-function selectedModel(services: WorkflowRuntime["services"]): { provider: string; id: string } {
-  const provider = services.settingsManager.getDefaultProvider();
-  const modelId = services.settingsManager.getDefaultModel();
-  const configured = provider && modelId ? services.modelRuntime.getModel(provider, modelId) : undefined;
-  const selected = configured ?? services.modelRuntime.getAvailableSnapshot()[0] ?? services.modelRuntime.getModels()[0];
-  return selected ? { provider: selected.provider, id: selected.id } : { provider: "openai", id: "gpt" };
+
+async function selectedModel(services: WorkflowRuntime["services"]): Promise<{ provider: string; id: string } | undefined> {
+  const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory(), noTools: "all" });
+  try {
+    const model = session.model;
+    return model ? { provider: model.provider, id: model.id } : undefined;
+  } finally {
+    session.dispose();
+  }
 }
 
 function shellQuote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
@@ -300,11 +303,11 @@ async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, 
   }
 }
 
-function createWorkflowContext(runtime: WorkflowRuntime, options: WorkflowIo): unknown {
-  const model = selectedModel(runtime.services);
+async function createWorkflowContext(runtime: WorkflowRuntime, options: WorkflowIo): Promise<unknown> {
+  const model = await selectedModel(runtime.services);
   const sessionManager = SessionManager.inMemory();
   const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
-  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, model, modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
+  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
 }
 
 async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], context: unknown): Promise<void> {
@@ -318,7 +321,7 @@ async function withWorkflowRuntime<T>(options: WorkflowIo, action: (runtime: Wor
   let context: unknown = { cwd: options.cwd ?? process.cwd(), mode: "print", hasUI: false, headless: true };
   try {
     const runtime = await createWorkflowRuntime(options, shutdownHandlers);
-    context = createWorkflowContext(runtime, options);
+    context = await createWorkflowContext(runtime, options);
     return await action(runtime, context);
   } finally {
     await shutdownWorkflowRuntime(shutdownHandlers, context);

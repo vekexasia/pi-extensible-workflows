@@ -35,15 +35,18 @@ void test("navigator shows attention-ordered runs in the real TUI", { skip: !pro
     });
 
     await h.launch();
-    if (h.readPane(40).includes("interrupted workflow")) { h.sendKey("ctrl+c"); await new Promise((resolve) => setTimeout(resolve, 500)); }
+    await h.waitFor("interrupted", 10_000);
+    h.sendKey("ctrl+c");
+    await new Promise((resolve) => setTimeout(resolve, 500));
     h.send("/workflow");
     await h.waitFor("Close", 10_000);
 
     const screen = h.readPane(40);
+    const normalized = screen.replace(/\s+/g, " ");
 
-    const buildLine = screen.split("\n").findIndex((l) => l.includes("build") && l.includes("interrupted"));
-    const testLine = screen.split("\n").findIndex((l) => l.includes("test-suite") && l.includes("failed"));
-    const deployLine = screen.split("\n").findIndex((l) => l.includes("deploy") && l.includes("completed"));
+    const buildLine = normalized.indexOf("build interrupted");
+    const testLine = normalized.indexOf("test-suite failed");
+    const deployLine = normalized.indexOf("deploy completed");
 
     assert.ok(buildLine >= 0, `Expected 'build interrupted' in screen:\n${screen}`);
     assert.ok(testLine >= 0, `Expected 'test-suite failed' in screen:\n${screen}`);
