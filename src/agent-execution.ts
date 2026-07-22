@@ -391,7 +391,7 @@ export class WorkflowAgentExecutor {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       if (recoveryModel) resolved = this.resolve({ ...options, modelOverride: recoveryModel });
       options.budget?.beforeAttempt();
-      let accepted = false;
+      const accepted = options.schema !== undefined;
       let schemaResult: JsonValue | undefined;
       let session: NativeSession | undefined;
       let setup: AgentSetup | undefined;
@@ -409,6 +409,7 @@ export class WorkflowAgentExecutor {
         async execute(_id: string, value: unknown) {
           if (!accepted) return { content: [{ type: "text" as const, text: "Result acceptance is not enabled yet." }], details: {}, isError: true };
           if (!Value.Check(options.schema as object, value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
+          if (schemaResult !== undefined) return { content: [{ type: "text" as const, text: "Result has already been accepted." }], details: {}, isError: true };
           schemaResult = structuredClone(value) as JsonValue;
           void session?.abort?.();
           return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
@@ -491,7 +492,7 @@ export class WorkflowAgentExecutor {
             activity = undefined;
             if (event.message.role === "assistant") {
               const needsMoreWork = hasToolCall(event.message);
-              const final = !needsMoreWork || (options.schema !== undefined && accepted);
+              const final = !needsMoreWork || (options.schema !== undefined && hasSchemaResult());
               if (!budgetError) { try { options.budget?.afterTurn(accounting(activeSession.getSessionStats()), final); if (!final) { const instruction = options.budget?.instruction(); if (instruction) void session?.steer?.(instruction); } } catch (error) { budgetError ??= error instanceof WorkflowError ? error : new WorkflowError("BUDGET_EXHAUSTED", error instanceof Error ? error.message : String(error)); void session?.abort?.(); } }
               turnStarted = false;
               report(true);
@@ -510,14 +511,15 @@ export class WorkflowAgentExecutor {
         const promptText = `${context}\n\nTask:\n${setup.prompt}${instruction ? `\n\n${instruction}` : ""}`;
         options.budget?.beforeTurn();
         turnStarted = true;
-        await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause);
+        try { await promptWithProviderPause(session, promptText, remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); } catch (error) { if (!hasSchemaResult()) throw error; }
         if (conversationMismatch) throw conversationMismatch;
         throwIfTerminalAssistantError(session, setup.sessionInput.model);
-        { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? false : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
+        { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, options.schema !== undefined ? hasSchemaResult() : !latestAssistantHasToolCall(session.messages)); turnStarted = false; }
         if (budgetError) throw budgetError;
         if (options.schema) {
-          accepted = true;
-          try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+          if (!hasSchemaResult()) {
+            try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Submit the final result now by calling workflow_result exactly once. Do not return prose.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
+          }
           throwIfTerminalAssistantError(session, setup.sessionInput.model);
           if (!hasSchemaResult()) {
             try { options.budget?.beforeTurn(); turnStarted = true; await promptWithProviderPause(session, "Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", remaining(options.timeoutMs, started), executionSignal, this.root.providerPause); { const completedAccounting = accounting(session.getSessionStats()); options.budget?.afterTurn(completedAccounting, true); turnStarted = false; } } catch (error) { if (!hasSchemaResult()) throw error; }
