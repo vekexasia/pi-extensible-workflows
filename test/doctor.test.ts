@@ -189,7 +189,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
 void test("CLI workflow arguments cover schema types, defaults, enums, and missing values", () => {
   const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, label: { type: "string" }, ratio: { type: "number" }, mode: { type: "string", enum: ["fast", "safe"] }, verbose: { type: "boolean", default: false }, format: { type: "string", default: "plain" }, tags: { type: "array", items: { type: "string", enum: ["one", "two"] } }, scores: { type: "array", items: { type: "number" } } }, required: ["issue"], additionalProperties: false };
   assert.deepEqual(parseWorkflowCliArgs(schema, ["123", "--label", "hello", "--ratio=1.5", "--mode", "fast", "--tags", "one", "--tags=two", "--scores", "2.5", "--scores=3"]), { issue: 123, label: "hello", ratio: 1.5, mode: "fast", verbose: false, format: "plain", tags: ["one", "two"], scores: [2.5, 3] });
-  assert.deepEqual(parseWorkflowCliArgs(schema, ["--input", "{\"issue\":7}"]), { issue: 7 });
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["--input", "{\"issue\":7}"]), { issue: 7, verbose: false, format: "plain" });
   assert.throws(() => parseWorkflowCliArgs(schema, []), /Missing required argument: issue/);
   assert.throws(() => parseWorkflowCliArgs(schema, ["--label"]), /Missing value for --label/);
   assert.throws(() => parseWorkflowCliArgs(schema, ["--ratio", "--mode", "fast"]), /Missing value for --ratio/);
@@ -200,6 +200,16 @@ void test("CLI workflow arguments cover schema types, defaults, enums, and missi
   const help = formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } });
   assert.match(help, /Issue number/);
   assert.match(help, /--tags <string>.*enum="one","two"/);
+});
+void test("CLI parser handles delimiter passthrough, negated booleans, and negative numeric positionals", () => {
+  const stringSchema = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };
+  const booleanSchema = { type: "object", properties: { issue: { type: "integer" }, verbose: { type: "boolean", default: true } }, required: ["issue"], additionalProperties: false };
+  const integerSchema = { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false };
+  const numberSchema = { type: "object", properties: { value: { type: "number" } }, required: ["value"], additionalProperties: false };
+  assert.deepEqual(parseWorkflowCliArgs(stringSchema, ["--", "--approve"]), { value: "--approve" });
+  assert.equal(parseWorkflowCliArgs(booleanSchema, ["1", "--no-verbose"]).verbose, false);
+  assert.deepEqual(parseWorkflowCliArgs(integerSchema, ["-7"]), { value: -7 });
+  assert.deepEqual(parseWorkflowCliArgs(numberSchema, ["-1.5"]), { value: -1.5 });
 });
 
 void test("exported launchers are executable and delegate unchanged arguments", async () => {
@@ -310,6 +320,12 @@ void test("headless CLI trust overrides are honored without leaking into workflo
   const conflict = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: () => true }`, ["run", "--approve", "--no-approve", "cliTrust"]);
   assert.equal(conflict.status, 1);
   assert.match(conflict.stderr, /cannot be combined/);
+});
+void test("isolated CLI passes post-delimiter trust-like literals to workflows", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliLiteral: { description: "Echo a literal option", input: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false }, output: { type: "string" }, run: (input) => input.value }`, ["run", "--approve", "cliLiteral", "--", "--approve"]);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, '"--approve"\n');
 });
 
 void test("CLI cancellation aborts the workflow and exits non-zero", () => {

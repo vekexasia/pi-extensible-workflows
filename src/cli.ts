@@ -142,6 +142,7 @@ export function parseWorkflowCliArgs(schema: JsonSchema, rawArgs: readonly strin
   if (input !== undefined) {
     if (Object.keys(result).length || positionalUsed) throw new Error("--input cannot be combined with CLI arguments");
     if (!object(input)) throw new Error("Workflow input must be a JSON object");
+    for (const field of plan.fields) if (!has(input, field.name) && has(field.schema, "default")) input[field.name] = clone(field.schema.default);
     return input;
   }
   for (const field of plan.fields) if (!has(result, field.name) && has(field.schema, "default")) result[field.name] = clone(field.schema.default);
@@ -154,8 +155,10 @@ function exportUsage(): string { return "Usage: pi-extensible-workflows export <
 function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustOverride?: boolean } {
   const args: string[] = [];
   let trustOverride: boolean | undefined;
+  let endOptions = false;
   for (const arg of rawArgs) {
-    if (arg === "--approve" || arg === "--no-approve") {
+    if (arg === "--") { endOptions = true; args.push(arg); continue; }
+    if (!endOptions && (arg === "--approve" || arg === "--no-approve")) {
       const next = arg === "--approve";
       if (trustOverride !== undefined && trustOverride !== next) throw new Error("--approve and --no-approve cannot be combined");
       trustOverride = next;
