@@ -51,7 +51,7 @@ const cliExtension: WorkflowExtension = {
     },
   },
 };
-registerWorkflowExtension(cliExtension);
+function registerCliExtension(): void { registerWorkflowExtension(cliExtension); }
 
 function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, functionDefinition: string, args: readonly string[], abort = false): { status: number | null; stdout: string; stderr: string } {
   const script = join(paths.root, "isolated-cli.mjs");
@@ -185,16 +185,21 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.match(linkedOutput, /^# pi-extensible-workflows doctor/m);
   assert.equal(existsSync(join(paths.root, ".pi", "agent", "auth.json")), false);
 });
-void test("CLI workflow arguments follow registered schemas", () => {
-  const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, verbose: { type: "boolean", default: false }, tags: { type: "array", items: { type: "string" } } }, required: ["issue"], additionalProperties: false };
-  assert.deepEqual(parseWorkflowCliArgs(schema, ["123", "--verbose", "--tags", "one", "--tags=two"]), { issue: 123, verbose: true, tags: ["one", "two"] });
+void test("CLI workflow arguments cover schema types, defaults, enums, and missing values", () => {
+  const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, label: { type: "string" }, ratio: { type: "number" }, mode: { type: "string", enum: ["fast", "safe"] }, verbose: { type: "boolean", default: false }, format: { type: "string", default: "plain" }, tags: { type: "array", items: { type: "string" } }, scores: { type: "array", items: { type: "number" } } }, required: ["issue"], additionalProperties: false };
+  assert.deepEqual(parseWorkflowCliArgs(schema, ["123", "--label", "hello", "--ratio=1.5", "--mode", "fast", "--tags", "one", "--tags=two", "--scores", "2.5", "--scores=3"]), { issue: 123, label: "hello", ratio: 1.5, mode: "fast", verbose: false, format: "plain", tags: ["one", "two"], scores: [2.5, 3] });
   assert.deepEqual(parseWorkflowCliArgs(schema, ["--input", "{\"issue\":7}"]), { issue: 7 });
+  assert.throws(() => parseWorkflowCliArgs(schema, []), /Missing required argument: issue/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--label"]), /Missing value for --label/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--ratio", "--mode", "fast"]), /Missing value for --ratio/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["--mode", "slow", "1"]), /Invalid value for enum/);
   assert.throws(() => parseWorkflowCliArgs(schema, ["not-an-integer"]), /Invalid integer/);
-  assert.throws(() => parseWorkflowCliArgs(schema, ["123", "--unknown"]), /Unknown option/);
+  assert.throws(() => parseWorkflowCliArgs(schema, ["1", "--unknown"]), /Unknown option/);
   assert.match(formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } }), /Issue number/);
 });
 
 void test("exported launchers are executable and delegate unchanged arguments", async () => {
+  registerCliExtension();
   const paths = fixture();
   let output = "";
   let warning = "";
@@ -213,9 +218,16 @@ void test("exported launchers are executable and delegate unchanged arguments", 
   chmodSync(runner, 0o755);
   execFileSync(destination, ["value with spaces", "--quoted", "a'b"], { env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, CAPTURE: capture }, encoding: "utf8" });
   assert.deepEqual(JSON.parse(readFileSync(capture, "utf8")), ["run", "cliEcho", "value with spaces", "--quoted", "a'b"]);
+  const indexUrl = pathToFileURL(join(process.cwd(), "dist", "src", "index.js")).href;
+  const cliUrl = pathToFileURL(join(process.cwd(), "dist", "src", "cli.js")).href;
+  writeFileSync(runner, `#!/usr/bin/env node\nimport { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};\nimport { runCli } from ${JSON.stringify(cliUrl)};\nregisterWorkflowExtension({ version: "1.0.0", headline: "Real runner", description: "Real runner", functions: { cliEcho: { description: "Echo", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) } } });\nprocess.exitCode = await runCli(process.argv.slice(2), { stderr: (text) => process.stderr.write(text) });\n`);
+  chmodSync(runner, 0o755);
+  const realOutput = execFileSync(destination, ["7"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1", PATH: `${fakeBin}:${process.env.PATH ?? ""}` }, encoding: "utf8" });
+  assert.equal(realOutput, '{"issue":7}\n');
 });
 
 void test("export refuses existing files and replaces them only with --force", async () => {
+  registerCliExtension();
   const paths = fixture();
   const destination = join(paths.root, "bin", "cli-echo");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
@@ -224,8 +236,10 @@ void test("export refuses existing files and replaces them only with --force", a
   assert.equal(await runCli(["export", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
   assert.equal(readFileSync(destination, "utf8"), "keep me\n");
   assert.match(error, /use --force/);
+  registerCliExtension();
   assert.equal(await runCli(["export", "cliEcho", "--output", destination, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
   assert.match(readFileSync(destination, "utf8"), /^#!\/bin\/sh\n/);
+  registerCliExtension();
 
   const target = join(paths.root, "bin", "target");
   const link = join(paths.root, "bin", "cli-link");
@@ -234,12 +248,26 @@ void test("export refuses existing files and replaces them only with --force", a
   assert.equal(await runCli(["export", "cliEcho", "--output", link], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
   assert.equal(lstatSync(link).isSymbolicLink(), true);
   assert.equal(readFileSync(target, "utf8"), "keep target\n");
+  registerCliExtension();
   assert.equal(await runCli(["export", "cliEcho", "--output", link, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
   assert.equal(lstatSync(link).isSymbolicLink(), false);
   assert.equal(readFileSync(target, "utf8"), "keep target\n");
+  const directory = join(paths.root, "bin", "destination-directory");
+  mkdirSync(directory);
+  registerCliExtension();
+  assert.equal(await runCli(["export", "cliEcho", "--output", directory, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 1);
+  assert.equal(lstatSync(directory).isDirectory(), true);
+});
+void test("CLI validates registered function output schemas", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliBadOutput: { description: "Return an invalid result", input: { type: "object", additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: () => ({ issue: "not an integer" }) }`, ["run", "cliBadOutput"]);
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /Invalid output from cliBadOutput|invalid output/i);
 });
 
 void test("CLI progress stays on stderr and the final result stays on stdout", async () => {
+  registerCliExtension();
   const paths = fixture();
   let stdout = "";
   let stderr = "";
@@ -248,6 +276,35 @@ void test("CLI progress stays on stderr and the final result stays on stdout", a
   assert.equal(stdout, '{"issue":7}\n');
   assert.match(stderr, /Workflow: cliEcho/);
   assert.equal(stderr.includes("\u001b["), false);
+});
+void test("CLI TTY progress repaints and respects terminal width", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let stdout = "";
+  let stderr = "";
+  const previousColumns = process.stderr.columns;
+  Object.defineProperty(process.stderr, "columns", { configurable: true, value: 20 });
+  try {
+    assert.equal(await runCli(["run", "cliEcho", "7"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, (text) => { stdout += text; }), 0);
+  } finally {
+    Object.defineProperty(process.stderr, "columns", { configurable: true, value: previousColumns });
+  }
+  assert.equal(stdout, '{"issue":7}\n');
+  assert.ok(stderr.includes("\u001b[?25l"));
+  assert.ok(stderr.includes("\u001b[1A"));
+  assert.match(stderr, /…/);
+});
+void test("headless CLI trust overrides are honored without leaking into workflow arguments", () => {
+  const paths = fixture();
+  const approved = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["run", "--approve", "cliTrust", "7"]);
+  assert.equal(approved.status, 0);
+  assert.equal(approved.stdout, '{"issue":7}\n');
+  const unapproved = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["run", "--no-approve", "cliTrust", "7"]);
+  assert.equal(unapproved.status, 0);
+  assert.equal(unapproved.stdout, '{"issue":7}\n');
+  const conflict = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: () => true }`, ["run", "--approve", "--no-approve", "cliTrust"]);
+  assert.equal(conflict.status, 1);
+  assert.match(conflict.stderr, /cannot be combined/);
 });
 
 void test("CLI cancellation aborts the workflow and exits non-zero", () => {
@@ -264,4 +321,23 @@ void test("headless CLI checkpoints fail explicitly", () => {
   assert.equal(result.status, 1);
   assert.equal(result.stdout, "");
   assert.match(result.stderr, /Headless CLI checkpoints are unsupported/);
+});
+void test("headless runtime cleanup runs for non-execution CLI paths", async () => {
+  const paths = fixture();
+  const options = { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {}, write: () => {} };
+  registerCliExtension();
+  assert.equal(await runCli(["run", "cliEcho", "--help"], options), 0);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["run", "cliEcho"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["run", "missing"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["export", "cliEcho", "--help"], options), 0);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  assert.equal(await runCli(["export", "missing"], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
+  const destination = join(paths.root, "existing");
+  writeFileSync(destination, "keep\n");
+  assert.equal(await runCli(["export", "cliEcho", "--output", destination], options), 1);
+  assert.doesNotThrow(() => { registerCliExtension(); });
 });

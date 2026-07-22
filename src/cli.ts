@@ -12,7 +12,7 @@ import { runSessionInspector, transcriptFileLines } from "./session-inspector.js
 import type { PersistedRun } from "./persistence.js";
 import type { WorkflowCatalogFunction } from "./index.js";
 
-export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean }
+export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean; isTTY?: boolean }
 
 type CliScalar = "string" | "integer" | "number" | "boolean";
 type CliField = { name: string; option: string; schema: Record<string, unknown>; type: CliScalar | "array"; itemType?: CliScalar; required: boolean };
@@ -165,9 +165,10 @@ function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustO
 type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => void; cwd?: string; agentDir?: string; trustOverride?: boolean; isTTY?: boolean; signal?: AbortSignal };
 
 type HeadlessWorkflowTool = { execute: (toolCallId: string, params: Record<string, JsonValue>, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, context: unknown) => Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> };
-type WorkflowRuntime = { catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; extensions: ReturnType<Awaited<ReturnType<typeof createAgentSessionServices>>["resourceLoader"]["getExtensions"]>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: Array<(event: unknown, context: unknown) => Promise<void> | void> };
+type ShutdownHandler = (event: unknown, context: unknown) => Promise<void> | void;
+type WorkflowRuntime = { catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; extensions: ReturnType<Awaited<ReturnType<typeof createAgentSessionServices>>["resourceLoader"]["getExtensions"]>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
 
-async function createWorkflowRuntime(options: WorkflowIo): Promise<WorkflowRuntime> {
+async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: ShutdownHandler[] = []): Promise<WorkflowRuntime> {
   const cwd = options.cwd ?? process.cwd();
   const agentDir = options.agentDir ?? getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
@@ -184,14 +185,13 @@ async function createWorkflowRuntime(options: WorkflowIo): Promise<WorkflowRunti
   });
   const extensions = services.resourceLoader.getExtensions();
   const tools: unknown[] = [];
-  const shutdownHandlers: Array<(event: unknown, context: unknown) => Promise<void> | void> = [];
   const activeTools = [...new Set(["read", "bash", "edit", "write"].concat(extensions.extensions.flatMap((extension) => [...extension.tools.keys()]), ["workflow"]))];
   const headlessPi = {
     registerTool(tool: unknown) { tools.push(tool); },
     registerCommand() {},
     getThinkingLevel: () => services.settingsManager.getDefaultThinkingLevel() ?? "medium",
     getActiveTools: () => activeTools,
-    on(name: string, handler: unknown) { if (name === "session_shutdown" && typeof handler === "function") shutdownHandlers.push(handler as (event: unknown, context: unknown) => Promise<void> | void); },
+    on(name: string, handler: unknown) { if (name === "session_shutdown" && typeof handler === "function") shutdownHandlers.push(handler as ShutdownHandler); },
     appendEntry() {},
     sendMessage() {},
     events: { emit() {} },
@@ -226,7 +226,6 @@ function writeLauncher(destination: string, workflowName: string, force: boolean
   try {
     writeFileSync(tempPath, `#!/bin/sh\nexec pi-extensible-workflows run ${shellQuote(workflowName)} "$@"\n`, { mode: 0o755 });
     chmodSync(tempPath, 0o755);
-    if (force) { try { rmSync(destination, { force: true }); } catch { /* The rename below reports the actual failure. */ } }
     renameSync(tempPath, destination);
   } finally { rmSync(tempDir, { recursive: true, force: true }); }
 }
@@ -249,12 +248,8 @@ class CliProgress {
   finish(): void { if (this.tty && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; } }
 }
 
-async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, JsonValue>, runtime: WorkflowRuntime, options: WorkflowIo): Promise<JsonValue> {
+async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, JsonValue>, runtime: WorkflowRuntime, options: WorkflowIo, context: unknown): Promise<JsonValue> {
   if (!Value.Check(fn.input, args)) throw new Error(`Invalid input for ${fn.name}`);
-  const model = selectedModel(runtime.services);
-  const sessionManager = SessionManager.inMemory();
-  const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
-  const context = { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, model, modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
   const progress = new CliProgress(options.stderr, options.isTTY ?? process.stderr.isTTY);
   try {
     const result = await runtime.workflowTool.execute(randomUUID(), { workflow: fn.name, args, foreground: true }, options.signal, (update: unknown) => { if (object(update) && object(update.details) && object(update.details.run)) progress.update(update.details.run as unknown as PersistedRun); }, context);
@@ -265,7 +260,31 @@ async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, 
     try { return parseJsonInput(first.text); } catch { throw new Error("Workflow returned invalid JSON"); }
   } finally {
     progress.finish();
-    for (const handler of runtime.shutdownHandlers) await Promise.resolve(handler({ type: "session_shutdown", reason: "quit" }, context)).catch(() => undefined);
+  }
+}
+
+function createWorkflowContext(runtime: WorkflowRuntime, options: WorkflowIo): unknown {
+  const model = selectedModel(runtime.services);
+  const sessionManager = SessionManager.inMemory();
+  const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
+  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, model, modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
+}
+
+async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], context: unknown): Promise<void> {
+  for (const handler of handlers) {
+    try { await handler({ type: "session_shutdown", reason: "quit" }, context); } catch { /* Shutdown is best effort. */ }
+  }
+}
+
+async function withWorkflowRuntime<T>(options: WorkflowIo, action: (runtime: WorkflowRuntime, context: unknown) => Promise<T>): Promise<T> {
+  const shutdownHandlers: ShutdownHandler[] = [];
+  let context: unknown = { cwd: options.cwd ?? process.cwd(), mode: "print", hasUI: false, headless: true };
+  try {
+    const runtime = await createWorkflowRuntime(options, shutdownHandlers);
+    context = createWorkflowContext(runtime, options);
+    return await action(runtime, context);
+  } finally {
+    await shutdownWorkflowRuntime(shutdownHandlers, context);
   }
 }
 
@@ -274,23 +293,24 @@ async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): 
   const args = parsed.args;
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(workflowUsage()); return args.length ? 0 : 1; }
   const name = args[0] as string;
-  const runtime = await createWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) });
-  const help = args.slice(1).some((arg) => arg === "--help" || arg === "-h");
-  const fn = runtime.catalog.functions.find((candidate) => candidate.name === name);
-  if (!fn) throw new Error(`Unknown workflow function: ${name}`);
-  if (help) { options.write(formatWorkflowCliHelp(fn)); return 0; }
-  const input = parseWorkflowCliArgs(fn.input, args.slice(1));
-  const controller = new AbortController();
-  if (options.signal?.aborted) controller.abort();
-  const onAbort = () => { controller.abort(); };
-  options.signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const value = await invokeWorkflow(fn, input, runtime, { ...options, signal: controller.signal });
-    options.write(`${JSON.stringify(value)}\n`);
-    return 0;
-  } finally {
-    options.signal?.removeEventListener("abort", onAbort);
-  }
+  return withWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) }, async (runtime, context) => {
+    const help = args.slice(1).some((arg) => arg === "--help" || arg === "-h");
+    const fn = runtime.catalog.functions.find((candidate) => candidate.name === name);
+    if (!fn) throw new Error(`Unknown workflow function: ${name}`);
+    if (help) { options.write(formatWorkflowCliHelp(fn)); return 0; }
+    const input = parseWorkflowCliArgs(fn.input, args.slice(1));
+    const controller = new AbortController();
+    if (options.signal?.aborted) controller.abort();
+    const onAbort = () => { controller.abort(); };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const value = await invokeWorkflow(fn, input, runtime, { ...options, signal: controller.signal }, context);
+      options.write(`${JSON.stringify(value)}\n`);
+      return 0;
+    } finally {
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+  });
 }
 
 async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): Promise<number> {
@@ -298,36 +318,37 @@ async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
   const args = parsed.args;
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(exportUsage()); return args.length ? 0 : 1; }
   const workflowName = args[0] as string;
-  let name: string | undefined;
-  let output: string | undefined;
-  let force = false;
-  for (let index = 1; index < args.length; index += 1) {
-    const arg = args[index] as string;
-    if (arg === "--force") { force = true; continue; }
-    const equals = arg.indexOf("=");
-    const option = equals >= 0 ? arg.slice(0, equals) : arg;
-    if (option === "--name" || option === "--output") {
-      const value = equals >= 0 ? arg.slice(equals + 1) : args[++index];
-      if (!value) throw new Error(`Missing value for ${option}`);
-      if (option === "--name") name = value; else output = value;
-      continue;
+  return withWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) }, async (runtime) => {
+    let name: string | undefined;
+    let output: string | undefined;
+    let force = false;
+    for (let index = 1; index < args.length; index += 1) {
+      const arg = args[index] as string;
+      if (arg === "--force") { force = true; continue; }
+      const equals = arg.indexOf("=");
+      const option = equals >= 0 ? arg.slice(0, equals) : arg;
+      if (option === "--name" || option === "--output") {
+        const value = equals >= 0 ? arg.slice(equals + 1) : args[++index];
+        if (!value) throw new Error(`Missing value for ${option}`);
+        if (option === "--name") name = value; else output = value;
+        continue;
+      }
+      if (arg === "--help" || arg === "-h") { options.write(exportUsage()); return 0; }
+      throw new Error(`Unknown option: ${arg}`);
     }
-    if (arg === "--help" || arg === "-h") { options.write(exportUsage()); return 0; }
-    throw new Error(`Unknown option: ${arg}`);
-  }
-  const runtime = await createWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) });
-  if (!runtime.catalog.functions.some((candidate) => candidate.name === workflowName)) throw new Error(`Unknown workflow function: ${workflowName}`);
-  const command = commandName(name ?? kebabCase(workflowName));
-  if (!command) throw new Error("Command name must be a non-empty name without path separators");
-  const destination = output ? output : join(homedir(), ".local", "bin", command);
-  writeLauncher(destination, workflowName, force);
-  if (!output) {
-    const binDir = join(homedir(), ".local", "bin");
-    const pathEntries = (process.env.PATH ?? "").split(":").filter(Boolean).map((entry) => { try { return realpathSync(entry); } catch { return entry; } });
-    if (!pathEntries.includes(binDir)) options.stderr(`Warning: ${binDir} is not in PATH\n`);
-  }
-  options.write(`Exported ${destination}\n`);
-  return 0;
+    if (!runtime.catalog.functions.some((candidate) => candidate.name === workflowName)) throw new Error(`Unknown workflow function: ${workflowName}`);
+    const command = commandName(name ?? kebabCase(workflowName));
+    if (!command) throw new Error("Command name must be a non-empty name without path separators");
+    const destination = output ? output : join(homedir(), ".local", "bin", command);
+    writeLauncher(destination, workflowName, force);
+    if (!output) {
+      const binDir = join(homedir(), ".local", "bin");
+      const pathEntries = (process.env.PATH ?? "").split(":").filter(Boolean).map((entry) => { try { return realpathSync(entry); } catch { return entry; } });
+      if (!pathEntries.includes(binDir)) options.stderr(`Warning: ${binDir} is not in PATH\n`);
+    }
+    options.write(`Exported ${destination}\n`);
+    return 0;
+  });
 }
 
 export async function runCli(args: readonly string[], options: CliOptions = {}, write: (text: string) => void = (text) => { process.stdout.write(text); }): Promise<number> {
@@ -350,7 +371,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
   }
   if (args[0] === "run" || args[0] === "export") {
     try {
-      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}) };
+      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}), ...(options.isTTY !== undefined ? { isTTY: options.isTTY } : {}) };
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
   }
