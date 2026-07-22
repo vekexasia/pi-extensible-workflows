@@ -3554,7 +3554,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 if (action === "Copy transcript path") await copyArtifact(attempt.sessionFile, "transcript path");
                 else if (action === "View transcript") await openTranscript(attempt.sessionFile);
                 else {
-                  const running = !SETTLED_AGENT_STATES.has(selected.state);
+                  const running = !SETTLED_AGENT_STATES.has(selected.state) && attempt.attempt === attempts.at(-1)?.attempt && !attempt.error;
                   if (action === "Fork as Pi session in pane" && running && !await ctx.ui.confirm("Fork running attempt?", "This attempt is still running. The snapshot may end mid-turn and will not receive later updates. It opens read-only to avoid concurrent changes to the workflow agent's working directory. Continue?")) continue;
                   try {
                     await openHerdrPane({ action: action === "Open transcript in pane" ? "transcript" : "fork", cwd: worktree?.cwd ?? attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(action === "Fork as Pi session in pane" && running ? { readOnly: true } : {}) });
