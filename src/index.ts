@@ -2625,7 +2625,15 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (!existing && await store.ownsWorktree(owner)) await eventPublisher.worktree(store, metadata, worktree);
     return worktree;
   };
-  const readWorktreeState = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<WorkflowWorktreeState> => { await persistWorktree(store, metadata, owner); return store.worktreeState(owner); };
+  const readWorktreeState = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<WorkflowWorktreeState> => {
+    const run = runs.get(store.runId);
+    if (!run) fail("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
+    await run.lifecycle.enter();
+    try {
+      await persistWorktree(store, metadata, owner);
+      return await store.worktreeState(owner);
+    } finally { await run.lifecycle.leave(); }
+  };
   const shellForRun = async (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity): Promise<ShellResult> => {
     await lifecycle.enter();
     try {
