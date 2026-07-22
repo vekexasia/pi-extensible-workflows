@@ -4,11 +4,9 @@ description: Use when the task is complex enough to require multiple subagents o
 ---
 
 # pi-extensible-workflows
-
 Use `workflow` only for genuinely multi-agent orchestration; one agent uses ordinary tools or `Agent` directly. Give phases distinct responsibilities and keep result flow explicit.
 
 ## Pattern
-
 ```js
 const reportSchema = { type: "object", properties: { summary: { type: "string" }, findings: { type: "array", items: { type: "string" } } }, required: ["summary", "findings"], additionalProperties: false };
 
@@ -46,17 +44,10 @@ return withWorktree("fix-tests", async () => {
 Shell results are journaled only after process exit and RPC validation. A host crash after side effects but before journaling can rerun the command on resume; use `shell()` mainly for verification and bounded gates, not exactly-once mutations.
 
 ## `agent()` options
-
 ```typescript
 interface AgentOptions {
-  label?: string; // optional non-empty display name
-  model?: string; // configured alias or provider/model[:thinking]
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-  role?: string; // one of the available workflow roles
-  tools?: string[]; // [] = no tools; omitted uses role or launch tools
-  outputSchema?: JsonSchema;
-  retries?: number; // non-negative; use for safe, repeatable work
-  timeoutMs?: number | null; // positive milliseconds; null means unlimited
+  label?: string; model?: string; role?: string; tools?: string[];
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null;
 }
 ```
 
@@ -65,7 +56,6 @@ Extensions may add JSON-compatible agent options such as `advisor: true`; core k
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
 
 ## Persistent conversations
-
 Use `conversation(name, options)` when several agent turns should share a persisted transcript and build on one another. Unlike independent `agent(prompt, options)` calls, the returned handle continues from the last successful turn:
 
 ```js
@@ -78,7 +68,6 @@ return { findings, fix };
 Await each `handle.run(prompt, turnOptions)` call before starting the next one; conversation turns must be sequential and cannot overlap. Conversation creation accepts the same execution-policy options as `agent()`. `timeoutMs` and `retries` passed to `run()` are turn-local, so a failed turn does not advance the persisted conversation head.
 
 ## Worktrees
-
 Use `withWorktree(callback)` or `withWorktree(name, callback)` for top-level agents that collaborate in one worktree:
 ```js
 const results = await withWorktree("implementation", async () => parallel("implementation", {
@@ -101,7 +90,6 @@ const results = await parallel("implementation", {
 Registered extension functions receive `withWorktree` in context and can compose other registered functions with `context.invoke("reviewRepository", { focus: "security" })`. Their public inputs and outputs remain JSON; callbacks cannot cross the extension boundary.
 
 ## Rules
-
 - Use `log(messageString)` for brief operator status.
 - A role owns execution policy: with `role`, do not set `model`, `thinking`, or `tools`; only task options such as `outputSchema`, retries, timeout, or a `withWorktree` scope may accompany it.
 - Use `parallel()` for independent tasks with different flows and `pipeline()` when every keyed item follows the same ordered stages; do not duplicate identical chains in `parallel()`. Signatures are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; keys are stable task, item, and stage names.
