@@ -2090,7 +2090,8 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   return lines.join("\n");
 }
 function formatCheckpointReview(checkpoint: AwaitingCheckpoint): string {
-  return [`Name: ${checkpoint.name}`, "Prompt:", checkpoint.prompt, "Context:", JSON.stringify(checkpoint.context, null, 2)].join("\n");
+  const context = JSON.stringify(checkpoint.context, null, 2);
+  return [`Name: ${checkpoint.name}`, "Prompt:", checkpoint.prompt, context === "null" ? "Context: null" : "Context:", ...(context === "null" ? [] : [context])].join("\n");
 }
 
 const DELIVERY_LIMIT_BYTES = 4 * 1024;
@@ -2517,6 +2518,17 @@ function tuiHostCapabilities(tui: unknown): TuiHostCapabilities {
   return { terminal: { ...(tui.terminal.rows === undefined ? {} : { rows: tui.terminal.rows }) } };
 }
 function tuiRows(tui: unknown): number { const rows = tuiHostCapabilities(tui).terminal?.rows; return typeof rows === "number" && Number.isFinite(rows) ? rows : 24; }
+const WORKFLOW_OVERLAY_BORDER_ROWS = 2;
+type WorkflowOverlayComponent = { render(width: number): string[]; invalidate(): void; handleInput?(data: string): void; dispose?(): void };
+function borderWorkflowOverlay(component: WorkflowOverlayComponent, theme: { fg(color: "border", text: string): string }): WorkflowOverlayComponent {
+  return {
+    ...component,
+    render(width: number) {
+      const border = theme.fg("border", "─".repeat(Math.max(1, width)));
+      return [border, ...component.render(width), border];
+    },
+  };
+}
 type KeybindingsHostCapabilities = { getKeys?: (name: string) => readonly string[] };
 function isKeybindingGetter(value: unknown): value is NonNullable<KeybindingsHostCapabilities["getKeys"]> { return typeof value === "function"; }
 function keybindingsHostCapabilities(keybindings: unknown): KeybindingsHostCapabilities {
@@ -3456,9 +3468,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
                 let offset = 0;
                 let renderedLines: string[] = [];
-                const viewport = () => Math.max(1, tuiRows(tui) - 3);
+                const viewport = () => Math.max(1, tuiRows(tui) - 3 - WORKFLOW_OVERLAY_BORDER_ROWS);
                 const move = (delta: number) => { offset = Math.max(0, Math.min(Math.max(0, renderedLines.length - viewport()), offset + delta)); };
-                return {
+                return borderWorkflowOverlay({
                   render(width: number) {
                     renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
                     offset = Math.min(offset, Math.max(0, renderedLines.length - viewport()));
@@ -3475,7 +3487,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
                     tui.requestRender();
                   },
-                };
+                }, theme);
               }, { overlay: true });
             } catch (error) {
               ctx.ui.notify(`Cannot open transcript: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -3587,7 +3599,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   let disposed = false;
                   let stopRequested = false;
                   let stopStatus: string | undefined;
-                  const terminalRows = () => Math.max(1, tuiRows(tui));
+                  const terminalRows = () => Math.max(1, tuiRows(tui) - WORKFLOW_OVERLAY_BORDER_ROWS);
                   const keyLabels: Record<string, string> = { up: "↑", down: "↓", pageUp: "pgup", pageDown: "pgdn", escape: "esc" };
                   const keyLabel = (binding: string, fallback: string) => {
                     const keys = keybindingKeys(keybindings, binding);
@@ -3596,9 +3608,9 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   const dashboardLayout = () => {
                     const rows = terminalRows();
                     const hintRows = rows >= 4 ? 1 : 0;
-                    const separatorRows = rows >= 6 ? 1 : 0;
+                    const separatorRows = rows >= 8 ? 1 : 0;
                     const available = Math.max(1, rows - hintRows - separatorRows);
-                    const actionViewport = Math.min(options.length, Math.max(1, Math.floor(available / 2)));
+                    const actionViewport = Math.min(options.length, Math.max(1, Math.ceil(available / 2)));
                     return { rows, hintRows, separatorRows, actionViewport, dashboardViewport: available - actionViewport };
                   };
                   const updateDashboard = async (selectedOption: string | undefined) => {
@@ -3635,7 +3647,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     void updateDashboard(selectedOption).catch(() => undefined).finally(() => { refreshing = false; });
                   }, 1000);
                   timer.unref();
-                  return {
+                  return borderWorkflowOverlay({
                     render(width: number) {
                       const dashboard = stopStatus ? `${view.dashboard}\n\n${stopStatus}` : view.dashboard;
                       const dashboardLines = truncateToVisualLines(theme.fg("accent", dashboard), Number.MAX_SAFE_INTEGER, width, 1).visualLines;
@@ -3673,7 +3685,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                       tui.requestRender();
                     },
                     dispose() { disposed = true; clearInterval(timer); setWorkflowStatus(undefined); },
-                  };
+                  }, theme);
                 }, { overlay: true })
               : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Close"]);
             if (!actionChoice || actionChoice === "Close") return;
@@ -3684,12 +3696,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 const highlighted = highlightCode(view.script, "javascript");
                 let offset = 0;
                 let renderedLines: string[] = [];
-                const viewport = () => Math.max(1, tuiRows(tui) - 3);
+                const viewport = () => Math.max(1, tuiRows(tui) - 3 - WORKFLOW_OVERLAY_BORDER_ROWS);
                 const move = (delta: number) => {
                   const maxOffset = Math.max(0, renderedLines.length - viewport());
                   offset = Math.max(0, Math.min(maxOffset, offset + delta));
                 };
-                return {
+                return borderWorkflowOverlay({
                   render(width: number) {
                     renderedLines = highlighted.flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
                     const maxOffset = Math.max(0, renderedLines.length - viewport());
@@ -3710,7 +3722,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
                     tui.requestRender();
                   },
-                };
+                }, theme);
               }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } });
               continue;
             }
@@ -3738,11 +3750,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                 let offset = 0;
                 let renderedLines: string[] = [];
                 const layout = () => {
-                  const rows = Math.max(1, tuiRows(tui));
+                  const rows = Math.max(1, tuiRows(tui) - WORKFLOW_OVERLAY_BORDER_ROWS);
                   const compactControls = rows < 4;
                   const titleRows = rows >= 5 ? 1 : 0;
                   const hintRows = rows >= 8 ? 1 : 0;
-                  const separatorRows = rows >= 8 ? 2 : 0;
+                  const separatorRows = rows >= 8 ? 1 : 0;
                   const controlRows = compactControls ? 1 : options.length;
                   const contentViewport = Math.max(0, rows - titleRows - hintRows - separatorRows - controlRows);
                   return { rows, compactControls, titleRows, hintRows, separatorRows, contentViewport };
@@ -3751,7 +3763,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   const maxOffset = Math.max(0, renderedLines.length - layout().contentViewport);
                   offset = Math.max(0, Math.min(maxOffset, offset + delta));
                 };
-                return {
+                return borderWorkflowOverlay({
                   render(width: number) {
                     renderedLines = truncateToVisualLines(formatCheckpointReview(checkpoint), Number.MAX_SAFE_INTEGER, width, 0).visualLines;
                     const currentLayout = layout();
@@ -3766,7 +3778,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                       ...renderedLines.slice(offset, offset + currentLayout.contentViewport),
                       ...(currentLayout.separatorRows ? [""] : []),
                       ...controls,
-                      ...(currentLayout.separatorRows ? [""] : []),
                       ...(currentLayout.hintRows ? [hint] : []),
                     ];
                   },
@@ -3780,7 +3791,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                     else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
                     tui.requestRender();
                   },
-                };
+                }, theme);
               }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } });
               if (decision) {
                 const accepted = await answerCheckpoint(store.runId, checkpoint.name, decision === "Approve", true);

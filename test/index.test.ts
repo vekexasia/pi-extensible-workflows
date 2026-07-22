@@ -1062,13 +1062,19 @@ void test("navigator opens the complete workflow script in a scrollable TUI pane
         let result: string | undefined;
         const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
         if (customCalls === 1) {
-          const dashboard = component.render(80).join("\n");
+          const dashboardLines = component.render(80);
+          const dashboard = dashboardLines.join("\n");
+          assert.match(dashboardLines[0] ?? "", /^─+$/);
+          assert.match(dashboardLines.at(-1) ?? "", /^─+$/);
           assert.match(dashboard, /View script/);
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 2) {
-          assert.match(component.render(80).join("\n"), /SCRIPT_START/);
+          const scriptLines = component.render(80);
+          assert.match(scriptLines[0] ?? "", /^─+$/);
+          assert.match(scriptLines.at(-1) ?? "", /^─+$/);
+          assert.match(scriptLines.join("\n"), /SCRIPT_START/);
           for (let index = 0; index < 10; index += 1) component.handleInput?.("tui.select.pageDown");
           assert.match(component.render(80).join("\n"), /SCRIPT_END/);
           component.handleInput?.("tui.select.cancel");
@@ -1113,12 +1119,18 @@ void test("navigator opens a selected native transcript in a scrollable TUI over
         let result: string | undefined;
         const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
         if (customCalls === 1) {
-          const dashboard = component.render(80).join("\n");
+          const dashboardLines = component.render(80);
+          const dashboard = dashboardLines.join("\n");
+          assert.match(dashboardLines[0] ?? "", /^─+$/);
+          assert.match(dashboardLines.at(-1) ?? "", /^─+$/);
           assert.match(dashboard, /View transcript/);
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 2) {
-          const initial = component.render(80).join("\n");
+          const transcriptLines = component.render(80);
+          const initial = transcriptLines.join("\n");
+          assert.match(transcriptLines[0] ?? "", /^─+$/);
+          assert.match(transcriptLines.at(-1) ?? "", /^─+$/);
           assert.match(initial, /TRANSCRIPT_END/);
           assert.doesNotMatch(initial, /FIRST_USER/);
           assert.match(initial, /Home\/End jump/);
@@ -1263,7 +1275,10 @@ void test("navigator reviews each pending checkpoint before answering", async ()
           component.handleInput?.("tui.select.down");
           component.handleInput?.("tui.select.confirm");
         } else if (customCalls === 2) {
-          const initial = component.render(40).join("\n");
+          const reviewLines = component.render(40);
+          const initial = reviewLines.join("\n");
+          assert.match(reviewLines[0] ?? "", /^─+$/);
+          assert.match(reviewLines.at(-1) ?? "", /^─+$/);
           assert.ok(initial.split("\n").length <= 12);
           assert.match(initial, /Name: first/);
           assert.match(initial, /Review the first artifact\?/);
