@@ -1646,6 +1646,10 @@ function encoded(value: unknown): string {
   return json;
 }
 
+function encodedRpcResult(id: number, value: JsonValue): string {
+  return encoded({ type: "rpcResult", id, ok: true, value });
+}
+
 function readAgentIdentity(value: unknown): AgentIdentity {
   if (!object(value)) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
   const structuralPath = value.structuralPath;
@@ -1745,7 +1749,7 @@ function executeShellCommand(command: string, options: ShellOptions, signal: Abo
       if (signal.aborted) { reject(new WorkflowError("CANCELLED", "Workflow cancelled")); return; }
       if (timedOut) { reject(new WorkflowError("SHELL_FAILED", `Shell command timed out after ${String(options.timeoutMs)}ms`)); return; }
       const result = { exitCode: exitCode === null ? null : exitCode, stdout, stderr };
-      try { encoded({ type: "rpcResult", id: Number.MAX_SAFE_INTEGER, ok: true, value: result }); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
+      try { encodedRpcResult(Number.MAX_SAFE_INTEGER, result); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
       resolve(result);
     });
     if (signal.aborted) { onAbort(); return; }
@@ -1866,7 +1870,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       }
       else fail("INTERNAL_ERROR", `Unknown worker RPC method: ${method}`);
       encoded(value);
-      child.send(encoded({ type: "rpcResult", id, ok: true, value }));
+      child.send(encodedRpcResult(id, value));
     } catch (error) {
       const typed = asWorkflowError(error);
       child.send(encoded({ type: "rpcResult", id, ok: false, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } }));
