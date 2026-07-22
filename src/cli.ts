@@ -4,7 +4,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync,
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources } from "@earendil-works/pi-coding-agent";
+import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import workflowExtension, { formatWorkflowProgress, workflowCatalog, type JsonSchema, type JsonValue } from "./index.js";
@@ -173,15 +173,39 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
   const agentDir = options.agentDir ?? getAgentDir();
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
   const requiredTrust = hasTrustRequiringProjectResources(cwd);
-  const savedTrust = new ProjectTrustStore(agentDir).get(cwd);
-  const trusted = options.trustOverride ?? (!requiredTrust || savedTrust === true || settingsManager.getDefaultProjectTrust() === "always");
-  settingsManager.setProjectTrusted(trusted);
+  const trustStore = new ProjectTrustStore(agentDir);
+  const defaultProjectTrust = settingsManager.getDefaultProjectTrust();
+  const resolveProjectTrust = async ({ extensionsResult }: { extensionsResult: LoadExtensionsResult }): Promise<boolean> => {
+    if (options.trustOverride !== undefined) return options.trustOverride;
+    if (!requiredTrust) return true;
+    const projectTrustContext = {
+      cwd,
+      mode: "print" as const,
+      hasUI: false,
+      ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {} },
+    };
+    for (const extension of extensionsResult.extensions) {
+      for (const handler of extension.handlers.get("project_trust") ?? []) {
+        try {
+          const result = await handler({ type: "project_trust", cwd }, projectTrustContext) as { trusted?: unknown; remember?: unknown };
+          if (result.trusted === "undecided") continue;
+          if (result.trusted !== "yes" && result.trusted !== "no") continue;
+          const trusted = result.trusted === "yes";
+          if (result.remember === true) trustStore.set(cwd, trusted);
+          return trusted;
+        } catch { /* Project trust extensions are best effort, as in Pi. */ }
+      }
+    }
+    const savedTrust = trustStore.get(cwd);
+    if (savedTrust !== null) return savedTrust;
+    return defaultProjectTrust === "always";
+  };
   const services = await createAgentSessionServices({
     cwd,
     agentDir,
     settingsManager,
     resourceLoaderOptions: {},
-    resourceLoaderReloadOptions: { resolveProjectTrust: async () => trusted },
+    resourceLoaderReloadOptions: { resolveProjectTrust },
   });
   const extensions = services.resourceLoader.getExtensions();
   const tools: unknown[] = [];
@@ -196,7 +220,7 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
     sendMessage() {},
     events: { emit() {} },
   };
-  workflowExtension(headlessPi as never);
+  workflowExtension(headlessPi as never, agentDir, undefined, undefined, agentDir);
   const workflowTool = tools.find((tool) => object(tool) && tool.name === "workflow") as HeadlessWorkflowTool | undefined;
   if (!workflowTool) throw new Error("The workflow runtime could not be initialized");
   return { catalog: workflowCatalog(), services, extensions, workflowTool, shutdownHandlers };
@@ -235,17 +259,30 @@ class CliProgress {
   #lastStable = "";
   #lines = 0;
   #frame = 0;
+  #run: PersistedRun | undefined;
+  #timer: ReturnType<typeof setInterval> | undefined;
   constructor(private readonly stderr: (text: string) => void, private readonly tty: boolean) {}
   update(run: PersistedRun): void {
     const stable = formatWorkflowProgress(run, "◇");
     if (!this.tty) { if (stable !== this.#lastStable) { this.#lastStable = stable; this.stderr(`${stable}\n`); } return; }
+    this.#run = run;
+    this.#timer ??= setInterval(() => { this.render(); }, 80);
+    this.#timer.unref();
+    this.render();
+  }
+  render(): void {
+    if (!this.#run) return;
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
-    const text = formatWorkflowProgress(run, spinner).split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`).join("\n");
+    const text = formatWorkflowProgress(this.#run, spinner).split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`).join("\n");
     this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${text}\n`);
     this.#lines = text.split("\n").length;
   }
-  finish(): void { if (this.tty && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; } }
+  finish(): void {
+    if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
+    if (this.tty && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
+    this.#run = undefined;
+  }
 }
 
 async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, JsonValue>, runtime: WorkflowRuntime, options: WorkflowIo, context: unknown): Promise<JsonValue> {

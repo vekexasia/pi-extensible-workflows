@@ -1223,6 +1223,7 @@ export interface WorkflowValidationContext {
   modelAliases?: Readonly<Record<string, string>>;
   knownModels?: ReadonlySet<string>;
   settingsPath?: string;
+  agentDir?: string;
 }
 
 
@@ -1252,7 +1253,7 @@ function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters
   const workflowName = functionName ?? (typeof params.name === "string" && params.name.trim() ? params.name.trim() : "");
   if (!workflowName) fail("INVALID_METADATA", "Inline workflows require name");
   const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : fn?.description ? { description: fn.description } : {}) });
-  const globalAgentDefinitions = loadAgentDefinitions(context.cwd, undefined, false);
+  const globalAgentDefinitions = loadAgentDefinitions(context.cwd, context.agentDir, false);
   const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};
   const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
   const aliases = context.modelAliases ?? {};
@@ -2553,9 +2554,10 @@ function parseThinking(value: unknown): ModelSpec["thinking"] | undefined {
   }
 }
 
-export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard, createSession: SessionFactory = createNativeAgentSession) {
+export default function workflowExtension(pi: ExtensionAPI, home?: string, clipboard = copyToClipboard, createSession: SessionFactory = createNativeAgentSession, agentDir?: string) {
   beginWorkflowExtensionLoading();
   const registry = loadingRegistry();
+  const extensionAgentDir = agentDir ?? getAgentDir();
   const registerEntryRenderer = piHostCapabilities(pi).registerEntryRenderer;
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
@@ -2903,7 +2905,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
-    const settingsPath = workflowSettingsPath();
+    const settingsPath = workflowSettingsPath(extensionAgentDir);
     const currentSettings = loadSettings(settingsPath);
     resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath);
     const currentAliases = currentSettings.modelAliases ?? {};
@@ -2916,7 +2918,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const blockedAliasTargets = Object.fromEntries(Object.entries(previousAliases).filter(([name]) => !Object.prototype.hasOwnProperty.call(currentAliases, name)));
     const snapshot = createLaunchSnapshot({ ...loaded.snapshot, settingsPath, settings: { ...loaded.snapshot.settings, modelAliases: currentAliases }, modelAliases: currentAliases });
     await run.store.saveSnapshot(snapshot);
-    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
+    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, agentDir: extensionAgentDir, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
     run.executor.setRunContext(workflowRunContext(run.store.cwd, run.store.sessionId, run.store.runId, loaded.snapshot.metadata, loaded.snapshot.args, run.abortController.signal));
     const drift = aliasDrift(previousAliases, currentAliases);
     if (drift.length) await run.store.appendEvent({ type: "warning", message: `Model alias mappings changed on resume: ${drift.join("; ")}` });
@@ -2932,7 +2934,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
-    const settingsPath = workflowSettingsPath();
+    const settingsPath = workflowSettingsPath(extensionAgentDir);
     const currentSettings = loadSettings(settingsPath);
     resolveAgentResourcePolicy(run.store.cwd, trustedProject, settingsPath);
     const currentAliases = currentSettings.modelAliases ?? {};
@@ -2948,7 +2950,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata);
     const snapshot = createLaunchSnapshot({ ...loaded.snapshot, settingsPath, settings: { ...loaded.snapshot.settings, modelAliases: currentAliases }, modelAliases: currentAliases });
     await run.store.saveSnapshot(snapshot);
-    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
+    run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, agentDir: extensionAgentDir, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
     const drift = aliasDrift(previousAliases, currentAliases);
     if (drift.length) await run.store.appendEvent({ type: "warning", message: `Model alias mappings changed on resume: ${drift.join("; ")}` });
     const controller = new AbortController();
@@ -3104,7 +3106,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const roleDefinitions = loaded.snapshot.roles ?? {};
       const abortController = new AbortController();
       const providerErrorRecovery = createProviderErrorRecovery(ctx, new Set(loaded.snapshot.models), () => { abortController.abort(); });
-      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) });
+      runs.set(runId, { executor: new WorkflowAgentExecutor({ cwd: ctx.cwd, agentDir: extensionAgentDir, model, tools: new Set(loaded.snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(store.cwd, projectTrusted(ctx), loaded.snapshot.settingsPath ?? workflowSettingsPath(extensionAgentDir)) }, createSession), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -3129,7 +3131,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   });
   pi.on("before_agent_start", (event, ctx) => {
     if (!pi.getActiveTools().includes("workflow")) return;
-    const roles = Object.entries(loadAgentDefinitions(ctx.cwd, undefined, projectTrusted(ctx))).filter(([, definition]) => definition.description);
+    const roles = Object.entries(loadAgentDefinitions(ctx.cwd, extensionAgentDir, projectTrusted(ctx))).filter(([, definition]) => definition.description);
     if (!roles.length) return;
     const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- \`${name}\`: ${String(definition.description)}`).join("\n")}`;
     return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
@@ -3143,7 +3145,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     async execute(toolCallId, params, signal, onUpdate, ctx) {
       try {
       const headless = object(ctx) && ctx.headless === true;
-      const settingsPath = workflowSettingsPath();
+      const settingsPath = workflowSettingsPath(extensionAgentDir);
       const defaults = loadSettings(settingsPath);
       if (!ctx.model) throw new WorkflowError("UNKNOWN_MODEL", "A launching model is required");
       const settings = Object.freeze({ concurrency: params.concurrency ?? defaults.concurrency, ...(defaults.modelAliases ? { modelAliases: defaults.modelAliases } : {}) });
@@ -3157,7 +3159,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_stop" && name !== "workflow_catalog");
       const trustedProject = projectTrusted(ctx);
       if (typeof ctx.cwd === "string") resolveAgentResourcePolicy(ctx.cwd, trustedProject, settingsPath);
-      const validated = validateWorkflowLaunchWithRegistry({ ...params, args: params.args }, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
+      const validated = validateWorkflowLaunchWithRegistry({ ...params, args: params.args }, { cwd: ctx.cwd, agentDir: extensionAgentDir, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
       const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames, functionName } = validated;
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
       const runId = randomUUID();
@@ -3182,7 +3184,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const background = !params.foreground;
       const providerPause = async () => { if (background) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
-      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(ctx.cwd, projectTrusted(ctx)), runContext }, createSession);
+      const executor = new WorkflowAgentExecutor({ cwd: ctx.cwd, agentDir: extensionAgentDir, model: rootModel, tools: new Set(rootTools), availableModels, knownModels, modelAliases: defaults.modelAliases ?? {}, settingsPath, agentDefinitions, runStore: store, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(ctx.cwd, projectTrusted(ctx), settingsPath), runContext }, createSession);
       runs.set(runId, { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) });
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
@@ -3382,7 +3384,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         }
       };
       const manageAliases = async (): Promise<void> => {
-        const settingsPath = workflowSettingsPath();
+        const settingsPath = workflowSettingsPath(extensionAgentDir);
         const modelRegistry = contextHostCapabilities(ctx).modelRegistry;
         const available = () => [...new Set((modelRegistry?.getAvailable?.() ?? []).map((model) => `${model.provider}/${model.id}`))].sort();
         const selectTarget = async (): Promise<string | undefined> => {
