@@ -80,22 +80,22 @@
         <h2>Tool API</h2>
         <p>The extension registers these core tools and one command:</p>
         <ul>
-          <li><code>workflow</code> runs an inline or registered deterministic JavaScript workflow.</li>
+          <li><code>workflow</code> runs an inline or registered-function deterministic JavaScript workflow.</li>
           <li><code>workflow_resume</code> resumes a budget-exhausted run with an optional budget patch.</li>
           <li><code>workflow_respond</code> approves or rejects a pending checkpoint or budget decision.</li>
           <li><code>workflow_stop</code> stops an active workflow run by ID.</li>
-          <li><code>workflow_catalog</code> lists registered workflow functions, variables, reusable workflows, and model aliases; it is registered only when the active registry has one of these entries.</li>
+          <li><code>workflow_catalog</code> lists registered functions, variables, and model aliases; it is registered only when the active registry has one of these entries.</li>
           <li><code>/workflow</code> lists and controls runs in the current Pi session.</li>
         </ul>
         <h3><code>workflow</code> parameters</h3>
         <div class="table-wrap"><table>
           <thead><tr><th>Field</th><th>Type</th><th>Contract</th></tr></thead>
           <tbody>
-            <tr><td><code>name</code></td><td>string</td><td>Required for an inline script; registered workflows use their registered name.</td></tr>
+            <tr><td><code>name</code></td><td>string</td><td>Required for an inline script; a registered function uses its registered name.</td></tr>
             <tr><td><code>description</code></td><td>string</td><td>Optional human-readable metadata.</td></tr>
             <tr><td><code>script</code></td><td>string</td><td>Immutable workflow source. Mutually exclusive with <code>workflow</code>.</td></tr>
-            <tr><td><code>workflow</code></td><td>string</td><td>Registered reusable workflow by its unqualified name.</td></tr>
-            <tr><td><code>args</code></td><td>JSON value</td><td>Available inside the script as <code>args</code>; defaults to <code>null</code>.</td></tr>
+            <tr><td><code>workflow</code></td><td>string</td><td>Registered function by its unqualified name.</td></tr>
+            <tr><td><code>args</code></td><td>JSON value</td><td>Available inside an inline script as <code>args</code>; for a registered function it must satisfy the function input schema. Defaults to <code>null</code> for inline scripts.</td></tr>
             <tr><td><code>foreground</code></td><td>boolean</td><td>Wait for the final value instead of returning a run ID; the model-visible result also includes the completed run ID.</td></tr>
             <tr><td><code>concurrency</code></td><td>integer 1-16</td><td>Per-run active-agent limit.</td></tr>
             <tr><td><code>budget</code></td><td>object</td><td>Optional aggregate soft/hard limits for <code>tokens</code>, <code>costUsd</code>, <code>durationMs</code>, and <code>agentLaunches</code>.</td></tr>
@@ -182,8 +182,8 @@
         <p>Calls from one source location must not race outside <code>parallel</code> or <code>pipeline</code>. Their structural keys make replay deterministic. Ordinary branch failures wait for sibling work to settle; cancellation is immediate.</p>
       </section>
       <section id="extensions">
-        <h2>Extensions, reusable workflows, and roles</h2>
-        <p>Trusted Pi extensions can register global functions, run-scoped variables, and reusable workflows while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the semantic version, descriptions, schemas, and workflow source.</p>
+        <h2>Extensions, reusable functions, and roles</h2>
+        <p>Trusted Pi extensions can register global functions and run-scoped variables while extensions load. Register from the default extension factory so every session-loading cycle receives a fresh registration. Registration validates the semantic version, descriptions, and function or variable schemas. A registered function is the reusable workflow: there is no separate workflow-script registration API.</p>
         <p>The following is the core of <code>~/.pi/agent/extensions/review-loop.ts</code>. It registers a reusable developer-review loop as <code>developUntilApproved</code>.</p>
         <pre><code class="language-typescript"><span class="tok-keyword">import</span> <span class="tok-punctuation">{</span>
   registerWorkflowExtension<span class="tok-punctuation">,</span>
@@ -261,7 +261,7 @@
 <span class="tok-keyword">export</span> <span class="tok-keyword">default</span> <span class="tok-keyword">function</span> <span class="tok-punctuation">(</span><span class="tok-punctuation">)</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">void</span> <span class="tok-punctuation">{</span>
   <span class="tok-function">registerWorkflowExtension</span><span class="tok-punctuation">(</span>reviewLoopExtension<span class="tok-punctuation">)</span><span class="tok-punctuation">;</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>After Pi loads the extension, <code>workflow_catalog</code> exposes <code>developUntilApproved</code>. Call it from workflow source, for example <code>return developUntilApproved({ task: args.task, maxIterations: 5 });</code>. Registered functions receive <code>agent</code>, <code>prompt</code>, combinators, lifecycle helpers, and run metadata through their context. They can compose registered functions without importing their source, for example <code>const report = await context.invoke("reviewRepository", { focus: "security" });</code>. The catalog exposes metadata and schemas, never implementations, resolver values, or source.</p>
+        <p>After Pi loads the extension, <code>workflow_catalog</code> exposes <code>developUntilApproved</code> with its input and output schemas. Launch it directly with <code>{ "workflow": "developUntilApproved", "args": { "task": "..." } }</code>; the runtime validates the input before creating the run and validates the final result against the output schema. Registered functions also receive <code>agent</code>, <code>prompt</code>, combinators, lifecycle helpers, and run metadata through their context. They can compose registered functions without importing their source, for example <code>const report = await context.invoke("reviewRepository", { focus: "security" });</code>. The catalog exposes metadata and schemas, never implementations, resolver values, or source.</p>
         <h3>Role files</h3>
         <p>Global roles live under <code>&lt;agentDir&gt;/pi-extensible-workflows/roles/&lt;name&gt;.md</code>, defaulting to <code>~/.pi/agent/pi-extensible-workflows/roles/&lt;name&gt;.md</code>; set <code>PI_CODING_AGENT_DIR</code> to change it. Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/roles/&lt;name&gt;.md</code>.</p>
         <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
@@ -309,7 +309,7 @@ Focus on correctness and regressions.</code></pre>
   <span class="tok-property">context</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">commit</span><span class="tok-punctuation">:</span> args.commit <span class="tok-punctuation">}</span><span class="tok-punctuation">,</span>
 <span class="tok-punctuation">}</span>);
 <span class="tok-keyword">if</span> (decision !== <span class="tok-string">"approved"</span>) <span class="tok-keyword">return</span> <span class="tok-punctuation">{</span> <span class="tok-property">approved</span><span class="tok-punctuation">:</span> <span class="tok-boolean">false</span> <span class="tok-punctuation">}</span>;</code></pre>
-        <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Sandboxed workflow scripts receive <code>"approved"</code> or <code>"rejected"</code> from direct <code>checkpoint()</code>; registered workflow functions receive a boolean from <code>WorkflowOrchestrationContext.checkpoint</code>. Responses are journaled and replay after cold recovery.</p>
+        <p>Checkpoint prompts are limited to 1 KB and serialized context to 4 KB. Sandboxed workflow scripts receive <code>"approved"</code> or <code>"rejected"</code> from direct <code>checkpoint()</code>; registered functions receive a boolean from <code>WorkflowOrchestrationContext.checkpoint</code>. Responses are journaled and replay after cold recovery.</p>
         <p>Use <code>withWorktree(name, callback)</code> for canonical worktree scopes: put collaborating top-level agents in one named callback, or put each independent parallel branch in its own named callback. The runtime creates deterministic owned branches and worktrees lazily; the caller branch is unchanged, children and retries reuse the enclosing scope, and recovery preserves the existing ownership and cleanup behavior. A later run can pass the previous terminal run's ID as <code>parentRunId</code> to reuse matching named scopes without copying, merging, or creating another branch. Borrowed bindings are validated on cold resume and remain invalid if their originating run is deleted.</p>
         <p><code>worktreeState()</code> is available only inside an active worktree scope. It returns the host-derived <code>name</code> (for named scopes), <code>path</code>, <code>branch</code>, <code>base</code>, current <code>head</code>, and <code>dirty</code> state. The first read creates the validated worktree lazily; later reads are fresh, read-only Git inspection. Read it after awaited development, not in a parallel sibling, or it can race the developer.</p>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> results = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"issues"</span>, <span class="tok-punctuation">{</span>
@@ -356,7 +356,7 @@ Focus on correctness and regressions.</code></pre>
 <span class="tok-command">npx</span> pi-extensible-workflows inspect [session-id]
 <span class="tok-command">npx</span> pi-extensible-workflows transcript &lt;session-file&gt;
 <span class="tok-command">npm</span> run inspect -- [session-id]</code></pre>
-        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered workflows. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
+        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered functions. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
         <h3><code>/workflow</code> controls</h3>
         <pre><code class="language-text">/workflow doctor
 /workflow model-aliases

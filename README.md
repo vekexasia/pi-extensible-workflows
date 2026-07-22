@@ -20,7 +20,7 @@ For source installs and local development, see the [installation guide](https://
 
 ## Capabilities
 
-The main Pi agent acts as the orchestrator: it writes workflow scripts on the fly for each task. Pi extensions can add reusable functions and variables to those scripts, or register complete workflows that can be invoked by name.
+The main Pi agent acts as the orchestrator: it writes workflow scripts on the fly for each task. Pi extensions can add reusable functions and variables to those scripts; every registered function is also directly runnable as a top-level workflow.
 
 A workflow can fan out across specialized agents, combine their results, and resume without rerunning completed work.
 
