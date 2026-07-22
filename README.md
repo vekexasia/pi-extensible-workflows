@@ -67,6 +67,8 @@ npx pi-extensible-workflows export <workflow-name> [--name <command>] [--output 
 ```
 
 `doctor` validates the installation and active Pi resources. `inspect` opens a read-only terminal view of persisted workflow runs. `transcript` renders a session transcript to stdout. `run` derives flat CLI arguments and help from a registered function's input schema. Use `--input '<json>'` for nested or otherwise complex inputs. It executes in the current working directory, writes the final JSON result to stdout, and writes progress and errors to stderr. `export` creates an executable POSIX launcher in `~/.local/bin` by default.
+`run` and `export` accept the trust overrides `--approve` and `--no-approve`; the generated launcher forwards its arguments to `run`. `--` ends launcher option parsing, and later tokens are passed to workflow input instead of being interpreted as launcher options.
+Launch snapshots use identity version 4. A cold resume intentionally rejects persisted v3 runs with `RESUME_INCOMPATIBLE`; relaunch the workflow instead.
 
 ## Development
 

@@ -35,13 +35,13 @@
       <p class="lead">Use the workflow tools when a task benefits from explicit orchestration, parallel work, durable checkpoints, or worktree-scoped agent changes.</p>
       <section id="quick-start">
         <h2>Quick start</h2>
-        <p>Call <code>workflow</code> with either an inline script or a registered workflow. Use <code>workflow_respond</code> only to answer a pending checkpoint or budget-adjustment proposal, using the exact name or proposal ID reported by the run. Use <code>workflow_stop</code> with the run ID to stop an active run from the current Pi session.</p>
+        <p>Call <code>workflow</code> with either an inline script or a registered function. Use <code>workflow_respond</code> only to answer a pending checkpoint or budget-adjustment proposal, using the exact name or proposal ID reported by the run. Use <code>workflow_stop</code> with the run ID to stop an active run from the current Pi session.</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"release-check"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"phase('inspect'); return await agent('Inspect the package');"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"target"</span><span class="tok-punctuation">:</span> <span class="tok-string">"dist"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Inline scripts require <code>name</code>. A registered workflow uses its unqualified name in <code>workflow</code> instead of <code>script</code>:</p>
+        <p>Inline scripts require <code>name</code>. A registered function uses its unqualified name in <code>workflow</code> instead of <code>script</code>:</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"releaseCheck"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>

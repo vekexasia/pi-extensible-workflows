@@ -178,7 +178,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(inspected, "session-a");
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: pi-extensible-workflows doctor | inspect [session-id] | transcript <session-file>\n");
+  assert.equal(output, "Usage: pi-extensible-workflows doctor | inspect [session-id] | transcript <session-file> | run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]\n");
   const bin = join(paths.root, "bin", "pi-extensible-workflows");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
@@ -200,6 +200,9 @@ void test("CLI workflow arguments cover schema types, defaults, enums, and missi
   const help = formatWorkflowCliHelp({ name: "developIssue", version: "1.0.0", headline: "Test", extensionDescription: "Test", description: "Develop issue", input: schema, output: { type: "string" } });
   assert.match(help, /Issue number/);
   assert.match(help, /--tags <string>.*enum="one","two"/);
+  assert.ok(help.includes("  --approve".padEnd(28) + "Trust project resources for this launch"));
+  assert.ok(help.includes("  --no-approve".padEnd(28) + "Do not trust project resources for this launch"));
+  assert.ok(help.includes("  --".padEnd(28) + "End launcher option parsing; pass later tokens to workflow input"));
 });
 void test("CLI parser handles delimiter passthrough, negated booleans, and negative numeric positionals", () => {
   const stringSchema = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };

@@ -324,6 +324,7 @@ Focus on correctness and regressions.</code></pre>
         <h3 id="run-artifacts">Run storage and executed source</h3>
         <p>Runs are stored under <code>~/.pi/workflows/projects/&lt;cwd-slug&gt;-&lt;cwd-hash&gt;/sessions/&lt;session-id&gt;/runs/&lt;run-id&gt;/</code>. Identity checks use the resolved launch cwd and Pi session ID.</p>
         <p>Every new run contains <code>workflow.js</code> with the exact UTF-8 JavaScript source that was preflighted and executed. It is an immutable inspection artifact written during atomic run creation. <code>snapshot.json</code> remains authoritative for execution and resume; historical runs without <code>workflow.js</code> remain loadable.</p>
+        <p>Launch snapshots use identity version 4. Cold resume intentionally rejects persisted v3 snapshots with <code>RESUME_INCOMPATIBLE</code>; relaunch the workflow instead.</p>
         <p>Each run's private <code>system-prompts.json</code> records the full effective system prompt at every native Pi <code>agent_start</code>, after <code>before_agent_start</code> extensions have run. Entries include the native session ID, attempt, turn, SHA-256 digest, and prompt. Native Pi JSONL transcripts intentionally omit system prompts.</p>
         <p>Run directories use mode <code>0700</code> and the prompt artifact uses <code>0600</code>. Treat it as sensitive because it can contain role bodies, project instructions, tool guidance, and extension modifications. Confirmed run deletion removes it; native Pi transcripts remain in Pi session storage.</p>
         <h3 id="lifecycle-events">Workflow lifecycle events</h3>
@@ -352,8 +353,11 @@ Focus on correctness and regressions.</code></pre>
         <pre><code class="language-shell"><span class="tok-command">npx</span> pi-extensible-workflows doctor
 <span class="tok-command">npx</span> pi-extensible-workflows inspect [session-id]
 <span class="tok-command">npx</span> pi-extensible-workflows transcript &lt;session-file&gt;
+<span class="tok-command">npx</span> pi-extensible-workflows run &lt;workflow-name&gt; [workflow arguments]
+<span class="tok-command">npx</span> pi-extensible-workflows export &lt;workflow-name&gt; [--name &lt;command&gt;] [--output &lt;path&gt;] [--force]
 <span class="tok-command">npm</span> run inspect -- [session-id]</code></pre>
         <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered functions. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
+        <p><code>run</code> accepts flat workflow arguments plus <code>--approve</code> or <code>--no-approve</code> trust overrides. The generated <code>export</code> launcher forwards later arguments to <code>run</code>. Before <code>--</code>, these are launcher options; <code>--</code> ends launcher option parsing and passes later tokens to workflow input.</p>
         <h3><code>/workflow</code> controls</h3>
         <pre><code class="language-text">/workflow doctor
 /workflow model-aliases

@@ -68,7 +68,7 @@ export function formatWorkflowCliHelp(fn: WorkflowCatalogFunction, command = "pi
     const label = field === plan.positional ? `${field.option} <${scalarLabel(scalarFieldType(field))}>` : fieldLabel(field);
     lines.push(`  ${label.padEnd(24)}${fieldDescription(field)}`);
   }
-  lines.push("  --input <json>".padEnd(28) + "JSON input escape hatch for complex schemas", "  -h, --help".padEnd(28) + "Show this help");
+  lines.push("  --input <json>".padEnd(28) + "JSON input escape hatch for complex schemas", ...launcherHelpLines(), "  -h, --help".padEnd(28) + "Show this help");
   return `${lines.join("\n")}\n`;
 }
 
@@ -149,8 +149,15 @@ export function parseWorkflowCliArgs(schema: JsonSchema, rawArgs: readonly strin
   return result;
 }
 
-function workflowUsage(): string { return "Usage: pi-extensible-workflows run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]\n"; }
-function exportUsage(): string { return "Usage: pi-extensible-workflows export <workflow-name> [--name <command>] [--output <path>] [--force]\n"; }
+function launcherHelpLines(): string[] {
+  return [
+    "  --approve".padEnd(28) + "Trust project resources for this launch",
+    "  --no-approve".padEnd(28) + "Do not trust project resources for this launch",
+    "  --".padEnd(28) + "End launcher option parsing; pass later tokens to workflow input",
+  ];
+}
+function workflowUsage(): string { return [`Usage: pi-extensible-workflows run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
+function exportUsage(): string { return [`Usage: pi-extensible-workflows export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
 function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustOverride?: boolean } {
   const args: string[] = [];
   let trustOverride: boolean | undefined;
@@ -416,7 +423,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
   }
-  write("Usage: pi-extensible-workflows doctor | inspect [session-id] | transcript <session-file>\n");
+  write("Usage: pi-extensible-workflows doctor | inspect [session-id] | transcript <session-file> | run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]\n");
   return 1;
 }
 
