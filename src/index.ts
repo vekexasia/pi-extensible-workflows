@@ -10,10 +10,9 @@ import * as acorn from "acorn";
 import { Script } from "node:vm";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, SessionManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, parseFrontmatter, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAccounting, type AgentAttempt, type AgentBudgetHooks, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery, type AgentSetupHook, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
 import { herdrPaneId, openHerdrPane } from "./herdr.js";
-import { transcriptLines } from "./session-inspector.js";
 import { acquireSessionLease, atomicWriteFile, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./persistence.js";
 
@@ -3461,38 +3460,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               ctx.ui.notify(`Failed to copy ${artifact}: ${error instanceof Error ? error.message : String(error)}`, "error");
             }
           };
-          const openTranscript = async (transcript: string): Promise<void> => {
-            try {
-              const entries = SessionManager.open(transcript).buildContextEntries();
-              if (ctx.mode !== "tui") { ctx.ui.notify(`Transcript: ${transcript}`, "info"); return; }
-              await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
-                let offset = 0;
-                let renderedLines: string[] = [];
-                const viewport = () => Math.max(1, tuiRows(tui) - 3 - WORKFLOW_OVERLAY_BORDER_ROWS);
-                const move = (delta: number) => { offset = Math.max(0, Math.min(Math.max(0, renderedLines.length - viewport()), offset + delta)); };
-                return borderWorkflowOverlay({
-                  render(width: number) {
-                    renderedLines = transcriptLines(entries).flatMap((line) => line ? truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, width, 0).visualLines : [""]);
-                    offset = Math.min(offset, Math.max(0, renderedLines.length - viewport()));
-                    return [theme.fg("accent", "Native Pi transcript"), ...renderedLines.slice(offset, offset + viewport()), "", theme.fg("dim", "↑↓/pgup/pgdn scroll · esc close")];
-                  },
-                  invalidate() {},
-                  handleInput(data: string) {
-                    if (keybindings.matches(data, "tui.select.up")) move(-1);
-                    else if (keybindings.matches(data, "tui.select.down")) move(1);
-                    else if (keybindings.matches(data, "tui.select.pageUp")) move(-viewport());
-                    else if (keybindings.matches(data, "tui.select.pageDown")) move(viewport());
-                    else if (keybindings.matches(data, "tui.editor.cursorLineStart")) offset = 0;
-                    else if (keybindings.matches(data, "tui.editor.cursorLineEnd")) offset = Math.max(0, renderedLines.length - viewport());
-                    else if (keybindings.matches(data, "tui.select.cancel")) done(undefined);
-                    tui.requestRender();
-                  },
-                }, theme);
-              }, { overlay: true });
-            } catch (error) {
-              ctx.ui.notify(`Cannot open transcript: ${error instanceof Error ? error.message : String(error)}`, "warning");
-            }
-          };
           const loadDashboard = async () => {
             const loaded = await store.load();
             const checkpoints = await store.awaitingCheckpoints();
@@ -3523,16 +3490,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             }
             if (ctx.mode !== "tui") actions.set("Refresh", "refresh");
             else actions.set("View script", "view-script");
-            const transcripts = [...new Set([...loaded.run.agents.flatMap((agent) => (agent.attemptDetails ?? []).map((attempt) => attempt.sessionFile)), ...loaded.run.nativeSessions.map(({ sessionFile }) => sessionFile)])];
             if (loaded.run.agents.length) actions.set("Agents...", "agents");
-            if (!loaded.run.agents.length && ctx.mode === "tui" && transcripts.length) actions.set("View transcript", "view-transcript");
-            if (!loaded.run.agents.length && transcripts.length) actions.set("Transcript paths", "transcripts");
             if (terminalStates.has(loaded.run.state)) add("Delete", "delete");
             if (ctx.mode === "tui") {
               addCopy("Copy run path", store.directory, "run path");
               addCopy("Copy run ID", store.runId, "run ID");
             }
-            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, transcripts, script: loaded.snapshot.script, agents: loaded.run.agents, worktrees, cwd: loaded.run.cwd };
+            return { dashboard: formatNavigatorDashboard(loaded.run, checkpoints, worktrees), actions, copies, reviews, script: loaded.snapshot.script, agents: loaded.run.agents, worktrees, cwd: loaded.run.cwd };
           };
           const selectAgent = async (dashboard: Awaited<ReturnType<typeof loadDashboard>>): Promise<void> => {
             const byId = new Map(dashboard.agents.map((agent) => [agent.id, agent]));
@@ -3553,14 +3517,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             const attempts = [...(selected.attemptDetails ?? [])].sort((left, right) => left.attempt - right.attempt);
             const worktree = selected.worktreeOwner ? dashboard.worktrees.find((candidate) => candidate.owner === selected.worktreeOwner) : undefined;
             const actions = [
-              ...(attempts.length ? ["View transcript", "Copy transcript path", ...(herdrPaneId() ? ["Open transcript in pane", "Fork as Pi session in pane"] : [])] : []),
+              ...(attempts.length && herdrPaneId() ? ["Fork as Pi session in pane"] : []),
               ...(worktree ? ["Copy branch", "Copy worktree path"] : []),
               "Copy agent ID",
               "Back",
             ];
             const chooseAttempt = async (): Promise<AgentAttemptSummary | undefined> => {
               const choices = attempts.map((attempt) => `Attempt ${String(attempt.attempt)}`);
-              const choice = choices.length === 1 ? choices[0] : await ctx.ui.select("Transcript attempts", [...choices, "Back"]);
+              const choice = choices.length === 1 ? choices[0] : await ctx.ui.select("Fork attempts", [...choices, "Back"]);
               const index = choice ? choices.indexOf(choice) : -1;
               return index >= 0 ? attempts[index] : undefined;
             };
@@ -3570,20 +3534,16 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               if (action === "Copy agent ID") { await copyArtifact(selected.id, "agent ID"); continue; }
               if (action === "Copy branch" && worktree) { await copyArtifact(worktree.branch, "branch"); continue; }
               if (action === "Copy worktree path" && worktree) { await copyArtifact(worktree.path, "worktree path"); continue; }
-              if (action === "View transcript" || action === "Copy transcript path" || action === "Open transcript in pane" || action === "Fork as Pi session in pane") {
+              if (action === "Fork as Pi session in pane") {
                 const attempt = await chooseAttempt();
                 if (!attempt) continue;
-                if (action === "Copy transcript path") await copyArtifact(attempt.sessionFile, "transcript path");
-                else if (action === "View transcript") await openTranscript(attempt.sessionFile);
-                else {
-                  const running = !SETTLED_AGENT_STATES.has(selected.state) && attempt.attempt === attempts.at(-1)?.attempt && !attempt.error;
-                  if (action === "Fork as Pi session in pane" && running && !await ctx.ui.confirm("Fork running attempt?", "This attempt is still running. The snapshot may end mid-turn and will not receive later updates. It opens read-only to avoid concurrent changes to the workflow agent's working directory. Continue?")) continue;
-                  try {
-                    await openHerdrPane({ action: action === "Open transcript in pane" ? "transcript" : "fork", cwd: worktree?.cwd ?? attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(action === "Fork as Pi session in pane" && running ? { readOnly: true } : {}) });
-                    ctx.ui.notify(`${action === "Open transcript in pane" ? "Opened transcript" : "Forked Pi session"} in pane.`, "info");
-                  } catch (error) {
-                    ctx.ui.notify(`Cannot ${action === "Open transcript in pane" ? "open transcript" : "fork Pi session"} in pane: ${error instanceof Error ? error.message : String(error)}`, "warning");
-                  }
+                const running = !SETTLED_AGENT_STATES.has(selected.state) && attempt.attempt === attempts.at(-1)?.attempt && !attempt.error;
+                if (running && !await ctx.ui.confirm("Fork running attempt?", "This attempt is still running. The snapshot may end mid-turn and will not receive later updates. It opens read-only to avoid concurrent changes to the workflow agent's working directory. Continue?")) continue;
+                try {
+                  await openHerdrPane({ action: "fork", cwd: worktree?.cwd ?? attempt.setup?.cwd ?? dashboard.cwd, original: attempt.sessionFile, ...(running ? { readOnly: true } : {}) });
+                  ctx.ui.notify("Forked Pi session in pane.", "info");
+                } catch (error) {
+                  ctx.ui.notify(`Cannot fork Pi session in pane: ${error instanceof Error ? error.message : String(error)}`, "warning");
                 }
               }
             }
@@ -3724,19 +3684,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
                   },
                 }, theme);
               }, { overlay: true, overlayOptions: { anchor: "top-left", width: "100%", maxHeight: "100%" } });
-              continue;
-            }
-            if (actionChoice === "View transcript") {
-              const transcript = await ctx.ui.select("Native Pi transcripts", [...view.transcripts, "Back"]);
-              if (transcript && transcript !== "Back") await openTranscript(transcript);
-              continue;
-            }
-            if (actionChoice === "Transcript paths") {
-              const transcript = await ctx.ui.select("Native Pi transcript paths", [...view.transcripts, "Back"]);
-              if (transcript && transcript !== "Back") {
-                if (ctx.mode === "tui") await copyArtifact(transcript, "transcript path");
-                else ctx.ui.notify(transcript, "info");
-              }
               continue;
             }
             const copy = view.copies.get(actionChoice);

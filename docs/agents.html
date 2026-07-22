@@ -128,7 +128,7 @@
           <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. A <code>budget_exhausted</code> run can resume through <code>workflow_resume</code> with retained historical usage and an acceptable budget; completed, failed, and stopped runs remain non-resumable.</li>
           <li><strong>Cancellation:</strong> stopping a run is immediate, cascades to owned agents, and cannot be undone. A cancelled workflow reports <code>CANCELLED</code> or a stopped run state.</li>
         </ul>
-        <p>Use <code>/workflow</code> to inspect state and budgets, manage model aliases, pause, resume, adjust an exhausted budget, stop, approve, reject, or delete a run. Agents are grouped by structural task scope; select one to inspect its transcript, ID, and applicable branch or worktree actions. The run ID returned by a background invocation is the handle for run-level actions.</p>
+        <p>Use <code>/workflow</code> to inspect state and budgets, manage model aliases, pause, resume, adjust an exhausted budget, stop, approve, reject, or delete a run. Agents are grouped by structural task scope; select one to fork an attempt in a Herdr pane when available, inspect its ID, and see applicable branch or worktree actions. The run ID returned by a background invocation is the handle for run-level actions.</p>
       </section>
       <section class="callout">
         <h2>Need the implementation details?</h2>

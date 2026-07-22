@@ -658,7 +658,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   await command("delete run-a", ctx as never);
   assert.equal(existsSync(store.directory), false);
 });
-void test("TUI navigator exposes agent-scoped transcript and worktree actions", async () => {
+void test("TUI navigator exposes agent-scoped worktree actions without transcript actions", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-actions-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
@@ -690,8 +690,7 @@ void test("TUI navigator exposes agent-scoped transcript and worktree actions", 
       select: async (prompt: string, options: string[]) => {
         if (prompt === "Workflows\n") return options.find((option) => option.includes("copy")) ?? "Close";
         if (prompt === "Agents") return options.find((option) => option.includes("#1")) ?? "Back";
-        if (prompt === "Transcript attempts") return "Attempt 2";
-        if (prompt.includes("issue-65")) { const action = ["Copy branch", "Copy worktree path", "Copy transcript path", "Copy agent ID", "Back"][detailActions] ?? "Back"; detailActions += 1; return options.includes(action) ? action : "Back"; }
+        if (prompt.includes("issue-65")) { const action = ["Copy branch", "Copy worktree path", "Copy agent ID", "Back"][detailActions] ?? "Back"; detailActions += 1; return options.includes(action) ? action : "Back"; }
         return "Back";
       },
       custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; dispose?(): void }) => {
@@ -708,11 +707,11 @@ void test("TUI navigator exposes agent-scoped transcript and worktree actions", 
   const command = commands[0]?.handler;
   assert.ok(command);
   await command("", ctx as never);
-  assert.deepEqual(copied, [store.directory, runId, worktree.branch, worktree.path, transcriptB, "agent"]);
+  assert.deepEqual(copied, [store.directory, runId, worktree.branch, worktree.path, "agent"]);
   assert.ok(notifications.some(({ message }) => message === "Copied branch."));
   assert.ok(notifications.some(({ message }) => message === "Copied worktree path."));
-  assert.ok(notifications.some(({ message }) => message === "Copied transcript path."));
   assert.ok(notifications.some(({ message }) => message === "Copied agent ID."));
+  assert.doesNotMatch(JSON.stringify(notifications), /transcript/i);
   assert.equal(customCalls, 4);
   await store.delete(true);
 });
@@ -1090,77 +1089,62 @@ void test("navigator opens the complete workflow script in a scrollable TUI pane
   assert.equal(customCalls, 3);
 });
 
-void test("navigator opens a selected native transcript in a scrollable TUI overlay", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-transcript-viewer-"));
-  const cwd = join(home, "project");
-  const transcriptPath = join(home, "native.jsonl");
-  const session = { type: "session", version: 3, id: "native", timestamp: "2026-01-01T00:00:00.000Z", cwd };
-  const entries = [
-    { type: "message", id: "user", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "FIRST_USER", timestamp: 1 } },
-    { type: "message", id: "assistant", parentId: "user", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/index.ts" } }], api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: 2 } },
-    { type: "message", id: "tool", parentId: "assistant", timestamp: "2026-01-01T00:00:03.000Z", message: { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "TOOL_OUTPUT" }], isError: false, timestamp: 3 } },
-    ...Array.from({ length: 12 }, (_, index) => ({ type: "message", id: `message-${String(index)}`, parentId: index === 0 ? "tool" : `message-${String(index - 1)}`, timestamp: `2026-01-01T00:00:${String(index + 4).padStart(2, "0")}.000Z`, message: { role: index % 2 ? "assistant" : "user", content: `TRANSCRIPT_LINE_${String(index)}`, ...(index % 2 ? { api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop" } : {}), timestamp: index + 4 } })),
-    { type: "message", id: "end", parentId: "message-11", timestamp: "2026-01-01T00:00:20.000Z", message: { role: "assistant", content: [{ type: "text", text: "TRANSCRIPT_END" }], api: "openai-responses", provider: "openai", model: "gpt", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 20 } },
-  ];
-  writeFileSync(transcriptPath, `${[session, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
-  await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "completed", agents: [], nativeSessions: [{ sessionId: "native", sessionFile: transcriptPath }] }, snapshot);
-  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
-  workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
-  let customCalls = 0;
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      notify() {}, confirm: async () => false,
-      select: async (prompt: string, options: string[]) => { if (prompt === "Workflows\n") return options[0] ?? "Close"; assert.equal(prompt, "Native Pi transcripts"); assert.ok(options.includes(transcriptPath)); return transcriptPath; },
-      custom: async (factory: (tui: { terminal: { rows: number }; requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        customCalls += 1;
-        let result: string | undefined;
-        const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
-        if (customCalls === 1) {
-          const dashboardLines = component.render(80);
-          const dashboard = dashboardLines.join("\n");
-          assert.match(dashboardLines[0] ?? "", /^─+$/);
-          assert.match(dashboardLines.at(-1) ?? "", /^─+$/);
-          assert.match(dashboard, /View transcript/);
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.confirm");
-        } else if (customCalls === 2) {
-          const transcriptLines = component.render(80);
-          const initial = transcriptLines.join("\n");
-          assert.match(transcriptLines[0] ?? "", /^─+$/);
-          assert.match(transcriptLines.at(-1) ?? "", /^─+$/);
-          assert.match(initial, /TRANSCRIPT_END/);
-          assert.doesNotMatch(initial, /FIRST_USER/);
-          assert.match(initial, /Home\/End jump/);
-          component.handleInput?.("tui.editor.cursorLineStart");
-          const first = component.render(80).join("\n");
-          assert.match(first, /\[user\]/);
-          assert.match(first, /\[assistant\]/);
-          assert.match(first, /Tool call: read/);
-          assert.match(first, /FIRST_USER/);
-          assert.doesNotMatch(first, /TRANSCRIPT_END/);
-          for (let index = 0; index < 20; index += 1) component.handleInput?.("tui.select.pageDown");
-          assert.match(component.render(80).join("\n"), /TRANSCRIPT_END/);
-          component.handleInput?.("tui.editor.cursorLineStart");
-          component.handleInput?.("tui.editor.cursorLineEnd");
-          const last = component.render(80).join("\n");
-          assert.match(last, /TRANSCRIPT_END/);
-          assert.doesNotMatch(last, /FIRST_USER/);
-          component.handleInput?.("tui.select.cancel");
-        } else {
-          assert.match(component.render(80).join("\n"), /View transcript/);
-          component.handleInput?.("tui.select.cancel");
-        }
-        component.dispose?.();
-        return result;
-      },
-    },
-  };
-  await commands[0]?.handler("", ctx as never);
-  assert.equal(customCalls, 3);
-  await store.delete(true);
+void test("navigator omits transcript actions outside and inside Herdr", async () => {
+  const previousEnvironment = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
+  try {
+    for (const inHerdr of [false, true]) {
+      process.env.HERDR_ENV = inHerdr ? "1" : "0";
+      if (inHerdr) process.env.HERDR_PANE_ID = "navigator-test-pane"; else delete process.env.HERDR_PANE_ID;
+      const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-transcript-actions-"));
+      const cwd = join(home, "project");
+      mkdirSync(cwd);
+      const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "navigator" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+      const noAgent = new RunStore(cwd, "session", "no-agent-run", home);
+      await noAgent.create({ id: "no-agent-run", workflowName: "no-agent-run", cwd, sessionId: "session", state: "completed", agents: [], nativeSessions: [{ sessionId: "native", sessionFile: join(home, "native.jsonl") }] }, snapshot);
+      const withAgent = new RunStore(cwd, "session", "agent-run", home);
+      await withAgent.create({ id: "agent-run", workflowName: "agent-run", cwd, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1, attemptDetails: [{ attempt: 1, sessionId: "native-agent", sessionFile: join(home, "agent.jsonl"), accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], nativeSessions: [] }, snapshot);
+      const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+      workflowExtension({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+      const dashboardActions: string[][] = [];
+      const agentActions: string[][] = [];
+      let workflowSelection = 0;
+      const ctx = {
+        cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session" },
+        ui: {
+          notify() {},
+          confirm: async () => false,
+          select: async (prompt: string, options: string[]) => {
+            if (prompt === "Workflows\n") {
+              workflowSelection += 1;
+              const target = workflowSelection === 1 ? "agent-run" : "no-agent-run";
+              return options.find((option) => option.includes(target)) ?? "Close";
+            }
+            if (prompt === "Agents") return options[0] ?? "Back";
+            if (options.includes("Copy agent ID")) { agentActions.push(options); return "Back"; }
+            if (agentActions.length === 0 && options.includes("Agents...")) return "Agents...";
+            dashboardActions.push(options);
+            return "Close";
+          },
+        },
+      };
+      const command = commands[0]?.handler;
+      assert.ok(command);
+      await command("", ctx as never);
+      await command("", ctx as never);
+      const renderedActions = [...dashboardActions.flat(), ...agentActions.flat()].join("\n");
+      assert.doesNotMatch(renderedActions, /View transcript|Transcript paths|Copy transcript path|Open transcript in pane/);
+      assert.equal(agentActions.length, 1);
+      const selectedAgentActions = agentActions[0];
+      assert.ok(selectedAgentActions);
+      assert.equal(selectedAgentActions.includes("Fork as Pi session in pane"), inHerdr);
+      assert.ok(selectedAgentActions.includes("Copy agent ID"));
+      await noAgent.delete(true);
+      await withAgent.delete(true);
+    }
+  } finally {
+    if (previousEnvironment.HERDR_ENV === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = previousEnvironment.HERDR_ENV;
+    if (previousEnvironment.HERDR_PANE_ID === undefined) delete process.env.HERDR_PANE_ID; else process.env.HERDR_PANE_ID = previousEnvironment.HERDR_PANE_ID;
+  }
 });
 
 
