@@ -16,15 +16,14 @@ import {
   resolveAgentResourcePolicy,
   resolveModelReference,
   parseRoleMarkdown,
-  preflight,
-  registeredWorkflowDefinitions,
+  registeredWorkflowFunctions,
   workflowRoleDirectories,
   workflowProjectSettingsPath,
   workflowSettingsPath,
   WorkflowError,
   type AgentResourceExclusions,
   type AgentResourcePolicy,
-  type WorkflowScriptDefinition,
+  type WorkflowFunction,
   type WorkflowSettings,
 } from "./index.js";
 import type { AgentDefinition } from "./agent-execution.js";
@@ -32,7 +31,7 @@ import type { AgentDefinition } from "./agent-execution.js";
 export type DoctorSeverity = "error" | "warning";
 export interface DoctorDiagnostic { severity: DoctorSeverity; code: string; message: string; source?: string; hint?: string }
 export interface DoctorRole { name: string; path: string; scope: "global" | "project"; active: boolean; overrides?: string; overriddenBy?: string }
-export interface DoctorWorkflow { name: string; description: string; valid: boolean }
+export interface DoctorFunction { name: string; description: string; valid: boolean }
 export interface DoctorTrust { required: boolean; trusted: boolean; source: string }
 export interface DoctorPiState {
   trust: DoctorTrust;
@@ -42,7 +41,7 @@ export interface DoctorPiState {
   extensionErrors: readonly { path?: string; message: string }[];
   extensions?: readonly string[];
   skills?: readonly string[];
-  workflows: Readonly<Record<string, WorkflowScriptDefinition>>;
+  functions: Readonly<Record<string, WorkflowFunction>>;
 }
 export interface DoctorReport {
   cwd: string;
@@ -52,7 +51,7 @@ export interface DoctorReport {
   trust: DoctorTrust;
   activeTools: readonly string[];
   roles: readonly DoctorRole[];
-  workflows: readonly DoctorWorkflow[];
+  functions: readonly DoctorFunction[];
   resourcePolicy: AgentResourcePolicy;
   diagnostics: readonly DoctorDiagnostic[];
 }
@@ -136,7 +135,7 @@ async function discoverPi(cwd: string, agentDir: string): Promise<DoctorPiState>
         ...extensions.errors.map(({ path, error }) => ({ path, message: error })),
         ...services.diagnostics.filter(({ type }) => type === "error").map(({ message }) => ({ message })),
       ],
-      workflows: registeredWorkflowDefinitions(),
+      functions: registeredWorkflowFunctions(),
     };
   } finally {
     if (previousOffline === undefined) delete process.env.PI_OFFLINE;
@@ -208,7 +207,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   try { pi = await (options.discoverPi ?? discoverPi)(cwd, agentDir); }
   catch (error) {
     diagnostics.push(diagnostic("error", "PI_DISCOVERY", `Pi headless discovery failed: ${(error as Error).message}`, undefined, "Open and trust the project in Pi, fix extension errors, then rerun doctor."));
-    pi = { trust: { required: false, trusted: false, source: "discovery failed" }, activeTools: [], knownModels: [], availableModels: [], extensionErrors: [], workflows: {} };
+    pi = { trust: { required: false, trusted: false, source: "discovery failed" }, activeTools: [], knownModels: [], availableModels: [], extensionErrors: [], functions: {} };
   }
   if (options.activeTools) pi = { ...pi, activeTools: options.activeTools.filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_catalog") };
   if (pi.trust.required && !pi.trust.trusted) diagnostics.push(diagnostic("warning", "PROJECT_UNTRUSTED", "Pi project resources are inactive because the project is not trusted", cwd, "Open this project in Pi, choose Trust, then rerun doctor."));
@@ -253,32 +252,23 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     if (definition) definitions.set(name, definition); else definitions.delete(name);
   }
 
-  const workflows: DoctorWorkflow[] = [];
-  for (const [name, workflow] of Object.entries(pi.workflows).sort(([left], [right]) => left.localeCompare(right))) {
+  const functions: DoctorFunction[] = [];
+  for (const [name, fn] of Object.entries(pi.functions).sort(([left], [right]) => left.localeCompare(right))) {
     let valid = true;
     try {
-      const checked = preflight(workflow.script, {
-        models: new Set(pi.knownModels),
-        tools: activeTools,
-        agentTypes: new Set(definitions.keys()),
-        modelAliases: aliases,
-        knownModels,
-        settingsPath,
-        skipModelAvailability: true,
-      }, [], { name, description: workflow.description });
-      for (const model of checked.referenced.models) if (!knownModels.has(model) || !availableModels.has(model)) diagnostics.push(diagnostic("warning", "MODEL_UNAVAILABLE", `Model is valid-shaped but unavailable: ${model}`, name));
+      if (!fn.description.trim()) throw new WorkflowError("INVALID_METADATA", `Invalid workflow function description: ${name}`);
     } catch (error) {
       valid = false;
       const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error));
-      diagnostics.push(diagnostic("error", `WORKFLOW_${typed.code}`, typed.message, name, "Fix the registered workflow source or its referenced role/tool/model/extension."));
+      diagnostics.push(diagnostic("error", `FUNCTION_${typed.code}`, typed.message, name, "Fix the registered function metadata and schemas."));
     }
-    workflows.push({ name, description: workflow.description, valid });
+    functions.push({ name, description: fn.description, valid });
   }
 
   const severityOrder: Record<DoctorSeverity, number> = { error: 0, warning: 1 };
   diagnostics.sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity] || (left.source ?? "").localeCompare(right.source ?? "") || left.code.localeCompare(right.code) || left.message.localeCompare(right.message));
   roles.sort((left, right) => left.name.localeCompare(right.name) || left.scope.localeCompare(right.scope));
-  return { cwd, agentDir, settingsPath, settings, trust: pi.trust, activeTools: [...activeTools].sort(), roles, workflows, resourcePolicy, diagnostics };
+  return { cwd, agentDir, settingsPath, settings, trust: pi.trust, activeTools: [...activeTools].sort(), roles, functions, resourcePolicy, diagnostics };
 }
 
 function count(report: DoctorReport, severity: DoctorSeverity): number { return report.diagnostics.filter((item) => item.severity === severity).length; }
@@ -316,8 +306,8 @@ export function formatDoctorReport(report: DoctorReport): string {
     "## Roles",
     ...(report.roles.length ? report.roles.map((role) => `- \`${role.name}\` (${role.scope}, ${role.active ? "active" : role.overriddenBy ? `overridden by ${role.overriddenBy}` : "inactive: project untrusted"}) - \`${role.path}\`${role.overrides ? `; overrides \`${role.overrides}\`` : ""}`) : ["- None found"]),
     "",
-    "## Reusable workflows",
-    ...(report.workflows.length ? report.workflows.map((workflow) => `- [${workflow.valid ? "ok" : "error"}] \`${workflow.name}\` - ${workflow.description}`) : ["- None registered"]),
+    "## Reusable functions",
+    ...(report.functions.length ? report.functions.map((fn) => `- [${fn.valid ? "ok" : "error"}] \`${fn.name}\` - ${fn.description}`) : ["- None registered"]),
     "",
     "## Diagnostics",
     ...(report.diagnostics.length ? report.diagnostics.map((item) => `- [${item.severity}] ${item.code}${item.source ? ` \`${item.source}\`` : ""}: ${item.message}${item.hint ? ` Fix: ${item.hint}` : ""}`) : ["- [ok] No diagnostics"]),

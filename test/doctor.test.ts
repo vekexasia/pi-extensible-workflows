@@ -14,7 +14,7 @@ function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
     knownModels: ["openai/gpt"],
     availableModels: ["openai/gpt"],
     extensionErrors: [],
-    workflows: {},
+    functions: {},
     ...overrides,
   };
 }
@@ -81,30 +81,26 @@ void test("doctor rejects invalid role descriptions", async () => {
   assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-description.md")));
   assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "long-description.md")));
 });
-void test("doctor preflights every registered workflow", async () => {
+void test("doctor reports every registered function", async () => {
   const paths = fixture();
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Review");
-  const workflows = {
-    "test.missing-role": { description: "missing role", script: `agent("x",{role:"missing"});` },
-    "test.missing-tool": { description: "missing tool", script: `agent("x",{tools:["cat"]});` },
-    "test.bad-meta": { description: "bad meta", script: `const x = ;` },
+  const functions: DoctorPiState["functions"] = {
+    missingRole: { description: "missing role", input: { type: "object" }, output: { type: "string" }, run: () => "role" },
+    missingTool: { description: "missing tool", input: { type: "object" }, output: { type: "string" }, run: () => "tool" },
+    badMeta: { description: "bad metadata", input: { type: "object" }, output: { type: "string" }, run: () => "meta" },
   };
-  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ workflows }) }));
-  assert.deepEqual(report.workflows.map(({ name, valid }) => [name, valid]), [
-    ["test.bad-meta", false],
-    ["test.missing-role", false],
-    ["test.missing-tool", false],
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ functions }) }));
+  assert.deepEqual(report.functions.map(({ name, valid }) => [name, valid]), [
+    ["badMeta", true],
+    ["missingRole", true],
+    ["missingTool", true],
   ]);
-  assert.ok(report.diagnostics.some(({ code, message }) => code === "WORKFLOW_UNKNOWN_AGENT_TYPE" && /missing/.test(message)));
-  assert.ok(report.diagnostics.some(({ code, message }) => code === "WORKFLOW_UNKNOWN_TOOL" && /cat/.test(message)));
-  assert.ok(report.diagnostics.some(({ code }) => code === "WORKFLOW_INVALID_SYNTAX"));
+  assert.equal(report.diagnostics.some(({ code }) => code.startsWith("FUNCTION_")), false);
 });
-void test("doctor skips model availability during workflow preflight but preserves warnings", async () => {
+void test("doctor reports registered functions without model availability probes", async () => {
   const paths = fixture();
-  const workflows = { "test.unavailable": { description: "unavailable model", script: `agent("x",{model:"openai/gpt"});` } };
-  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ availableModels: [], workflows }) }));
-  assert.equal(report.workflows.find(({ name }) => name === "test.unavailable")?.valid, true);
-  assert.ok(report.diagnostics.some(({ code, message, source }) => code === "MODEL_UNAVAILABLE" && source === "test.unavailable" && /openai\/gpt/.test(message)));
+  const functions: DoctorPiState["functions"] = { unavailable: { description: "unavailable model", input: { type: "object" }, output: { type: "string" }, run: () => "ok" } };
+  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ availableModels: [], functions }) }));
+  assert.equal(report.functions.find(({ name }) => name === "unavailable")?.valid, true);
 });
 
 void test("doctor respects untrusted projects and does not mutate fixtures", async () => {
@@ -149,7 +145,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   let output = "";
   const exit = await withHome(paths.root, () => runCli(["doctor"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; }));
   assert.equal(exit, 0);
-  for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Reusable workflows", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
+  for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Reusable functions", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
   let inspected: string | undefined;
   assert.equal(await runCli(["inspect", "session-a"], { inspect: async (sessionId) => { inspected = sessionId; } }), 0);
   assert.equal(inspected, "session-a");

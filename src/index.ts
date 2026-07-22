@@ -78,7 +78,7 @@ export interface AgentRecord { id: string; name: string; label?: string; path: s
 export interface WorkflowRunEvent { type: string; message: string }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 3;
-export interface LaunchSnapshot { identityVersion?: number; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
+export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline" | "function"; functionName?: string; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
 export interface WorkflowOrchestrationContext {
@@ -100,8 +100,7 @@ export interface WorkflowFunctionContext extends WorkflowOrchestrationContext {
 }
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
-export interface WorkflowScriptDefinition { description: string; script: string }
-export interface WorkflowExtension { version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; workflows?: Readonly<Record<string, WorkflowScriptDefinition>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
+export interface WorkflowExtension { version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
 export interface WorkflowJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
 
 export class WorkflowError extends Error {
@@ -166,7 +165,7 @@ const WORKFLOW_ERROR_PROSE: Record<WorkflowErrorCode, (detail: string) => string
   INVALID_SCHEMA: (detail) => `The workflow schema is invalid: ${detail}.`,
   REGISTRY_FROZEN: (detail) => `Workflow extension registration is closed: ${detail}.`,
   GLOBAL_COLLISION: (detail) => `The workflow global name is already in use: ${detail}.`,
-  MISSING_WORKFLOW: (detail) => `The workflow primitive is unavailable: ${detail}.`,
+  MISSING_WORKFLOW: (detail) => `The registered workflow function is unavailable: ${detail}.`,
   UNKNOWN_MODEL: (detail) => `The workflow requested the unavailable model ${detail.replace(/^(?:Unknown model(?: for role [^:]+)?|Invalid model spec):\s*/, "")}.`,
   UNKNOWN_TOOL: (detail) => `The workflow requested the unavailable tool ${detail.replace(/^Unknown tool:\s*/, "")}.`,
   UNKNOWN_AGENT_TYPE: (detail) => `The workflow requested the unavailable agent role ${detail.replace(/^Unknown agent role:\s*/, "")}.`,
@@ -991,8 +990,7 @@ function validateStaticWithWorktree(call: WorkflowCall): void {
 
 export interface WorkflowCatalogFunction { name: string; version: string; headline: string; extensionDescription: string; description: string; input: JsonSchema; output: JsonSchema }
 export interface WorkflowCatalogVariable { name: string; version: string; headline: string; extensionDescription: string; description: string; schema: JsonSchema }
-export interface WorkflowCatalogWorkflow { name: string; version: string; headline: string; extensionDescription: string; description: string }
-export interface WorkflowCatalog { functions: readonly WorkflowCatalogFunction[]; variables: readonly WorkflowCatalogVariable[]; workflows: readonly WorkflowCatalogWorkflow[]; modelAliases?: Readonly<Record<string, string>> }
+export interface WorkflowCatalog { functions: readonly WorkflowCatalogFunction[]; variables: readonly WorkflowCatalogVariable[]; modelAliases?: Readonly<Record<string, string>> }
 const RESERVED_GLOBALS = new Set(["agent", "conversation", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "worktreeState", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -1000,7 +998,6 @@ const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-
 export class WorkflowRegistry {
   readonly #extensions = new Set<Readonly<WorkflowExtension>>();
   readonly #globals = new Map<string, string>();
-  readonly #workflows = new Map<string, WorkflowScriptDefinition>();
   readonly #hooks = new Map<string, RegisteredAgentSetupHook>();
   #frozen = false;
 
@@ -1009,12 +1006,12 @@ export class WorkflowRegistry {
 
   register(extension: WorkflowExtension): void {
     if (this.#frozen) fail("REGISTRY_FROZEN", "Workflow extension registration is closed after session_start");
-    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "functions", "variables", "workflows", "agentSetupHooks"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version, headline, and description");
+    if (object(extension) && Object.prototype.hasOwnProperty.call(extension, "workflows")) fail("INVALID_METADATA", "Separate registered workflow definitions were removed; register a function with input and output schemas instead");
+    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "functions", "variables", "agentSetupHooks"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim() || typeof extension.description !== "string" || !extension.description.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version, headline, and description");
     const functions = extension.functions ?? {};
     const variables = extension.variables ?? {};
-    const workflows = extension.workflows ?? {};
     const agentSetupHooks = extension.agentSetupHooks ?? {};
-    if (!object(functions) || !object(variables) || !object(workflows) || !object(agentSetupHooks) || (Object.keys(functions).length === 0 && Object.keys(variables).length === 0 && Object.keys(workflows).length === 0 && Object.keys(agentSetupHooks).length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, variables, workflows, or agent setup hooks");
+    if (!object(functions) || !object(variables) || !object(agentSetupHooks) || (Object.keys(functions).length === 0 && Object.keys(variables).length === 0 && Object.keys(agentSetupHooks).length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, variables, or agent setup hooks");
     const names = [...Object.keys(functions), ...Object.keys(variables)];
     if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", "Global name collision inside extension");
     for (const name of names) {
@@ -1032,46 +1029,38 @@ export class WorkflowRegistry {
       if (!object(variable) || Object.keys(variable).some((key) => !["description", "schema", "resolve"].includes(key)) || typeof variable.description !== "string" || !variable.description.trim() || typeof variable.resolve !== "function") fail("INVALID_METADATA", `Invalid workflow variable: ${name}`);
       validateSchema(variable.schema, `${name} schema`);
     }
-    for (const [name, workflow] of Object.entries(workflows)) {
-      if (!IDENTIFIER.test(name) || !object(workflow) || Object.keys(workflow).some((key) => !["description", "script"].includes(key)) || typeof workflow.description !== "string" || !workflow.description.trim() || typeof workflow.script !== "string" || !workflow.script.trim()) fail("INVALID_METADATA", `Invalid workflow script: ${name}`);
-      if (this.#workflows.has(name)) fail("DUPLICATE_NAME", `Reusable workflow already registered: ${name}`);
-      parseWorkflow(workflow.script);
-    }
     for (const [name, hook] of Object.entries(agentSetupHooks)) {
       if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "setup"].includes(key)) || typeof hook.setup !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent setup hook: ${name}`);
       if (this.#hooks.has(name)) fail("DUPLICATE_NAME", `Agent setup hook already registered: ${name}`);
     }
-    const stored = deepFreeze({ ...extension, functions, variables, workflows, agentSetupHooks });
+    const stored = deepFreeze({ ...extension, functions, variables, agentSetupHooks });
     this.#extensions.add(stored);
     for (const name of names) this.#globals.set(name, name);
-    for (const [name, workflow] of Object.entries(workflows)) this.#workflows.set(name, workflow);
     for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });
   }
 
-  workflow(name: string): WorkflowScriptDefinition {
-    if (!IDENTIFIER.test(name)) fail("MISSING_WORKFLOW", `Registered workflows require an unqualified name: ${name}`);
-    const workflow = this.#workflows.get(name);
-    if (!workflow) fail("MISSING_WORKFLOW", `Workflow is unavailable: ${name}`);
-    return workflow;
+  function(name: string): WorkflowFunction {
+    if (!IDENTIFIER.test(name)) fail("MISSING_WORKFLOW", `Registered functions require an unqualified name: ${name}`);
+    const fn = [...this.#extensions].find((extension) => extension.functions?.[name])?.functions?.[name];
+    if (!fn) fail("MISSING_WORKFLOW", `Registered function is unavailable: ${name}; the separate registered-workflow format was removed`);
+    return fn;
   }
 
-  workflows(): Readonly<Record<string, WorkflowScriptDefinition>> {
-    return Object.freeze(Object.fromEntries(this.#workflows));
+  functions(): Readonly<Record<string, WorkflowFunction>> {
+    return Object.freeze(Object.fromEntries([...this.#extensions].flatMap((extension) => Object.entries(extension.functions ?? {}))));
   }
 
   catalog(): WorkflowCatalog {
     const functions: WorkflowCatalogFunction[] = [];
     const variables: WorkflowCatalogVariable[] = [];
-    const workflows: WorkflowCatalogWorkflow[] = [];
     for (const extension of this.#extensions) {
       for (const [name, fn] of Object.entries(extension.functions ?? {})) functions.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: fn.description, input: structuredClone(fn.input), output: structuredClone(fn.output) });
       for (const [name, variable] of Object.entries(extension.variables ?? {})) variables.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: variable.description, schema: structuredClone(variable.schema) });
-      for (const [name, workflow] of Object.entries(extension.workflows ?? {})) workflows.push({ name, version: extension.version, headline: extension.headline, extensionDescription: extension.description, description: workflow.description });
     }
     let aliases: Readonly<Record<string, string>> | undefined;
     try { aliases = loadSettings().modelAliases; } catch { aliases = undefined; }
     const sort = (left: { name: string }, right: { name: string }) => left.name.localeCompare(right.name);
-    return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), workflows: workflows.sort(sort), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
+    return deepFreeze({ functions: functions.sort(sort), variables: variables.sort(sort), ...(aliases ? { modelAliases: structuredClone(aliases) } : {}) });
   }
 
   globals(): Readonly<Record<string, { name: string }>> {
@@ -1079,8 +1068,7 @@ export class WorkflowRegistry {
   }
 
   async invokeFunction(name: string, input: unknown, context: Readonly<WorkflowFunctionContext>, path: string, journal: WorkflowJournal): Promise<JsonValue> {
-    const fn = [...this.#extensions].find((extension) => extension.functions?.[name])?.functions?.[name];
-    if (!fn) fail("MISSING_WORKFLOW", `Workflow function is unavailable: ${name}`);
+    const fn = this.function(name);
     if (!object(input) || !jsonValue(input) || !Value.Check(fn.input, input)) fail("RESULT_INVALID", `Invalid input for ${name}`);
     const replayed = journal.get(path);
     if (replayed !== undefined) {
@@ -1101,7 +1089,7 @@ export class WorkflowRegistry {
     return [...this.#hooks.values()].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
   }
 }
-type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "workflow" | "workflows" | "catalog" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
+type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "catalog" | "globals" | "invokeFunction" | "variables" | "agentSetupHooks">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -1110,8 +1098,8 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     get frozen() { return registry.frozen; },
     freeze: () => { registry.freeze(); },
     register: (extension) => { registry.register(extension); },
-    workflow: (name) => registry.workflow(name),
-    workflows: () => registry.workflows(),
+    function: (name) => registry.function(name),
+    functions: () => registry.functions(),
     catalog: () => registry.catalog(),
     globals: () => registry.globals(),
     invokeFunction: (...args) => registry.invokeFunction(...args),
@@ -1132,22 +1120,22 @@ function loadingRegistry(): WorkflowRegistryApi { return workflowRegistryHost().
 beginWorkflowExtensionLoading();
 export function registerWorkflowExtension(extension: WorkflowExtension): void { loadingRegistry().register(extension); }
 export function workflowCatalog(): WorkflowCatalog { return loadingRegistry().catalog(); }
-export function registeredWorkflowDefinitions(): Readonly<Record<string, WorkflowScriptDefinition>> { return loadingRegistry().workflows(); }
+export function registeredWorkflowFunctions(): Readonly<Record<string, WorkflowFunction>> { return loadingRegistry().functions(); }
 
 
 export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown; name?: unknown; description?: unknown }): string {
   const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : typeof args.workflow === "string" && args.workflow.trim() ? args.workflow : "workflow";
-  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered workflow" : ""}`;
+  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered function" : ""}`;
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
 export const WORKFLOW_TOOL_LABEL = "Workflow";
 export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
-export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered workflows use their workflow name. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID, and parentRunId reuses matching named worktrees from a terminal run.";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered functions use their function name. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID, and parentRunId reuses matching named worktrees from a terminal run.";
 export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
   name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
   script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
-  workflow: Type.Optional(Type.String({ description: "Registered reusable workflow as an unqualified name" })),
+  workflow: Type.Optional(Type.String({ description: "Registered reusable function as an unqualified name" })),
   args: Type.Optional(Type.Unknown({ description: "JSON-compatible workflow arguments" })),
   foreground: Type.Optional(Type.Boolean({ description: "Wait for completion instead of running in the background" })),
   concurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })),
@@ -1225,6 +1213,7 @@ export interface WorkflowValidationParameters {
   description?: string;
   script?: string;
   workflow?: string;
+  args?: unknown;
 }
 
 export interface WorkflowValidationContext {
@@ -1244,7 +1233,10 @@ export interface ValidatedWorkflowLaunch {
   agentDefinitions: Readonly<Record<string, AgentDefinition>>;
   projectAgentDefinitions: Readonly<Record<string, AgentDefinition>>;
   roleNames: readonly string[];
+  functionName?: string;
 }
+
+function functionLaunchScript(name: string): string { return `return await ${name}(args);`; }
 
 export function validateWorkflowLaunch(params: WorkflowValidationParameters, context: WorkflowValidationContext): ValidatedWorkflowLaunch {
   return validateWorkflowLaunchWithRegistry(params, context, loadingRegistry());
@@ -1252,12 +1244,15 @@ export function validateWorkflowLaunch(params: WorkflowValidationParameters, con
 function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters, context: WorkflowValidationContext, registry: WorkflowRegistryApi): ValidatedWorkflowLaunch {
   if (Object.prototype.hasOwnProperty.call(params, "maxAgentLaunches")) fail("INVALID_METADATA", "maxAgentLaunches has been removed; use budget.agentLaunches");
   if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
-  const definition = typeof params.workflow === "string" ? registry.workflow(params.workflow) : undefined;
-  const script = typeof params.script === "string" && params.script.trim() ? params.script : definition?.script ?? "";
-  if (!script) fail("INVALID_SYNTAX", "Provide script or registered workflow");
-  const workflowName = typeof params.name === "string" && params.name.trim() ? params.name.trim() : typeof params.workflow === "string" ? params.workflow : "";
+  const functionName = typeof params.workflow === "string" ? params.workflow : undefined;
+  const fn = functionName === undefined ? undefined : registry.function(functionName);
+  const args = params.args === undefined ? null : params.args;
+  if (functionName !== undefined && fn && (!object(args) || !jsonValue(args) || !Value.Check(fn.input, args))) fail("RESULT_INVALID", `Invalid input for ${functionName}`);
+  const script = functionName !== undefined && fn ? functionLaunchScript(functionName) : typeof params.script === "string" && params.script.trim() ? params.script : "";
+  if (!script) fail("INVALID_SYNTAX", "Provide script or registered function");
+  const workflowName = functionName ?? (typeof params.name === "string" && params.name.trim() ? params.name.trim() : "");
   if (!workflowName) fail("INVALID_METADATA", "Inline workflows require name");
-  const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : definition?.description ? { description: definition.description } : {}) });
+  const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : fn?.description ? { description: fn.description } : {}) });
   const globalAgentDefinitions = loadAgentDefinitions(context.cwd, undefined, false);
   const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};
   const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
@@ -1266,7 +1261,7 @@ function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters
   const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)), modelAliases: aliases, knownModels, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) }, [], metadata);
   const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
   validateRolePolicies(agentDefinitions, roleNames, context.availableModels, context.rootTools, aliases, knownModels, context.settingsPath);
-  return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames };
+  return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames, ...(functionName ? { functionName } : {}) };
 }
 
 function deepFreeze<T>(value: T): T {
@@ -1280,11 +1275,21 @@ function deepFreeze<T>(value: T): T {
 type LaunchSnapshotInput = Omit<LaunchSnapshot, "identityVersion"> & { identityVersion?: number };
 
 export function createLaunchSnapshot(input: LaunchSnapshotInput): Readonly<LaunchSnapshot> {
-  return deepFreeze(structuredClone({ ...input, identityVersion: input.identityVersion ?? LAUNCH_SNAPSHOT_IDENTITY_VERSION }));
+  return deepFreeze(structuredClone({ ...input, launchKind: input.launchKind ?? (input.functionName ? "function" : "inline"), identityVersion: input.identityVersion ?? LAUNCH_SNAPSHOT_IDENTITY_VERSION }));
 }
 
 export function loadLaunchSnapshot(input: LaunchSnapshot): Readonly<LaunchSnapshot> {
   return deepFreeze(structuredClone(input));
+}
+
+function launchScriptForSnapshot(snapshot: Readonly<LaunchSnapshot>, registry: WorkflowRegistryApi): string {
+  if (snapshot.launchKind === "function") {
+    if (!snapshot.functionName) fail("RESUME_INCOMPATIBLE", "Persisted registered function launch is missing its function name");
+    try { registry.function(snapshot.functionName); } catch (error) { if (error instanceof WorkflowError && error.code === "MISSING_WORKFLOW") throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted registered function is unavailable: ${snapshot.functionName}`); throw error; }
+    return functionLaunchScript(snapshot.functionName);
+  }
+  if (snapshot.launchKind === "inline") return snapshot.script;
+  fail("RESUME_INCOMPATIBLE", "This persisted run uses the removed registered-workflow format; launch it again as a registered function or inline script");
 }
 
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
@@ -2863,11 +2868,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     if (catalogRegistered || !pi.getActiveTools().includes("workflow")) return;
     const catalog = registry.catalog();
     const hasAliases = Object.keys(catalog.modelAliases ?? {}).length > 0;
-    if (!catalog.functions.length && !catalog.variables.length && !catalog.workflows.length && !hasAliases) return;
+    if (!catalog.functions.length && !catalog.variables.length && !hasAliases) return;
     pi.registerTool({
       name: "workflow_catalog",
       label: "Workflow Catalog",
-      description: "List global workflow functions, variables, and reusable workflows",
+      description: "List reusable workflow functions, variables, and model aliases",
       parameters: Type.Object({}, { additionalProperties: false }),
       async execute() { return { content: [{ type: "text" as const, text: JSON.stringify(registry.catalog()) }], details: {} }; }
     });
@@ -2919,7 +2924,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const resumeAliases = { ...previousAliases, ...currentAliases };
     const blockedAliases = new Set(Object.keys(previousAliases).filter((name) => !Object.prototype.hasOwnProperty.call(currentAliases, name)));
     const blockedAliasTargets = Object.fromEntries(Object.entries(previousAliases).filter(([name]) => !Object.prototype.hasOwnProperty.call(currentAliases, name)));
-    preflight(loaded.snapshot.script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata);
+    const script = launchScriptForSnapshot(loaded.snapshot, registry);
+    preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata);
     const snapshot = createLaunchSnapshot({ ...loaded.snapshot, settingsPath, settings: { ...loaded.snapshot.settings, modelAliases: currentAliases }, modelAliases: currentAliases });
     await run.store.saveSnapshot(snapshot);
     run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
@@ -2938,7 +2944,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     }
     await scheduler.cancelRun(run.store.runId);
     await run.lifecycle.resume();
-    const execution = runWorkflow(loaded.snapshot.script, loaded.snapshot.args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: async (prompt, options, signal, identity) => {
+    const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: async (prompt, options, signal, identity) => {
       await run.lifecycle.enter();
       const conversationId = identity.conversation ? conversationIdentityPath(identity) : undefined;
       const conversationLock = conversationId ? `${run.store.runId}:${conversationId}` : "";
@@ -3128,8 +3134,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_stop" && name !== "workflow_catalog");
       const trustedProject = projectTrusted(ctx);
       if (typeof ctx.cwd === "string") resolveAgentResourcePolicy(ctx.cwd, trustedProject, settingsPath);
-      const validated = validateWorkflowLaunchWithRegistry(params, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
-      const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames } = validated;
+      const validated = validateWorkflowLaunchWithRegistry({ ...params, args: params.args }, { cwd: ctx.cwd, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
+      const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames, functionName } = validated;
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
       const runId = randomUUID();
       const args = (params.args ?? null) as JsonValue;
@@ -3145,7 +3151,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
       const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model, defaults.modelAliases, knownModels, settingsPath)] : []; });
       const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models, ...roleModels])];
-      const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, settings, settingsPath, ...(defaults.modelAliases ? { modelAliases: defaults.modelAliases } : {}), ...(budget ? { budget } : {}), models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, schemas: checked.schemas });
+      const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, settings, settingsPath, ...(functionName ? { launchKind: "function" as const, functionName } : {}), ...(defaults.modelAliases ? { modelAliases: defaults.modelAliases } : {}), ...(budget ? { budget } : {}), models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, schemas: checked.schemas });
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], nativeSessions: [], ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
@@ -3847,4 +3853,4 @@ export type { AwaitingCheckpoint, CompletedOperation, ConversationHead, NativeSe
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentProviderFailure, AgentProviderRecovery, AgentSetup, AgentSetupContext, AgentSetupHook, AgentToolCallProgress, RegisteredAgentSetupHook, SessionInput } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
-export type { DoctorDiagnostic, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust, DoctorWorkflow } from "./doctor.js";
+export type { DoctorDiagnostic, DoctorFunction, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust } from "./doctor.js";

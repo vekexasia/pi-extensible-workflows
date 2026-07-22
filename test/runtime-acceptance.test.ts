@@ -206,6 +206,24 @@ void test("cold resume rejects obsolete identity snapshots", async () => {
   await assert.rejects(command("resume run-a", ctx), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /identity version/.test(error.message));
   await shutdown();
 });
+void test("cold resume rejects persisted pre-function workflow references clearly", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-legacy-workflow-reference-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const current = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "legacy" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const legacySnapshot = { ...current };
+  delete legacySnapshot.launchKind;
+  await store.create({ id: "run-a", workflowName: "legacy", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, legacySnapshot);
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  const ctx = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; if (name === "session_shutdown") shutdown = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command);
+  await start({}, ctx);
+  await assert.rejects(command("resume run-a", ctx), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /removed registered-workflow format/.test(error.message));
+  await shutdown?.();
+});
 
 void test("cold resume rejects project roles after trust is revoked", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-untrusted-resume-"));
