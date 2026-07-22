@@ -493,7 +493,14 @@ export class RunStore {
     const nextSeen = new Set(seen);
     nextSeen.add(this.runId);
     const binding = await this.borrowedWorktree(name);
-    if (binding) return this.resolveBorrowedWorktree(binding, nextSeen);
+    if (binding) {
+      const loaded = await this.load();
+      if (loaded.run.parentRunId === undefined) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree ${name} has no parent run`);
+      const parent = await this.sourceRun(loaded.run.parentRunId);
+      const resolved = await parent.findNamedWorktree(name, nextSeen);
+      if (!resolved || resolved.sourceRunId !== binding.sourceRunId || resolved.owner !== binding.owner) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree binding for ${name} is not inherited from its parent run`);
+      return resolved;
+    }
     const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
     const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
     if (matches.length === 0) return undefined;

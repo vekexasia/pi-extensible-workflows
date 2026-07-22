@@ -312,6 +312,11 @@ void test("reuses named worktrees through durable follow-up bindings without del
   assert.deepEqual(await second.worktree(owner), original);
   assert.equal(existsSync(original.path), true);
   await second.validateBorrowedWorktrees();
+  const unrelated = new RunStore(repo, "session-a", "unrelated", home);
+  await unrelated.create({ ...run(repo), id: "unrelated", state: "completed" }, snapshot);
+  writeFileSync(join(first.directory, "borrowed-worktrees.json"), JSON.stringify([{ name: "banana", sourceRunId: "unrelated", owner }]));
+  await assert.rejects(first.validateBorrowedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  await unrelated.delete(true);
   writeFileSync(join(first.directory, "borrowed-worktrees.json"), JSON.stringify([{ name: " banana ", sourceRunId: "source", owner }]));
   await assert.rejects(first.validateBorrowedWorktrees(), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   await first.delete(true);
