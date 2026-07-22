@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -53,7 +53,8 @@ function fieldDescription(field: CliField): string {
   const description = typeof field.schema.description === "string" ? field.schema.description.trim() : "";
   const required = field.required ? "required" : "optional";
   const defaultValue = has(field.schema, "default") ? ` default=${JSON.stringify(field.schema.default)}` : "";
-  const enumValue = Array.isArray(field.schema.enum) ? ` enum=${field.schema.enum.map((value) => JSON.stringify(value)).join(",")}` : "";
+  const enumSchema = field.type === "array" && object(field.schema.items) ? field.schema.items : field.schema;
+  const enumValue = Array.isArray(enumSchema.enum) ? ` enum=${enumSchema.enum.map((value) => JSON.stringify(value)).join(",")}` : "";
   return [description, required, defaultValue, enumValue].filter(Boolean).join("; ");
 }
 
@@ -247,13 +248,19 @@ function commandName(value: string): string { return value.trim() && !value.incl
 function writeLauncher(destination: string, workflowName: string, force: boolean): void {
   const parent = dirname(destination);
   mkdirSync(parent, { recursive: true });
-  if (!force) { try { lstatSync(destination); throw new Error(`Destination already exists: ${destination}; use --force to replace it`); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; } }
   const tempDir = mkdtempSync(join(parent, ".pi-extensible-workflows-"));
   const tempPath = join(tempDir, "launcher");
   try {
     writeFileSync(tempPath, `#!/bin/sh\nexec pi-extensible-workflows run ${shellQuote(workflowName)} "$@"\n`, { mode: 0o755 });
     chmodSync(tempPath, 0o755);
-    renameSync(tempPath, destination);
+    if (force) renameSync(tempPath, destination);
+    else {
+      try { linkSync(tempPath, destination); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Destination already exists: ${destination}; use --force to replace it`, { cause: error });
+        throw error;
+      }
+    }
   } finally { rmSync(tempDir, { recursive: true, force: true }); }
 }
 
