@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
@@ -251,7 +251,7 @@ function writeLauncher(destination: string, workflowName: string, force: boolean
   const tempDir = mkdtempSync(join(parent, ".pi-extensible-workflows-"));
   const tempPath = join(tempDir, "launcher");
   try {
-    writeFileSync(tempPath, `#!/bin/sh\nexec pi-extensible-workflows run ${shellQuote(workflowName)} "$@"\n`, { mode: 0o755 });
+    writeFileSync(tempPath, `#!/bin/sh\nexec node ${shellQuote(fileURLToPath(import.meta.url))} run ${shellQuote(workflowName)} "$@"\n`, { mode: 0o755 });
     chmodSync(tempPath, 0o755);
     if (force) renameSync(tempPath, destination);
     else {
