@@ -72,6 +72,7 @@ export interface AgentResourcePolicy { globalSettingsPath: string; projectSettin
 export interface AgentSetupSummary { hookNames: readonly string[]; model: ModelSpec; tools: readonly string[]; cwd: string; disabledAgentResources?: { skills: readonly string[]; extensions: readonly string[]; unmatchedSkills: readonly string[]; unmatchedExtensions: readonly string[] } }
 export interface AgentAttemptSummary { attempt: number; sessionId: string; sessionFile: string; error?: { code: string; message: string }; accounting: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; setup?: AgentSetupSummary }
 export interface WorkflowWorktreeCreatedEvent extends WorkflowEventBase { owner: string; branch: string; path: string; base: string }
+export interface WorkflowWorktreeReference { readonly path: string; readonly branch: string }
 export interface WorkflowWorktreeState { [key: string]: JsonValue; name?: string; path: string; branch: string; base: string; head: string; dirty: boolean }
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: string; message: string }
@@ -86,7 +87,10 @@ export interface WorkflowOrchestrationContext {
   prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string;
   parallel: (...args: readonly unknown[]) => Promise<JsonValue>;
   pipeline: (...args: readonly unknown[]) => Promise<JsonValue>;
-  withWorktree: (...args: readonly unknown[]) => Promise<JsonValue>;
+  withWorktree: {
+    (callback: WorkflowWorktreeCallback): Promise<JsonValue>;
+    (name: string, callback: WorkflowWorktreeCallback): Promise<JsonValue>;
+  };
   worktreeState: () => Promise<WorkflowWorktreeState>;
   checkpoint: (...args: readonly unknown[]) => Promise<boolean>;
   phase: (name: string) => void;
@@ -97,6 +101,7 @@ export interface WorkflowFunctionContext extends WorkflowOrchestrationContext {
   run: Readonly<WorkflowRunContext>;
   invoke: (name: string, input: Readonly<Record<string, JsonValue>>) => Promise<JsonValue>;
 }
+export type WorkflowWorktreeCallback = (reference: Readonly<WorkflowWorktreeReference>) => JsonValue | Promise<JsonValue>;
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowExtension { version: string; headline: string; description: string; functions?: Readonly<Record<string, WorkflowFunction>>; variables?: Readonly<Record<string, WorkflowVariable>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>> }
@@ -1425,7 +1430,10 @@ const internalWithWorktree = async (...values) => {
     worktreeOccurrences.set(occurrenceKey, occurrence);
     owner = path("worktree", "unnamed", ...inherited, "callsite:" + callSite, "occurrence:" + String(occurrence));
   }
-  return await worktreeOwners.run(owner, callback);
+  const state = await rpc("worktreeState", [owner]);
+  if (!state || typeof state !== "object" || typeof state.path !== "string" || typeof state.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
+  const reference = Object.freeze({ path: state.path, branch: state.branch });
+  return await worktreeOwners.run(owner, () => callback(reference));
 };
 const internalConversation = (...values) => {
   const callSite = values.pop();
@@ -2345,7 +2353,11 @@ function namedRecord(value: unknown, kind: string): Array<[string, unknown]> {
   if (!object(value)) fail("INVALID_METADATA", `${kind} must be a record`);
   return Object.entries(value);
 }
-function hostWithWorktree(args: readonly unknown[], identity: string, occurrences: Map<string, number>): Promise<JsonValue> {
+function publicWorktreeReference(state: WorkflowWorktreeState): Readonly<WorkflowWorktreeReference> {
+  if (!object(state) || typeof state.path !== "string" || typeof state.branch !== "string") fail("WORKTREE_FAILED", "Worktree reference is invalid");
+  return Object.freeze({ path: state.path, branch: state.branch });
+}
+async function hostWithWorktree(args: readonly unknown[], identity: string, occurrences: Map<string, number>, resolveState: ((owner: string, signal: AbortSignal) => Promise<WorkflowWorktreeState>) | undefined, signal: AbortSignal): Promise<JsonValue> {
   if (args.length !== 1 && args.length !== 2) fail("INVALID_METADATA", "withWorktree requires a callback or a name and callback");
   const callback = args[args.length - 1];
   if (typeof callback !== "function") fail("INVALID_METADATA", "withWorktree callback must be a function");
@@ -2360,7 +2372,9 @@ function hostWithWorktree(args: readonly unknown[], identity: string, occurrence
     occurrences.set(key, occurrence);
     owner = operationPath("worktree", "unnamed", "function", identity, ...structuralPath, `occurrence:${String(occurrence)}`);
   }
-  return inheritedHostWorktreeOwner.run(owner, async () => await (callback as () => unknown)()) as Promise<JsonValue>;
+  if (!resolveState) fail("WORKTREE_FAILED", "No worktree state bridge is available");
+  const reference = publicWorktreeReference(await resolveState(owner, signal));
+  return inheritedHostWorktreeOwner.run(owner, async () => await (callback as (reference: Readonly<WorkflowWorktreeReference>) => unknown)(reference)) as Promise<JsonValue>;
 }
 function workflowRunContext(cwd: string, sessionId: string, runId: string, workflow: WorkflowMetadata, args: JsonValue, signal: AbortSignal): Readonly<WorkflowRunContext> {
   return Object.freeze({ cwd, sessionId, runId, workflow: deepFreeze(structuredClone(workflow)), args: deepFreeze(structuredClone(args)), signal });
@@ -2486,7 +2500,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
       pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
-      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences),
+      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences, bridge.worktreeState, signal),
       worktreeState: () => {
         const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
         if (!scopedWorktreeOwner) fail("INVALID_METADATA", "worktreeState() requires an active withWorktree() scope");

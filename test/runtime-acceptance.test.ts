@@ -242,9 +242,16 @@ void test("cold resume rejects project roles after trust is revoked", async () =
 void test("cold resume replays completed agents by hidden structural identity", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-replay-"));
   const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
   const script = `return withWorktree("recovery", async () => agent("must replay"));`;
   let replayPath = "";
-  assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; } }).result, "original");
+  assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; }, worktreeState: async () => ({ path: "/worktrees/recovery", branch: "recovery-branch", base: "base", head: "base", dirty: false }) }).result, "original");
   assert.ok(replayPath);
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create({ id: "run-a", workflowName: "agent-replay", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "agent-replay" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
@@ -564,7 +571,7 @@ void test("parent registry survives nested agent session lifecycle", async () =>
   assert.equal(listed.functions.some(({ name }) => name === "afterNested"), true);
   registerAcceptanceExtension();
 });
-void test("registered function context exposes host-derived worktree state", async () => {
+void test("registered function context exposes callback worktree references", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-state-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd, { recursive: true });
@@ -577,20 +584,25 @@ void test("registered function context exposes host-derived worktree state", asy
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown } }> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   registerWorkflowExtension({
-    version: "1.0.0", headline: "Worktree state", description: "Worktree state acceptance",
+    version: "1.0.0", headline: "Worktree reference", description: "Worktree reference acceptance",
     functions: {
-      readState: { description: "Read state", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.withWorktree("registered", async () => context.worktreeState()); } },
+      readReference: { description: "Read reference", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { let frozen = false; const reference = await context.withWorktree("registered", async (value) => { frozen = Object.isFrozen(value); return { path: value.path, branch: value.branch }; }); return { reference, frozen }; } },
+      readState: { description: "Read legacy state", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { return context.withWorktree("registered", async () => context.worktreeState()); } },
     },
   });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const result = await workflow.execute("id", { name: "worktree-state", script: "return readState({});", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  const state = result.details.value as { name?: string; path: string; branch: string; base: string; head: string; dirty: boolean };
-  assert.equal(state.name, "registered");
-  assert.match(state.path, /worktrees/);
-  assert.match(state.branch, /pi-extensible-workflows/);
-  assert.equal(state.head, state.base);
-  assert.equal(state.dirty, false);
+  const result = await workflow.execute("id", { name: "worktree-reference", script: "return { reference: await readReference({}), state: await readState({}) };", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const value = result.details.value as { reference: { reference: { path: string; branch: string }; frozen: boolean }; state: { name?: string; path: string; branch: string; base: string; head: string; dirty: boolean } };
+  assert.match(value.reference.reference.path, /worktrees/);
+  assert.match(value.reference.reference.branch, /pi-extensible-workflows/);
+  assert.deepEqual(Object.keys(value.reference.reference), ["path", "branch"]);
+  assert.equal(value.reference.frozen, true);
+  assert.equal(value.state.name, "registered");
+  assert.equal(value.state.path, value.reference.reference.path);
+  assert.equal(value.state.branch, value.reference.reference.branch);
+  assert.equal(value.state.head, value.state.base);
+  assert.equal(value.state.dirty, false);
 });
 
 void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {

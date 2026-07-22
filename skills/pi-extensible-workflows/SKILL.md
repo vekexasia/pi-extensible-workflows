@@ -32,13 +32,13 @@ Workflow JavaScript has no imports, filesystem, network, process, or timers. Del
 
 Use a bounded verification loop when command output controls the gate:
 ```js
-return withWorktree("fix-tests", async () => {
+return withWorktree("fix-tests", async ({ path, branch }) => {
   for (let attempt = 1; attempt <= 5; attempt += 1) {
     const tests = await shell("yarn test", { env: { CI: "1" } });
-    if (tests.exitCode === 0) return tests;
+    if (tests.exitCode === 0) return { path, branch, tests };
     await agent(prompt("Fix these failures:\n\n{output}", { output: tests.stderr || tests.stdout }));
   }
-  return shell("yarn test", { env: { CI: "1" } });
+  return { path, branch, tests: await shell("yarn test", { env: { CI: "1" } }) };
 });
 ```
 Shell results are journaled only after process exit and RPC validation. A host crash after side effects but before journaling can rerun the command on resume; use `shell()` mainly for verification and bounded gates, not exactly-once mutations.
@@ -70,14 +70,14 @@ Await each `handle.run(prompt, turnOptions)` call before starting the next one; 
 ## Worktrees
 Use `withWorktree(callback)` or `withWorktree(name, callback)` for top-level agents that collaborate in one worktree:
 ```js
-const results = await withWorktree("implementation", async () => parallel("implementation", {
-  api: () => agent("Implement the API"),
-  tests: () => agent("Add integration tests"),
-}));
+const result = await withWorktree("issue", async ({ path, branch }) => {
+  const report = await agent("Implement the issue");
+  return { path, branch, report };
+});
 ```
-The callback result is unchanged and the worktree is created only when the first enclosed agent launches. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
+Entering the scope materializes its worktree before the callback. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
-Inside an active `withWorktree()` scope, `worktreeState()` returns fresh host-derived Git state: `name` (for named scopes), `path`, `branch`, `base`, `head`, and `dirty`. Read it after awaited development rather than from a racing parallel sibling. Registered extension functions use the equivalent scoped operation through `context.worktreeState()`.
+The legacy `worktreeState()` API remains available only inside an active scope. It returns fresh host-derived Git state including `name`, `path`, `branch`, `base`, `head`, and `dirty`; prefer the callback reference for agent-facing workflow code. Registered extension functions use `context.withWorktree((reference) => ...)` and may use `context.worktreeState()` for legacy compatibility.
 
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:
 ```js

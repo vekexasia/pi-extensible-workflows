@@ -2288,36 +2288,52 @@ void test("withWorktree returns bare values and propagates one owner through par
   const result = await runWorkflow(`const shared = await withWorktree("shared", async () => ({
     parallel: await parallel("batch", { first: () => agent("first"), second: () => agent("second") }),
     pipeline: await pipeline("pipe", { one: 1, two: 2 }, { review: value => agent(String(value)) }),
-  })); return { shared, outside: await agent("outside") };`, null, { agent: async (prompt, _options, _signal, identity) => { identities.push({ prompt, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) }); return prompt; } }).result;
+  })); return { shared, outside: await agent("outside") };`, null, {
+    agent: async (prompt, _options, _signal, identity) => { identities.push({ prompt, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) }); return prompt; },
+    worktreeState: async () => ({ path: "/worktrees/shared", branch: "branch", base: "base", head: "base", dirty: false }),
+  }).result;
   assert.deepEqual(result, { shared: { parallel: { first: "first", second: "second" }, pipeline: { one: "1", two: "2" } }, outside: "outside" });
   const scoped = identities.filter(({ prompt }) => prompt !== "outside");
   assert.equal(new Set(scoped.map(({ worktreeOwner }) => worktreeOwner)).size, 1);
   assert.ok(scoped[0]?.worktreeOwner);
   assert.equal(identities.find(({ prompt }) => prompt === "outside")?.worktreeOwner, undefined);
 });
+void test("withWorktree callbacks receive frozen public references", async () => {
+  let materialized = 0;
+  const result = await runWorkflow(`return await withWorktree("public", async (reference) => ({ value: { path: reference.path, branch: reference.branch }, keys: Object.keys(reference), frozen: Object.isFrozen(reference) }));`, null, {
+    worktreeState: async () => { materialized += 1; return { path: "/worktrees/public", branch: "public-branch", base: "base", head: "head", dirty: false }; },
+  }).result;
+  assert.deepEqual(result, { value: { path: "/worktrees/public", branch: "public-branch" }, keys: ["path", "branch"], frozen: true });
+  assert.equal(materialized, 1);
+});
 void test("worktreeState reads only the active scope and rejects indirect or argument calls", async () => {
   const owners: string[] = [];
   const bridge = { worktreeState: async (owner: string) => { owners.push(owner); return { ...(owner === "worktree/named/shared" ? { name: "shared" } : {}), path: `/worktrees/${String(owners.length)}`, branch: "branch", base: "base", head: `head-${String(owners.length)}`, dirty: owners.length === 2 }; } };
-  assert.deepEqual(await runWorkflow(`return await withWorktree("shared", async () => worktreeState());`, null, bridge).result, { name: "shared", path: "/worktrees/1", branch: "branch", base: "base", head: "head-1", dirty: false });
-  assert.deepEqual(await runWorkflow(`return await withWorktree(async () => worktreeState());`, null, bridge).result, { path: "/worktrees/2", branch: "branch", base: "base", head: "head-2", dirty: true });
+  assert.deepEqual(await runWorkflow(`return await withWorktree("shared", async () => worktreeState());`, null, bridge).result, { name: "shared", path: "/worktrees/2", branch: "branch", base: "base", head: "head-2", dirty: true });
+  assert.deepEqual(await runWorkflow(`return await withWorktree(async () => worktreeState());`, null, bridge).result, { path: "/worktrees/4", branch: "branch", base: "base", head: "head-4", dirty: false });
   assert.equal(owners[0], "worktree/named/shared");
-  assert.match(owners[1] ?? "", /^worktree\/unnamed\/callsite%3A\d+%3A\d+\/occurrence%3A1$/);
+  assert.equal(owners[1], "worktree/named/shared");
+  assert.match(owners[2] ?? "", /^worktree\/unnamed\/callsite%3A\d+%3A\d+\/occurrence%3A1$/);
+  assert.match(owners[3] ?? "", /^worktree\/unnamed\/callsite%3A\d+%3A\d+\/occurrence%3A1$/);
   await assert.rejects(runWorkflow(`return worktreeState();`, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(runWorkflow(`const alias = worktreeState; return withWorktree("shared", async () => alias());`, null, bridge).result, /direct worktreeState.*aliases.*unsupported/i);
   await assert.rejects(runWorkflow(`return await withWorktree("shared", async () => worktreeState("path"));`, null, bridge).result, /does not accept arguments/i);
   assert.throws(() => preflight(`worktreeState("path")`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 
-void test("withWorktree validates calls, keeps empty scopes empty, and replays unnamed identity", async () => {
+void test("withWorktree validates calls, materializes empty scopes, and replays unnamed identity", async () => {
   const emptyOwners: string[] = [];
-  assert.deepEqual(await runWorkflow(`return await withWorktree("empty", async () => ({ ok: true }));`, null, { agent: async (_prompt, _options, _signal, identity) => { emptyOwners.push(identity.worktreeOwner ?? ""); return null; } }).result, { ok: true });
+  const materializedOwners: string[] = [];
+  const materialize = async (owner: string) => { materializedOwners.push(owner); return { path: "/worktrees/empty", branch: "branch", base: "base", head: "base", dirty: false }; };
+  assert.deepEqual(await runWorkflow(`return await withWorktree("empty", async () => ({ ok: true }));`, null, { worktreeState: materialize, agent: async (_prompt, _options, _signal, identity) => { emptyOwners.push(identity.worktreeOwner ?? ""); return null; } }).result, { ok: true });
   assert.deepEqual(emptyOwners, []);
+  assert.deepEqual(materializedOwners, ["worktree/named/empty"]);
   const namedOwners: string[] = [];
-  await runWorkflow(`return await Promise.all([withWorktree("same", async () => agent("one")), withWorktree("same", async () => agent("two")), withWorktree("other", async () => agent("three"))]);`, null, { agent: async (_prompt, _options, _signal, identity) => { namedOwners.push(identity.worktreeOwner ?? ""); return "done"; } }).result;
+  await runWorkflow(`return await Promise.all([withWorktree("same", async () => agent("one")), withWorktree("same", async () => agent("two")), withWorktree("other", async () => agent("three"))]);`, null, { worktreeState: materialize, agent: async (_prompt, _options, _signal, identity) => { namedOwners.push(identity.worktreeOwner ?? ""); return "done"; } }).result;
   assert.equal(namedOwners[0], namedOwners[1]);
   assert.notEqual(namedOwners[0], namedOwners[2]);
   const script = `return await withWorktree(async () => agent("same"));`;
-  const owner = async () => { let value = ""; await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { value = identity.worktreeOwner ?? ""; return "done"; } }).result; return value; };
+  const owner = async () => { let value = ""; await runWorkflow(script, null, { worktreeState: materialize, agent: async (_prompt, _options, _signal, identity) => { value = identity.worktreeOwner ?? ""; return "done"; } }).result; return value; };
   assert.equal(await owner(), await owner());
   assert.deepEqual(inspectWorkflowScript(`withWorktree("shared", async () => agent("x"));`).map(({ kind, name }) => ({ kind, name })), [{ kind: "withWorktree", name: "shared" }, { kind: "agent", name: null }]);
   for (const source of [`withWorktree("", () => 1)`, `withWorktree("shared", 1)`, `withWorktree("shared", () => 1, 2)`]) assert.throws(() => preflight(source, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
