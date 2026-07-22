@@ -127,12 +127,20 @@ void test("registers workflow_catalog only for active non-empty registries", asy
   assert.throws(() => { registerWorkflowExtension({ version: "1.0.0", headline: "Late", description: "Late", functions: { x: { description: "x", input: { type: "object" }, output: { type: "string" }, run: () => "x" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
   const catalogTool = activeTools.find(({ name }) => name === "workflow_catalog");
   assert.ok(catalogTool?.execute);
-  const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { functions: Array<Record<string, unknown>>; variables: Array<Record<string, unknown>> };
+  const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { functions: Array<Record<string, unknown>>; variables: Array<Record<string, unknown>>; modelAliases?: Record<string, string> };
   assert.deepEqual(catalog.functions.map(({ name }) => ({ name })), [{ name: "hello" }, { name: "inspect" }]);
   assert.deepEqual(catalog.variables.map(({ name }) => ({ name })), [{ name: "branch" }]);
-  assert.deepEqual(Object.keys(catalog.functions[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "input", "name", "output", "version"]);
-  assert.deepEqual(Object.keys(catalog.variables[0] ?? {}).sort(), ["description", "extensionDescription", "headline", "name", "schema", "version"]);
-  assert.doesNotMatch(JSON.stringify(catalog), /"script"|"run"|"resolve"|"source"|"main"|"ok"/);
+  assert.deepEqual(Object.keys(catalog.functions[0] ?? {}).sort(), ["description", "input", "name"]);
+  assert.deepEqual(Object.keys(catalog.variables[0] ?? {}).sort(), ["description", "name", "schema"]);
+  assert.doesNotMatch(JSON.stringify(catalog), /"output"|"extensionDescription"|"headline"|"version"|"script"|"run"|"resolve"|"source"|"main"|"ok"/);
+  const functionDetail = JSON.parse((await catalogTool.execute("id" as never, { name: "hello" } as never)).content[0]?.text ?? "null") as Record<string, unknown>;
+  assert.deepEqual(Object.keys(functionDetail).sort(), ["description", "extensionDescription", "headline", "input", "name", "output", "version"]);
+  assert.deepEqual(functionDetail.output, { type: "string" });
+  const variableDetail = JSON.parse((await catalogTool.execute("id" as never, { name: "branch" } as never)).content[0]?.text ?? "null") as Record<string, unknown>;
+  assert.deepEqual(Object.keys(variableDetail).sort(), ["description", "extensionDescription", "headline", "name", "schema", "version"]);
+  assert.deepEqual(variableDetail.schema, { type: "string" });
+  const missing = JSON.parse((await catalogTool.execute("id" as never, { name: "missing" } as never)).content[0]?.text ?? "null") as { error: { code: string; name: string; message: string } };
+  assert.deepEqual(missing.error, { code: "NOT_FOUND", name: "missing", message: "No registered workflow function or variable is available: missing" });
   await activeShutdown();
 });
 
@@ -1928,7 +1936,11 @@ void test("workflow catalog exposes aliases without guidance metadata", () => {
   writeFileSync(path, JSON.stringify({ modelAliases: { reviewer: "anthropic/opus:high" } }));
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  try { assert.deepEqual(new WorkflowRegistry().catalog().modelAliases, { reviewer: "anthropic/opus:high" }); } finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
+  try {
+    const registry = new WorkflowRegistry();
+    assert.deepEqual(registry.catalog().modelAliases, { reviewer: "anthropic/opus:high" });
+    assert.deepEqual(registry.catalogIndex().modelAliases, { reviewer: "anthropic/opus:high" });
+  } finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
 });
 
 void test("workflow catalog and session_start tolerate malformed settings", async () => {
@@ -2513,6 +2525,13 @@ void test("freezes registries and produces a deterministic flat catalog", () => 
   second.register({ version: "1.0.0", headline: "Catalog", description: "Catalog test", functions: { another: { description: "Release", input: { type: "object" }, output: { type: "string" }, run: () => "another" } } });
   assert.deepEqual(registry.catalog().functions.map(({ name }) => ({ name })), [{ name: "inspect" }, { name: "release" }]);
   assert.deepEqual(registry.catalog().variables.map(({ name }) => ({ name })), [{ name: "branch" }]);
+  const index = registry.catalogIndex();
+  assert.deepEqual(index.functions.map(({ name, description }) => ({ name, description })), [{ name: "inspect", description: "Inspect" }, { name: "release", description: "Release" }]);
+  assert.deepEqual(index.variables.map(({ name, description }) => ({ name, description })), [{ name: "branch", description: "Branch" }]);
+  assert.deepEqual(Object.keys(index.functions[0] ?? {}).sort(), ["description", "input", "name"]);
+  assert.deepEqual(registry.catalogDetail("release"), { name: "release", version: "1.0.0", headline: "Catalog", extensionDescription: "Catalog test", description: "Release", input: { type: "object" }, output: { type: "string" } });
+  assert.deepEqual(registry.catalogDetail("branch"), { name: "branch", version: "1.0.0", headline: "Catalog", extensionDescription: "Catalog test", description: "Branch", schema: { type: "string" } });
+  assert.deepEqual(registry.catalogDetail("missing"), { error: { code: "NOT_FOUND", name: "missing", message: "No registered workflow function or variable is available: missing" } });
   assert.throws(() => { registry.register({ version: "1.0.0", headline: "Duplicate", description: "Duplicate", functions: { inspect: { description: "Duplicate", input: { type: "object" }, output: { type: "string" }, run: () => "duplicate" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "GLOBAL_COLLISION");
   registry.freeze();
   assert.equal(registry.frozen, true);

@@ -28,8 +28,7 @@ Pass structured input from the main agent with `args`:
 { "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue` (`args` is `null` when omitted). `workflow_stop` requires the exact run ID; foreground results retain their value and completed `runId`, while background launches return `runId` immediately. A terminal `parentRunId` reuses matching named `withWorktree` scopes; unnamed or missing names create new worktrees.
-
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. Use its registered functions, variables, and model aliases; direct function launches use `{ "workflow": "name", "args": { ... } }` and enforce schemas. Alias targets are metadata, not availability probes.
+If `workflow_catalog` is available, call it once before creating the first workflow for a task. The name-less result is a compact index with launch-ready input schemas, descriptions, variables, and configured model aliases. Use those inputs to launch registered functions directly with `{ "workflow": "name", "args": { ... } }`; their input and output schemas are enforced. Request full detail with `{ "name": "name" }` only when composing a function programmatically or inspecting its output contract and extension metadata; do not load full definitions unconditionally. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.
 
 Workflow JavaScript has no imports, filesystem, network, process, or timers. Delegate that work to agents. `shell(command, options)` is the trusted host RPC for deterministic gates: it inherits the workflow or active-worktree cwd, merges string `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, but launch failures and timeouts fail with `SHELL_FAILED`.
 
