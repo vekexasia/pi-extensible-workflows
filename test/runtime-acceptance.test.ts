@@ -193,8 +193,8 @@ void test("cold resume rejects obsolete identity snapshots", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-old-snapshot-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 0, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 5 } as never, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
-  assert.equal((await store.load()).snapshot.identityVersion, 0);
+  await store.create({ id: "run-a", workflowName: "old", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ identityVersion: 3, script: "return true", args: null, metadata: { name: "old" }, settings: { concurrency: 1, maxAgentLaunches: 5 } as never, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  assert.equal((await store.load()).snapshot.identityVersion, 3);
   await store.saveOwnership([{ id: "run-a:1", label: "legacy", state: "running", options: { label: "legacy", cwd, tools: [], isolation: "worktree" } }] as never);
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
