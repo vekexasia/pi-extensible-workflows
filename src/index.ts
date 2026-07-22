@@ -1667,7 +1667,9 @@ function shellProcessKill(child: ChildProcess): void {
         const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
         killer.unref();
       } else child.kill(signal);
-    } catch { /* The process may already have exited. */ }
+    } catch {
+      try { child.kill(signal); } catch { /* The process may already have exited. */ }
+    }
   };
   child.once("close", () => { if (forceKill) clearTimeout(forceKill); });
   killProcessTree("SIGTERM");
@@ -1717,7 +1719,7 @@ function executeShellCommand(command: string, options: ShellOptions, signal: Abo
       if (signal.aborted) { reject(new WorkflowError("CANCELLED", "Workflow cancelled")); return; }
       if (timedOut) { reject(new WorkflowError("SHELL_FAILED", `Shell command timed out after ${String(options.timeoutMs)}ms`)); return; }
       const result = { exitCode: exitCode === null ? null : exitCode, stdout, stderr };
-      try { encoded(result); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
+      try { encoded({ type: "rpcResult", id: Number.MAX_SAFE_INTEGER, ok: true, value: result }); } catch (error) { reject(error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error))); return; }
       resolve(result);
     });
     if (signal.aborted) { onAbort(); return; }
