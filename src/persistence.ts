@@ -35,12 +35,6 @@ const gitIdentity = {
 };
 
 function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
-function worktreeName(owner: string): string | undefined {
-  const prefix = "worktree/named/";
-  const encoded = owner.startsWith(prefix) ? owner.slice(prefix.length) : "";
-  if (!encoded || encoded.includes("/")) return undefined;
-  try { return decodeURIComponent(encoded); } catch { return undefined; }
-}
 
 export function projectStorageKey(cwd: string): string {
   const exact = resolve(cwd);
@@ -573,7 +567,7 @@ export class RunStore {
     try {
       const record = await this.worktree(owner);
       const [head, status] = await Promise.all([git(record.cwd, ["rev-parse", "HEAD"]), git(record.cwd, ["status", "--porcelain=v1"])]);
-      const name = worktreeName(record.owner);
+      const name = this.worktreeName(record.owner);
       return { ...(name === undefined ? {} : { name }), path: record.path, branch: record.branch, base: record.base, head: head.trim(), dirty: status.trim() !== "" };
     } catch (error) {
       throw error instanceof WorkflowError && error.code === "WORKTREE_FAILED" ? error : new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
