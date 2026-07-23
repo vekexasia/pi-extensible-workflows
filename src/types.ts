@@ -23,6 +23,17 @@ export type AgentState = (typeof AGENT_STATES)[number];
 export type WorkflowErrorCode = (typeof ERROR_CODES)[number];
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type JsonSchema = { [key: string]: JsonValue };
+export interface AgentOptions {
+  label?: string;
+  model?: string;
+  thinking?: NonNullable<ModelSpec["thinking"]>;
+  tools?: string[];
+  role?: string;
+  outputSchema?: JsonSchema;
+  retries?: number;
+  timeoutMs?: number | null;
+  [key: string]: JsonValue;
+}
 export interface ShellOptions { timeoutMs?: number; env?: Record<string, string> }
 export interface ShellResult { exitCode: number | null; stdout: string; stderr: string }
 export type BudgetDimension = "tokens" | "costUsd" | "durationMs" | "agentLaunches";
@@ -61,13 +72,12 @@ export interface WorkflowRunEvent { type: string; message: string }
 export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
 export interface WorkflowPhaseRecord { phase: string; afterAgent: number }
 export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; retry?: WorkflowRetryProvenance; phase?: string; phaseHistory?: readonly WorkflowPhaseRecord[]; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
-export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; retry?: WorkflowRetryProvenance; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 4;
 export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: NonNullable<ModelSpec["thinking"]>; tools?: readonly string[]; disabledAgentResources?: AgentResourceExclusions }
 export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline" | "function"; functionName?: string; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
 export interface PreflightResult { metadata: WorkflowMetadata; referenced: { phases: readonly string[]; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[] }; schemas: readonly JsonSchema[]; dynamicAgentRoles: boolean }
-export interface WorkflowOrchestrationContext { agent: (...args: readonly unknown[]) => Promise<JsonValue>; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: (...args: readonly unknown[]) => Promise<JsonValue>; pipeline: (...args: readonly unknown[]) => Promise<JsonValue>; withWorktree: { (callback: WorkflowWorktreeCallback): Promise<JsonValue>; (name: string, callback: WorkflowWorktreeCallback): Promise<JsonValue> }; checkpoint: (...args: readonly unknown[]) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void }
+export interface WorkflowOrchestrationContext { agent: (prompt: string, options?: Readonly<AgentOptions>) => Promise<JsonValue>; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: (...args: readonly unknown[]) => Promise<JsonValue>; pipeline: (...args: readonly unknown[]) => Promise<JsonValue>; withWorktree: { (callback: WorkflowWorktreeCallback): Promise<JsonValue>; (name: string, callback: WorkflowWorktreeCallback): Promise<JsonValue> }; checkpoint: (...args: readonly unknown[]) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void }
 export interface WorkflowRunContext { cwd: string; sessionId: string; runId: string; workflow: Readonly<WorkflowMetadata>; args: JsonValue; signal: AbortSignal }
 export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { run: Readonly<WorkflowRunContext>; invoke: (name: string, input: Readonly<Record<string, JsonValue>>) => Promise<JsonValue> }
 export type WorkflowWorktreeCallback = (reference: Readonly<WorkflowWorktreeReference>) => JsonValue | Promise<JsonValue>;

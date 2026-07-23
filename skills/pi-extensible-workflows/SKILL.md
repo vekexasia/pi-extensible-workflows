@@ -46,12 +46,13 @@ Most of the times using `shell()` to perform mutations is an antipattern. Use it
 
 ## `agent()` options
 ```typescript
-interface AgentOptions {
+export interface AgentOptions {
   label?: string; model?: string; role?: string; tools?: string[];
   thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; 
   outputSchema?: JsonSchema; 
   retries?: number; 
   timeoutMs?: number | null;
+  [key: string]: JsonValue;
 }
 ```
 
