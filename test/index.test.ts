@@ -159,6 +159,46 @@ void test("workflow_retry links children, replays parallel branches, inherits bu
   assert.deepEqual((await sourceStore.load()).run.usage, sourceUsage);
   assert.equal((await sourceStore.load()).run.state, "failed");
 });
+void test("failed retry children retain inherited and newly created named worktrees without duplicates", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-named-union-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const script = `return parallel("named", { inherited: () => withWorktree("inherited", async () => agent("inherited")), fresh: () => withWorktree("fresh", async () => agent("fresh")) });`;
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "named-retry", description: "named retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent"], agentTypes: [], roles: {}, schemas: [] });
+  const root = new RunStore(cwd, "session", "root", home);
+  await root.create({ id: "root", workflowName: "named-retry", cwd, sessionId: "session", state: "failed", agents: [], nativeSessions: [] }, snapshot);
+  const inheritedOwner = structuralPath("worktree", "named", "inherited");
+  await root.worktree(inheritedOwner);
+  const source = new RunStore(cwd, "session", "source", home);
+  await source.create({ id: "source", workflowName: "named-retry", cwd, sessionId: "session", state: "failed", parentRunId: "root", retry: { sourceRunId: "root", lineageRootRunId: "root", completedPaths: [], incompletePaths: [], namedWorktrees: ["inherited"] }, agents: [], nativeSessions: [] }, snapshot);
+  await source.worktree(inheritedOwner);
+  await source.worktree(structuralPath("worktree", "named", "fresh"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {},
+  });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["agent", "workflow"] } as never, home, async () => {}, createSession);
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(retry);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const started = await retry.execute("retry-named-union", { runId: "source" }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  let child: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child = (await new RunStore(cwd, "session", childId, home).load()).run;
+    if (child.state === "completed" || child.state === "failed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(child?.state, "completed");
+  assert.deepEqual(child.retry?.namedWorktrees, ["inherited", "fresh"]);
+});
 void test("workflow_retry rejects concurrent children for one mutable retry lineage", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-concurrency-"));
   let sessions = 0;
@@ -3053,6 +3093,65 @@ void test("foreground workflow failures preserve codes while returning main-agen
   await assert.rejects(tool.execute("id", { name: "custom", script: "throw new Error('The release was rejected by the approval gate.');", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The release was rejected by the approval gate.");
   await assert.rejects(tool.execute("id", { name: "value", script: "throw 'plain thrown value';", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && error.message === "The workflow encountered an internal error: plain thrown value.");
 });
+void test("foreground failure diagnostics advertise valid named worktrees", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-named-worktree-diagnostics-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  let toolResultHandler: ((event: object, ctx: object) => Promise<unknown>) | undefined;
+  let partialPath = "";
+  let failBad = true;
+  let goodAttempts = 0;
+  let badAttempts = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => {
+      if (input.sessionLabel.includes(":good:")) goodAttempts += 1;
+      if (input.sessionLabel.includes(":bad:")) {
+        badAttempts += 1;
+        partialPath = join(input.cwd, "partial.txt");
+        if (failBad) { writeFileSync(partialPath, "partial"); failBad = false; throw new Error("named worktree failure"); }
+        assert.equal(existsSync(partialPath), true);
+        assert.equal(readFileSync(partialPath, "utf8"), "partial");
+      }
+    },
+    steer: async () => {},
+    dispose() {},
+  });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "tool_result") toolResultHandler = handler as typeof toolResultHandler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow && toolResultHandler);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(workflow.execute("named-worktree-diagnostics", { name: "named-worktree-diagnostics", script: `return withWorktree("diagnostic-tree", async () => parallel("branches", { good: () => agent("good", {label:"good"}), bad: () => agent("bad", {label:"bad"}) }));`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const patched = await toolResultHandler({ type: "tool_result", toolName: "workflow", toolCallId: "named-worktree-diagnostics", input: {}, content: [{ type: "text", text: "old" }], details: {}, isError: true }, {});
+  assert.ok(patched);
+  const diagnostic = JSON.parse((patched as { content: Array<{ text: string }> }).content[0]?.text ?? "null") as WorkflowFailureDiagnostics;
+  assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
+  assert.deepEqual(diagnostic.retry.namedWorktrees, ["diagnostic-tree"]);
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(retry);
+  const started = await retry.execute("retry-from-diagnostic", { runId: diagnostic.retry.sourceRunId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  let child: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child = (await new RunStore(cwd, "session", childId, home).load()).run;
+    if (child.state === "completed" || child.state === "failed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(child?.state, "completed");
+  assert.equal(goodAttempts, 1);
+  assert.equal(badAttempts, 2);
+  assert.equal(readFileSync(partialPath, "utf8"), "partial");
+});
 void test("foreground failures patch finalized tool results with bounded diagnostics", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
   type ToolResultHandler = (event: object, ctx: object) => Promise<{ content?: readonly object[]; details?: unknown; isError?: boolean } | undefined> | { content?: readonly object[]; details?: unknown; isError?: boolean } | undefined;
@@ -3097,6 +3196,7 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.deepEqual(diagnostic.completedSiblingPaths, [["reviewers", "good"]]);
   assert.match(formatWorkflowFailureDiagnostics(diagnostic), /Completed sibling agents: good path=reviewers > good/);
   assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
   assert.ok(diagnostic.retry.sourceRunId);
   assert.ok(diagnostic.retry.completedPaths.length > 0);
   assert.ok(diagnostic.retry.incompletePaths.length > 0);
@@ -3134,6 +3234,124 @@ void test("failure diagnostics include replayable shell operations", async () =>
   assert.ok(patched);
   const diagnostic = JSON.parse((patched as { content: Array<{ text: string }> }).content[0]?.text ?? "null") as WorkflowFailureDiagnostics;
   assert.ok(diagnostic.retry?.completedPaths.some((path) => path.startsWith("shell/")));
+});
+void test("background failure diagnostics drive workflow_retry with the advertised run ID", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  const tools: Tool[] = [];
+  const delivered: string[] = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-background-retry-diagnostics-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  let failBad = true;
+  let goodAttempts = 0;
+  let badAttempts = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => {
+      if (input.sessionLabel.includes(":good:")) goodAttempts += 1;
+      if (input.sessionLabel.includes(":bad:")) { badAttempts += 1; if (failBad) { failBad = false; throw new Error("background retry failure"); } }
+    },
+    steer: async () => {},
+    dispose() {},
+  });
+  workflowExtension({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { delivered.push(message.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(workflow && retry);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await workflow.execute("background-retry", { name: "background-retry", script: `return withWorktree("background-tree", async () => parallel("branches", { good: () => agent("good", {label:"good"}), bad: () => agent("bad", {label:"bad"}) }));` }, undefined, undefined, context);
+  let diagnosticMessage: string | undefined;
+  for (let attempt = 0; attempt < 100 && !diagnosticMessage; attempt += 1) {
+    diagnosticMessage = delivered.find((message) => message.includes("failure diagnostics:"));
+    if (!diagnosticMessage) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(diagnosticMessage);
+  const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as WorkflowFailureDiagnostics;
+  assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
+  assert.deepEqual(diagnostic.retry.namedWorktrees, ["background-tree"]);
+  const started = await retry.execute("background-retry-child", { runId: diagnostic.retry.sourceRunId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  let child: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child = (await new RunStore(cwd, "session", childId, home).load()).run;
+    if (child.state === "completed" || child.state === "failed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(child?.state, "completed");
+  assert.equal(goodAttempts, 1);
+  assert.equal(badAttempts, 2);
+});
+void test("failed retry diagnostics remove completed paths from inherited incomplete paths", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  const tools: Tool[] = [];
+  const delivered: string[] = [];
+  const diagnostics: WorkflowFailureDiagnostics[] = [];
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-diagnostic-paths-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  let firstAttempts = 0;
+  let secondAttempts = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => {
+      if (input.sessionLabel.includes(":first:")) { firstAttempts += 1; if (firstAttempts === 1) throw new Error("first attempt failed"); }
+      if (input.sessionLabel.includes(":second:")) { secondAttempts += 1; throw new Error("second attempt failed"); }
+    },
+    steer: async () => {},
+    dispose() {},
+  });
+  workflowExtension({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) {
+    delivered.push(message.content);
+    if (message.content.includes("failure diagnostics:")) diagnostics.push(JSON.parse(message.content.slice(message.content.indexOf("{"))) as WorkflowFailureDiagnostics);
+  }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(workflow && retry);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await workflow.execute("retry-diagnostic-source", { name: "retry-diagnostic-source", script: `return pipeline("stages", { item: "input" }, { first: value => agent("first", {label:"first"}), second: value => agent("second", {label:"second"}) });` }, undefined, undefined, context);
+  for (let attempt = 0; attempt < 100 && diagnostics.length < 1; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  assert.equal(diagnostics.length, 1);
+  const sourceDiagnostic = diagnostics[0];
+  assert.ok(sourceDiagnostic?.retry);
+  const started = await retry.execute("retry-diagnostic-child", { runId: sourceDiagnostic.retry.sourceRunId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  for (let attempt = 0; attempt < 100 && !diagnostics.some((diagnostic) => diagnostic.runId === childId); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  const childDiagnostic = diagnostics.find((diagnostic) => diagnostic.runId === childId);
+  assert.ok(childDiagnostic);
+  assert.ok(childDiagnostic.retry);
+  const childRetry = childDiagnostic.retry;
+  assert.equal(childDiagnostic.state, "failed");
+  assert.ok(childRetry.completedPaths.some((path) => path.includes("first")));
+  assert.ok(childRetry.incompletePaths.some((path) => path.includes("second")));
+  assert.ok(childRetry.incompletePaths.every((incomplete) => childRetry.completedPaths.every((completed) => completed !== incomplete && !completed.startsWith(`${incomplete}/`))));
+  const nextStarted = await retry.execute("retry-diagnostic-next-child", { runId: childId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const nextChildId = (JSON.parse(nextStarted.content[0]?.text ?? "null") as { runId: string }).runId;
+  let nextChild: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    nextChild = (await new RunStore(cwd, "session", nextChildId, home).load()).run;
+    if (nextChild.state === "completed" || nextChild.state === "failed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(nextChild);
+  assert.ok(nextChild.retry);
+  const nextRetry = nextChild.retry;
+  assert.equal(nextChild.state, "failed");
+  assert.ok(nextRetry.completedPaths.some((path) => path.includes("first")));
+  assert.ok(nextRetry.incompletePaths.some((path) => path.includes("second")));
+  assert.ok(nextRetry.incompletePaths.every((incomplete) => nextRetry.completedPaths.every((completed) => completed !== incomplete && !completed.startsWith(`${incomplete}/`))));
+  assert.equal(firstAttempts, 2);
+  assert.equal(secondAttempts, 2);
 });
 void test("background failures and workflow responses deliver prose to the main agent", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };

@@ -702,7 +702,29 @@ export class RunStore {
     const borrowed = await Promise.all(bindings.map(async (binding) => (await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference));
     return [...owned.filter((record): record is WorktreeReference => record !== undefined), ...borrowed];
   }
-
+  async validNamedWorktrees(): Promise<readonly string[]> {
+    const load = async (path: string): Promise<unknown> => {
+      try { return await json<unknown>(path); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+    };
+    const names = new Set<string>();
+    const rawRecords = await load(join(this.directory, "worktrees.json"));
+    let bindings: readonly BorrowedWorktreeBinding[];
+    try { bindings = await this.borrowedWorktreeRecords(); }
+    catch (error) { if (error instanceof WorkflowError && error.code === "WORKTREE_FAILED") return []; throw error; }
+    const boundOwners = new Set(bindings.map((binding) => binding.owner));
+    for (const record of Array.isArray(rawRecords) ? rawRecords : []) {
+      if (!record || typeof record !== "object") continue;
+      const owner = (record as Partial<WorktreeReference>).owner;
+      if (typeof owner !== "string") continue;
+      const name = this.worktreeName(owner);
+      if (!name || owner !== this.namedWorktreeOwner(name) || boundOwners.has(owner)) continue;
+      try { await this.ownedWorktree(owner); names.add(name); } catch { /* Do not advertise stale or invalid records. */ }
+    }
+    for (const binding of bindings) {
+      try { await this.resolveBorrowedWorktree(binding, new Set([this.runId])); names.add(binding.name); } catch { /* Do not advertise stale inherited records. */ }
+    }
+    return [...names];
+  }
   async changedWorktrees(): Promise<readonly WorktreeReference[]> {
     const changed: WorktreeReference[] = [];
     for (const valid of await this.worktrees()) {
