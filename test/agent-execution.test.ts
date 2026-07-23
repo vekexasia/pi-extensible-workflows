@@ -770,32 +770,3 @@ void test("filters disabled native extensions before factories and skills before
   assert.match(parent.systemPrompt ?? "", /disabled-skill/);
   parent.dispose();
 });
-void test("continues a persisted conversation head and fails closed on execution-policy or prompt drift", async () => {
-  const conversations = new Map<string, { id: string; policy: unknown; head: { turn: number; sessionId: string; sessionFile: string; leafId: string; systemPrompt: string; systemPromptSha256: string; toolDefinitionsSha256: string } }>();
-  const inputs: Array<{ continuation?: { sessionId: string; sessionFile: string; leafId: string } }> = [];
-  let created = 0;
-  let promptDrift = false;
-  const runStore = {
-    conversation: async (id: string) => conversations.get(id),
-    saveConversation: async (conversation: (typeof conversations extends Map<string, infer Value> ? Value : never)) => { conversations.set(conversation.id, conversation); },
-    recordSystemPrompt: async () => {},
-  } as unknown as RunStore;
-  const executor = new WorkflowAgentExecutor({ ...root, runStore }, async (input) => {
-    inputs.push({ ...(input.continuation ? { continuation: input.continuation } : {}) });
-    const leafId = input.continuation?.leafId ?? `leaf-${String(++created)}`;
-    const messages = [assistant("initial")];
-    return {
-      sessionId: "developer-session", sessionFile: "/sessions/developer.jsonl", messages, model: { provider: "openai", model: "gpt" }, getSessionStats: sessionStats, systemPrompt: promptDrift ? "CHANGED" : "SYSTEM", agent: { state: { tools: [] } },
-      getLeafId: () => leafId, getToolDefinitions: () => [{ name: "read", description: "read", parameters: { type: "object" } }],
-      async prompt(text) { messages[0] = assistant(text.includes("second") ? "second" : "first"); }, dispose() {},
-    };
-  });
-  assert.equal((await executor.execute("first", { label: "developer", workflowName: "flow", conversation: { id: "developer", turn: 1 } })).value, "first");
-  assert.equal((await executor.execute("second", { label: "developer", workflowName: "flow", conversation: { id: "developer", turn: 2 } })).value, "second");
-  assert.deepEqual(inputs.map(({ continuation }) => continuation?.leafId), [undefined, "leaf-1"]);
-  assert.equal(conversations.get("developer")?.head.turn, 2);
-  promptDrift = true;
-  await assert.rejects(executor.execute("third", { label: "developer", workflowName: "flow", conversation: { id: "developer", turn: 3 } }), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
-  assert.equal(conversations.get("developer")?.head.turn, 2);
-  assert.equal(inputs.length, 3);
-});

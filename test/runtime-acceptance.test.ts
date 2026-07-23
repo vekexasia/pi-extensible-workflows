@@ -225,6 +225,22 @@ void test("cold resume rejects persisted pre-function workflow references clearl
   await shutdown?.();
 });
 
+void test("cold resume rejects removed stateful workflow primitives", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-removed-primitive-resume-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create({ id: "run-a", workflowName: "legacy", cwd, sessionId: "session-a", state: "interrupted", agents: [], nativeSessions: [] }, createLaunchSnapshot({ script: "return conversation('developer');", args: null, metadata: { name: "legacy" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  let shutdown: (() => Promise<void>) | undefined;
+  const ctx = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session-a" } };
+  workflowExtension({ on(name: string, handler: never) { if (name === "session_start") start = handler; if (name === "session_shutdown") shutdown = handler; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  assert.ok(start && command && shutdown);
+  await start({}, ctx);
+  await assert.rejects(command("resume run-a", ctx), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /removed/.test(error.message));
+  await shutdown();
+});
+
 void test("cold resume rejects project roles after trust is revoked", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-untrusted-resume-"));
   const cwd = join(home, "project");
@@ -330,45 +346,6 @@ void test("production Pi seam installs child tools and registers native steering
   assert.ok(steer); await steer("redirect"); assert.deepEqual(received, ["redirect"]);
 });
 
-void test("production conversation turns reopen transcript and advance persisted head", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-conversation-acceptance-"));
-  const inputs: SessionInput[] = [];
-  const createSession = async (input: SessionInput): Promise<NativeSession> => {
-    inputs.push(input);
-    const continued = input.continuation !== undefined;
-    let leafId = input.continuation?.leafId ?? "root";
-    return {
-      sessionId: "conversation-session",
-      sessionFile: "/sessions/conversation.jsonl",
-      model: { provider: "openai", model: "gpt" },
-      messages: [{ role: "assistant", content: [{ type: "text", text: continued ? "second" : "first" }] }],
-      getSessionStats: sessionStats,
-      systemPrompt: "stable conversation prompt",
-      getLeafId: () => leafId,
-      getToolDefinitions: () => [],
-      prompt: async () => { leafId = continued ? "leaf-2" : "leaf-1"; },
-      steer: async () => {},
-      dispose() {},
-    };
-  };
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown; runId: string } }> }> = [];
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  const result = await workflow.execute("id", { name: "conversation-acceptance", script: "const handle = conversation('developer'); return [await handle.run('first'), await handle.run('second')];", foreground: true }, new AbortController().signal, undefined, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  assert.deepEqual(result.details.value, ["first", "second"]);
-  assert.equal(inputs.length, 2);
-  assert.equal(inputs[0]?.continuation, undefined);
-  assert.deepEqual(inputs[1]?.continuation, { sessionId: "conversation-session", sessionFile: "/sessions/conversation.jsonl", leafId: "leaf-1" });
-  const store = new RunStore(home, "session", result.details.runId, home);
-  const artifact = JSON.parse(readFileSync(store.conversationPath(), "utf8")) as { conversations: Record<string, { head: { turn: number; leafId: string } }> };
-  const conversations = Object.values(artifact.conversations);
-  assert.equal(conversations.length, 1);
-  const conversation = conversations[0];
-  assert.ok(conversation);
-  assert.equal(conversation.head.turn, 2);
-  assert.equal(conversation.head.leafId, "leaf-2");
-});
 
 void test("concurrency-1 cancellation and nested containment retain accounting and retry separation", async () => {
   const started: string[] = [];

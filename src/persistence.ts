@@ -11,14 +11,6 @@ import { loadLaunchSnapshot, WorkflowError } from "./index.js";
 
 export interface NativeSessionReference { sessionId: string; sessionFile: string }
 export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
-export interface ConversationHead { turn: number; sessionId: string; sessionFile: string; leafId: string; systemPrompt: string; systemPromptSha256: string; toolDefinitionsSha256: string }
-export interface PersistedConversation { id: string; policy: JsonValue; head: ConversationHead }
-type ConversationArtifact = { version: 1; conversations: Record<string, PersistedConversation> };
-function isConversationArtifact(value: unknown): value is ConversationArtifact {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const artifact = value as { version?: unknown; conversations?: unknown };
-  return artifact.version === 1 && Boolean(artifact.conversations) && typeof artifact.conversations === "object" && !Array.isArray(artifact.conversations);
-}
 export interface PersistedRun extends RunRecord { nativeSessions: readonly NativeSessionReference[] }
 export interface CompletedOperation { path: string; value: JsonValue }
 export interface AwaitingCheckpoint { path: string; name: string; prompt: string; context: JsonValue }
@@ -197,7 +189,6 @@ export class RunStore {
   private launchSnapshotWrite: Promise<void> = Promise.resolve();
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptWrite: Promise<void> = Promise.resolve();
-  private conversationWrite: Promise<void> = Promise.resolve();
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
@@ -217,7 +208,6 @@ export class RunStore {
       await atomicJson(join(temporary, "borrowed-worktrees.json"), []);
       await atomicJson(join(temporary, "state.json"), run);
       await atomicJson(join(temporary, "system-prompts.json"), { version: 1, entries: [] });
-      await atomicJson(join(temporary, "conversations.json"), { version: 1, conversations: {} });
       await rename(temporary, this.directory);
     } catch (error) {
       await rm(temporary, { recursive: true, force: true });
@@ -296,27 +286,6 @@ export class RunStore {
     return (await json<{ version: 1; entries: EffectiveSystemPrompt[] }>(this.systemPromptPath()).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1 as const, entries: [] }; throw error; })).entries;
   }
 
-  conversationPath(): string { return join(this.directory, "conversations.json"); }
-  async conversation(id: string): Promise<PersistedConversation | undefined> {
-    await this.conversationWrite;
-    let artifact: ConversationArtifact;
-    try { const raw = await json<unknown>(this.conversationPath()); if (!isConversationArtifact(raw)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation state is corrupt"); artifact = raw; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; if (error instanceof WorkflowError) throw error; throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot load conversation state: ${error instanceof Error ? error.message : String(error)}`); }
-    return artifact.conversations[id];
-  }
-  async saveConversation(conversation: PersistedConversation): Promise<void> {
-    const write = this.conversationWrite.then(async () => {
-      const path = this.conversationPath();
-      let artifact: ConversationArtifact;
-      try { const raw = await json<unknown>(path); if (!isConversationArtifact(raw)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation state is corrupt"); artifact = raw; } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") artifact = { version: 1, conversations: {} }; else if (error instanceof WorkflowError) throw error; else throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot load conversation state: ${error instanceof Error ? error.message : String(error)}`); }
-      const previous = artifact.conversations[conversation.id];
-      if (previous && previous.head.turn + 1 !== conversation.head.turn) throw new WorkflowError("RESUME_INCOMPATIBLE", `Conversation head is not the previous turn: ${conversation.id}`);
-      if (!previous && conversation.head.turn !== 1) throw new WorkflowError("RESUME_INCOMPATIBLE", `Conversation must start at turn one: ${conversation.id}`);
-      artifact.conversations[conversation.id] = structuredClone(conversation);
-      await atomicJson(path, artifact);
-    });
-    this.conversationWrite = write.catch(() => undefined);
-    await write;
-  }
   private async updateJournal<T>(update: (journal: Journal) => T | Promise<T>): Promise<T> {
     let result!: T;
     const write = this.journalWrite.then(async () => {
