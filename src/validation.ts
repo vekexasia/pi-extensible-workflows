@@ -580,6 +580,7 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   if (Object.prototype.hasOwnProperty.call(params, "maxAgentLaunches")) fail("INVALID_METADATA", "maxAgentLaunches has been removed; use budget.agentLaunches");
   if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
   const functionName = typeof params.workflow === "string" ? params.workflow : undefined;
+  if (functionName !== undefined && params.name !== undefined) fail("INVALID_METADATA", "Registered function launches do not accept name; workflow is the run name");
   const workflowName = functionName ?? (typeof params.name === "string" ? params.name.trim() : "");
   if (functionName === undefined && !workflowName) fail("INVALID_METADATA", "Inline workflow launches require a non-empty name");
   const fn = functionName === undefined ? undefined : registry?.function(functionName);

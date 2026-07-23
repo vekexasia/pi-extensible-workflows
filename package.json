@@ -1,6 +1,6 @@
 {
   "name": "pi-extensible-workflows",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Deterministic multi-agent workflow orchestration for Pi",
   "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
   "repository": {

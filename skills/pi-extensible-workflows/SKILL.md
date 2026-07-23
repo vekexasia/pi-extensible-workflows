@@ -22,7 +22,7 @@ return agent(
 );
 ```
 
-Inline launches require a non-empty `name`. Registered function launches may omit `name`; they use the registered function name as the run name:
+Inline launches require a non-empty `name`. Registered function launches must omit `name`; they use `workflow` as the run name:
 ```json
 { "workflow": "workflowName", "args": { "issue": 42 } }
 ```

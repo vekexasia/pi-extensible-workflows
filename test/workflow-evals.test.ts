@@ -110,12 +110,12 @@ void test("extracts the parent oracle in assistant-batch and content-part order"
 
 void test("matches captured validation results by tool-call id and retains schema-boundary errors", () => {
   const oracle = extractParentOracle([
-    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "bad", name: "workflow", arguments: [] }, { type: "toolCall", id: "good", name: "workflow", arguments: { name: "good", workflow: "registered" } }] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "bad", name: "workflow", arguments: [] }, { type: "toolCall", id: "good", name: "workflow", arguments: { workflow: "registered" } }] } },
     { type: "message", message: { role: "toolResult", toolCallId: "good", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script: "return 1" } }, isError: false } },
     { type: "message", message: { role: "toolResult", toolCallId: "bad", toolName: "workflow", content: [{ type: "text", text: "Tool input validation failed" }], isError: true } },
   ]);
   const calls = extractCapturedWorkflows(oracle);
-  assert.deepEqual(calls.map(({ toolCallId, arguments: args, script }) => ({ toolCallId, args, script })), [{ toolCallId: "bad", args: [], script: undefined }, { toolCallId: "good", args: { name: "good", workflow: "registered" }, script: "return 1" }]);
+  assert.deepEqual(calls.map(({ toolCallId, arguments: args, script }) => ({ toolCallId, args, script })), [{ toolCallId: "bad", args: [], script: undefined }, { toolCallId: "good", args: { workflow: "registered" }, script: "return 1" }]);
   assert.deepEqual(captureValidationReports(oracle, calls), { reports: [{ callIndex: 0, valid: false, message: "Tool input validation failed" }, { callIndex: 1, valid: true }], errors: [], verified: true });
 });
 

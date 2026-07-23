@@ -22,7 +22,7 @@ For source installs and local development, see the [installation guide](https://
 
 The main Pi agent acts as the orchestrator: it writes workflow scripts on the fly for each task. Pi extensions can add reusable functions and variables to those scripts; every registered function is also directly runnable as a top-level workflow.
 
-Inline workflow launches require a non-empty `name`; registered function launches may omit it and use their registered function name as the run name. Workflow worktree scopes always use the explicit `withWorktree(name, callback)` form.
+Inline workflow launches require a non-empty `name`; registered function launches reject `name` and use their registered function name as the run name. Workflow worktree scopes always use the explicit `withWorktree(name, callback)` form.
 
 A workflow can fan out across specialized agents, combine their results, and resume without rerunning completed work.
 

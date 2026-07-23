@@ -147,9 +147,9 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
 }
 export const WORKFLOW_TOOL_LABEL = "Workflow";
 export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
-export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline launches require an explicit non-empty name; registered function launches use the registered function name and workflow only selects that function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID. Use workflow_retry with an explicit failed run ID to replay completed structural operations; parentRunId only reuses named worktrees.";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline launches require an explicit non-empty name; registered function launches reject name and use workflow as the run name. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID. Use workflow_retry with an explicit failed run ID to replay completed structural operations; parentRunId only reuses named worktrees.";
 export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
-  name: Type.Optional(Type.String({ description: "Required non-empty name for inline workflow runs; not needed for registered functions, which use their registered name" })),
+  name: Type.Optional(Type.String({ description: "Required non-empty name for inline workflow runs; invalid for registered function launches" })),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
   script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
   workflow: Type.Optional(Type.String({ description: "Registered reusable function as an unqualified name" })),

@@ -1,10 +1,13 @@
 # Changelog
 ## Unreleased
 
+## [3.0.0] - 2026-07-23
+
 ### Breaking changes
 
 - Removed persistent workflow conversations. Use independent `agent()` calls and pass completed results explicitly to later prompts.
 - Added explicit `workflow_retry({ runId })` for failed runs, with linked child runs, cumulative budgets, structural journal replay, and durable named-worktree lineage.
+- Registered function launches now reject a separate `name`; `workflow` is their run name.
 
 ## [2.0.0] - 2026-07-23
 
@@ -48,4 +51,5 @@
 - Runtime acceptance suite: 24 tests passing.
 - Build, lint, documentation checks, and package dry-run passing.
 
+[3.0.0]: https://github.com/vekexasia/pi-extensible-workflows/compare/v2.0.0...v3.0.0
 [2.0.0]: https://github.com/vekexasia/pi-extensible-workflows/compare/v1.0.1...v2.0.0
