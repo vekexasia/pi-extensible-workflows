@@ -714,8 +714,9 @@ void test("cold resume recomputes variables and marks resolver failures", { time
   await stopped.create({ id: "stop-run", workflowName: "cold-stop", cwd, sessionId: "session", state: "interrupted", agents: [], nativeSessions: [] }, snapshot("cold-stop", "return true;"));
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  const messages: string[] = [];
   const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
-  workflowExtension({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  workflowExtension({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, registerTool() {}, registerCommand(_name: string, value: { handler: typeof command }) { command = value.handler; }, sendMessage(value: { content: string }) { messages.push(value.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
   assert.ok(start && command);
   await start({}, context);
   await command("resume cold-run", context);
@@ -725,6 +726,12 @@ void test("cold resume recomputes variables and marks resolver failures", { time
   await assert.rejects(command("resume failed-run", context), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
   assert.deepEqual((await failed.load()).run.error, { code: "INTERNAL_ERROR", message: "resumeFailureVariable: resume variable failure" });
   assert.equal((await failed.load()).run.state, "failed");
+  const diagnosticMessage = messages.find((value) => value.includes("failure diagnostics:"));
+  assert.ok(diagnosticMessage);
+  const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as { runId: string; retry: { sourceRunId: string; action: string } };
+  assert.equal(diagnostic.runId, "failed-run");
+  assert.equal(diagnostic.retry.sourceRunId, "failed-run");
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.runId)} })`);
   const started = new Promise<void>((resolve) => { markStopVariableStarted = resolve; });
   stopVariableAborted = false;
   const resuming = command("resume stop-run", context).catch(() => undefined);
