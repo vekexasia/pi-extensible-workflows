@@ -35,8 +35,11 @@ export function projectStorageKey(cwd: string): string {
   return `${slug}-${createHash("sha256").update(exact).digest("hex").slice(0, 12)}`;
 }
 
+export function projectSessionsDirectory(cwd: string, home = homedir()): string {
+  return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions");
+}
 export function runsDirectory(cwd: string, sessionId: string, home = homedir()): string {
-  return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions", safePart(sessionId), "runs");
+  return join(projectSessionsDirectory(cwd, home), safePart(sessionId), "runs");
 }
 
 const SESSION_OWNER_FILE = "owner.json";
@@ -51,6 +54,16 @@ async function processAlive(pid: number, startedAt?: number): Promise<boolean> {
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; }
   }
   return true;
+}
+export async function hasLiveSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<boolean> {
+  const path = join(runsDirectory(cwd, sessionId, home), SESSION_OWNER_FILE);
+  let owner: unknown;
+  try { owner = JSON.parse(await readFile(path, "utf8")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an invalid ownership lease`);
+  const candidate = owner as Partial<SessionOwner>;
+  if (typeof candidate.pid !== "number" || !Number.isInteger(candidate.pid) || candidate.pid < 1 || typeof candidate.token !== "string" || !candidate.token || typeof candidate.startedAt !== "number" || !Number.isFinite(candidate.startedAt)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an invalid ownership lease`);
+  return processAlive(candidate.pid, candidate.startedAt);
 }
 
 function sameOwner(left: unknown, right: unknown): boolean {

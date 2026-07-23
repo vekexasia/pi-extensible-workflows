@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
-import { formatWorkflowCliHelp, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { formatWorkflowCliHelp, parseDoctorCleanupArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
 import { registerWorkflowExtension, type JsonValue, type WorkflowExtension } from "../src/index.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
@@ -378,4 +378,10 @@ void test("headless runtime cleanup runs for non-execution CLI paths", async () 
   writeFileSync(destination, "keep\n");
   assert.equal(await runCli(["export", "cliEcho", "--output", destination], options), 1);
   assert.doesNotThrow(() => { registerCliExtension(); });
+});
+void test("doctor cleanup parses a positive age and confirmation flag", () => {
+  assert.deepEqual(parseDoctorCleanupArgs(["--older-than-days", "30", "--yes"]), { olderThanDays: 30, yes: true });
+  assert.deepEqual(parseDoctorCleanupArgs([]), { olderThanDays: 90, yes: false });
+  assert.throws(() => parseDoctorCleanupArgs(["--older-than-days", "0"]), /positive integer/);
+  assert.throws(() => parseDoctorCleanupArgs(["--older-than-days", "1.5"]), /positive integer/);
 });
