@@ -72,7 +72,7 @@ void test("workflow call preview summarizes inline and registered functions safe
   assert.match(preview, /^workflow review\nReview code/m);
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
   assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow audit\nRegistered function");
-  assert.equal(formatWorkflowPreview({ name: "audit-run", workflow: "audit" }), "workflow audit-run\nRegistered function");
+  assert.equal(formatWorkflowPreview({ name: "audit-run", workflow: "audit" }), "workflow audit\nRegistered function");
   assert.equal(formatWorkflowPreview({ script: "not javascript", name: "review" }), "workflow review");
 });
 

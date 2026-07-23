@@ -131,7 +131,7 @@ export class RunLifecycle {
 export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown; name?: unknown; description?: unknown }): string {
   const explicitName = typeof args.name === "string" && args.name.trim() ? args.name.trim() : undefined;
   const registeredName = typeof args.workflow === "string" && args.workflow.trim() ? args.workflow.trim() : undefined;
-  const name = explicitName ?? registeredName ?? "workflow";
+  const name = registeredName ?? explicitName ?? "workflow";
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${registeredName ? "\nRegistered function" : ""}`;
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
