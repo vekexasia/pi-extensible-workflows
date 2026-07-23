@@ -6,7 +6,7 @@ import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAg
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
-import { mergeAgentResourceExclusions, resolveModelReference, WorkflowError } from "./index.js";
+import { mergeAgentResourceExclusions, modelAliasName, resolveModelReference, WorkflowError } from "./index.js";
 import type { RunStore } from "./persistence.js";
 
 export interface AgentBudgetHooks {
@@ -274,13 +274,14 @@ export class WorkflowAgentExecutor {
     const forbidden = requested.find((tool) => !this.root.tools.has(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${forbidden}`);
     const requestedModel = options.model ?? definition?.model;
-    const hasAlias = requestedModel !== undefined && Object.prototype.hasOwnProperty.call(this.root.modelAliases ?? {}, requestedModel);
-    if (requestedModel !== undefined && this.root.blockedAliases?.has(requestedModel) && !hasAlias) { const target = this.root.blockedAliasTargets?.[requestedModel]; throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${target ? ` resolved to ${target}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`); }
-    const aliasThinking = requestedModel !== undefined && hasAlias ? resolveModelReference(requestedModel, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath).thinking : undefined;
+    const alias = requestedModel === undefined ? undefined : modelAliasName(requestedModel, this.root.modelAliases ?? {});
+    const blockedAlias = requestedModel?.split(":", 1)[0];
+    if (requestedModel !== undefined && blockedAlias && this.root.blockedAliases?.has(blockedAlias) && !alias) { const target = this.root.blockedAliasTargets?.[blockedAlias]; throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${requestedModel}${target ? ` resolved to ${target}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`); }
+    const aliasThinking = requestedModel !== undefined && alias ? resolveModelReference(requestedModel, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath).thinking : undefined;
     const model = options.modelOverride ?? parseModel(requestedModel, this.root.model, options.thinking ?? (aliasThinking === undefined ? definition?.thinking : undefined), this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
     const availableModels = this.root.knownModels ?? this.root.availableModels ?? new Set([modelCapability(this.root.model)]);
     if (!availableModels.has(modelCapability(model))) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model${requestedModel ? ` ${requestedModel} resolved to ${modelCapability(model)}` : ""}${this.root.settingsPath ? ` (settings: ${this.root.settingsPath})` : ""}`);
-    return { model, ...(hasAlias ? { requestedModel } : {}), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
+    return { model, ...(alias && requestedModel ? { requestedModel } : {}), tools: [...requested], systemPromptAppend: definition?.prompt ?? "" };
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {

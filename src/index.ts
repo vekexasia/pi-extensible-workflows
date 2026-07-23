@@ -420,14 +420,20 @@ export function parseModelReference(value: string): ModelSpec {
 }
 
 function aliasError(message: string, settingsPath: string): never { fail("CONFIG_ERROR", `${message} (settings: ${settingsPath})`); }
+export function modelAliasName(value: string, aliases: Readonly<Record<string, string>>): string | undefined {
+  const name = /^([^/:\s]+)(?::[^:\s]+)?$/.exec(value)?.[1];
+  return name && Object.prototype.hasOwnProperty.call(aliases, name) ? name : undefined;
+}
 export function validateModelAliases(value: unknown, settingsPath = "workflow settings"): Readonly<Record<string, string>> {
   if (!object(value)) aliasError("modelAliases must be an object", settingsPath);
   const aliases: Record<string, string> = {};
   for (const [name, target] of Object.entries(value)) {
     if (!MODEL_ALIAS_NAME.test(name)) aliasError(`Invalid model alias name: ${name}`, settingsPath);
     if (typeof target !== "string" || !target.trim()) aliasError(`Invalid model alias target for ${name}`, settingsPath);
-    try { parseModelReference(target); } catch (error) { aliasError(`Invalid model alias target for ${name}: ${errorText(error)}`, settingsPath); }
     aliases[name] = target;
+  }
+  for (const name of Object.keys(aliases)) {
+    try { resolveModelReference(name, aliases); } catch (error) { aliasError(`Invalid model alias target for ${name}: ${errorText(error)}`, settingsPath); }
   }
   return Object.freeze(aliases);
 }
@@ -439,20 +445,25 @@ function unknownModel(value: string, target: string | undefined, settingsPath?: 
 }
 
 export function resolveModelReference(value: string, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
-  const target = Object.prototype.hasOwnProperty.call(aliases, value) ? aliases[value] : undefined;
-  if (target !== undefined) {
-    try { return parseModelReference(target); } catch { unknownModel(value, target, settingsPath); }
-  }
-  if (value.includes("/")) return parseModelReference(value);
-  const match = /^([^:\s]+)(?::([^:\s]+))?$/.exec(value);
-  const thinking = match?.[2];
-  if (!match?.[1] || thinking && !THINKING_LEVELS.includes(thinking as (typeof THINKING_LEVELS)[number])) unknownModel(value, undefined, settingsPath);
-  const candidates = [...(knownModels ?? [])].filter((model) => model.slice(model.indexOf("/") + 1) === match[1]);
-  if (candidates.length === 1) {
-    const parsed = parseModelReference(candidates[0] as string);
-    return thinking ? { ...parsed, thinking: thinking as NonNullable<ModelSpec["thinking"]> } : parsed;
-  }
-  unknownModel(value, undefined, settingsPath);
+  const resolveReference = (reference: string, chain: readonly string[]): ModelSpec => {
+    if (reference.includes("/")) return parseModelReference(reference);
+    const match = /^([^:\s]+)(?::([^:\s]+))?$/.exec(reference);
+    const thinking = match?.[2];
+    if (!match?.[1] || thinking && !THINKING_LEVELS.includes(thinking as (typeof THINKING_LEVELS)[number])) unknownModel(reference, undefined, settingsPath);
+    const alias = modelAliasName(reference, aliases);
+    if (alias) {
+      if (chain.includes(alias)) fail("UNKNOWN_MODEL", `Circular model alias: ${[...chain, alias].join(" -> ")}${settingsPath ? ` (settings: ${settingsPath})` : ""}`);
+      const parsed = resolveReference(aliases[alias] as string, [...chain, alias]);
+      return thinking ? { ...parsed, thinking: thinking as NonNullable<ModelSpec["thinking"]> } : parsed;
+    }
+    const candidates = [...(knownModels ?? [])].filter((model) => model.slice(model.indexOf("/") + 1) === match[1]);
+    if (candidates.length === 1) {
+      const parsed = parseModelReference(candidates[0] as string);
+      return thinking ? { ...parsed, thinking: thinking as NonNullable<ModelSpec["thinking"]> } : parsed;
+    }
+    unknownModel(reference, undefined, settingsPath);
+  };
+  return resolveReference(value, []);
 }
 
 function modelCapability(value: string, aliases?: Readonly<Record<string, string>>, knownModels?: ReadonlySet<string>, settingsPath?: string): string {
@@ -613,7 +624,7 @@ function validateRolePolicies(definitions: Readonly<Record<string, AgentDefiniti
     if (definition.model !== undefined) {
       const resolved = modelCapability(definition.model, aliases, knownModels, settingsPath);
       if (!availableModels.has(resolved)) {
-        if (Object.prototype.hasOwnProperty.call(aliases, definition.model)) unknownModel(definition.model, resolved, settingsPath);
+        if (modelAliasName(definition.model, aliases)) unknownModel(definition.model, resolved, settingsPath);
         fail("UNKNOWN_MODEL", `Unknown model for role ${role}: ${resolved}`);
       }
     }
@@ -1222,7 +1233,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const agentTypes = agentCalls.flatMap((call) => { const value = literalString(propertyNode(call.arguments[1], "role")); return value === undefined ? [] : [value]; });
   const missingModel = capabilities.skipModelAvailability ? undefined : modelRefs.find(({ resolved }) => !capabilities.models.has(resolved));
   if (missingModel) {
-    if (Object.prototype.hasOwnProperty.call(capabilities.modelAliases ?? {}, missingModel.requested)) unknownModel(missingModel.requested, missingModel.resolved, capabilities.settingsPath);
+    if (modelAliasName(missingModel.requested, capabilities.modelAliases ?? {})) unknownModel(missingModel.requested, missingModel.resolved, capabilities.settingsPath);
     fail("UNKNOWN_MODEL", `Unknown model: ${missingModel.resolved}`);
   }
   const missingTool = tools.find((tool) => !capabilities.tools.has(tool));
@@ -3460,12 +3471,12 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const settingsPath = workflowSettingsPath(extensionAgentDir);
         const modelRegistry = contextHostCapabilities(ctx).modelRegistry;
         const available = () => [...new Set((modelRegistry?.getAvailable?.() ?? []).map((model) => `${model.provider}/${model.id}`))].sort();
-        const selectTarget = async (): Promise<string | undefined> => {
+        const selectTarget = async (aliases: Readonly<Record<string, string>>): Promise<string | undefined> => {
           const models = available();
-          const choice = await ctx.ui.select("Model alias target", [...models, "Manual model ID", "Back"]);
+          const choice = await ctx.ui.select("Model alias target", [...models, ...Object.keys(aliases).sort(), "Manual model ID", "Back"]);
           if (!choice || choice === "Back") return undefined;
           if (choice !== "Manual model ID") return choice;
-          return (await ctx.ui.input("Manual model ID", "provider/model[:thinking]"))?.trim() || undefined;
+          return (await ctx.ui.input("Manual model ID", "provider/model[:thinking] or alias[:thinking]"))?.trim() || undefined;
         };
         const save = (aliases: Readonly<Record<string, string>>): boolean => {
           try { saveModelAliases(settingsPath, aliases); ctx.ui.notify(`Saved model aliases to ${settingsPath}.`, "info"); return true; }
@@ -3484,11 +3495,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
             const name = (await ctx.ui.input("Alias name", "reviewer-model"))?.trim();
             if (!name) continue;
             if (Object.prototype.hasOwnProperty.call(aliases, name)) { ctx.ui.notify(`Alias ${name} already exists; choose Edit ${name}.`, "warning"); continue; }
-            const target = await selectTarget();
+            const target = await selectTarget(aliases);
             if (!target) continue;
             const next = { ...aliases, [name]: target };
             try { validateModelAliases(next, settingsPath); } catch (error) { ctx.ui.notify(`${settingsPath}: ${error instanceof Error ? error.message : String(error)}`, "error"); continue; }
-            const parsed = parseModelReference(target);
+            const parsed = resolveModelReference(target, next, new Set(available()), settingsPath);
             if (!available().includes(`${parsed.provider}/${parsed.model}`)) {
               ctx.ui.notify(`Warning: ${target} is not currently available in Pi.`, "warning");
               if (!await ctx.ui.confirm("Save unknown model?", "Save this target for cross-machine portability?")) continue;
@@ -3498,11 +3509,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           }
           const edit = /^Edit (.+)$/.exec(choice);
           if (edit?.[1]) {
-            const target = await selectTarget();
+            const target = await selectTarget(aliases);
             if (!target) continue;
             const next = { ...aliases, [edit[1]]: target };
             try { validateModelAliases(next, settingsPath); } catch (error) { ctx.ui.notify(`${settingsPath}: ${error instanceof Error ? error.message : String(error)}`, "error"); continue; }
-            const parsed = parseModelReference(target);
+            const parsed = resolveModelReference(target, next, new Set(available()), settingsPath);
             if (!available().includes(`${parsed.provider}/${parsed.model}`)) {
               ctx.ui.notify(`Warning: ${target} is not currently available in Pi.`, "warning");
               if (!await ctx.ui.confirm("Save unknown model?", "Save this target for cross-machine portability?")) continue;

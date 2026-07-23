@@ -55,7 +55,8 @@
   <span class="tok-property">"concurrency"</span><span class="tok-punctuation">:</span> <span class="tok-number">8</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"modelAliases"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
     <span class="tok-property">"reviewer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"anthropic/claude-fable-5:high"</span><span class="tok-punctuation">,</span>
-    <span class="tok-property">"developer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-luna:xhigh"</span>
+    <span class="tok-property">"developer-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-luna:xhigh"</span><span class="tok-punctuation">,</span>
+    <span class="tok-property">"cheap-model"</span><span class="tok-punctuation">:</span> <span class="tok-string">"developer-model:low"</span>
   <span class="tok-punctuation">},</span>
   <span class="tok-property">"disabledAgentResources"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
     <span class="tok-property">"skills"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"learning-opportunities"</span><span class="tok-punctuation">],</span>
@@ -64,10 +65,10 @@
 <span class="tok-punctuation">}</span></code></pre>
         <p><code>concurrency</code> defaults to 8 and accepts integers from 1 through 16. A workflow call's <code>concurrency</code> field overrides this default for that run.</p>
         <h3 id="model-aliases">Model aliases</h3>
-        <p>Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>. Targets must be concrete <code>provider/model</code> references with an optional recognized thinking suffix. Alias chaining is rejected.</p>
-        <p>Aliases work anywhere the workflow runtime accepts a model, including role files. An exact configured alias wins over a native bare model name. Explicit call-level <code>thinking</code> overrides the alias suffix. Resolution never falls back: an unavailable target fails with <code>UNKNOWN_MODEL</code> and identifies the alias, resolved target when known, and settings path.</p>
+        <p>Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>. Targets may be concrete <code>provider/model</code> references or other aliases, with an optional recognized thinking suffix. Unknown targets and cycles are rejected.</p>
+        <p>Aliases work anywhere the workflow runtime accepts a model, including role files. An exact configured alias wins over a native bare model name. A thinking suffix on an alias reference overrides the resolved target's suffix, so <code>cheap-model:low</code> can reuse a model while changing its thinking level. Explicit call-level <code>thinking</code> remains highest precedence. Resolution never falls back: an unavailable target fails with <code>UNKNOWN_MODEL</code> and identifies the alias, resolved target when known, and settings path.</p>
         <p>Each launch and resume snapshots one alias mapping for that execution segment. Completed and replayed calls retain their results; pending, retried, and new calls use mappings reloaded on resume. Mapping changes produce one persisted warning in run events and the inspector.</p>
-        <p><code>workflow_catalog</code> lists alias names and concrete targets without probing availability or injecting them into guidance. <code>/workflow</code> can list, add, edit, and delete global aliases. It atomically updates only <code>modelAliases</code>, preserves other settings, and affects new launches and resumes without <code>/reload</code>.</p>
+        <p><code>workflow_catalog</code> lists alias names and targets without probing availability or injecting them into guidance. <code>/workflow</code> can list, add, edit, and delete global aliases. It atomically updates only <code>modelAliases</code>, preserves other settings, and affects new launches and resumes without <code>/reload</code>.</p>
         <h3 id="agent-resource-exclusions">Workflow-agent resource exclusions</h3>
         <p>Trusted projects can add exclusions in <code>&lt;cwd&gt;/.pi/pi-extensible-workflows/settings.json</code>. Only <code>disabledAgentResources</code> is used as project policy; global concurrency and model aliases are not overridden. Project exclusions are ignored when the project is untrusted and merge additively with global exclusions when trusted.</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
