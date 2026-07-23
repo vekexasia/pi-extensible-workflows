@@ -2869,6 +2869,26 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.equal(emptyResult.isError, true);
   assert.equal(emptyDiagnostic.error.message, "The workflow failed without an error message.");
 });
+void test("failure diagnostics include replayable shell operations", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  type ToolResultHandler = (event: object, ctx: object) => Promise<{ content?: readonly object[]; details?: unknown; isError?: boolean } | undefined> | { content?: readonly object[]; details?: unknown; isError?: boolean } | undefined;
+  const tools: Tool[] = [];
+  let toolResultHandler: ToolResultHandler | undefined;
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shell-diagnostics-"));
+  workflowExtension({
+    registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {},
+    on(name: string, handler: unknown) { if (name === "tool_result") toolResultHandler = handler as ToolResultHandler; },
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "shell"],
+  } as never, home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow && toolResultHandler);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(workflow.execute("shell-diagnostics", { name: "shell-diagnostics", script: `await shell("printf ok"); throw new Error("boom");`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const patched = await toolResultHandler({ type: "tool_result", toolName: "workflow", toolCallId: "shell-diagnostics", input: {}, content: [{ type: "text", text: "old" }], details: {}, isError: true }, {});
+  assert.ok(patched);
+  const diagnostic = JSON.parse((patched as { content: Array<{ text: string }> }).content[0]?.text ?? "null") as WorkflowFailureDiagnostics;
+  assert.ok(diagnostic.retry?.completedPaths.some((path) => path.startsWith("shell/")));
+});
 void test("background failures and workflow responses deliver prose to the main agent", async () => {
   type Tool = { name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId?: string; accepted?: boolean } }> };
   const tools: Tool[] = [];
