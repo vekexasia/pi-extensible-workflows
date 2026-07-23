@@ -6,9 +6,10 @@ description: Use when the task is complex enough to require multiple subagents o
 # pi-extensible-workflows
 Use `workflow` only for genuinely multi-agent orchestration; one agent uses ordinary tools or `Agent` directly. Give phases distinct responsibilities and keep result flow explicit.
 
-## Pattern
+## Example
 ```js
 const reportSchema = { type: "object", properties: { summary: { type: "string" }, findings: { type: "array", items: { type: "string" } } }, required: ["summary", "findings"], additionalProperties: false };
+
 
 const reports = await parallel("research", {
   first: () => agent("Research the first target.", { role: "scout", outputSchema: reportSchema }),
@@ -26,28 +27,31 @@ Pass structured input from the main agent with `args`:
 { "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue` (`args` is `null` when omitted). `workflow_stop` requires the exact run ID; foreground results retain their value and completed `runId`, while background launches return `runId` immediately. A terminal `parentRunId` reuses matching named `withWorktree` scopes; unnamed or missing names create new worktrees.
-If `workflow_catalog` is available, call it once before creating the first workflow for a task. The name-less result is a compact index with launch-ready input schemas, descriptions, variables, and configured model aliases. Use those inputs to launch registered functions directly with `{ "workflow": "name", "args": { ... } }`; their input and output schemas are enforced. Request full detail with `{ "name": "name" }` only when composing a function programmatically or inspecting its output contract and extension metadata; do not load full definitions unconditionally. Alias targets are catalog metadata, not an availability probe. Do not try to reinvent already exposed functions.
+Inspect tool `workflow_catalog` result at least once before creating the first workflow for a task. 
 
 Workflow JavaScript has no imports, filesystem, network, process, or timers. Delegate that work to agents. `shell(command, options)` is the trusted host RPC for deterministic gates: it inherits the workflow or active-worktree cwd, merges string `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, but launch failures and timeouts fail with `SHELL_FAILED`.
 
-Use a bounded verification loop when command output controls the gate:
+Example use of `shell`:
+
 ```js
-return withWorktree("fix-tests", async ({ path, branch }) => {
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
-    const tests = await shell("yarn test", { env: { CI: "1" } });
-    if (tests.exitCode === 0) return { path, branch, tests };
-    await agent(prompt("Fix these failures:\n\n{output}", { output: tests.stderr || tests.stdout }));
-  }
-  return { path, branch, tests: await shell("yarn test", { env: { CI: "1" } }) };
-});
+// ... other code
+const testRes = await shell("yarn test", { env: { CI: "1" } });
+if (testRes.exitCode === 0) {
+   // success path
+   return {...}
+}
 ```
-Shell results are journaled only after process exit and RPC validation. A host crash after side effects but before journaling can rerun the command on resume; use `shell()` mainly for verification and bounded gates, not exactly-once mutations.
+
+Most of the times using `shell()` to perform mutations is an antipattern. Use it mainly for verifications or idempotent actions.
 
 ## `agent()` options
 ```typescript
 interface AgentOptions {
   label?: string; model?: string; role?: string; tools?: string[];
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; outputSchema?: JsonSchema; retries?: number; timeoutMs?: number | null;
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; 
+  outputSchema?: JsonSchema; 
+  retries?: number; 
+  timeoutMs?: number | null;
 }
 ```
 
@@ -65,7 +69,7 @@ const fix = await handle.run("Now propose the smallest fix.");
 return { findings, fix };
 ```
 
-Await each `handle.run(prompt, turnOptions)` call before starting the next one; conversation turns must be sequential and cannot overlap. Conversation creation accepts the same execution-policy options as `agent()`. `timeoutMs` and `retries` passed to `run()` are turn-local, so a failed turn does not advance the persisted conversation head.
+Conversation turns must be sequential and cannot overlap. Conversation creation accepts the same execution-policy options as `agent()`. `timeoutMs` and `retries` passed to `run()` are turn-local, so a failed turn does not advance the persisted conversation head.
 
 ## Worktrees
 Use `withWorktree(callback)` or `withWorktree(name, callback)` for top-level agents that collaborate in one worktree:
@@ -94,7 +98,7 @@ Registered extension functions receive `withWorktree` in context and can compose
 - Preserve item metadata in workflow code between pipeline stages instead of making agents echo it through `outputSchema`.
 - Use a JavaScript loop for repeated work; each direct `agent(...)` call gets deterministic call-site and occurrence identity.
 - Runs default to background; set tool-call `foreground: true` when asked to wait.
-- Add `budget` only for aggregate limits. Valid dimensions are exactly `tokens`, `costUsd`, `durationMs`, and `agentLaunches`; each is `{ soft?: number, hard?: number }` with `soft < hard`.
+- Add `budget` only for aggregate limits. Do not invent limits, omit if user do not ask explicitly. Valid dimensions are exactly `tokens`, `costUsd`, `durationMs`, and `agentLaunches`; each is `{ soft?: number, hard?: number }` with `soft < hard`.
 - `budget_exhausted` runs resume through `workflow_resume`: omitted patch values stay unchanged, `null` removes a limit, and tightening resumes directly. Relaxation stores the exact proposal and returns `{ state: "awaiting_approval", proposalId }`; `workflow_respond` must answer that ID. Rejection leaves the run exhausted; approval applies the budget and cold-resumes it.
 - `parallel()` and `pipeline()` return keyed bare values; await them before use. Interpolate results with `prompt("...{value}", { value })`; placeholders in plain strings remain literal.
 - Use `outputSchema` only when another phase compares, aggregates, or validates a result, never for final prose. Keep only consumer-needed fields and avoid repeated evidence. Agents with it must call `workflow_result`; one repair prompt is built in. Omit `retries` unless an extra retry is justified and work is idempotent.

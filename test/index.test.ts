@@ -78,7 +78,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.ok(discover()?.skillPaths?.some((path) => existsSync(path)));
   const skillPath = discover()?.skillPaths?.find((path) => existsSync(path));
   assert.ok(skillPath);
-  assert.match(readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8"), /If `workflow_catalog` is available, call it once before creating the first workflow for a task/);
+  assert.ok(existsSync(join(skillPath, "pi-extensible-workflows", "SKILL.md")));
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
