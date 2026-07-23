@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSessionEvent, InlineExtension, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, truncateWorkflowProgress, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentOptions, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext, type WorkflowOrchestrationContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
@@ -22,6 +22,35 @@ const typeCheckAgentContext = (context: WorkflowOrchestrationContext): void => {
   void context.agent(42);
 };
 void typeCheckAgentContext;
+const typeCheckAgentSetupHook: WorkflowExtension = {
+  version: "1.0.0",
+  headline: "Typed setup hook",
+  description: "Compile-time setup hook contract",
+  agentSetupHooks: {
+    typed: {
+      setup(agent) {
+        const model: string | undefined = agent.options.model;
+        const tools: string[] | undefined = agent.options.tools;
+        const extension: InlineExtension = () => {};
+        agent.sessionInput.cwd = "/tmp";
+        agent.sessionInput.tools.push("read");
+        agent.sessionInput.extensionFactories ??= [];
+        agent.sessionInput.extensionFactories.push(extension);
+        const customTool: ToolDefinition = { name: "typed", label: "Typed", description: "Typed", parameters: { type: "object" }, async execute() { return { content: [], details: undefined }; } };
+        agent.sessionInput.customTools ??= [];
+        agent.sessionInput.customTools.push(customTool);
+        agent.sessionInput.systemPromptAppend = "append";
+        const session: Promise<NativeSession> = agent.createSession(agent.sessionInput);
+        void model;
+        void tools;
+        void session;
+        // @ts-expect-error extension factories must use Pi's inline extension type
+        agent.sessionInput.extensionFactories.push(123);
+      },
+    },
+  },
+};
+void typeCheckAgentSetupHook;
 const typeCheckWorktreeContext = (context: WorkflowOrchestrationContext): void => {
   void context.withWorktree("scope", () => "value");
   // @ts-expect-error withWorktree requires an explicit name

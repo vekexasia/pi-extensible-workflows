@@ -1,3 +1,4 @@
+import type { AgentSessionEvent, CreateAgentSessionOptions, InlineExtension, SessionStats, ToolDefinition } from "@earendil-works/pi-coding-agent";
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
 export const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
@@ -83,7 +84,41 @@ export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { 
 export type WorkflowWorktreeCallback = (reference: Readonly<WorkflowWorktreeReference>) => JsonValue | Promise<JsonValue>;
 export interface WorkflowFunction { description: string; input: JsonSchema; output: JsonSchema; run: (input: Readonly<Record<string, JsonValue>>, context: Readonly<WorkflowFunctionContext>) => Promise<JsonValue> | JsonValue }
 export interface WorkflowVariable { description: string; schema: JsonSchema; resolve: (run: Readonly<WorkflowRunContext>) => Promise<JsonValue> | JsonValue }
-export interface AgentSetup { prompt: string; options: Record<string, JsonValue>; sessionInput: { extensionFactories?: unknown[]; [key: string]: unknown }; createSession: unknown }
+type NativeAgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
+type NativeSessionStats = Pick<SessionStats, "tokens" | "cost">;
+export interface NativeSession {
+  readonly sessionId: string;
+  readonly sessionFile: string | undefined;
+  readonly messages: readonly NativeAgentMessage[];
+  getSessionStats(): NativeSessionStats;
+  readonly systemPrompt?: string;
+  readonly model?: { provider: string; model?: string; id?: string };
+  readonly agent?: { state: { tools: readonly { name: string }[] } };
+  getLeafId?: () => string | null;
+  getToolDefinitions?: () => unknown;
+  subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
+  prompt(text: string): Promise<void>;
+  steer?(text: string): Promise<void>;
+  abort?(): Promise<void>;
+  dispose(): void;
+}
+type SessionTools = NonNullable<CreateAgentSessionOptions["tools"]>;
+type SessionCustomTools = NonNullable<CreateAgentSessionOptions["customTools"]>;
+export interface SessionInput {
+  cwd: string;
+  model: ModelSpec;
+  tools: SessionTools;
+  sessionLabel: string;
+  agentDir?: string;
+  customTools?: SessionCustomTools;
+  resultTool?: ToolDefinition;
+  systemPromptAppend?: string;
+  extensionFactories?: InlineExtension[];
+  resourcePolicy?: AgentResourcePolicy;
+  options?: AgentOptions;
+}
+export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
+export interface AgentSetup { prompt: string; options: AgentOptions; sessionInput: SessionInput; createSession: SessionFactory }
 export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal }
 export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
 export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }

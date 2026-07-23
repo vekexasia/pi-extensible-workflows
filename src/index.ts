@@ -9,6 +9,6 @@ export { default } from "./host.js";
 export { acquireSessionLease, projectStorageKey, RunStore, runsDirectory, SessionLease, structuralPath } from "./persistence.js";
 export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PendingWorkflowDecision, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
-export type { AgentAttempt, AgentBudgetHooks, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentProviderFailure, AgentProviderRecovery, AgentToolCallProgress, SessionInput } from "./agent-execution.js";
+export type { AgentAttempt, AgentBudgetHooks, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentProviderFailure, AgentProviderRecovery, AgentToolCallProgress, AgentSetup, AgentSetupContext, AgentSetupHook, NativeSession, RegisteredAgentSetupHook, SessionFactory, SessionInput } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";
 export type { DoctorDiagnostic, DoctorFunction, DoctorOptions, DoctorPiState, DoctorReport, DoctorRole, DoctorSeverity, DoctorTrust } from "./doctor.js";

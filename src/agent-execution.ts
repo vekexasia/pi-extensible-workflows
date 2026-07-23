@@ -2,13 +2,14 @@ import { realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
-import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./types.js";
+import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetup, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, NativeSession, RegisteredAgentSetupHook, SessionFactory, SessionInput, WorkflowRunContext } from "./types.js";
 import { jsonObject, mergeAgentResourceExclusions, modelAliasName, modelCapability, resolveModelReference } from "./utils.js";
 import { WorkflowError } from "./types.js";
 import type { RunStore } from "./persistence.js";
+export type { AgentSetup, AgentSetupContext, AgentSetupHook, NativeSession, RegisteredAgentSetupHook, SessionFactory, SessionInput } from "./types.js";
 export interface AgentBudgetHooks {
   beforeAttempt(): void;
   beforeTurn(): void;
@@ -66,29 +67,6 @@ export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: stri
 export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; activity?: AgentActivity; persist: boolean }
 export interface AgentAttempt { attempt: number; sessionId: string; sessionFile: string; result?: JsonValue; error?: { code: string; message: string }; accounting: AgentAccounting; setup?: AgentSetupSummary }
 export interface AgentExecutionResult { value: JsonValue; attempts: readonly AgentAttempt[]; cwd: string }
-export interface AgentSetup { prompt: string; options: Record<string, JsonValue>; sessionInput: SessionInput; createSession: SessionFactory }
-export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>; readonly identity: Readonly<AgentIdentity>; readonly attempt: number; readonly signal: AbortSignal }
-export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
-export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }
-type NativeSessionStats = Pick<SessionStats, "tokens" | "cost">;
-export interface NativeSession {
-  readonly sessionId: string;
-  readonly sessionFile: string | undefined;
-  readonly messages: readonly AgentMessage[];
-  getSessionStats(): NativeSessionStats;
-  readonly systemPrompt?: string;
-  readonly model?: { provider: string; model?: string; id?: string };
-  readonly agent?: { state: { tools: readonly { name: string }[] } };
-  getLeafId?: () => string | null;
-  getToolDefinitions?: () => unknown;
-  subscribe?(listener: (event: AgentSessionEvent) => void): () => void;
-  prompt(text: string): Promise<void>;
-  steer?(text: string): Promise<void>;
-  abort?(): Promise<void>;
-  dispose(): void;
-}
-export interface SessionInput { cwd: string; model: ModelSpec; tools: string[]; sessionLabel: string; agentDir?: string; customTools?: ToolDefinition[]; resultTool?: ToolDefinition; systemPromptAppend?: string; extensionFactories?: InlineExtension[]; resourcePolicy?: AgentResourcePolicy; options?: Record<string, JsonValue> }
-export type SessionFactory = (input: SessionInput) => Promise<NativeSession>;
 
 function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: ThinkingLevel, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
   if (!value) return { ...fallback, ...(thinking ? { thinking } : {}) };
@@ -129,7 +107,7 @@ function terminalProviderError(error: WorkflowError): TerminalProviderError | un
   return typeof candidate.provider === "string" && typeof candidate.model === "string" && typeof candidate.error === "string" ? { provider: candidate.provider, model: candidate.model, error: candidate.error } : undefined;
 }
 
-function accounting(stats: NativeSessionStats): AgentAccounting {
+function accounting(stats: ReturnType<NativeSession["getSessionStats"]>): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 function canonicalSourcePath(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
