@@ -38,7 +38,7 @@ Example use of `shell`:
 const testRes = await shell("yarn test", { env: { CI: "1" } });
 if (testRes.exitCode === 0) {
    // success path
-   return {...}
+   return { ok: true };
 }
 ```
 

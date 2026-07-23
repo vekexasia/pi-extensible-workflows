@@ -97,6 +97,11 @@ void test("registers the workflow tool, command, and conditional skill", async (
   const skillPath = discover()?.skillPaths?.find((path) => existsSync(path));
   assert.ok(skillPath);
   assert.ok(existsSync(join(skillPath, "pi-extensible-workflows", "SKILL.md")));
+  const skillSource = readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8");
+  const shellExample = /Example use of `shell`:[\s\S]*?```js\n([\s\S]*?)\n```/.exec(skillSource)?.[1];
+  assert.ok(shellExample);
+  assert.match(skillSource, /return \{ ok: true \};/);
+  assert.doesNotThrow(() => preflight(shellExample, { models: new Set(), tools: new Set(), agentTypes: new Set() }));
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { workflow: "missing", name: "missing-run" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
