@@ -129,15 +129,17 @@ export class RunLifecycle {
 }
 
 export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown; name?: unknown; description?: unknown }): string {
-  const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "workflow";
-  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered function" : ""}`;
+  const explicitName = typeof args.name === "string" && args.name.trim() ? args.name.trim() : undefined;
+  const registeredName = typeof args.workflow === "string" && args.workflow.trim() ? args.workflow.trim() : undefined;
+  const name = registeredName ?? explicitName ?? "workflow";
+  if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${registeredName ? "\nRegistered function" : ""}`;
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
 export const WORKFLOW_TOOL_LABEL = "Workflow";
 export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
-export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Every launch requires an explicit non-empty name; use workflow only to select a registered function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID. Use workflow_retry with an explicit failed run ID to replay completed structural operations; parentRunId only reuses named worktrees.";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline launches require an explicit non-empty name; registered function launches use the registered function name and workflow only selects that function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID. Use workflow_retry with an explicit failed run ID to replay completed structural operations; parentRunId only reuses named worktrees.";
 export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
-  name: Type.String({ minLength: 1, description: "Explicit name for this workflow run" }),
+  name: Type.Optional(Type.String({ description: "Required non-empty name for inline workflow runs; not needed for registered functions, which use their registered name" })),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
   script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
   workflow: Type.Optional(Type.String({ description: "Registered reusable function as an unqualified name" })),
@@ -619,22 +621,14 @@ function publicWorktreeReference(reference: WorkflowWorktreeReference): Readonly
   if (!object(reference) || typeof reference.path !== "string" || typeof reference.branch !== "string") fail("WORKTREE_FAILED", "Worktree reference is invalid");
   return Object.freeze({ path: reference.path, branch: reference.branch });
 }
-async function hostWithWorktree(args: readonly unknown[], identity: string, occurrences: Map<string, number>, resolveWorktree: ((owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>) | undefined, signal: AbortSignal): Promise<JsonValue> {
-  if (args.length !== 1 && args.length !== 2) fail("INVALID_METADATA", "withWorktree requires a callback or a name and callback");
-  const callback = args[args.length - 1];
+async function hostWithWorktree(args: readonly unknown[], resolveWorktree: ((owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>) | undefined, signal: AbortSignal): Promise<JsonValue> {
+  if (args.length !== 2) fail("INVALID_METADATA", "withWorktree requires a name and callback");
+  const name = args[0];
+  const callback = args[1];
+  if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "withWorktree name must be a non-empty string");
   if (typeof callback !== "function") fail("INVALID_METADATA", "withWorktree callback must be a function");
-  let owner: string;
-  if (args.length === 2) {
-    if (typeof args[0] !== "string" || !args[0].trim()) fail("INVALID_METADATA", "withWorktree name must be a non-empty string");
-    owner = operationPath("worktree", "named", args[0].trim());
-  } else {
-    const structuralPath = inheritedHostAgentPath.getStore() ?? [];
-    const key = `${identity}\0${JSON.stringify(structuralPath)}`;
-    const occurrence = (occurrences.get(key) ?? 0) + 1;
-    occurrences.set(key, occurrence);
-    owner = operationPath("worktree", "unnamed", "function", identity, ...structuralPath, `occurrence:${String(occurrence)}`);
-  }
   if (!resolveWorktree) fail("WORKTREE_FAILED", "No worktree bridge is available");
+  const owner = operationPath("worktree", "named", name.trim());
   const reference = publicWorktreeReference(await resolveWorktree(owner, signal));
   return inheritedHostWorktreeOwner.run(owner, async () => await (callback as (reference: Readonly<WorkflowWorktreeReference>) => unknown)(reference)) as Promise<JsonValue>;
 }
@@ -720,7 +714,6 @@ function nextNamedOccurrence(counters: Map<string, number>, label: string): stri
 function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, variables: Readonly<Record<string, JsonValue>>, registry: WorkflowRegistryApi): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionShellOccurrences = new Map<string, number>();
-  const functionWorktreeOccurrences = new Map<string, number>();
   const functionInvokeOccurrences = new Map<string, number>();
   const invokeFunction = async (name: string, input: Readonly<Record<string, JsonValue>>, path: string, signal: AbortSignal, worktreeOwner?: string, structuralPath: readonly string[] = [], breadcrumb?: string): Promise<JsonValue> => {
     const replayed = await store.replay(path);
@@ -762,7 +755,7 @@ function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runConte
       prompt: workflowPrompt,
       parallel: (...args: readonly unknown[]) => hostParallel(args[0], args[1]),
       pipeline: (...args: readonly unknown[]) => hostPipeline(args[0], args[1], args[2]),
-      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, path, functionWorktreeOccurrences, bridge.worktree, signal),
+      withWorktree: (...args: readonly unknown[]) => hostWithWorktree(args, bridge.worktree, signal),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);

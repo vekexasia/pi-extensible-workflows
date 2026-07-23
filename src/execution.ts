@@ -80,27 +80,16 @@ const inheritedAgentPath = new AsyncLocalStorage();
 const agentOccurrences = new Map();
 const shellOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
-const worktreeOccurrences = new Map();
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
 const rejectShell = () => { throw workError("INVALID_METADATA", "Workflow shell calls must use a direct shell(...) call; aliases and indirect calls are unsupported"); };
 const rejectWorktree = () => { throw workError("INVALID_METADATA", "withWorktree calls must use a direct withWorktree(...) call; aliases and indirect calls are unsupported"); };
 const internalWithWorktree = async (...values) => {
-  const callSite = values.pop();
-  if (typeof callSite !== "string") throw workError("INTERNAL_ERROR", "Missing withWorktree call-site identity");
-  if (values.length !== 1 && values.length !== 2) throw workError("INVALID_METADATA", "withWorktree requires a callback or a name and callback");
-  const callback = values[values.length - 1];
+  if (values.length !== 2) throw workError("INVALID_METADATA", "withWorktree requires a name and callback");
+  const name = values[0];
+  const callback = values[1];
+  if (typeof name !== "string" || !name.trim()) throw workError("INVALID_METADATA", "withWorktree name must be a non-empty string");
   if (typeof callback !== "function") throw workError("INVALID_METADATA", "withWorktree callback must be a function");
-  let owner;
-  if (values.length === 2) {
-    if (typeof values[0] !== "string" || !values[0].trim()) throw workError("INVALID_METADATA", "withWorktree name must be a non-empty string");
-    owner = path("worktree", "named", values[0].trim());
-  } else {
-    const inherited = inheritedAgentPath.getStore() || [];
-    const occurrenceKey = JSON.stringify([inherited, callSite]);
-    const occurrence = (worktreeOccurrences.get(occurrenceKey) || 0) + 1;
-    worktreeOccurrences.set(occurrenceKey, occurrence);
-    owner = path("worktree", "unnamed", ...inherited, "callsite:" + callSite, "occurrence:" + String(occurrence));
-  }
+  const owner = path("worktree", "named", name.trim());
   const reference = await rpc("worktree", [owner]);
   if (!reference || typeof reference !== "object" || typeof reference.path !== "string" || typeof reference.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
   return await worktreeOwners.run(owner, () => callback(Object.freeze({ path: reference.path, branch: reference.branch })));

@@ -35,15 +35,14 @@
       <p class="lead">Use the workflow tools when a task benefits from explicit orchestration, parallel work, durable checkpoints, or worktree-scoped agent changes.</p>
       <section id="quick-start">
         <h2>Quick start</h2>
-        <p>Call <code>workflow</code> with either an inline script or a registered function. Every launch requires an explicit non-empty <code>name</code>; <code>workflow</code> only selects the reusable function. Use <code>workflow_respond</code> only to answer a pending checkpoint or budget-adjustment proposal, using the exact name or proposal ID reported by the run. Use <code>workflow_stop</code> with the run ID to stop an active run from the current Pi session.</p>
+        <p>Call <code>workflow</code> with an inline script or a registered function. Inline scripts require an explicit non-empty <code>name</code>; registered functions use their registered function name as the run name. Use <code>workflow_respond</code> only to answer a pending checkpoint or budget-adjustment proposal, using the exact name or proposal ID reported by the run. Use <code>workflow_stop</code> with the run ID to stop an active run from the current Pi session.</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
   <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"release-check"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"script"</span><span class="tok-punctuation">:</span> <span class="tok-string">"phase('inspect'); return await agent('Inspect the package');"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"target"</span><span class="tok-punctuation">:</span> <span class="tok-string">"dist"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Every launch requires <code>name</code>. For registered functions, use an explicit run name alongside the unqualified function name in <code>workflow</code>:</p>
+        <p>Inline launches require a non-empty <code>name</code>. Registered function launches may omit <code>name</code>; they use the registered function name as the run name:</p>
         <pre><code class="language-json"><span class="tok-punctuation">{</span>
-  <span class="tok-property">"name"</span><span class="tok-punctuation">:</span> <span class="tok-string">"release-check-run"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"releaseCheck"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>

@@ -70,6 +70,23 @@ void test("loads workflow scripts, runtime prompts, models, and costs from stati
   assert.match(broken.parseError ?? "", /Invalid workflow syntax/);
   assert.deepEqual(report.totalModels.map(({ model, cost }) => [model, cost]), [["openai-codex/gpt-5.6-luna", 0.25], ["openai-codex/gpt-5.6-sol", 0.1]]);
 });
+void test("session inspector prefers persisted registered function identity over launch alias", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-inspector-registered-name-"));
+  const cwd = join(home, "project");
+  const parentPath = join(home, "parent.jsonl");
+  const sessionId = "session-registered-name";
+  const runId = "run-registered-name";
+  writeJsonl(parentPath, [
+    { type: "session", version: 3, id: sessionId, timestamp: "2026-01-01T00:00:00.000Z", cwd },
+    { type: "message", id: "parent-assistant", parentId: null, timestamp: "2026-01-01T00:00:01.000Z", message: { role: "assistant", content: [{ type: "toolCall", id: "call-registered", name: "workflow", arguments: { name: "alias", workflow: "registeredFunction", args: {}, foreground: true } }], api: "openai-responses", provider: "provider-root", model: "model-root", usage: usage(0), stopReason: "toolUse", timestamp: 1 } },
+    { type: "message", id: "parent-result", parentId: "parent-assistant", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "toolResult", toolCallId: "call-registered", toolName: "workflow", content: [{ type: "text", text: "done" }], details: { runId }, isError: false, timestamp: 2 } },
+  ]);
+  await new RunStore(cwd, sessionId, runId, home).create({ id: runId, workflowName: "registeredFunction", cwd, sessionId, state: "completed", agents: [], nativeSessions: [] }, createLaunchSnapshot({
+    script: "return null;", args: {}, metadata: { name: "registeredFunction" }, settings: { concurrency: 1 }, functionName: "registeredFunction", models: [], tools: [], agentTypes: [], schemas: [],
+  }));
+  const report = await loadSessionReport(parentPath, home);
+  assert.equal(report.workflows[0]?.name, "registeredFunction");
+});
 
 void test("reports transcript policy per attempt and persisted fallback policy", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-inspector-policy-"));

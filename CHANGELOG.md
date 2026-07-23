@@ -10,26 +10,26 @@
 
 ### Highlights
 
-- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ name: "run-name", workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
+- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
 - Added the headless CLI: `run` launches registered functions, `export` creates executable POSIX launchers, and `transcript` renders saved sessions. Schema-derived flags, JSON input, trust overrides, and `--` passthrough are supported.
 - Added the host-mediated `shell(command, options)` primitive with deterministic workflow identity, timeout and environment options, worktree-aware execution, and structured results.
 - Added reusable worktrees. `withWorktree` callbacks receive a frozen `{ path, branch }` reference, and `parentRunId` can borrow matching named worktrees from a terminal run.
 - Added bounded structured failure diagnostics, provider-failure recovery in the TUI, and Herdr pane inspection and attempt forking.
 
 ### Breaking changes
-- `workflow` now requires an explicit non-empty `name` for every launch, including registered functions; `workflow` selects the function and no longer names the run.
-- Removed registered workflow scripts: `WorkflowExtension.workflows`, `WorkflowScriptDefinition`, `registry.workflow()` / `workflows()`, and `registeredWorkflowDefinitions()`.
+- Inline `workflow` launches require an explicit non-empty `name`; registered function launches may omit `name` and use the registered function name as the run name.
+- Registered function launches ignore any separately supplied run name so function identity remains stable.
+- Removed registered workflow scripts: `WorkflowExtension.workflows`, `WorkflowScriptDefinition`, `registry.workflow()` / `workflows()`, and `registeredWorkflowDefinitions`.
   - Migrate each workflow to `functions.<name>` with `description`, `input`, `output`, and `run(input, context)`.
-  - Launch it with `{ name: "run-name", workflow: "name", args: {...} }`.
+  - Launch it with `{ workflow: "name", args: {...} }`.
 - Changed `workflow_catalog` to return a compact index by default and removed its `workflows` collection.
   - Use the default call for discovery and `{ "name": "entry" }` for full details.
   - Host integrations should use `workflowCatalogIndex()`, `workflowCatalogDetail()`, or `registeredWorkflowFunctions()`.
-- Bumped launch snapshot identity to v4. Cold resume rejects v3 and pre-function snapshots with `RESUME_INCOMPATIBLE`.
+- Bumped launch snapshot identity to v5. Cold resume rejects older snapshots, including v4 snapshots using the previous worktree or registered-function naming contracts, with `RESUME_INCOMPATIBLE`.
   - Relaunch affected workflows after updating. Completed runs remain inspectable and deletable.
 - Changed budget relaxation to an asynchronous proposal. `workflow_resume` now returns `{ state: "awaiting_approval", proposalId }`.
   - Answer with `workflow_respond` using the returned `proposalId`. Budget tightening still resumes directly.
-- `withWorktree` now materializes eagerly and passes its frozen reference to the callback.
-  - Accept the callback argument instead of using empty scopes as lazy markers.
+- `withWorktree` now requires an explicit non-empty name and callback; unnamed scopes are rejected.
 - Removed transcript browsing from the navigator.
   - Use `pi-extensible-workflows transcript <session-file>` or Herdr pane actions.
 
@@ -40,7 +40,7 @@
 - Fixed fullscreen flashing, shell process-tree cleanup, shell RPC size boundaries, running-attempt fork classification, and exported launchers without a global CLI installation.
 - Borrowed worktree bindings are persisted, lineage-checked, and fail closed when invalid. Borrowed worktrees are never deleted with the borrowing run.
 - Global and trusted-project roles now propagate consistently through CLI launches, nested agents, and cold resume.
-- Updated the README, developer and agent documentation, and bundled workflow skill for the CLI, trust model, shell gates, worktree reuse, and v4 snapshot contract.
+- Updated the README, developer and agent documentation, and bundled workflow skill for the CLI, trust model, shell gates, worktree reuse, and v5 snapshot contract.
 
 ### Verification
 

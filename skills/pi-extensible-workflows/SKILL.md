@@ -22,9 +22,9 @@ return agent(
 );
 ```
 
-Pass an explicit run name with every launch. The `workflow` field only selects a registered function:
+Inline launches require a non-empty `name`. Registered function launches may omit `name`; they use the registered function name as the run name:
 ```json
-{ "name": "issue-review", "workflow": "workflowName", "args": { "issue": 42 } }
+{ "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue` (`args` is `null` when omitted). `workflow_stop` requires the exact run ID; foreground results retain their value and completed `runId`, while background launches return `runId` immediately. A terminal `parentRunId` reuses matching named `withWorktree` scopes but does not replay journal results. For an explicitly failed run, call `workflow_retry({ runId })`: it creates a linked child, replays completed agent, shell, function, and checkpoint operations, and executes incomplete work. Retry versus per-agent `retries` and `workflow_resume` is always explicit; external side effects before failure are not guaranteed exactly once.
 Inspect tool `workflow_catalog` result at least once before creating the first workflow for a task. 
@@ -69,7 +69,7 @@ return { findings, fix };
 ```
 
 ## Worktrees
-Use `withWorktree(callback)` or `withWorktree(name, callback)` for top-level agents that collaborate in one worktree:
+Use `withWorktree(name, callback)` for top-level agents that collaborate in one explicitly named worktree scope:
 ```js
 const result = await withWorktree("issue", async ({ path, branch }) => {
   const report = await agent("Implement the issue");

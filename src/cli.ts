@@ -308,7 +308,7 @@ async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, 
   if (!Value.Check(fn.input, args)) throw new Error(`Invalid input for ${fn.name}`);
   const progress = new CliProgress(options.stderr, options.isTTY ?? process.stderr.isTTY);
   try {
-    const result = await runtime.workflowTool.execute(randomUUID(), { name: fn.name, workflow: fn.name, args, foreground: true }, options.signal, (update: unknown) => { if (object(update) && object(update.details) && object(update.details.run)) progress.update(update.details.run as unknown as PersistedRun); }, context);
+    const result = await runtime.workflowTool.execute(randomUUID(), { workflow: fn.name, args, foreground: true }, options.signal, (update: unknown) => { if (object(update) && object(update.details) && object(update.details.run)) progress.update(update.details.run as unknown as PersistedRun); }, context);
     const details = object(result.details) ? result.details : {};
     if (has(details, "value")) return details.value as JsonValue;
     const first = result.content[0];
