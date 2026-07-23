@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
-import workflowExtension, { formatWorkflowProgress, workflowCatalog, type JsonSchema, type JsonValue } from "./index.js";
+import workflowExtension, { formatWorkflowProgress, truncateWorkflowProgress, workflowCatalog, type JsonSchema, type JsonValue, type WorkflowProgressStyles } from "./index.js";
 import { runSessionInspector, transcriptFileLines } from "./session-inspector.js";
 import type { PersistedRun } from "./persistence.js";
 import type { WorkflowCatalogFunction } from "./index.js";
@@ -274,16 +274,25 @@ function writeLauncher(destination: string, workflowName: string, force: boolean
 }
 
 
+function terminalProgressStyles(enabled: boolean): WorkflowProgressStyles {
+  const style = (code: number) => enabled ? (text: string) => `\x1b[${String(code)}m${text}\x1b[0m` : (text: string) => text;
+  return { accent: style(36), success: style(32), error: style(31), warning: style(33), muted: style(90), dim: style(2), bold: style(1) };
+}
 class CliProgress {
   #lastStable = "";
   #lines = 0;
   #frame = 0;
   #run: PersistedRun | undefined;
   #timer: ReturnType<typeof setInterval> | undefined;
-  constructor(private readonly stderr: (text: string) => void, private readonly tty: boolean) {}
+  #interactive: boolean;
+  #styles: WorkflowProgressStyles;
+  constructor(private readonly stderr: (text: string) => void, tty: boolean) {
+    this.#interactive = tty && process.env.NO_COLOR === undefined && process.env.TERM !== "dumb";
+    this.#styles = terminalProgressStyles(this.#interactive);
+  }
   update(run: PersistedRun): void {
-    const stable = formatWorkflowProgress(run, "◇");
-    if (!this.tty) { if (stable !== this.#lastStable) { this.#lastStable = stable; this.stderr(`${stable}\n`); } return; }
+    const stable = formatWorkflowProgress(run, "◇", this.#styles);
+    if (!this.#interactive) { if (stable !== this.#lastStable) { this.#lastStable = stable; this.stderr(`${stable}\n`); } return; }
     this.#run = run;
     this.#timer ??= setInterval(() => { this.render(); }, 80);
     this.#timer.unref();
@@ -293,13 +302,13 @@ class CliProgress {
     if (!this.#run) return;
     const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][this.#frame++ % 10] ?? "◇";
     const width = process.stderr.columns || 80;
-    const text = formatWorkflowProgress(this.#run, spinner).split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`).join("\n");
+    const text = truncateWorkflowProgress(formatWorkflowProgress(this.#run, spinner, this.#styles), width).join("\n");
     this.stderr(`${this.#lines ? `\x1b[${String(this.#lines)}A` : ""}${this.#lines ? "" : "\x1b[?25l"}\x1b[0J${text}\n`);
     this.#lines = text.split("\n").length;
   }
   finish(): void {
     if (this.#timer) { clearInterval(this.#timer); this.#timer = undefined; }
-    if (this.tty && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
+    if (this.#interactive && this.#lines) { this.stderr(`\x1b[${String(this.#lines)}A\x1b[0J\x1b[?25h`); this.#lines = 0; }
     this.#run = undefined;
   }
 }

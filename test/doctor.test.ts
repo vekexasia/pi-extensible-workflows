@@ -312,6 +312,20 @@ void test("CLI TTY progress repaints and respects terminal width", async () => {
   assert.ok(stderr.includes("\u001b[1A"));
   assert.match(stderr, /…/);
 });
+void test("CLI TTY progress disables colors with NO_COLOR", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  let stderr = "";
+  const previousNoColor = process.env.NO_COLOR;
+  process.env.NO_COLOR = "1";
+  try {
+    assert.equal(await runCli(["run", "cliEcho", "7"], { cwd: paths.cwd, agentDir: paths.agentDir, isTTY: true, stderr: (text) => { stderr += text; } }, () => {}), 0);
+  } finally {
+    if (previousNoColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = previousNoColor;
+  }
+  assert.match(stderr, /Workflow: cliEcho/);
+  assert.equal(stderr.includes("\u001b["), false);
+});
 void test("headless CLI trust overrides are honored without leaking into workflow arguments", () => {
   const paths = fixture();
   const approved = runIsolatedCli(paths, `cliTrust: { description: "Trust override", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["run", "--approve", "cliTrust", "7"]);

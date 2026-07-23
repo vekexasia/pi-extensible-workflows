@@ -712,6 +712,33 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   const settled = { ...run, agents: [{ ...agent, state: "completed" as const, activity: { kind: "text" as const, text: "stale output" } }] } as Parameters<typeof formatWorkflowProgress>[0];
   assert.doesNotMatch(formatWorkflowProgress(settled), /stale output|◇ read/);
 });
+void test("workflow progress applies semantic styles without coloring agent names", () => {
+  const styles = {
+    accent: (text: string) => `<accent>${text}</accent>`,
+    success: (text: string) => `<success>${text}</success>`,
+    error: (text: string) => `<error>${text}</error>`,
+    warning: (text: string) => `<warning>${text}</warning>`,
+    muted: (text: string) => `<muted>${text}</muted>`,
+    dim: (text: string) => `<dim>${text}</dim>`,
+    bold: (text: string) => `<bold>${text}</bold>`,
+  };
+  const run = { id: "run", workflowName: "styled", cwd: "/repo", sessionId: "session", state: "budget_exhausted", phase: "work", agents: [
+    { id: "run:1", name: "done", path: "run:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "live", path: "run:2", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1, activity: { kind: "text" as const, text: "answer" } },
+    { id: "run:3", name: "waiting", path: "run:3", state: "queued", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:4", name: "failed", path: "run:4", state: "failed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:5", name: "cancelled", path: "run:5", state: "cancelled", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const progress = formatWorkflowProgress(run, "@", styles);
+  assert.match(progress, /<bold><accent>Workflow: styled/);
+  assert.match(progress, /<warning>!<\/warning>/);
+  assert.match(progress, /<success>✓<\/success> done <success>\[completed\]<\/success>/);
+  assert.match(progress, /<accent>@<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding<\/dim>/);
+  assert.match(progress, /<muted>○<\/muted> waiting <muted>\[queued\]<\/muted>/);
+  assert.match(progress, /<error>✗<\/error> failed <error>\[failed\]<\/error>/);
+  assert.match(progress, /<error>✗<\/error> cancelled <error>\[cancelled\]<\/error>/);
+  assert.doesNotMatch(progress, /<accent>[^<]*live/);
+});
 void test("workflow cards group structural scopes with stable creation order", () => {
   const run = { id: "run", workflowName: "grouped", cwd: "/repo", sessionId: "session", state: "running", agents: [
     { id: "run:1", name: "developer", path: "run:1", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
