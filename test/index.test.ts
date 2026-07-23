@@ -1639,6 +1639,17 @@ void test("run lifecycle pauses cooperatively, resumes waiters, and keeps termin
   await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   assert.deepEqual(states, ["pausing", "paused", "running", "stopped"]);
 });
+void test("run lifecycle does not resurrect a paused run after stop races its pause", async () => {
+  let releasePauseTransition!: () => void;
+  const pauseTransition = new Promise<void>((resolve) => { releasePauseTransition = resolve; });
+  const lifecycle = new RunLifecycle("running", async (state) => { if (state === "pausing") await pauseTransition; });
+  const pausing = lifecycle.pause();
+  assert.equal(lifecycle.state, "pausing");
+  const stopping = lifecycle.terminal("stopped");
+  releasePauseTransition();
+  await Promise.all([pausing, stopping]);
+  assert.equal(lifecycle.state, "stopped");
+});
 
 void test("run lifecycle waits for resume before awaiting input and wakes on resolution", async () => {
   const pausedStates: string[] = [];
@@ -1664,6 +1675,160 @@ void test("run lifecycle waits for resume before awaiting input and wakes on res
   await waiting;
   await lifecycle.leave();
   assert.deepEqual(states, ["awaiting_input", "running"]);
+});
+async function waitForIssue105(check: () => boolean | Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    if (await check()) return;
+    if (attempt % 10 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    else await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  assert.fail("Timed out waiting for issue #105 test gate");
+}
+void test("pause waits for parallel agents and blocks later operations until resume", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-pause-parallel-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const events: Array<{ channel: string; data: unknown }> = [];
+  const starts: string[] = [];
+  const releases = new Map<string, () => void>();
+  let resolveBothStarted!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { resolveBothStarted = resolve; });
+  let sessionCount = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    const label = input.sessionLabel.split(":")[1] ?? "unknown";
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    releases.set(label, release);
+    return {
+      sessionId: `${label}-${String(++sessionCount)}`, sessionFile: `/sessions/${label}.jsonl`,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+      prompt: async () => { starts.push(label); if (starts.includes("first") && starts.includes("second")) resolveBothStarted(); await gate; },
+      abort: async () => { release(); }, steer: async () => {}, dispose() {},
+    };
+  };
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  const running = workflow.execute("id", { name: "parallel-pause", script: "const values = await Promise.all([agent('first', {label:'first'}), agent('second', {label:'second'})]); values.push(await agent('after', {label:'after'})); return values;", concurrency: 2, foreground: true }, new AbortController().signal, undefined, context);
+  await bothStarted;
+  const runId = (await listRunIds(cwd, "session", home))[0];
+  assert.ok(runId);
+  const store = new RunStore(cwd, "session", runId, home);
+  await command(`pause ${runId}`, context);
+  assert.equal((await store.load()).run.state, "pausing");
+  releases.get("first")?.();
+  await waitForIssue105(async () => (await store.load()).run.agents.some((agent) => agent.name === "first" && agent.state === "completed"));
+  assert.equal((await store.load()).run.state, "pausing");
+  releases.get("second")?.();
+  await waitForIssue105(async () => (await store.load()).run.state === "paused");
+  assert.deepEqual([...starts].sort(), ["first", "second"]);
+  await command(`resume ${runId}`, context);
+  await waitForIssue105(() => starts.includes("after"));
+  releases.get("after")?.();
+  await running;
+  assert.equal((await store.load()).run.state, "completed");
+  const stateEvents = events.filter(({ channel, data }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT && (data as { runId: string }).runId === runId).map(({ data }) => (data as { state: string }).state);
+  assert.deepEqual(stateEvents, ["pausing", "paused", "running", "completed"]);
+  assert.equal(events.filter(({ channel, data }) => channel === WORKFLOW_RUN_RESUMED_EVENT && (data as { runId: string }).runId === runId).length, 1);
+});
+void test("pause blocks shell work at both shared and worktree operation boundaries", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-pause-shell-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  execFileSync("git", ["-C", cwd, "commit", "--allow-empty", "-qm", "initial"]);
+  const runBoundary = async (name: string, script: string, startPath: string, releasePath: string, afterPath: string) => {
+    const sessionId = name;
+    const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+    const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+    const createSession = async (): Promise<NativeSession> => { throw new Error("agent must not launch"); };
+    workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+    const workflow = tools.find(({ name }) => name === "workflow");
+    const command = commands[0]?.handler;
+    assert.ok(workflow && command);
+    const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => sessionId }, ui: { notify() {} } };
+    const running = workflow.execute("id", { name, script, foreground: true }, new AbortController().signal, undefined, context);
+    await waitForIssue105(() => existsSync(startPath));
+    const runId = (await listRunIds(cwd, sessionId, home))[0];
+    assert.ok(runId);
+    const store = new RunStore(cwd, sessionId, runId, home);
+    await command(`pause ${runId}`, context);
+    assert.equal((await store.load()).run.state, "pausing");
+    writeFileSync(releasePath, "release");
+    await waitForIssue105(async () => (await store.load()).run.state === "paused");
+    assert.equal(existsSync(afterPath), false);
+    await command(`resume ${runId}`, context);
+    await waitForIssue105(() => existsSync(afterPath));
+    await running;
+    assert.equal((await store.load()).run.state, "completed");
+  };
+  const shell = (startPath: string, releasePath: string) => `${process.execPath} -e ${JSON.stringify(`const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(startPath)},"started");const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releasePath)})){clearInterval(timer);process.exit(0);}},1);`)}`;
+  const sharedStart = join(home, "shared-start");
+  const sharedRelease = join(home, "shared-release");
+  const sharedAfter = join(home, "shared-after");
+  await runBoundary("pause-shell", `await shell(${JSON.stringify(shell(sharedStart, sharedRelease))}); await shell(${JSON.stringify(`${process.execPath} -e ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(sharedAfter)},"after")`)}`)}); return true;`, sharedStart, sharedRelease, sharedAfter);
+  const worktreeStart = join(home, "worktree-start");
+  const worktreeRelease = join(home, "worktree-release");
+  const worktreeAfter = join(home, "worktree-after");
+  await runBoundary("pause-worktree", `return await withWorktree("pause-scope", async () => { await shell(${JSON.stringify(shell(worktreeStart, worktreeRelease))}); await shell(${JSON.stringify(`${process.execPath} -e ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(worktreeAfter)},"after")`)}`)}); return true; });`, worktreeStart, worktreeRelease, worktreeAfter);
+});
+void test("navigator Pause and Resume actions round-trip persisted state and refresh", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-pause-resume-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const startPath = join(home, "navigator-start");
+  const releasePath = join(home, "navigator-release");
+  const afterPath = join(home, "navigator-after");
+  const blocked = `${process.execPath} -e ${JSON.stringify(`const fs=require("node:fs");fs.writeFileSync(${JSON.stringify(startPath)},"started");const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releasePath)})){clearInterval(timer);process.exit(0);}},1);`)}`;
+  const after = `${process.execPath} -e ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(afterPath)},"after")`)}`;
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const createSession = async (): Promise<NativeSession> => { throw new Error("agent must not launch"); };
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  let customCalls = 0;
+  const context = { cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { if (message.startsWith("Paused workflow")) writeFileSync(releasePath, "release"); }, confirm: async () => true, select: async (_prompt: string, options: string[]) => options[0] ?? "Close", custom: async (factory: (tui: { requestRender(): void; terminal: { rows: number } }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => { customCalls += 1; const component = factory({ requestRender() {}, terminal: { rows: 20 } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {}); const dashboard = component.render(200).join("\\n"); const action = customCalls === 1 ? "Pause" : customCalls === 2 ? "Close" : customCalls === 3 ? "Resume" : "Close"; assert.match(dashboard, new RegExp(action)); component.handleInput?.(action === "Close" ? "tui.select.cancel" : "tui.select.confirm"); component.dispose?.(); return action === "Close" ? undefined : action; } } };
+  const result = await workflow.execute("id", { name: "navigator-pause-resume", script: `await shell(${JSON.stringify(blocked)}); await shell(${JSON.stringify(after)}); return true;` }, new AbortController().signal, undefined, context);
+  const runId = (JSON.parse((result as { content: [{ text: string }] }).content[0].text) as { runId: string }).runId;
+  await waitForIssue105(() => existsSync(startPath));
+  await command("", context);
+  await waitForIssue105(async () => (await new RunStore(cwd, "session", runId, home).load()).run.state === "paused");
+  await command("", context);
+  await waitForIssue105(async () => (await new RunStore(cwd, "session", runId, home).load()).run.state === "completed");
+  assert.equal(existsSync(afterPath), true);
+});
+void test("invalid and duplicate lifecycle controls fail with typed errors without blocking waiters", async () => {
+  const lifecycle = new RunLifecycle("running");
+  await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await lifecycle.enter();
+  const pausing = lifecycle.pause();
+  await assert.rejects(lifecycle.pause(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await lifecycle.leave();
+  await pausing;
+  let entered = false;
+  const waiting = lifecycle.enter().then(() => { entered = true; });
+  const resumed = lifecycle.resume();
+  await assert.rejects(lifecycle.resume(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await resumed;
+  await waiting;
+  assert.equal(entered, true);
+  await lifecycle.leave();
+  await lifecycle.terminal("stopped");
+  await assert.rejects(lifecycle.pause(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await assert.rejects(lifecycle.terminal("failed"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  const raced = new RunLifecycle("running");
+  await raced.pause();
+  await Promise.all([raced.resume(), raced.terminal("stopped")]);
+  assert.equal(raced.state, "stopped");
 });
 
 void test("loads markdown agent roles only from canonical global and project directories", () => {

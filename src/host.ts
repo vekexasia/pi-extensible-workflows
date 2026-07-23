@@ -100,7 +100,7 @@ export class RunLifecycle {
   async pause(): Promise<void> {
     if (this.#state !== "running") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot pause ${this.#state} run`);
     await this.#set("pausing", "pause");
-    if (this.#active === 0) await this.#set("paused", "pause");
+    if (this.#active === 0 && this.state === "pausing") await this.#set("paused", "pause");
   }
 
   async resume(): Promise<void> {
