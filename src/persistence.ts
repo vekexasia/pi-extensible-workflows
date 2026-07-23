@@ -541,6 +541,23 @@ export class RunStore {
     if (!resolved) throw new WorkflowError("WORKTREE_FAILED", `Missing named worktree ${name}`);
     return resolved;
   }
+  async validateDeletionWorktrees(): Promise<void> {
+    try {
+      const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+      if (!Array.isArray(records)) throw new Error("Worktree records are invalid");
+      const owners = new Set<string>();
+      records.map((record) => {
+        if (!record || typeof record !== "object" || typeof (record as Partial<WorktreeReference>).owner !== "string") throw new Error("Invalid worktree record");
+        const owner = (record as Partial<WorktreeReference>).owner as string;
+        if (owners.has(owner)) throw new Error(`Duplicate worktree record for ${owner}`);
+        owners.add(owner);
+        return this.structuralWorktree(owner, record);
+      });
+    } catch (error) {
+      throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
 
   async validateBorrowedWorktrees(): Promise<void> {
     try {

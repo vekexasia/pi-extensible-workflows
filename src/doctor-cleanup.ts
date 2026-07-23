@@ -1,12 +1,19 @@
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { validateBudget } from "./budget.js";
 import { RUN_STATES, type RunState } from "./types.js";
+import { jsonValue, validateModelAliases } from "./utils.js";
+import { validateSchema } from "./validation.js";
 import { acquireSessionLease, hasLiveSessionLease, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "./persistence.js";
 
 const TERMINAL_STATES = new Set<RunState>(["completed", "failed", "stopped"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_RUN_FILES = ["state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json"] as const;
+const AGENT_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
+const SCHEDULER_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
+const BUDGET_DIMENSIONS = new Set(["tokens", "costUsd", "durationMs", "agentLaunches"]);
+const BUDGET_EVENT_TYPES = new Set(["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"]);
 
 export interface DoctorCleanupOptions { cwd?: string; home?: string; olderThanDays?: number; yes?: boolean; now?: number }
 export interface CleanupRunResult { sessionId: string; runId: string; action: "candidate" | "skipped" | "deleted" | "failed"; state: string; stateMtimeMs: number; path: string; reason?: string }
@@ -25,28 +32,85 @@ function runItem(entry: StoredRun, action: CleanupRunResult["action"], reason?: 
 function sameNames(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every((value, index) => value === right[index]); }
 async function jsonFile(path: string): Promise<unknown> { return JSON.parse(await readFile(path, "utf8")) as unknown; }
 async function requiredFile(path: string): Promise<void> { const info = await lstat(path); if (!info.isFile()) throw new Error(`Required artifact is not a regular file: ${path}`); }
-function stringList(value: unknown, label: string): void { if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) throw new Error(`${label} is invalid`); }
-
+function stringList(value: unknown, label: string, nonEmpty = false): void { if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || (nonEmpty && !item))) throw new Error(`${label} is invalid`); }
+function optionalString(value: unknown, label: string): void { if (value !== undefined && typeof value !== "string") throw new Error(`${label} is invalid`); }
+function nonNegativeInteger(value: unknown, label: string): void { if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`${label} is invalid`); }
+function positiveInteger(value: unknown, label: string): void { if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error(`${label} is invalid`); }
+function finiteNumber(value: unknown, label: string): void { if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`${label} is invalid`); }
+function model(value: unknown, label: string): void { if (!object(value) || typeof value.provider !== "string" || !value.provider || typeof value.model !== "string" || !value.model || (value.thinking !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinking as string))) throw new Error(`${label} is invalid`); }
+function accounting(value: unknown, label: string): void { if (!object(value)) throw new Error(`${label} is invalid`); for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"]) finiteNumber(value[key], `${label}.${key}`); }
+function resourceExclusions(value: unknown, label: string): void { if (value === undefined) return; if (!object(value)) throw new Error(`${label} is invalid`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); }
+function agentDefinition(value: unknown, label: string): void { if (!object(value)) throw new Error(`${label} is invalid`); optionalString(value.prompt, `${label}.prompt`); optionalString(value.description, `${label}.description`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinking as string)) throw new Error(`${label}.thinking is invalid`); if (value.tools !== undefined) stringList(value.tools, `${label}.tools`); resourceExclusions(value.disabledAgentResources, `${label}.disabledAgentResources`); }
+function validateScheduledOptions(value: unknown, label: string): void { if (!object(value) || typeof value.label !== "string" || !value.label || typeof value.cwd !== "string" || !value.cwd) throw new Error(`${label} is invalid`); optionalString(value.requestedLabel, `${label}.requestedLabel`); optionalString(value.parentBreadcrumb, `${label}.parentBreadcrumb`); stringList(value.tools, `${label}.tools`); optionalString(value.worktreeOwner, `${label}.worktreeOwner`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinking as string)) throw new Error(`${label}.thinking is invalid`); optionalString(value.role, `${label}.role`); if (value.schema !== undefined) validateSchema(value.schema, `${label}.schema`); if (value.retries !== undefined) nonNegativeInteger(value.retries, `${label}.retries`); if (value.timeoutMs !== undefined && value.timeoutMs !== null) positiveInteger(value.timeoutMs, `${label}.timeoutMs`); if (value.agentOptions !== undefined && (!object(value.agentOptions) || !jsonValue(value.agentOptions))) throw new Error(`${label}.agentOptions is invalid`); if (value.agentIdentity !== undefined) { if (!object(value.agentIdentity) || !Array.isArray(value.agentIdentity.structuralPath) || value.agentIdentity.structuralPath.some((part) => typeof part !== "string") || typeof value.agentIdentity.callSite !== "string") throw new Error(`${label}.agentIdentity is invalid`); positiveInteger(value.agentIdentity.occurrence, `${label}.agentIdentity.occurrence`); optionalString(value.agentIdentity.parentBreadcrumb, `${label}.agentIdentity.parentBreadcrumb`); optionalString(value.agentIdentity.worktreeOwner, `${label}.agentIdentity.worktreeOwner`); } }
+function validateAgent(value: unknown, label: string): void { if (!object(value) || typeof value.id !== "string" || !value.id || typeof value.name !== "string" || !value.name || typeof value.path !== "string" || !value.path || typeof value.state !== "string" || !AGENT_STATES.has(value.state)) throw new Error(`${label} is invalid`); optionalString(value.label, `${label}.label`); optionalString(value.parentId, `${label}.parentId`); if (value.structuralPath !== undefined) stringList(value.structuralPath, `${label}.structuralPath`); optionalString(value.parentBreadcrumb, `${label}.parentBreadcrumb`); optionalString(value.worktreeOwner, `${label}.worktreeOwner`); optionalString(value.role, `${label}.role`); optionalString(value.requestedModel, `${label}.requestedModel`); model(value.model, `${label}.model`); stringList(value.tools, `${label}.tools`); nonNegativeInteger(value.attempts, `${label}.attempts`); if (value.attemptDetails !== undefined) { if (!Array.isArray(value.attemptDetails)) throw new Error(`${label}.attemptDetails is invalid`); for (const [index, attempt] of value.attemptDetails.entries()) { const at = `${label}.attemptDetails[${String(index)}]`; if (!object(attempt) || !Number.isSafeInteger(attempt.attempt) || Number(attempt.attempt) < 1 || typeof attempt.sessionId !== "string" || !attempt.sessionId || typeof attempt.sessionFile !== "string" || !attempt.sessionFile) throw new Error(`${at} is invalid`); accounting(attempt.accounting, `${at}.accounting`); if (attempt.error !== undefined && (!object(attempt.error) || typeof attempt.error.code !== "string" || typeof attempt.error.message !== "string")) throw new Error(`${at}.error is invalid`); if (attempt.setup !== undefined) { if (!object(attempt.setup) || !Array.isArray(attempt.setup.hookNames) || attempt.setup.hookNames.some((name) => typeof name !== "string") || typeof attempt.setup.cwd !== "string") throw new Error(`${at}.setup is invalid`); model(attempt.setup.model, `${at}.setup.model`); stringList(attempt.setup.tools, `${at}.setup.tools`); resourceExclusions(attempt.setup.disabledAgentResources, `${at}.setup.disabledAgentResources`); } } } if (value.accounting !== undefined) accounting(value.accounting, `${label}.accounting`); if (value.toolCalls !== undefined) { if (!Array.isArray(value.toolCalls)) throw new Error(`${label}.toolCalls is invalid`); for (const call of value.toolCalls) if (!object(call) || typeof call.id !== "string" || typeof call.name !== "string" || !["running", "completed", "failed"].includes(call.state as string)) throw new Error(`${label}.toolCalls is invalid`); } if (value.activity !== undefined && (!object(value.activity) || !["reasoning", "tool", "text"].includes(value.activity.kind as string) || typeof value.activity.text !== "string")) throw new Error(`${label}.activity is invalid`); }
+function validateUsage(value: unknown, label: string): void { if (!object(value)) throw new Error(`${label} is invalid`); for (const key of ["tokens", "costUsd", "durationMs", "agentLaunches"]) finiteNumber(value[key], `${label}.${key}`); }
+function validateBudgetEvents(value: unknown): void { if (value === undefined) return; if (!Array.isArray(value)) throw new Error("Persisted budget events are invalid"); for (const [index, event] of value.entries()) { const label = `budgetEvents[${String(index)}]`; if (!object(event) || typeof event.type !== "string" || !BUDGET_EVENT_TYPES.has(event.type) || !Number.isSafeInteger(event.budgetVersion) || Number(event.budgetVersion) < 1 || !Array.isArray(event.dimensions) || event.dimensions.some((dimension) => typeof dimension !== "string" || !BUDGET_DIMENSIONS.has(dimension)) || typeof event.at !== "number" || !Number.isFinite(event.at) || event.limits === undefined) throw new Error(`${label} is invalid`); validateUsage(event.usage, `${label}.usage`); validateBudget(event.limits); } }
 function validateRunRecord(run: PersistedRun): void {
-  if (!object(run) || typeof run.id !== "string" || !run.id || typeof run.workflowName !== "string" || typeof run.cwd !== "string" || typeof run.sessionId !== "string" || !run.sessionId || !RUN_STATES.includes(run.state) || !Array.isArray(run.agents) || !Array.isArray(run.nativeSessions)) throw new Error("Persisted run state is invalid");
-  if (run.parentRunId !== undefined && (typeof run.parentRunId !== "string" || !run.parentRunId)) throw new Error("Persisted parent run is invalid");
-  if (run.retry !== undefined) {
-    if (!object(run.retry) || typeof run.retry.sourceRunId !== "string" || !run.retry.sourceRunId || typeof run.retry.lineageRootRunId !== "string" || !run.retry.lineageRootRunId) throw new Error("Persisted retry provenance is invalid");
-    stringList(run.retry.completedPaths, "Persisted retry completed paths"); stringList(run.retry.incompletePaths, "Persisted retry incomplete paths"); stringList(run.retry.namedWorktrees, "Persisted retry named worktrees");
-    if (run.parentRunId !== run.retry.sourceRunId) throw new Error("Persisted retry parent does not match its source");
+  const value = run as unknown;
+  if (!object(value) || typeof value.id !== "string" || !value.id || typeof value.workflowName !== "string" || !value.workflowName || typeof value.cwd !== "string" || !value.cwd || typeof value.sessionId !== "string" || !value.sessionId || !RUN_STATES.includes(value.state as RunState) || !Array.isArray(value.agents) || !Array.isArray(value.nativeSessions)) throw new Error("Persisted run state is invalid");
+  const agents = value.agents as Record<string, unknown>[];
+  agents.forEach((agent, index) => { validateAgent(agent, `agents[${String(index)}]`); });
+  const agentIds = new Set<string>();
+  for (const agent of agents) {
+    const id = agent.id as string;
+    if (agentIds.has(id)) throw new Error(`Duplicate persisted agent ${id}`);
+    agentIds.add(id);
   }
+  for (const agent of agents) {
+    const parentId = agent.parentId;
+    if (parentId !== undefined && (typeof parentId !== "string" || !agentIds.has(parentId))) throw new Error("Persisted agent has a missing parent");
+    const seen = new Set<string>();
+    let parent = typeof parentId === "string" ? parentId : undefined;
+    while (parent) {
+      if (seen.has(parent)) throw new Error("Persisted agent parent cycle");
+      seen.add(parent);
+      const parentAgent = agents.find((candidate) => candidate.id === parent);
+      parent = typeof parentAgent?.parentId === "string" ? parentAgent.parentId : undefined;
+    }
+  }
+  for (const [index, session] of (value.nativeSessions as unknown[]).entries()) if (!object(session) || typeof session.sessionId !== "string" || !session.sessionId || typeof session.sessionFile !== "string" || !session.sessionFile) throw new Error(`nativeSessions[${String(index)}] is invalid`);
+  optionalString(value.parentRunId, "Persisted parent run");
+  if (value.retry !== undefined) {
+    if (!object(value.retry) || typeof value.retry.sourceRunId !== "string" || !value.retry.sourceRunId || typeof value.retry.lineageRootRunId !== "string" || !value.retry.lineageRootRunId) throw new Error("Persisted retry provenance is invalid");
+    const sourceRunId = value.retry.sourceRunId;
+    stringList(value.retry.completedPaths, "Persisted retry completed paths");
+    stringList(value.retry.incompletePaths, "Persisted retry incomplete paths");
+    stringList(value.retry.namedWorktrees, "Persisted retry named worktrees");
+    if (value.parentRunId !== sourceRunId) throw new Error("Persisted retry parent does not match its source");
+  }
+  optionalString(value.phase, "Persisted phase");
+  if (value.phaseHistory !== undefined) {
+    if (!Array.isArray(value.phaseHistory)) throw new Error("Persisted phase history is invalid");
+    for (const phase of value.phaseHistory) { if (!object(phase) || typeof phase.phase !== "string" || !phase.phase) throw new Error("Persisted phase history is invalid"); nonNegativeInteger(phase.afterAgent, "Persisted phase history afterAgent"); }
+  }
+  if (value.error !== undefined && (!object(value.error) || typeof value.error.code !== "string" || typeof value.error.message !== "string")) throw new Error("Persisted run error is invalid");
+  validateBudget(value.budget);
+  if (value.budgetVersion !== undefined) positiveInteger(value.budgetVersion, "Persisted budget version");
+  if (value.usage !== undefined) validateUsage(value.usage, "Persisted usage");
+  validateBudgetEvents(value.budgetEvents);
+  if (value.events !== undefined) { if (!Array.isArray(value.events)) throw new Error("Persisted run events are invalid"); for (const event of value.events) if (!object(event) || typeof event.type !== "string" || typeof event.message !== "string") throw new Error("Persisted run event is invalid"); }
 }
-
-async function validateRunArtifacts(store: RunStore): Promise<readonly { name: string; sourceRunId: string }[]> {
+function validateSnapshot(snapshot: unknown): void { if (!object(snapshot) || typeof snapshot.script !== "string" || !snapshot.script || !jsonValue(snapshot.args) || !object(snapshot.metadata) || typeof snapshot.metadata.name !== "string" || !snapshot.metadata.name || (snapshot.metadata.description !== undefined && typeof snapshot.metadata.description !== "string") || !object(snapshot.settings) || !Number.isSafeInteger(snapshot.settings.concurrency) || Number(snapshot.settings.concurrency) < 1 || Number(snapshot.settings.concurrency) > 16 || !Array.isArray(snapshot.models) || snapshot.models.some((modelName) => typeof modelName !== "string") || !Array.isArray(snapshot.tools) || snapshot.tools.some((tool) => typeof tool !== "string") || !Array.isArray(snapshot.agentTypes) || snapshot.agentTypes.some((agentType) => typeof agentType !== "string") || !Array.isArray(snapshot.schemas)) throw new Error("Persisted launch snapshot is invalid"); if (snapshot.identityVersion !== undefined) positiveInteger(snapshot.identityVersion, "Persisted snapshot identity version"); if (snapshot.launchKind !== undefined && !["inline", "function"].includes(snapshot.launchKind as string)) throw new Error("Persisted snapshot launch kind is invalid"); if (snapshot.launchKind === "function" && (typeof snapshot.functionName !== "string" || !snapshot.functionName)) throw new Error("Persisted snapshot function name is invalid"); optionalString(snapshot.functionName, "Persisted snapshot function name"); if (snapshot.modelAliases !== undefined) validateModelAliases(snapshot.modelAliases); if (snapshot.settings.modelAliases !== undefined) validateModelAliases(snapshot.settings.modelAliases); resourceExclusions(snapshot.settings.disabledAgentResources, "Persisted snapshot disabled resources"); if (snapshot.roles !== undefined) { if (!object(snapshot.roles)) throw new Error("Persisted snapshot roles are invalid"); for (const [name, definition] of Object.entries(snapshot.roles)) agentDefinition(definition, `Persisted snapshot role ${name}`); } if (snapshot.projectRoles !== undefined) stringList(snapshot.projectRoles, "Persisted snapshot project roles"); for (const [index, schema] of snapshot.schemas.entries()) validateSchema(schema, `Persisted snapshot schema[${String(index)}]`); }
+function validateJournal(value: unknown): void { if (!object(value) || !object(value.completed) || (value.awaiting !== undefined && !object(value.awaiting)) || (value.decisions !== undefined && !object(value.decisions))) throw new Error("Persisted workflow journal is invalid"); for (const operation of Object.values(value.completed)) if (!object(operation) || typeof operation.path !== "string" || !operation.path || !jsonValue(operation.value)) throw new Error("Persisted completed operation is invalid"); for (const checkpoint of Object.values(value.awaiting ?? {})) if (!object(checkpoint) || typeof checkpoint.path !== "string" || !checkpoint.path || typeof checkpoint.name !== "string" || !checkpoint.name || typeof checkpoint.prompt !== "string" || !jsonValue(checkpoint.context)) throw new Error("Persisted awaiting checkpoint is invalid"); for (const decision of Object.values(value.decisions ?? {})) { if (!object(decision) || decision.kind !== "budget" || typeof decision.proposalId !== "string" || !decision.proposalId || typeof decision.runId !== "string" || !decision.runId || !object(decision.previous) || !object(decision.proposed) || !Number.isSafeInteger(decision.budgetVersion) || Number(decision.budgetVersion) < 1) throw new Error("Persisted budget decision is invalid"); validateUsage(decision.consumed, "Persisted budget decision usage"); validateBudget(decision.previous); validateBudget(decision.proposed); } }
+async function validateRunArtifacts(store: RunStore): Promise<readonly { sourceRunId: string }[]> {
   for (const name of REQUIRED_RUN_FILES) await requiredFile(join(store.directory, name));
-  const journal = await jsonFile(join(store.directory, "journal.json"));
-  if (!object(journal) || !object(journal.completed) || (journal.awaiting !== undefined && !object(journal.awaiting)) || (journal.decisions !== undefined && !object(journal.decisions))) throw new Error("Persisted workflow journal is invalid");
-  const ownership = await jsonFile(join(store.directory, "ownership.json"));
-  if (!Array.isArray(ownership)) throw new Error("Persisted ownership records are invalid");
-  const worktrees = await jsonFile(join(store.directory, "worktrees.json"));
-  if (!Array.isArray(worktrees)) throw new Error("Persisted worktree records are invalid");
+  validateJournal(await jsonFile(join(store.directory, "journal.json")));
+  const rawOwnership = await jsonFile(join(store.directory, "ownership.json"));
+  if (!Array.isArray(rawOwnership)) throw new Error("Persisted ownership records are invalid");
+  const ownership = rawOwnership as unknown[];
+  const ownershipIds = new Set<string>();
+  for (const [index, record] of ownership.entries()) {
+    const label = `ownership[${String(index)}]`;
+    if (!object(record) || typeof record.id !== "string" || !record.id || ownershipIds.has(record.id) || typeof record.label !== "string" || !record.label || typeof record.state !== "string" || !SCHEDULER_STATES.has(record.state)) throw new Error(`${label} is invalid`);
+    ownershipIds.add(record.id);
+    optionalString(record.parentId, `${label}.parentId`);
+    validateScheduledOptions(record.options, `${label}.options`);
+  }
+  for (const record of ownership) if (object(record) && record.parentId !== undefined && (typeof record.parentId !== "string" || !ownershipIds.has(record.parentId))) throw new Error("Persisted ownership parent is missing");
+  await store.validateDeletionWorktrees();
   const borrowed = await store.borrowedWorktrees();
-  return borrowed.map(({ sourceRunId }) => ({ name: sourceRunId, sourceRunId }));
+  await store.validateBorrowedWorktrees();
+  return borrowed.map(({ sourceRunId }) => ({ sourceRunId }));
 }
 
 async function sessionEntries(path: string): Promise<readonly import("node:fs").Dirent[]> {
@@ -80,6 +144,7 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
       const beforeState = await stat(join(store.directory, "state.json"));
       const loaded = await store.load();
       validateRunRecord(loaded.run);
+      validateSnapshot(loaded.snapshot);
       if (loaded.run.parentRunId !== undefined) await store.validateParentRun(loaded.run.parentRunId);
       if (loaded.run.retry) await store.validateRetrySource();
       const borrowed = await validateRunArtifacts(store);
@@ -99,6 +164,18 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
   if (!sameNames(beforeNames, afterNames)) throw new Error("Session inventory changed while scanning");
   const known = new Set(runs.map(({ runId }) => runId));
   for (const run of runs) for (const dependency of run.dependencies) if (!known.has(dependency)) throw new Error(`Run ${run.runId} depends on missing run ${dependency}`);
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (runId: string): void => {
+    if (visiting.has(runId)) throw new Error("Persisted run dependency cycle prevents safe cleanup");
+    if (visited.has(runId)) return;
+    visiting.add(runId);
+    const run = runs.find(({ runId: current }) => current === runId);
+    for (const dependency of run?.dependencies ?? []) visit(dependency);
+    visiting.delete(runId);
+    visited.add(runId);
+  };
+  for (const run of runs) visit(run.runId);
   return { sessionId, path, runs, liveLease };
 }
 
@@ -193,7 +270,8 @@ export async function doctorCleanup(options: DoctorCleanupOptions = {}): Promise
       while (freshPlan.candidates.length) {
         try { current = await scanSession(cwd, sessionId, home, lease); freshPlan = planSession(current, cutoffMs); for (const item of freshPlan.skipped) addUnique(skipped, item); } catch (error) { const message = textError(error); addFailure(failures, sessionId, message); clean = false; break; }
         if (!freshPlan.candidates.length) break;
-        const ordered = deletionOrder(current, freshPlan.candidates);
+        let ordered: readonly StoredRun[];
+        try { ordered = deletionOrder(current, freshPlan.candidates); } catch (error) { const message = textError(error); addFailure(failures, sessionId, message); clean = false; break; }
         const target = ordered[0];
         if (!target) break;
         let changed: string | undefined;
