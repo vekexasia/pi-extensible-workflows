@@ -5,10 +5,10 @@ import { Value } from "typebox/value";
 import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type AgentSessionEvent, type InlineExtension, type SessionStats, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
-import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./index.js";
-import { mergeAgentResourceExclusions, modelAliasName, resolveModelReference, WorkflowError } from "./index.js";
+import type { AgentIdentity, AgentResourceExclusions, AgentResourcePolicy, AgentSetupSummary, JsonSchema, JsonValue, ModelSpec, WorkflowRunContext } from "./types.js";
+import { jsonObject, mergeAgentResourceExclusions, modelAliasName, modelCapability, resolveModelReference } from "./utils.js";
+import { WorkflowError } from "./types.js";
 import type { RunStore } from "./persistence.js";
-
 export interface AgentBudgetHooks {
   beforeAttempt(): void;
   beforeTurn(): void;
@@ -95,7 +95,6 @@ function parseModel(value: string | undefined, fallback: ModelSpec, thinking?: T
   const parsed = resolveModelReference(value, aliases, knownModels, settingsPath);
   return { ...parsed, ...(thinking ? { thinking } : !parsed.thinking && fallback.thinking ? { thinking: fallback.thinking } : {}) };
 }
-function modelCapability(model: ModelSpec): string { return `${model.provider}/${model.model}`; }
 
 function text(messages: readonly AgentMessage[]): string {
   const message = [...messages].reverse().find((item) => item.role === "assistant");
@@ -190,19 +189,6 @@ export async function createNativeAgentSession(input: SessionInput): Promise<Nat
 }
 function changedOption(options: Readonly<Record<string, JsonValue>>, baseline: Readonly<Record<string, JsonValue>>, key: string): boolean { return JSON.stringify(options[key]) !== JSON.stringify(baseline[key]); }
 function validThinking(value: unknown): value is ThinkingLevel { return typeof value === "string" && ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value); }
-function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value !== "object" || seen.has(value)) return false;
-  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
-  const keys = Reflect.ownKeys(value);
-  if (keys.some((key) => typeof key !== "string")) return false;
-  seen.add(value);
-  const valid = (Array.isArray(value) ? Array.from(value) : keys.map((key) => (value as Record<string, unknown>)[key as string])).every((item) => jsonValue(item, seen));
-  seen.delete(value);
-  return valid;
-}
-function jsonObject(value: unknown): value is Record<string, JsonValue> { return jsonValue(value) && typeof value === "object" && value !== null && !Array.isArray(value); }
 interface ChildAgentToolParams {
   prompt: string;
   label: string;
