@@ -773,11 +773,15 @@ void test("cold-resumed failures deliver structured diagnostics while persistenc
   assert.ok(start && command);
   await start({}, ctx);
   await command("resume run-a", ctx);
-  for (let attempt = 0; attempt < 100 && (await store.load()).run.state !== "failed"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  const loaded = await store.load();
+  let loaded = await store.load();
+  let diagnosticMessage: string | undefined;
+  for (let attempt = 0; attempt < 100 && (loaded.run.state !== "failed" || !diagnosticMessage); attempt += 1) {
+    loaded = await store.load();
+    diagnosticMessage = messages.find((value) => value.includes("failure diagnostics:"));
+    if (loaded.run.state !== "failed" || !diagnosticMessage) await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   assert.equal(loaded.run.state, "failed");
   assert.deepEqual(loaded.run.error, { code: "INTERNAL_ERROR", message });
-  const diagnosticMessage = messages.find((value) => value.includes("failure diagnostics:"));
   assert.ok(diagnosticMessage);
   const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as { runId: string; state: string; error: { code: string; message: string }; artifacts: { statePath: string; journalPath: string } };
   assert.equal(diagnostic.runId, "run-a");

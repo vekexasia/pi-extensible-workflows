@@ -731,7 +731,7 @@ export class RunStore {
       const owner = (record as Partial<WorktreeReference>).owner;
       if (typeof owner !== "string") continue;
       const name = this.worktreeName(owner);
-      if (!name || invalidBindingNames.has(name) || boundOwners.has(owner)) continue;
+      if (!name || owner !== this.namedWorktreeOwner(name) || invalidBindingNames.has(name) || boundOwners.has(owner)) continue;
       try { await this.ownedWorktree(owner); names.add(name); } catch { /* Do not advertise stale or invalid records. */ }
     }
     for (const binding of validBindings) {

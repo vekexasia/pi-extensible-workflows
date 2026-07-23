@@ -1333,7 +1333,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const state = run.lifecycle.state === "stopped" || run.lifecycle.state === "interrupted" || run.lifecycle.state === "budget_exhausted" ? run.lifecycle.state : "failed";
       await eventPublisher.runFailed(run.store, run.metadata, typed, state);
       run.update?.(workflowToolUpdate(persisted));
-      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) void createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted).then((diagnostic) => { deliverFailure(pi, diagnostic); }).catch(() => undefined);
+      if (!["stopped", "interrupted", "budget_exhausted"].includes(run.lifecycle.state)) await createWorkflowFailureDiagnostics(run.store, run.metadata, typed, persisted).then((diagnostic) => { deliverFailure(pi, diagnostic); }).catch(() => undefined);
     }).finally(() => cleanupTerminalRun(run.store.runId));
     run.completion = completion;
     void completion;
