@@ -497,7 +497,7 @@ export class WorkflowAgentExecutor {
             }
           }
           if (event.type === "tool_execution_start") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: "running" }); activity = { kind: "tool", text: event.toolName }; report(false); }
-          if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; report(false); }
+          if (event.type === "tool_execution_end") { toolCalls.set(event.toolCallId, { id: event.toolCallId, name: event.toolName, state: event.isError ? "failed" : "completed" }); if (activity?.kind === "tool" && activity.text === event.toolName) activity = undefined; report(false); toolCalls.delete(event.toolCallId); }
         });
         report(false);
         if (setSteer) {

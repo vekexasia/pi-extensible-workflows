@@ -154,7 +154,8 @@ void test("streams non-content and tool-call progress", async () => {
   assert.doesNotMatch(JSON.stringify(updates), /REASONING_ONE|REASONING_TWO|RESPONSE_ONE|RESPONSE_TWO/);
   assert.ok(updates.some(({ activity }) => activity?.kind === "text" && activity.text === "responding"));
   assert.ok(updates.some(({ toolCalls, activity }) => activity?.kind === "tool" && toolCalls.some(({ name, state }) => name === "read" && state === "running")));
-  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [{ id: "call-1", name: "read", state: "completed" }], persist: true });
+  assert.ok(updates.some(({ toolCalls, persist }) => !persist && toolCalls.some(({ name, state }) => name === "read" && state === "completed")));
+  assert.deepEqual(updates.at(-1), { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, toolCalls: [], persist: true });
 });
 void test("uses cumulative session stats after compaction for progress, budget, and attempts", async () => {
   let listener: ((event: AgentSessionEvent) => void) | undefined;
