@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentOptions, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext, type WorkflowOrchestrationContext } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, truncateWorkflowProgress, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentOptions, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext, type WorkflowOrchestrationContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -717,6 +717,43 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   assert.doesNotMatch(formatWorkflowProgress(text), /streaming answer/);
   const settled = { ...run, agents: [{ ...agent, state: "completed" as const, activity: { kind: "text" as const, text: "stale output" } }] } as Parameters<typeof formatWorkflowProgress>[0];
   assert.doesNotMatch(formatWorkflowProgress(settled), /stale output|◇ read/);
+});
+void test("workflow progress applies semantic styles without coloring agent names", () => {
+  const styles = {
+    accent: (text: string) => `<accent>${text}</accent>`,
+    success: (text: string) => `<success>${text}</success>`,
+    error: (text: string) => `<error>${text}</error>`,
+    warning: (text: string) => `<warning>${text}</warning>`,
+    muted: (text: string) => `<muted>${text}</muted>`,
+    dim: (text: string) => `<dim>${text}</dim>`,
+    bold: (text: string) => `<bold>${text}</bold>`,
+  };
+  const run = { id: "run", workflowName: "styled", cwd: "/repo", sessionId: "session", state: "budget_exhausted", phase: "work", agents: [
+    { id: "run:1", name: "done", path: "run:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "live", path: "run:2", state: "running", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1, activity: { kind: "text" as const, text: "answer" } },
+    { id: "run:3", name: "waiting", path: "run:3", state: "queued", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:4", name: "failed", path: "run:4", state: "failed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:5", name: "cancelled", path: "run:5", state: "cancelled", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const progress = formatWorkflowProgress(run, "@", styles);
+  assert.match(progress, /<bold><accent>Workflow: styled/);
+  assert.match(progress, /<warning>!<\/warning>/);
+  assert.match(progress, /<success>✓<\/success> done <success>\[completed\]<\/success>/);
+  assert.match(progress, /<accent>@<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding<\/dim>/);
+  assert.match(progress, /<muted>○<\/muted> waiting <muted>\[queued\]<\/muted>/);
+  assert.match(progress, /<error>✗<\/error> failed <error>\[failed\]<\/error>/);
+  assert.match(progress, /<error>✗<\/error> cancelled <error>\[cancelled\]<\/error>/);
+  assert.doesNotMatch(progress, /<accent>[^<]*live/);
+});
+void test("workflow progress truncation closes ANSI styles within terminal width", () => {
+  const line = "\u001b[36m@\u001b[0m \u001b[1m\u001b[36mWorkflow: very-long-name (0/0 done)\u001b[0m\u001b[0m";
+  const stripAnsi = (value: string): string => value.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g"), "");
+  for (const width of [1, 20]) {
+    const rendered = truncateWorkflowProgress(line, width)[0] ?? "";
+    assert.ok(stripAnsi(rendered).length <= width);
+    assert.equal(rendered.endsWith("\u001b[0m"), true);
+  }
+  assert.equal(stripAnsi(truncateWorkflowProgress(line, 1)[0] ?? ""), "…");
 });
 void test("workflow cards group structural scopes with stable creation order", () => {
   const run = { id: "run", workflowName: "grouped", cwd: "/repo", sessionId: "session", state: "running", agents: [

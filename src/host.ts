@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
-import { copyToClipboard, getAgentDir, highlightCode, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, highlightCode, truncateToVisualLines, type ExtensionAPI, type Theme } from "@earendil-works/pi-coding-agent";
 import { createNativeAgentSession, FairAgentScheduler, WorkflowAgentExecutor, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery, type RegisteredAgentSetupHook, type SessionFactory } from "./agent-execution.js";
 import { herdrPaneId, openHerdrPane } from "./herdr.js";
 import { acquireSessionLease, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
@@ -17,6 +17,16 @@ import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistry, 
 import { agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
 import { ERROR_CODES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentAttemptSummary, type AgentOptions, type AgentRecord, type BudgetApprovalRequest, type BudgetEvent, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorCode, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowFailureAgent, type WorkflowFailureDiagnostics, type WorkflowFunctionContext, type WorkflowExecution, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowRunContext, type WorkflowSiblingAgent, type WorkflowWorktreeReference } from "./types.js";
 const SETTLED_AGENT_STATES: ReadonlySet<import("./types.js").AgentState> = new Set(["completed", "failed", "cancelled"]);
+export interface WorkflowProgressStyles {
+  accent(text: string): string;
+  success(text: string): string;
+  error(text: string): string;
+  warning(text: string): string;
+  muted(text: string): string;
+  dim(text: string): string;
+  bold(text: string): string;
+}
+const PLAIN_WORKFLOW_PROGRESS_STYLES: WorkflowProgressStyles = { accent: (text) => text, success: (text) => text, error: (text) => text, warning: (text) => text, muted: (text) => text, dim: (text) => text, bold: (text) => text };
 const WORKFLOW_FAILURE_DIAGNOSTICS = Symbol("workflowFailureDiagnostics");
 
 function workflowDetail(message: string): string {
@@ -173,33 +183,44 @@ function agentGroups(agents: readonly AgentRecord[], allAgents: readonly AgentRe
   }
   return [...groups].map(([, group]) => ({ label: agentGroupLabel(group.agents.map(({ agent }) => agent)), entries: group.agents }));
 }
-function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => string, allAgents: readonly AgentRecord[] = agents): string[] {
+function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => string, allAgents: readonly AgentRecord[] = agents, groupLabel: (label: string) => string = (label) => label): string[] {
   const groups = agentGroups(agents, allAgents);
   const grouped = groups.length > 1 || groups.some(({ label }) => label !== "Agents");
   return groups.flatMap((group) => [
-    ...(grouped ? [`  ${group.label}`] : []),
+    ...(grouped ? [`  ${groupLabel(group.label)}`] : []),
     ...group.entries.map((entry) => render(entry, grouped)),
   ]);
 }
-export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): string {
+function progressStyleForState(state: string, styles: WorkflowProgressStyles): (text: string) => string {
+  if (state === "completed") return (text) => styles.success(text);
+  if (state === "failed" || state === "cancelled") return (text) => styles.error(text);
+  if (state === "running") return (text) => styles.accent(text);
+  return (text) => styles.muted(text);
+}
+export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES): string {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
-  const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
-  lines.push(...formatCompactBudgetStatus(run).map((line) => `  ${line}`));
+  const workflowIcon = run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? spinner : "◆";
+  const workflowIconStyle = run.state === "completed" ? (text: string) => styles.success(text) : run.state === "failed" || run.state === "stopped" ? (text: string) => styles.error(text) : run.state === "budget_exhausted" ? (text: string) => styles.warning(text) : run.state === "running" ? (text: string) => styles.accent(text) : (text: string) => styles.muted(text);
+  const header = styles.bold(styles.accent(`Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`));
+  const lines = [`${workflowIconStyle(workflowIcon)} ${header}`];
+  const budgetWarning = run.state === "budget_exhausted" || (run.budgetEvents ?? []).some((event) => event.type === "hard_exhausted");
+  lines.push(...formatCompactBudgetStatus(run).map((line) => `  ${budgetWarning ? styles.warning(line) : line}`));
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
   const renderAgents = (agents: readonly AgentRecord[], offset: number, nested: boolean) => renderGroupedAgents(agents, ({ agent, index, depth }, grouped) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
-    const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner);
-    const name = grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId);
-    return `${indent}#${String(offset + index + 1)} ${icon} ${name} [${agent.state}]${activity ? ` ${activity}` : ""}`;
-  }, run.agents).map((line) => nested ? `  ${line}` : line);
+    const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner, styles);
+    const name = grouped ? agent.label ?? agent.name : styledAgentBreadcrumb(agent, byId, styles);
+    const state = progressStyleForState(agent.state, styles);
+    return `${indent}#${String(offset + index + 1)} ${state(icon)} ${name} ${state(`[${agent.state}]`)}${activity ? ` ${activity}` : ""}`;
+  }, run.agents, (label) => styles.muted(label)).map((line) => nested ? `  ${line}` : line);
   const phases = run.phaseHistory?.length ? run.phaseHistory : run.phase ? [{ phase: run.phase, afterAgent: 0 }] : [];
   let renderedAgents = 0;
   let nested = false;
   for (const phase of phases) {
     const boundary = Math.max(renderedAgents, Math.min(run.agents.length, phase.afterAgent));
     lines.push(...renderAgents(run.agents.slice(renderedAgents, boundary), renderedAgents, nested));
-    lines.push(`  [Phase: ${phase.phase}]`);
+    lines.push(`  ${styles.muted(`[Phase: ${phase.phase}]`)}`);
     renderedAgents = boundary;
     nested = true;
   }
@@ -222,11 +243,36 @@ function textBlock(text: string) {
   };
 }
 
-function workflowProgressBlock(run: PersistedRun) {
+const ANSI_SGR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`);
+export function truncateWorkflowProgress(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  return text.split("\n").flatMap((line) => {
+    if (!line) return [""];
+    const visualLines = truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, safeWidth, 0).visualLines;
+    if (visualLines.length <= 1) return [visualLines[0]?.trimEnd() ?? ""];
+    if (safeWidth === 1) return [ANSI_SGR.test(line) ? "…\u001b[0m" : "…"];
+    const prefix = (truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, safeWidth - 1, 0).visualLines[0] ?? "").trimEnd();
+    const truncated = `${prefix}…`;
+    return [ANSI_SGR.test(line) ? `${truncated}\u001b[0m` : truncated];
+  });
+}
+function themeWorkflowProgressStyles(theme: Theme): WorkflowProgressStyles {
+  return {
+    accent: (text) => theme.fg("accent", text),
+    success: (text) => theme.fg("success", text),
+    error: (text) => theme.fg("error", text),
+    warning: (text) => theme.fg("warning", text),
+    muted: (text) => theme.fg("muted", text),
+    dim: (text) => theme.fg("dim", text),
+    bold: (text) => theme.bold(text),
+  };
+}
+function workflowProgressBlock(run: PersistedRun, theme: Theme) {
+  const styles = themeWorkflowProgressStyles(theme);
   return {
     render(width: number) {
       const frame = workflowSpinner[Math.floor(Date.now() / 80) % workflowSpinner.length] ?? "◇";
-      return formatWorkflowProgress(run, frame).split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`);
+      return truncateWorkflowProgress(formatWorkflowProgress(run, frame, styles), width);
     },
     invalidate() {},
   };
@@ -272,7 +318,7 @@ function navigatorRunLabels(entries: readonly { store: RunStore; loaded: { run: 
   });
 }
 
-function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): string {
+function agentBreadcrumbParts(agent: AgentRecord, byId: Map<string, AgentRecord>): string[] {
   const name = agent.label ?? agent.name;
   const parts: string[] = agent.parentBreadcrumb ? [agent.parentBreadcrumb] : [];
   const seen = new Set<string>([agent.id]);
@@ -284,15 +330,21 @@ function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): st
     else break;
   }
   parts.push(name);
-  return parts.length > 1 ? parts.join(" > ") : name;
+  return parts;
+}
+function agentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>): string {
+  const parts = agentBreadcrumbParts(agent, byId);
+  return parts.length > 1 ? parts.join(" > ") : parts[0] ?? "";
+}
+function styledAgentBreadcrumb(agent: AgentRecord, byId: Map<string, AgentRecord>, styles: WorkflowProgressStyles): string {
+  const parts = agentBreadcrumbParts(agent, byId);
+  if (parts.length <= 1) return parts[0] ?? "";
+  return `${styles.muted(parts.slice(0, -1).join(" > "))} > ${parts[parts.length - 1] ?? ""}`;
 }
 
-function formatAgentActivity(agent: AgentRecord, spinner: string): string {
-  if (agent.activity?.kind === "reasoning") return `${spinner} reasoning`;
-  if (agent.activity?.kind === "text") return `${spinner} responding`;
-  if (agent.activity?.kind === "tool") return `${spinner} ${agent.activity.text}`;
-  const tool = [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running");
-  return tool ? `${spinner} ${tool.name}` : "";
+function formatAgentActivity(agent: AgentRecord, spinner: string, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES): string {
+  const label = agent.activity?.kind === "reasoning" ? "reasoning" : agent.activity?.kind === "text" ? "responding" : agent.activity?.kind === "tool" ? agent.activity.text : [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "";
+  return label ? `${styles.accent(spinner)} ${styles.dim(label)}` : "";
 }
 
 function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): string {
@@ -1650,7 +1702,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     renderCall(args) {
       return textBlock(formatWorkflowPreview(args));
     },
-    renderResult(result, { isPartial }, _theme, context) {
+    renderResult(result, { isPartial }, theme, context) {
       const details = result.details;
       if (isWorkflowFailureDiagnostics(details)) return textBlock(formatWorkflowFailureDiagnostics(details));
       const runDetails = details as { run?: PersistedRun; value?: JsonValue; preview?: string } | undefined;
@@ -1662,7 +1714,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         clearInterval(state.workflowSpinner);
         delete state.workflowSpinner;
       }
-      if (runDetails?.run) return workflowProgressBlock(runDetails.run);
+      if (runDetails?.run) return workflowProgressBlock(runDetails.run, theme);
       const content = result.content[0];
       return textBlock(isPartial ? "Workflow starting..." : runDetails?.preview ?? (content?.type === "text" ? content.text : "Workflow finished"));
     },
