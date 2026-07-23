@@ -264,7 +264,7 @@ async function storedSessionIds(cwd: string, home: string): Promise<readonly str
   if (entries.some((entry) => entry.isSymbolicLink())) throw new Error(`Project session inventory contains a symbolic link: ${path}`);
   const invalid = entries.find((entry) => !entry.isDirectory());
   if (invalid) throw new Error(`Project session inventory contains an unrecognized entry: ${join(path, invalid.name)}`);
-  return entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith(".")).map(({ name }) => name).sort();
+  return entries.filter((entry) => entry.isDirectory()).map(({ name }) => name).sort();
 }
 
 function addUnique(items: CleanupRunResult[], item: CleanupRunResult): void { if (!items.some((current) => current.sessionId === item.sessionId && current.runId === item.runId && current.action === item.action)) items.push(item); }
@@ -278,6 +278,7 @@ export async function doctorCleanup(options: DoctorCleanupOptions = {}): Promise
   const now = options.now ?? Date.now();
   if (!Number.isFinite(now)) throw new Error("Cleanup command start time is invalid");
   const cutoffMs = now - olderThanDays * DAY_MS;
+  if (!Number.isFinite(cutoffMs) || !Number.isFinite(new Date(cutoffMs).getTime())) throw new Error("older-than-days produces an unrepresentable cutoff");
   const sessions: CleanupSessionReport[] = [];
   const candidates: CleanupRunResult[] = [];
   const skipped: CleanupRunResult[] = [];

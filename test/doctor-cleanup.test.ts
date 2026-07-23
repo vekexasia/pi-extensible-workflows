@@ -209,3 +209,25 @@ void test("doctor cleanup fails closed for missing or corrupt persisted artifact
     assert.equal(existsSync(sibling.directory), true, mutation.file);
   }
 });
+void test("doctor cleanup fails closed for unrecorded worktree directories", async () => {
+  const paths = fixture(); const now = 1_000_000_000_000;
+  const store = await makeRun(paths, "orphaned-worktree", "completed", now);
+  const valuable = join(store.directory, "worktrees", "orphan", "valuable");
+  mkdirSync(valuable, { recursive: true });
+  const report = await doctorCleanup({ ...paths, olderThanDays: 90, yes: true, now });
+  assert.equal(report.failures.length, 1);
+  assert.deepEqual(report.deleted, []);
+  assert.equal(existsSync(valuable), true);
+  assert.equal(existsSync(store.directory), true);
+});
+void test("doctor cleanup scans hidden session directories", async () => {
+  const paths = fixture(); const now = 1_000_000_000_000;
+  const hidden = await makeRun(paths, "hidden-run", "completed", now, {}, ".hidden-session");
+  const report = await doctorCleanup({ ...paths, olderThanDays: 90, yes: true, now });
+  assert.deepEqual(report.deleted.map(({ sessionId, runId }) => ({ sessionId, runId })), [{ sessionId: ".hidden-session", runId: "hidden-run" }]);
+  assert.equal(existsSync(hidden.directory), false);
+});
+void test("doctor cleanup rejects an unrepresentable cutoff", async () => {
+  const paths = fixture();
+  await assert.rejects(doctorCleanup({ ...paths, olderThanDays: Number.MAX_SAFE_INTEGER, now: 1_000_000_000_000 }), /representable cutoff/);
+});
