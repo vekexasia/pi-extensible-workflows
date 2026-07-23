@@ -22,6 +22,12 @@ const typeCheckAgentContext = (context: WorkflowOrchestrationContext): void => {
   void context.agent(42);
 };
 void typeCheckAgentContext;
+const typeCheckWorktreeContext = (context: WorkflowOrchestrationContext): void => {
+  void context.withWorktree("scope", () => "value");
+  // @ts-expect-error withWorktree requires an explicit name
+  void context.withWorktree(() => "value");
+};
+void typeCheckWorktreeContext;
 
 void test("validates aggregate budgets and patches", () => {
   const budget = validateBudget({ tokens: { soft: 5, hard: 10 }, costUsd: { soft: 1, hard: 2.5 }, durationMs: { hard: 100 }, agentLaunches: { soft: 0, hard: 1 } });
@@ -65,7 +71,7 @@ void test("workflow call preview summarizes inline and registered functions safe
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
   assert.match(preview, /^workflow review\nReview code/m);
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
-  assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow workflow\nRegistered function");
+  assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow audit\nRegistered function");
   assert.equal(formatWorkflowPreview({ name: "audit-run", workflow: "audit" }), "workflow audit-run\nRegistered function");
   assert.equal(formatWorkflowPreview({ script: "not javascript", name: "review" }), "workflow review");
 });
@@ -95,7 +101,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { workflow: "missing", name: "missing-run" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
-  await assert.rejects(tool.execute("id", { workflow: "missing", name: " " }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(tool.execute("id", { workflow: "missing", name: " " }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 void test("workflow_retry links children, replays parallel branches, inherits budgets, and supports retry chains", async () => {
@@ -575,8 +581,8 @@ void test("direct function launches enforce input and output schemas", async () 
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
   const context = { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-function-schema-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  await assert.rejects(execute("id", { workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  await assert.rejects(execute("id", { name: " ", workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(execute("id", { workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(execute("id", { name: " ", workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(execute("id", { name: "needs-value", workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(execute("id", { name: "bad-result", workflow: "badResult", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });
@@ -2175,7 +2181,7 @@ void test("launch snapshots are detached and deeply immutable", () => {
   input.roles.reviewer.prompt = "mutated";
   input.roles.reviewer.disabledAgentResources.skills.push("mutated");
   assert.deepEqual(snapshot.args, { nested: [1] });
-  assert.equal(snapshot.identityVersion, 4);
+  assert.equal(snapshot.identityVersion, 5);
   assert.equal(snapshot.roles?.reviewer?.prompt, "original");
   assert.deepEqual(snapshot.roles.reviewer.disabledAgentResources, { skills: ["role-skill"], extensions: ["/role-extension.ts"] });
   assert.ok(Object.isFrozen(snapshot.args));
@@ -2406,23 +2412,16 @@ void test("withWorktree callbacks receive frozen public references", async () =>
   assert.equal(materialized, 1);
 });
 
-void test("withWorktree validates calls, materializes empty scopes, and replays unnamed identity", async () => {
-  const emptyOwners: string[] = [];
+void test("withWorktree requires explicit named scopes", async () => {
   const materializedOwners: string[] = [];
   const materialize = async (owner: string) => { materializedOwners.push(owner); return { path: "/worktrees/empty", branch: "branch" }; };
-  assert.deepEqual(await runWorkflow(`return await withWorktree("empty", async () => ({ ok: true }));`, null, { worktree: materialize, agent: async (_prompt, _options, _signal, identity) => { emptyOwners.push(identity.worktreeOwner ?? ""); return null; } }).result, { ok: true });
-  assert.deepEqual(emptyOwners, []);
+  assert.deepEqual(await runWorkflow(`return await withWorktree("empty", async () => ({ ok: true }));`, null, { worktree: materialize }).result, { ok: true });
   assert.deepEqual(materializedOwners, ["worktree/named/empty"]);
-  const namedOwners: string[] = [];
-  await runWorkflow(`return await Promise.all([withWorktree("same", async () => agent("one")), withWorktree("same", async () => agent("two")), withWorktree("other", async () => agent("three"))]);`, null, { worktree: materialize, agent: async (_prompt, _options, _signal, identity) => { namedOwners.push(identity.worktreeOwner ?? ""); return "done"; } }).result;
-  assert.equal(namedOwners[0], namedOwners[1]);
-  assert.notEqual(namedOwners[0], namedOwners[2]);
-  const script = `return await withWorktree(async () => agent("same"));`;
-  const owner = async () => { let value = ""; await runWorkflow(script, null, { worktree: materialize, agent: async (_prompt, _options, _signal, identity) => { value = identity.worktreeOwner ?? ""; return "done"; } }).result; return value; };
-  assert.equal(await owner(), await owner());
   assert.deepEqual(inspectWorkflowScript(`withWorktree("shared", async () => agent("x"));`).map(({ kind, name }) => ({ kind, name })), [{ kind: "withWorktree", name: "shared" }, { kind: "agent", name: null }]);
-  for (const source of [`withWorktree("", () => 1)`, `withWorktree("shared", 1)`, `withWorktree("shared", () => 1, 2)`]) assert.throws(() => preflight(source, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  for (const source of [`withWorktree(() => 1)`, `withWorktree("", () => 1)`, `withWorktree(1, () => 1)`, `withWorktree("shared", 1)`, `withWorktree("shared", () => 1, 2)`]) assert.throws(() => preflight(source, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight(`const alias = withWorktree; alias(() => 1);`, capabilities), /direct withWorktree.*aliases.*unsupported/i);
+  await assert.rejects(runWorkflow(`return await withWorktree(() => agent("same"));`).result, /withWorktree requires a name and callback/i);
+  await assert.rejects(runWorkflow(`return await withWorktree("scope", 1);`).result, /withWorktree callback must be a function/i);
   await assert.rejects(runWorkflow(`const alias = withWorktree; return alias(() => 1);`).result, /direct withWorktree.*aliases.*unsupported/i);
 });
 void test("parallel identities do not depend on completion order", async () => {

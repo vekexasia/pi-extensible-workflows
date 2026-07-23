@@ -301,12 +301,11 @@ export function instrumentWorkflow(script: string): string {
   validateRemovedWorkflowPrimitives(program, "INVALID_METADATA");
   const calls = workflowCalls(program).filter((call) => ["agent", "withWorktree", "shell"].includes(call.callee.name));
   const edits = calls.flatMap((call) => {
+    const replacement = { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME };
+    if (call.callee.name === "withWorktree") return [replacement];
     const callSite = `${String(call.start)}:${String(call.end)}`;
     const hiddenArgument = call.arguments.length === 0 || callHasTrailingComma(body, call) ? "" : ", ";
-    return [
-      { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME },
-      { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` },
-    ];
+    return [replacement, { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` }];
   }).sort((left, right) => right.start - left.start);
   let instrumented = body;
   for (const edit of edits) instrumented = instrumented.slice(0, edit.start) + edit.text + instrumented.slice(edit.end);
@@ -503,15 +502,13 @@ function validateStaticShellOptions(call: WorkflowCall): void {
   if (options.known) validateShellOptions(options.value);
 }
 
-function validateStaticWithWorktree(call: WorkflowCall): void {
+function validateStaticWithWorktree(call: WorkflowCall, compatibility: boolean): void {
   if (call.arguments.some((argument) => argument.type === "SpreadElement")) return;
-  if (call.arguments.length !== 1 && call.arguments.length !== 2) fail("INVALID_METADATA", "withWorktree requires a callback or a name and callback");
-  const callback = call.arguments[call.arguments.length - 1];
+  if (call.arguments.length !== 2) fail(compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA", "withWorktree requires a name and callback");
+  const callback = call.arguments[1];
   if (staticValue(callback).known) fail("INVALID_METADATA", "withWorktree callback must be a function");
-  if (call.arguments.length === 2) {
-    const name = staticValue(call.arguments[0]);
-    if (name.known && (typeof name.value !== "string" || !name.value.trim())) fail("INVALID_METADATA", "withWorktree name must be a non-empty string");
-  }
+  const name = staticValue(callArgument(call, 0));
+  if (name.known && (typeof name.value !== "string" || !name.value.trim())) fail("INVALID_METADATA", "withWorktree name must be a non-empty string");
 }
 
 
@@ -541,7 +538,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   for (const call of calls) {
     const operation = call.callee.name;
     if (operation === "agent") validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
-    if (operation === "withWorktree") validateStaticWithWorktree(call);
+    if (operation === "withWorktree") validateStaticWithWorktree(call, compatibility);
     if (operation === "shell") validateStaticShellOptions(call);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
     if (operation === "checkpoint" && stableName(call.arguments[0]) === false) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);
@@ -582,9 +579,9 @@ export function validateWorkflowLaunch(params: WorkflowValidationParameters, con
 export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters, context: WorkflowValidationContext, registry?: WorkflowRegistryApi): ValidatedWorkflowLaunch {
   if (Object.prototype.hasOwnProperty.call(params, "maxAgentLaunches")) fail("INVALID_METADATA", "maxAgentLaunches has been removed; use budget.agentLaunches");
   if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
-  const workflowName = typeof params.name === "string" ? params.name.trim() : "";
-  if (!workflowName) fail("INVALID_METADATA", "Workflow launches require a non-empty name");
   const functionName = typeof params.workflow === "string" ? params.workflow : undefined;
+  const workflowName = functionName ?? (typeof params.name === "string" ? params.name.trim() : "");
+  if (functionName === undefined && !workflowName) fail("INVALID_METADATA", "Inline workflow launches require a non-empty name");
   const fn = functionName === undefined ? undefined : registry?.function(functionName);
   if (functionName !== undefined && !registry) fail("MISSING_WORKFLOW", `Registered function is unavailable: ${functionName}`);
   const args = params.args === undefined ? null : params.args;

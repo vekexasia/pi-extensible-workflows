@@ -563,17 +563,18 @@ void test("registered function context exposes callback worktree references", as
   registerWorkflowExtension({
     version: "1.0.0", headline: "Worktree reference", description: "Worktree reference acceptance",
     functions: {
-      readReference: { description: "Read reference", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { let frozen = false; const reference = await context.withWorktree("registered", async (value) => { frozen = Object.isFrozen(value); return { path: value.path, branch: value.branch }; }); return { reference, frozen }; } },
+      readReference: { description: "Read reference", input: { type: "object" }, output: { type: "object" }, async run(_input, context) { let frozen = false; const reference = await context.withWorktree("registered", async (value) => { frozen = Object.isFrozen(value); return { path: value.path, branch: value.branch }; }); return { reference, frozen, runName: context.run.workflow.name }; } }
     },
   });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
-  const result = await workflow.execute("id", { name: "worktree-reference", script: "return readReference({});", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
-  const value = result.details.value as { reference: { path: string; branch: string }; frozen: boolean };
+  const result = await workflow.execute("id", { workflow: "readReference", args: {}, foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const value = result.details.value as { reference: { path: string; branch: string }; frozen: boolean; runName: string };
   assert.match(value.reference.path, /worktrees/);
   assert.match(value.reference.branch, /pi-extensible-workflows/);
   assert.deepEqual(Object.keys(value.reference), ["path", "branch"]);
   assert.equal(value.frozen, true);
+  assert.equal(value.runName, "readReference");
 });
 
 void test("shared worktree scopes persist one owner across production agents and functions", { timeout: 10000 }, async () => {
