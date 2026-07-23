@@ -209,7 +209,7 @@ export class TestHarness {
 
     // Wait for Pi to be ready
     try {
-      herdr("wait", "output", this.paneId, "--match", "ctrl", "--timeout", "15000");
+      await this.waitFor("ctrl", 15_000);
     } catch {
       const screen = this.readPane();
       throw new Error(`Pi did not start within 15s. Screen:\n${screen}`);
@@ -227,7 +227,12 @@ export class TestHarness {
   /** Wait for text to appear in the pane. */
   async waitFor(match: string, timeoutMs = 10_000): Promise<void> {
     if (!this.paneId) throw new Error("Not launched");
-    herdr("wait", "output", this.paneId, "--source", "recent-unwrapped", "--match", match, "--timeout", String(timeoutMs));
+    const deadline = Date.now() + timeoutMs;
+    do {
+      if (this.readPane().includes(match)) return;
+      await sleep(100);
+    } while (Date.now() < deadline);
+    throw new Error(`Timed out waiting for ${match}`);
   }
 
   /** Read recent pane content (plain text, soft-wraps joined). */
