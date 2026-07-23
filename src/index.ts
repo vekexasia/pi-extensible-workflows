@@ -3084,6 +3084,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       }
     }
     retryReservations.add(lineageRootRunId);
+    let childStarted = false;
     try {
       const trustedProject = projectTrusted(context);
       await sourceStore.validateRetrySource();
@@ -3131,9 +3132,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       scheduler.addRun(childRunId, loaded.snapshot.settings.concurrency, () => { childBudget.checkAgentLaunch(); });
       await eventPublisher.runStarted(childStore, loaded.snapshot.metadata);
       await coldResumeRun(childRun, false, {}, trustedProject, { model: hostModel, modelRegistry: modelRegistry ? { getAll: () => [...(modelRegistry.getAll?.() ?? [])], getAvailable: () => [...(modelRegistry.getAvailable?.() ?? [])] } : undefined });
+      const completion = runs.get(childRunId)?.completion;
+      if (completion) {
+        childStarted = true;
+        void completion.then(() => { retryReservations.delete(lineageRootRunId); }, () => { retryReservations.delete(lineageRootRunId); });
+      }
       return { runId: childRunId, parentRunId: loaded.run.id, state: "running" };
     } finally {
-      retryReservations.delete(lineageRootRunId);
+      if (!childStarted) retryReservations.delete(lineageRootRunId);
     }
   };
   pi.registerTool({

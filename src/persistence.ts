@@ -504,7 +504,12 @@ export class RunStore {
     }
     const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
     const matches = records.filter((candidate) => candidate && typeof candidate === "object" && (candidate as Partial<WorktreeReference>).owner === owner);
-    if (matches.length === 0) return undefined;
+    if (matches.length === 0) {
+      const loaded = await this.load();
+      if (loaded.run.parentRunId === undefined) return undefined;
+      const parent = await this.sourceRun(loaded.run.parentRunId);
+      return parent.findNamedWorktree(name, nextSeen);
+    }
     try {
       const reference = await this.ownedWorktree(owner);
       return { reference, sourceRunId: this.runId, owner };

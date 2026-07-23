@@ -190,24 +190,53 @@ void test("journals stable structural paths and replays only completed operation
   assert.equal(await store.replay(structuralPath("interrupted-parent")), undefined);
   await assert.rejects(store.complete(path, null), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
 });
-void test("replays only completed operations from a failed retry lineage", async () => {
+void test("replays completed agent, shell, and checkpoint operations across restart and retry chains", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-journal-"));
   const cwd = join(home, "project");
   const source = new RunStore(cwd, "session-a", "run-a", home);
   await source.create({ ...run(cwd), state: "failed" }, snapshot);
   const agentPath = structuralPath("agent", "parallel", "good");
+  const shellPath = structuralPath("shell", "setup");
   await source.complete(agentPath, "done");
+  await source.complete(shellPath, { exitCode: 0, stdout: "ok", stderr: "" });
   const checkpoint = { path: structuralPath("checkpoint", "ship"), name: "ship", prompt: "Ship?", context: null };
   await source.awaitCheckpoint(checkpoint);
   await source.answerCheckpoint("ship", true);
+  const pending = { path: structuralPath("checkpoint", "pending"), name: "pending", prompt: "Pending?", context: null };
+  await source.awaitCheckpoint(pending);
   const child = new RunStore(cwd, "session-a", "run-b", home);
-  await child.create({ id: "run-b", workflowName: "x", cwd, sessionId: "session-a", state: "interrupted", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [agentPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], nativeSessions: [] }, snapshot);
-  assert.deepEqual(await child.replay(agentPath), { path: agentPath, value: "done" });
-  assert.deepEqual(await child.replay(checkpoint.path), { path: checkpoint.path, value: true });
-  assert.equal(await child.replay(structuralPath("agent", "parallel", "bad")), undefined);
-  assert.equal(await child.awaitCheckpoint(checkpoint), true);
-  assert.deepEqual(await child.awaitingCheckpoints(), []);
-  assert.deepEqual((await source.load()).run.state, "failed");
+  await child.create({ id: "run-b", workflowName: "x", cwd, sessionId: "session-a", state: "failed", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [agentPath, shellPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], nativeSessions: [] }, snapshot);
+  const reloadedChild = new RunStore(cwd, "session-a", "run-b", home);
+  assert.deepEqual(await reloadedChild.replay(agentPath), { path: agentPath, value: "done" });
+  assert.deepEqual(await reloadedChild.replay(shellPath), { path: shellPath, value: { exitCode: 0, stdout: "ok", stderr: "" } });
+  assert.deepEqual(await reloadedChild.replay(checkpoint.path), { path: checkpoint.path, value: true });
+  assert.equal(await reloadedChild.replay(pending.path), undefined);
+  assert.equal(await reloadedChild.replay(structuralPath("agent", "parallel", "bad")), undefined);
+  assert.equal((await reloadedChild.awaitingCheckpoints()).length, 0);
+  assert.equal(await reloadedChild.awaitCheckpoint(checkpoint), true);
+  assert.deepEqual(await reloadedChild.awaitingCheckpoints(), []);
+  const grandchild = new RunStore(cwd, "session-a", "run-c", home);
+  const newPath = structuralPath("agent", "retry-only");
+  await grandchild.create({ id: "run-c", workflowName: "x", cwd, sessionId: "session-a", state: "interrupted", parentRunId: "run-b", retry: { sourceRunId: "run-b", lineageRootRunId: "run-a", completedPaths: [agentPath, shellPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], nativeSessions: [] }, snapshot);
+  await grandchild.complete(newPath, "new");
+  const restartedGrandchild = new RunStore(cwd, "session-a", "run-c", home);
+  assert.deepEqual(await restartedGrandchild.replay(agentPath), { path: agentPath, value: "done" });
+  assert.deepEqual(await restartedGrandchild.replay(shellPath), { path: shellPath, value: { exitCode: 0, stdout: "ok", stderr: "" } });
+  assert.deepEqual(await restartedGrandchild.replay(checkpoint.path), { path: checkpoint.path, value: true });
+  assert.deepEqual(await restartedGrandchild.replay(newPath), { path: newPath, value: "new" });
+  assert.equal(await restartedGrandchild.replay(structuralPath("agent", "parallel", "bad")), undefined);
+  assert.equal((await source.load()).run.state, "failed");
+});
+void test("rejects retry provenance cycles before replay or resume", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-cycle-"));
+  const cwd = join(home, "project");
+  const source = new RunStore(cwd, "session-a", "run-a", home);
+  await source.create({ ...run(cwd), state: "failed" }, snapshot);
+  const child = new RunStore(cwd, "session-a", "run-b", home);
+  await child.create({ id: "run-b", workflowName: "x", cwd, sessionId: "session-a", state: "failed", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [], incompletePaths: [], namedWorktrees: [] }, agents: [], nativeSessions: [] }, snapshot);
+  await source.updateState((current) => ({ ...current, retry: { sourceRunId: "run-b", lineageRootRunId: "run-a", completedPaths: [], incompletePaths: [], namedWorktrees: [] } }));
+  await assert.rejects(child.validateRetrySource(), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await assert.rejects(child.replay("agent/cycle"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
 });
 
 void test("persists awaiting checkpoints and atomically accepts only the first answer", async () => {
@@ -293,6 +322,14 @@ void test("reuses named worktrees through durable follow-up bindings without del
   assert.deepEqual(await second.worktree(owner), original);
   assert.equal(existsSync(original.path), true);
   await second.validateBorrowedWorktrees();
+  const retrySource = new RunStore(repo, "session-a", "retry-source", home);
+  await retrySource.create({ ...run(repo), id: "retry-source", state: "failed", parentRunId: "source", retry: { sourceRunId: "source", lineageRootRunId: "source", completedPaths: [], incompletePaths: [], namedWorktrees: ["banana"] } }, snapshot);
+  const retryChild = new RunStore(repo, "session-a", "retry-child", home);
+  await retryChild.create({ ...run(repo), id: "retry-child", state: "failed", parentRunId: "retry-source", retry: { sourceRunId: "retry-source", lineageRootRunId: "source", completedPaths: [], incompletePaths: [], namedWorktrees: ["banana"] } }, snapshot);
+  assert.deepEqual(await retryChild.worktree(owner), original);
+  assert.deepEqual(await retryChild.borrowedWorktrees(), [{ name: "banana", sourceRunId: "source", owner }]);
+  await retryChild.delete(true);
+  await retrySource.delete(true);
   const unrelated = new RunStore(repo, "session-a", "unrelated", home);
   await unrelated.create({ ...run(repo), id: "unrelated", state: "completed" }, snapshot);
   writeFileSync(join(first.directory, "borrowed-worktrees.json"), JSON.stringify([{ name: "banana", sourceRunId: "unrelated", owner }]));

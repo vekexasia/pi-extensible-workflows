@@ -85,13 +85,13 @@ void test("registers the workflow tool, command, and conditional skill", async (
   await assert.rejects(tool.execute("id", { workflow: "missing", name: " " }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
-void test("workflow_retry links a child and replays completed parallel branches", async () => {
+void test("workflow_retry links children, replays parallel branches, inherits budgets, and supports retry chains", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-tool-"));
   let sessions = 0;
-  let fail = true;
+  let remainingFailures = 2;
   const createSession = async (): Promise<NativeSession> => {
     const attempt = ++sessions;
-    return { sessionId: `retry-session-${String(attempt)}`, sessionFile: `/sessions/retry-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 }, cost: 0 }), prompt: async () => { if (fail && attempt === 2) throw new Error("first retry source failure"); }, steer: async () => {}, dispose() {} };
+    return { sessionId: `retry-session-${String(attempt)}`, sessionFile: `/sessions/retry-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 }, cost: 0 }), prompt: async () => { if (attempt > 1 && remainingFailures > 0) { remainingFailures -= 1; throw new Error("retry source failure"); } }, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
@@ -99,27 +99,105 @@ void test("workflow_retry links a child and replays completed parallel branches"
   const retry = tools.find(({ name }) => name === "workflow_retry");
   assert.ok(workflow && retry);
   const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  await assert.rejects(workflow.execute("source", { name: "retry-source", script: `return parallel("branches", { good: () => agent("good"), bad: () => agent("bad") });`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  await assert.rejects(workflow.execute("source", { name: "retry-source", script: `return parallel("branches", { good: () => agent("good"), bad: () => agent("bad") });`, budget: { tokens: { hard: 100 } }, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
   const sourceId = (await listRunIds(home, "session", home))[0];
   assert.ok(sourceId);
-  assert.equal((await new RunStore(home, "session", sourceId, home).load()).run.state, "failed");
-  fail = false;
-  const result = await retry.execute("retry", { runId: sourceId }, undefined, undefined, context) as { content: Array<{ text: string }> };
-  const started = JSON.parse(result.content[0]?.text ?? "null") as { runId: string; parentRunId: string; state: string };
-  assert.equal(started.parentRunId, sourceId);
-  assert.equal(started.state, "running");
-  let child: PersistedRun | undefined;
+  const sourceStore = new RunStore(home, "session", sourceId, home);
+  const source = await sourceStore.load();
+  assert.equal(source.run.state, "failed");
+  const sourceUsage = source.run.usage;
+  const firstResult = await retry.execute("retry", { runId: sourceId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const firstStarted = JSON.parse(firstResult.content[0]?.text ?? "null") as { runId: string; parentRunId: string; state: string };
+  assert.equal(firstStarted.parentRunId, sourceId);
+  assert.equal(firstStarted.state, "running");
+  const loadUntil = async (runId: string, state: PersistedRun["state"]) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const current = (await new RunStore(home, "session", runId, home).load()).run;
+      if (current.state === state) return current;
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`Timed out waiting for ${runId} to become ${state}`);
+  };
+  const first = await loadUntil(firstStarted.runId, "failed");
+  assert.equal(sessions, 3);
+  assert.equal(first.parentRunId, sourceId);
+  assert.ok(first.retry);
+  assert.equal(first.retry.sourceRunId, sourceId);
+  assert.equal(first.retry.lineageRootRunId, sourceId);
+  assert.deepEqual(first.retry.completedPaths.length, 1);
+  const secondResult = await retry.execute("retry-again", { runId: firstStarted.runId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const secondStarted = JSON.parse(secondResult.content[0]?.text ?? "null") as { runId: string; parentRunId: string; state: string };
+  assert.equal(secondStarted.parentRunId, firstStarted.runId);
+  assert.equal(secondStarted.state, "running");
+  const second = await loadUntil(secondStarted.runId, "completed");
+  assert.equal(sessions, 4);
+  assert.ok(second.retry);
+  assert.equal(second.retry.sourceRunId, firstStarted.runId);
+  assert.equal(second.retry.lineageRootRunId, sourceId);
+  assert.deepEqual(second.retry.completedPaths.length, 1);
+  assert.equal(second.usage?.agentLaunches, (sourceUsage?.agentLaunches ?? 0) + 2);
+  assert.deepEqual(second.budget, source.run.budget);
+  assert.deepEqual((await sourceStore.load()).run.usage, sourceUsage);
+  assert.equal((await sourceStore.load()).run.state, "failed");
+});
+void test("workflow_retry rejects concurrent children for one mutable retry lineage", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-concurrency-"));
+  let sessions = 0;
+  let entered!: () => void;
+  let release!: () => void;
+  const childEntered = new Promise<void>((resolve) => { entered = resolve; });
+  const childRelease = new Promise<void>((resolve) => { release = resolve; });
+  const createSession = async (): Promise<NativeSession> => {
+    const attempt = ++sessions;
+    return { sessionId: `retry-concurrent-${String(attempt)}`, sessionFile: `/sessions/retry-concurrent-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (attempt === 1) throw new Error("source failure"); if (attempt === 2) { entered(); await childRelease; } }, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(workflow && retry);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(workflow.execute("source", { name: "concurrent-source", script: `return agent("work");`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const sourceId = (await listRunIds(home, "session", home))[0];
+  assert.ok(sourceId);
+  const started = await retry.execute("retry", { runId: sourceId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  await childEntered;
+  await assert.rejects(retry.execute("retry-again", { runId: sourceId }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  release();
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    child = (await new RunStore(home, "session", started.runId, home).load()).run;
-    if (child.state === "completed") break;
+    const child = (await new RunStore(home, "session", childId, home).load()).run;
+    if (child.state === "completed") return;
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
-  assert.ok(child);
-  assert.equal(child.state, "completed");
-  assert.equal(child.parentRunId, sourceId);
-  assert.ok(child.retry);
-  assert.deepEqual(child.retry.completedPaths.length, 1);
-  assert.equal(sessions, 3);
+  throw new Error("Timed out waiting for the retry child to complete");
+});
+void test("workflow_retry rejects unsupported states, foreign sources, and incompatible snapshots", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-compatibility-"));
+  const launch = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "retry-compatibility" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const createRun = async (id: string, state: PersistedRun["state"], cwd = home, sessionId = "session") => {
+    mkdirSync(cwd, { recursive: true });
+    const store = new RunStore(cwd, sessionId, id, home);
+    await store.create({ id, workflowName: "retry-compatibility", cwd, sessionId, state, agents: [], nativeSessions: [] }, launch);
+    return store;
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home);
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(retry);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  for (const [index, state] of (["completed", "stopped", "interrupted", "running", "budget_exhausted"] as const).entries()) {
+    await createRun(`unsupported-${String(index)}`, state);
+    await assert.rejects(retry.execute("retry", { runId: `unsupported-${String(index)}` }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  }
+  await assert.rejects(retry.execute("missing", { runId: "missing" }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await createRun("foreign-session", "failed", home, "other-session");
+  await assert.rejects(retry.execute("foreign-session", { runId: "foreign-session" }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  await createRun("foreign-project", "failed", join(home, "other-project"));
+  await assert.rejects(retry.execute("foreign-project", { runId: "foreign-project" }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  const incompatible = await createRun("incompatible", "failed");
+  await incompatible.saveSnapshot({ ...launch, identityVersion: 999 });
+  await assert.rejects(retry.execute("incompatible", { runId: "incompatible" }, undefined, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
 });
 void test("probes optional Pi host capabilities while preserving model registry fallbacks", async () => {
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
@@ -2741,6 +2819,12 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.deepEqual(diagnostic.completedSiblingAgents.map(({ label, role, structuralPath }) => ({ label, role, structuralPath })), [{ label: "good", role: undefined, structuralPath: ["reviewers", "good"] }]);
   assert.deepEqual(diagnostic.completedSiblingPaths, [["reviewers", "good"]]);
   assert.match(formatWorkflowFailureDiagnostics(diagnostic), /Completed sibling agents: good path=reviewers > good/);
+  assert.ok(diagnostic.retry);
+  assert.ok(diagnostic.retry.sourceRunId);
+  assert.ok(diagnostic.retry.completedPaths.length > 0);
+  assert.ok(diagnostic.retry.incompletePaths.length > 0);
+  assert.match(diagnostic.retry.warning, /external side effects.*not guaranteed exactly once/i);
+  assert.match(formatWorkflowFailureDiagnostics(diagnostic), /Retry: workflow_retry\(\{ runId:/);
   assert.match(diagnostic.artifacts.statePath, /state\.json$/);
   assert.match(diagnostic.artifacts.journalPath, /journal\.json$/);
   assert.ok(Buffer.byteLength(result.content[0]?.text ?? "") <= 4096);
