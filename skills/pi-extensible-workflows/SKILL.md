@@ -22,9 +22,9 @@ return agent(
 );
 ```
 
-Pass structured input from the main agent with `args`:
+Pass an explicit run name with every launch. The `workflow` field only selects a registered function:
 ```json
-{ "workflow": "workflowName", "args": { "issue": 42 } }
+{ "name": "issue-review", "workflow": "workflowName", "args": { "issue": 42 } }
 ```
 Inside the workflow, read `args.issue` (`args` is `null` when omitted). `workflow_stop` requires the exact run ID; foreground results retain their value and completed `runId`, while background launches return `runId` immediately. A terminal `parentRunId` reuses matching named `withWorktree` scopes; unnamed or missing names create new worktrees.
 Inspect tool `workflow_catalog` result at least once before creating the first workflow for a task. 
