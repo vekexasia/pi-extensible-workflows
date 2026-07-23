@@ -1,4 +1,9 @@
 # Changelog
+## Unreleased
+
+### Breaking changes
+
+- Removed persistent workflow conversations. Use independent `agent()` calls and pass completed results explicitly to later prompts.
 
 ## [2.0.0] - 2026-07-23
 

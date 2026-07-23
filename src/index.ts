@@ -18,7 +18,7 @@ import type { AwaitingCheckpoint, PersistedRun, WorktreeReference } from "./pers
 
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
-export const WORKFLOW_CALL_KINDS = ["agent", "conversation", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
+export const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
 export type WorkflowCallKind = (typeof WORKFLOW_CALL_KINDS)[number];
 export const WORKFLOW_RUN_STARTED_EVENT = "workflow:run-started";
 export const WORKFLOW_RUN_RESUMED_EVENT = "workflow:run-resumed";
@@ -716,13 +716,19 @@ function validateDirectPrimitiveReferences(program: acorn.AnyNode, name: string)
   };
   visit(program);
 }
+function validateRemovedWorkflowPrimitives(program: acorn.AnyNode, code: WorkflowErrorCode): void {
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "CallExpression" && node.callee.type === "Identifier" && node.callee.name === "conversation") fail(code, "conversation() was removed; pass prior agent results explicitly");
+    for (const child of astChildren(node)) visit(child);
+  };
+  visit(program);
+}
 function hasIdentifier(node: acorn.AnyNode, name: string): boolean {
   if (node.type === "Identifier" && node.name === name) return true;
   return astChildren(node).some((child) => hasIdentifier(child, name));
 }
 
 const INTERNAL_AGENT_NAME = "__pi_extensible_workflows_agent";
-const INTERNAL_CONVERSATION_NAME = "__pi_extensible_workflows_conversation";
 const INTERNAL_WORKTREE_NAME = "__pi_extensible_workflows_withWorktree";
 const INTERNAL_SHELL_NAME = "__pi_extensible_workflows_shell";
 
@@ -741,15 +747,15 @@ function instrumentWorkflow(script: string): string {
   if (!body.trim()) return body;
   const program = parseWorkflow(body);
   if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
-  if (hasIdentifier(program, INTERNAL_CONVERSATION_NAME)) fail("INVALID_METADATA", `${INTERNAL_CONVERSATION_NAME} is reserved for workflow conversation instrumentation`);
   if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
   if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
-  const calls = workflowCalls(program).filter((call) => ["agent", "conversation", "withWorktree", "shell"].includes(call.callee.name));
+  validateRemovedWorkflowPrimitives(program, "INVALID_METADATA");
+  const calls = workflowCalls(program).filter((call) => ["agent", "withWorktree", "shell"].includes(call.callee.name));
   const edits = calls.flatMap((call) => {
     const callSite = `${String(call.start)}:${String(call.end)}`;
     const hiddenArgument = call.arguments.length === 0 || callHasTrailingComma(body, call) ? "" : ", ";
     return [
-      { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "conversation" ? INTERNAL_CONVERSATION_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME },
+      { start: call.callee.start, end: call.callee.end, text: call.callee.name === "agent" ? INTERNAL_AGENT_NAME : call.callee.name === "withWorktree" ? INTERNAL_WORKTREE_NAME : INTERNAL_SHELL_NAME },
       { start: call.end - 1, end: call.end - 1, text: `${hiddenArgument}${JSON.stringify(callSite)}` },
     ];
   }).sort((left, right) => right.start - left.start);
@@ -940,7 +946,7 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
     const first = callArgument(call, 0);
     const options = callArgument(call, 1);
     const placement = { execution, structure };
-    if (kind === "agent" || kind === "conversation") {
+    if (kind === "agent") {
       const retries = staticValue(propertyNode(options, "retries"));
       const outputSchema = staticValue(propertyNode(options, "outputSchema"));
       const optionKeys = options?.type === "ObjectExpression" ? options.properties.flatMap((property) => {
@@ -949,7 +955,7 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
         return key ? [key] : [];
       }) : [];
       const knownOptions = Object.fromEntries(optionKeys.flatMap((key) => { const value = staticValue(propertyNode(options, key)); return value.known && jsonValue(value.value) ? [[key, value.value]] : []; })) as Record<string, JsonValue>;
-      const base = { ...placement, kind, start: call.start, end: call.end, name: kind === "conversation" ? staticString(first) : null, prompt: kind === "conversation" ? null : staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticString(propertyNode(options, "role")) };
+      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticString(propertyNode(options, "role")) };
       return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(outputSchema.known && object(outputSchema.value) ? { outputSchema: outputSchema.value as JsonSchema } : {}), ...(optionKeys.length ? { options: knownOptions, optionKeys } : {}) };
     }
     if (kind === "checkpoint") return { ...placement, kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
@@ -994,7 +1000,7 @@ export interface WorkflowCatalogIndexFunction { name: string; description: strin
 export interface WorkflowCatalogIndexVariable { name: string; description: string; schema: JsonSchema }
 export interface WorkflowCatalogIndex { functions: readonly WorkflowCatalogIndexFunction[]; variables: readonly WorkflowCatalogIndexVariable[]; modelAliases?: Readonly<Record<string, string>> }
 export interface WorkflowCatalogError { error: { code: "NOT_FOUND"; name: string; message: string } }
-const RESERVED_GLOBALS = new Set(["agent", "conversation", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
+const RESERVED_GLOBALS = new Set(["agent", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
@@ -1177,26 +1183,21 @@ function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
   }
   return false;
 }
-
-export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }): PreflightResult {
+export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }, compatibility = false): PreflightResult {
   const checkedMetadata = validateWorkflowMetadata(metadata);
   const program = parseWorkflow(script);
   if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
-  if (hasIdentifier(program, INTERNAL_CONVERSATION_NAME)) fail("INVALID_METADATA", `${INTERNAL_CONVERSATION_NAME} is reserved for workflow conversation instrumentation`);
   if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
   if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
   validateDirectPrimitiveReferences(program, "withWorktree");
-  validateDirectPrimitiveReferences(program, "conversation");
+  validateRemovedWorkflowPrimitives(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
   validateDirectPrimitiveReferences(program, "shell");
   for (const [index, schema] of schemas.entries()) validateSchema(schema, `schema[${String(index)}]`);
   const calls = workflowCalls(program);
   const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
   for (const call of calls) {
     const operation = call.callee.name;
-    if (operation === "agent" || operation === "conversation") {
-      if (operation === "conversation" && (!literalString(call.arguments[0])?.trim() || call.arguments.length > 2)) fail("INVALID_METADATA", "conversation requires a stable name and optional options object");
-      validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
-    }
+    if (operation === "agent") validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
     if (operation === "withWorktree") validateStaticWithWorktree(call);
     if (operation === "shell") validateStaticShellOptions(call);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
@@ -1204,7 +1205,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (operation === "parallel" && (call.arguments.length !== 2 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "parallel requires an operation name string and tasks record");
     if (operation === "pipeline" && (call.arguments.length !== 3 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression" || call.arguments[2]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "pipeline requires an operation name string, items record, and stages record");
   }
-  const agentCalls = calls.filter((call) => call.callee.name === "agent" || call.callee.name === "conversation");
+  const agentCalls = calls.filter((call) => call.callee.name === "agent");
   const dynamicAgentRoles = agentCalls.some((call) => hasDynamicAgentRole(call.arguments[1]));
   const staticSchemas = agentCalls.flatMap((call) => { const value = staticValue(propertyNode(call.arguments[1], "outputSchema")); return value.known ? [value.value] : []; });
   for (const [index, schema] of staticSchemas.entries()) validateSchema(schema, `agent outputSchema[${String(index)}]`);
@@ -1316,7 +1317,7 @@ function launchScriptForSnapshot(snapshot: Readonly<LaunchSnapshot>, registry: W
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
 export const HEARTBEAT_TIMEOUT_MS = 5000;
 
-export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; conversation?: { name: string; turn: number } }
+export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string }
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
 export interface WorkflowBridge {
   agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>;
@@ -1397,7 +1398,6 @@ const path = (...names) => names.map(encodeURIComponent).join("/");
 const inheritedAgentPath = new AsyncLocalStorage();
 const agentOccurrences = new Map();
 const shellOccurrences = new Map();
-const conversationOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
 const worktreeOccurrences = new Map();
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
@@ -1423,44 +1423,6 @@ const internalWithWorktree = async (...values) => {
   const reference = await rpc("worktree", [owner]);
   if (!reference || typeof reference !== "object" || typeof reference.path !== "string" || typeof reference.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
   return await worktreeOwners.run(owner, () => callback(Object.freeze({ path: reference.path, branch: reference.branch })));
-};
-const internalConversation = (...values) => {
-  const callSite = values.pop();
-  if (typeof callSite !== "string") throw workError("INTERNAL_ERROR", "Missing workflow conversation call-site identity");
-  const name = values[0];
-  if (typeof name !== "string" || !name.trim()) throw workError("INVALID_METADATA", "conversation requires a non-empty name");
-  const conversationOptions = values.length < 2 || values[1] === undefined ? {} : values[1];
-  if (!conversationOptions || typeof conversationOptions !== "object" || Array.isArray(conversationOptions)) throw workError("INVALID_METADATA", "conversation options must be a JSON object");
-  const inherited = inheritedAgentPath.getStore() || [];
-  const occurrenceKey = JSON.stringify([inherited, callSite, name]);
-  const occurrence = (conversationOccurrences.get(occurrenceKey) || 0) + 1;
-  conversationOccurrences.set(occurrenceKey, occurrence);
-  const fixedOptions = structuredClone(conversationOptions);
-  const defaultTimeout = fixedOptions.timeoutMs;
-  const defaultRetries = fixedOptions.retries;
-  delete fixedOptions.timeoutMs;
-  delete fixedOptions.retries;
-  const worktreeOwner = worktreeOwners.getStore();
-  let turn = 0;
-  let active = false;
-  return Object.freeze({
-    run(prompt, turnOptions = {}) {
-      if (typeof prompt !== "string") throw workError("INVALID_METADATA", "conversation.run prompt must be a string");
-      if (!turnOptions || typeof turnOptions !== "object" || Array.isArray(turnOptions) || Object.keys(turnOptions).some(key => key !== "timeoutMs" && key !== "retries")) throw workError("INVALID_METADATA", "conversation.run options only support timeoutMs and retries");
-      if (active) throw workError("RESUME_INCOMPATIBLE", "Conversation turns cannot overlap");
-      active = true;
-      const turnNumber = turn + 1;
-      const options = { ...fixedOptions, ...(defaultTimeout !== undefined && turnOptions.timeoutMs === undefined ? { timeoutMs: defaultTimeout } : {}), ...(defaultRetries !== undefined && turnOptions.retries === undefined ? { retries: defaultRetries } : {}), ...turnOptions };
-      const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}), conversation: { name: name.trim(), turn: turnNumber } };
-      const result = rpc("agent", [prompt, options, identity]).then(value => { const unwrapped = unwrap(value); turn = turnNumber; return unwrapped; }).finally(() => { active = false; });
-      Object.defineProperties(result, {
-        toJSON: { value() { throw workError("INVALID_METADATA", "Workflow conversation result is a Promise; await it before serialization"); } },
-        toString: { value() { throw workError("INVALID_METADATA", "Workflow conversation result is a Promise; await it before interpolation"); } },
-        [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow conversation result is a Promise; await it before interpolation"); } },
-      });
-      return result;
-    },
-  });
 };
 const internalAgent = (...values) => {
   const callSite = values.pop();
@@ -1627,13 +1589,13 @@ const pipeline = async (operationName, items, stages) => {
   return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, conversation: internalConversation, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const [name, value] of Object.entries(config.variables || {})) Object.defineProperty(sandbox, name, { value: freeze(value), writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
 const body = config.script;
-Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_conversation,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalConversation, internalWithWorktree, internalShell))
+Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalWithWorktree, internalShell))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
   .catch(error => send({ type: "error", error: workerError(error) }))
   .finally(() => clearInterval(heartbeat));
@@ -1657,14 +1619,11 @@ function readAgentIdentity(value: unknown): AgentIdentity {
   const occurrence = value.occurrence;
   const worktreeOwner = value.worktreeOwner;
   const parentBreadcrumb = value.parentBreadcrumb;
-  const conversation = value.conversation;
-  const parsedConversation = object(conversation) && typeof conversation.name === "string" && Boolean(conversation.name.trim()) && positiveInteger(conversation.turn) ? { name: conversation.name, turn: conversation.turn } : undefined;
-  if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || typeof callSite !== "string" || !callSite || !positiveInteger(occurrence) || parentBreadcrumb !== undefined && (typeof parentBreadcrumb !== "string" || !parentBreadcrumb.trim()) || worktreeOwner !== undefined && (typeof worktreeOwner !== "string" || !worktreeOwner) || conversation !== undefined && !parsedConversation) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
-  return { structuralPath: [...structuralPath], callSite, occurrence, ...(typeof parentBreadcrumb === "string" ? { parentBreadcrumb } : {}), ...(typeof worktreeOwner === "string" ? { worktreeOwner } : {}), ...(parsedConversation ? { conversation: parsedConversation } : {}) };
+  if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || typeof callSite !== "string" || !callSite || !positiveInteger(occurrence) || parentBreadcrumb !== undefined && (typeof parentBreadcrumb !== "string" || !parentBreadcrumb.trim()) || worktreeOwner !== undefined && (typeof worktreeOwner !== "string" || !worktreeOwner)) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
+  return { structuralPath: [...structuralPath], callSite, occurrence, ...(typeof parentBreadcrumb === "string" ? { parentBreadcrumb } : {}), ...(typeof worktreeOwner === "string" ? { worktreeOwner } : {}) };
 }
 function readShellIdentity(value: unknown): ShellIdentity {
   const identity = readAgentIdentity(value);
-  if (identity.conversation) fail("INTERNAL_ERROR", "Shell identity cannot include a conversation");
   return { structuralPath: identity.structuralPath, callSite: identity.callSite, occurrence: identity.occurrence, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) };
 }
 function agentIdentityPath(identity: AgentIdentity): string {
@@ -1672,14 +1631,6 @@ function agentIdentityPath(identity: AgentIdentity): string {
 }
 function shellIdentityPath(identity: ShellIdentity): string {
   return operationPath("shell", ...(identity.worktreeOwner ? ["worktree", identity.worktreeOwner] : []), ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`);
-}
-function conversationIdentityPath(identity: AgentIdentity): string {
-  if (!identity.conversation) throw new WorkflowError("INTERNAL_ERROR", "Missing conversation identity");
-  return operationPath("conversation", identity.conversation.name, ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`);
-}
-function conversationTurnPath(identity: AgentIdentity): string {
-  if (!identity.conversation) throw new WorkflowError("INTERNAL_ERROR", "Missing conversation identity");
-  return operationPath(conversationIdentityPath(identity), `turn:${String(identity.conversation.turn)}`);
 }
 function readShellResult(value: unknown): ShellResult {
   if (!object(value) || (value.exitCode !== null && !Number.isInteger(value.exitCode)) || typeof value.stdout !== "string" || typeof value.stderr !== "string") fail("SHELL_FAILED", "Shell bridge returned an invalid result");
@@ -2649,7 +2600,6 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       return activity ? { ...agent, activity } : agent;
     }) } : run;
   };
-  const conversationLocks = new Set<string>();
   const terminalRunStates = new Map<string, "completed" | "failed" | "stopped">();
   let sessionLease: SessionLease | undefined;
   let sessionLeasePromise: Promise<SessionLease> | undefined;
@@ -2736,7 +2686,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot() }));
         run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}), ...(options.conversation ? { conversation: options.conversation } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.thinking ? { thinking: options.thinking } : {}), ...(options.role ? { role: options.role } : {}), ...(options.role ? {} : { tools: options.tools }), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, thinking) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
       const before = (await run.store.load()).run;
       await persistAgentAttempts(run.store, id, result.attempts);
       const completed = (await run.store.load()).run;
@@ -2975,7 +2925,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     const blockedAliases = new Set(Object.keys(previousAliases).filter((name) => !Object.prototype.hasOwnProperty.call(currentAliases, name)));
     const blockedAliasTargets = Object.fromEntries(Object.entries(previousAliases).filter(([name]) => !Object.prototype.hasOwnProperty.call(currentAliases, name)));
     const script = launchScriptForSnapshot(loaded.snapshot, registry);
-    preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata);
+    preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata, true);
     const snapshot = createLaunchSnapshot({ ...loaded.snapshot, settingsPath, settings: { ...loaded.snapshot.settings, modelAliases: currentAliases }, modelAliases: currentAliases });
     await run.store.saveSnapshot(snapshot);
     run.executor = new WorkflowAgentExecutor({ cwd: run.store.cwd, agentDir: extensionAgentDir, model: run.model, tools: new Set(snapshot.tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: snapshot.roles ?? {}, runStore: run.store, providerPause: async () => { deliver(pi, `Workflow ${snapshot.metadata.name} paused: provider limit.`); await run.lifecycle.providerPause(); }, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(run.store.cwd, run.projectTrusted(), settingsPath) }, createSession);
@@ -2997,23 +2947,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     await run.lifecycle.resume();
     const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: async (prompt, options, signal, identity) => {
       await run.lifecycle.enter();
-      const conversationId = identity.conversation ? conversationIdentityPath(identity) : undefined;
-      const conversationLock = conversationId ? `${run.store.runId}:${conversationId}` : "";
       try {
-        const path = conversationId ? conversationTurnPath(identity) : agentIdentityPath(identity);
+        const path = agentIdentityPath(identity);
         const replayed = await run.store.replay(path);
         if (replayed) {
-          if (conversationId) {
-            const conversation = await run.store.conversation(conversationId);
-            if (!conversation || conversation.head.turn < (identity.conversation?.turn ?? 0)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Completed conversation turn has no persisted head");
-          }
           return replayed.value;
-        }
-        if (conversationId) {
-          if (conversationLocks.has(conversationLock)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation turns cannot overlap");
-          const conversation = await run.store.conversation(conversationId);
-          if (conversation ? conversation.head.turn + 1 !== identity.conversation?.turn : identity.conversation?.turn !== 1) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation turn does not continue its persisted head");
-          conversationLocks.add(conversationLock);
         }
         const worktree = agentWorktree(identity);
         const cwd = worktree.worktreeOwner ? (await persistWorktree(run.store, run.metadata, worktree.worktreeOwner)).cwd : run.store.cwd;
@@ -3025,14 +2963,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         const label = displayAgentName(requestedLabel, role, resolved.model);
         const tools = resolved.tools;
         const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-        const spawned = scheduler.spawn(run.store.runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(conversationId ? { conversation: { id: conversationId, turn: identity.conversation?.turn ?? 0 } } : {}), agentOptions: options, agentIdentity: identity });
+        const spawned = scheduler.spawn(run.store.runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), agentOptions: options, agentIdentity: identity });
         const cancel = () => { scheduler.cancel(spawned.id); };
         signal.addEventListener("abort", cancel, { once: true });
         const outcome = await spawned.result.finally(() => { signal.removeEventListener("abort", cancel); });
         if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
         await run.store.complete(path, outcome.value);
         return outcome.value;
-      } finally { if (conversationLock) conversationLocks.delete(conversationLock); await run.lifecycle.leave(); }
+      } finally { await run.lifecycle.leave(); }
       }, worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { let previousPhase: string | undefined; const persisted = await persistRunState(run.store, run.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; }); await eventPublisher.phase(run.store, run.metadata, previousPhase, phase); runs.get(run.store.runId)?.update?.(workflowToolUpdate(persisted)); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
     run.execution = execution;
     const completion = execution.result.then(async (value) => {
@@ -3218,23 +3156,11 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
       const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: async (prompt, options, agentSignal, identity) => {
         await lifecycle.enter();
-        const conversationId = identity.conversation ? conversationIdentityPath(identity) : undefined;
-        const conversationLock = conversationId ? `${runId}:${conversationId}` : "";
         try {
-          const path = conversationId ? conversationTurnPath(identity) : agentIdentityPath(identity);
+          const path = agentIdentityPath(identity);
           const replayed = await store.replay(path);
           if (replayed) {
-            if (conversationId) {
-              const conversation = await store.conversation(conversationId);
-              if (!conversation || conversation.head.turn < (identity.conversation?.turn ?? 0)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Completed conversation turn has no persisted head");
-            }
             return replayed.value;
-          }
-          if (conversationId) {
-            if (conversationLocks.has(conversationLock)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation turns cannot overlap");
-            const conversation = await store.conversation(conversationId);
-            if (conversation ? conversation.head.turn + 1 !== identity.conversation?.turn : identity.conversation?.turn !== 1) throw new WorkflowError("RESUME_INCOMPATIBLE", "Conversation turn does not continue its persisted head");
-            conversationLocks.add(conversationLock);
           }
           const worktree = agentWorktree(identity);
           const cwd = worktree.worktreeOwner ? (await persistWorktree(store, checked.metadata, worktree.worktreeOwner)).cwd : ctx.cwd;
@@ -3246,14 +3172,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const label = displayAgentName(requestedLabel, role, resolved.model);
           const tools = resolved.tools;
           const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-          const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(conversationId ? { conversation: { id: conversationId, turn: identity.conversation?.turn ?? 0 } } : {}), agentOptions: options, agentIdentity: identity });
+          const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd, tools, ...worktree, ...(model ? { model } : {}), ...(thinking ? { thinking } : {}), ...(role ? { role } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), agentOptions: options, agentIdentity: identity });
           const cancel = () => { scheduler.cancel(spawned.id); };
           if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
           const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
           if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
           await store.complete(path, outcome.value);
           return outcome.value;
-        } finally { if (conversationLock) conversationLocks.delete(conversationLock); await lifecycle.leave(); }
+        } finally { await lifecycle.leave(); }
       }, worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: async (phase) => {
         await lifecycle.enter();
         try {
@@ -3851,7 +3777,7 @@ function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
 }
 
 export { acquireSessionLease, projectStorageKey, RunStore, runsDirectory, SessionLease, structuralPath } from "./persistence.js";
-export type { AwaitingCheckpoint, CompletedOperation, ConversationHead, NativeSessionReference, PendingWorkflowDecision, PersistedConversation, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
+export type { AwaitingCheckpoint, CompletedOperation, NativeSessionReference, PendingWorkflowDecision, PersistedOwnershipNode, PersistedRun, WorktreeReference } from "./persistence.js";
 export { FairAgentScheduler, WorkflowAgentExecutor } from "./agent-execution.js";
 export type { AgentAccounting, AgentAttempt, AgentBudgetHooks, AgentDefinition, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentProviderFailure, AgentProviderRecovery, AgentSetup, AgentSetupContext, AgentSetupHook, AgentToolCallProgress, RegisteredAgentSetupHook, SessionInput } from "./agent-execution.js";
 export { doctor, doctorExitCode, formatDoctorReport } from "./doctor.js";

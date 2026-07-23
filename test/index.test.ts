@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type AgentIdentity, type JsonValue, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -293,33 +293,6 @@ void test("TUI provider recovery aborts the workflow even when workflow code cat
     const runId = runIds[0];
     assert.ok(runId);
     assert.equal((await new RunStore(home, "session", runId, home).load()).run.state, "stopped");
-  } finally {
-    await shutdown?.();
-  }
-});
-void test("TUI terminal provider recovery changes model for a conversation and continues its persisted context", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-conversation-"));
-  let sessions = 0;
-  const inputs: SessionInput[] = [];
-  let shutdown: (() => Promise<void>) | undefined;
-  const createSession = async (input: SessionInput): Promise<NativeSession> => {
-    inputs.push(input);
-    const attempt = ++sessions;
-    let leafId = input.allowModelChange ? "model-change-leaf" : input.continuation?.leafId ?? "leaf-1";
-    const messages = [attempt === 2 ? { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" } : { role: "assistant", content: [{ type: "text", text: attempt === 1 ? "first" : attempt === 3 ? "second" : "third" }] }];
-    return { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", model: { provider: input.model.provider, model: input.model.model }, messages, getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), systemPrompt: "stable", getLeafId: () => leafId, prompt: async () => { if (attempt === 3) leafId = "leaf-2"; if (attempt === 4) leafId = "leaf-3"; }, steer: async () => {}, dispose() {} };
-  };
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  let selectCalls = 0;
-  const context = { cwd: home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" }, ui: { select: async () => { selectCalls += 1; return selectCalls === 1 ? "Change model" : "anthropic/opus"; } } };
-  try {
-    const result = await workflow.execute("id", { name: "provider-recovery-conversation", script: "const handle = conversation('developer', {model:'openai/gpt'}); return [await handle.run('first'), await handle.run('second'), await handle.run('third')];", foreground: true }, new AbortController().signal, undefined, context) as { details?: { value?: unknown } };
-    assert.deepEqual(result.details?.value, ["first", "second", "third"]);
-    assert.equal(sessions, 4);
-    assert.deepEqual(inputs.map(({ model, continuation, allowModelChange }) => ({ model: `${model.provider}/${model.model}`, thinking: model.thinking, continuation, allowModelChange })), [{ model: "openai/gpt", thinking: "medium", continuation: undefined, allowModelChange: undefined }, { model: "openai/gpt", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-1" }, allowModelChange: undefined }, { model: "anthropic/opus", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-1" }, allowModelChange: true }, { model: "anthropic/opus", thinking: "medium", continuation: { sessionId: "conversation-recovery", sessionFile: "/sessions/conversation-recovery.jsonl", leafId: "leaf-2" }, allowModelChange: undefined }]);
   } finally {
     await shutdown?.();
   }
@@ -2263,24 +2236,11 @@ void test("direct workflow agents use call-site and occurrence identity", async 
   assert.equal(secondIdentity.occurrence, 2);
   assert.notEqual(firstIdentity.callSite, thirdIdentity.callSite);
 });
-void test("conversation handles retain deterministic turn identity while ordinary agents stay fresh", async () => {
-  const calls: Array<{ prompt: string; identity: AgentIdentity; options: Readonly<Record<string, JsonValue>> }> = [];
-  await runWorkflow(`const developer = conversation("developer", { model: "openai/gpt" }); return [await developer.run("first"), await agent("fresh"), await developer.run("second", { timeoutMs: 10 })];`, null, { agent: async (prompt, options, _signal, identity) => { calls.push({ prompt, options, identity }); return prompt; } }).result;
-  const [first, fresh, second] = calls;
-  assert.ok(first && fresh && second);
-  assert.deepEqual([first.prompt, fresh.prompt, second.prompt], ["first", "fresh", "second"]);
-  assert.equal(first.identity.callSite, second.identity.callSite);
-  assert.equal(first.identity.occurrence, 1);
-  assert.equal(second.identity.occurrence, 1);
-  assert.deepEqual([first.identity.conversation, fresh.identity.conversation, second.identity.conversation], [{ name: "developer", turn: 1 }, undefined, { name: "developer", turn: 2 }]);
-  assert.equal(first.options.model, "openai/gpt");
-  assert.equal(second.options.timeoutMs, 10);
-});
-void test("conversation failures do not consume the next turn and overlapping runs fail", async () => {
-  const identities: Array<{ turn: number | undefined }> = [];
-  const result = await runWorkflow(`const handle = conversation("developer"); const first = handle.run("fail"); let overlap; try { await handle.run("overlap"); } catch (error) { overlap = error.code; } let firstCode; try { await first; } catch (error) { firstCode = error.code; } return [firstCode, overlap, await handle.run("retry")];`, null, { agent: async (prompt, _options, _signal, identity) => { identities.push({ turn: identity.conversation?.turn }); if (prompt === "fail") throw Object.assign(new Error("failed"), { code: "AGENT_FAILED" }); return prompt; } }).result;
-  assert.deepEqual(result, ["AGENT_FAILED", "RESUME_INCOMPATIBLE", "retry"]);
-  assert.deepEqual(identities, [{ turn: 1 }, { turn: 1 }]);
+void test("rejects removed persistent conversation primitive and passes prior results explicitly", async () => {
+  assert.deepEqual(await runWorkflow(`const previous = await agent("first"); return await agent(prompt("Use {previous}", { previous }));`, null, { agent: async (prompt) => prompt }).result, "Use first");
+  assert.throws(() => preflight(`conversation("developer")`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && /removed/.test(error.message));
+  assert.throws(() => preflight(`conversation("developer")`, capabilities, [], { name: "legacy" }, true), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" && /removed/.test(error.message));
+  assert.deepEqual(inspectWorkflowScript(`conversation("developer")`), []);
 });
 
 void test("withWorktree returns bare values and propagates one owner through parallel and pipeline", async () => {

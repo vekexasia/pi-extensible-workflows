@@ -59,17 +59,13 @@ Extensions may add JSON-compatible agent options such as `advisor: true`; core k
 
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
 
-## Persistent conversations
-Use `conversation(name, options)` when several agent turns should share a persisted transcript and build on one another. Unlike independent `agent(prompt, options)` calls, the returned handle continues from the last successful turn:
-
+## Passing agent results
+Use independent `agent(prompt, options)` calls and pass each completed result explicitly to the next prompt. This keeps workflow execution deterministic and makes replay state local to each call:
 ```js
-const handle = conversation("developer", { role: "developer" });
-const findings = await handle.run("Inspect the implementation.");
-const fix = await handle.run("Now propose the smallest fix.");
+const findings = await agent("Inspect the implementation.");
+const fix = await agent(prompt("Propose the smallest fix from these findings:\n\n{findings}", { findings }));
 return { findings, fix };
 ```
-
-Conversation turns must be sequential and cannot overlap. Conversation creation accepts the same execution-policy options as `agent()`. `timeoutMs` and `retries` passed to `run()` are turn-local, so a failed turn does not advance the persisted conversation head.
 
 ## Worktrees
 Use `withWorktree(callback)` or `withWorktree(name, callback)` for top-level agents that collaborate in one worktree:
