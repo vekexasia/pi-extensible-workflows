@@ -359,6 +359,12 @@ void test("a real paused run survives shutdown, replays completed shell work, an
   const store = new RunStore(cwd, "session", runId, home);
   await command(`pause ${runId}`, context);
   assert.equal((await store.load()).run.state, "pausing");
+  releasePrompt();
+  for (let attempt = 0; attempt < 1_000 && (await store.load()).run.state !== "paused"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  const paused = await store.load();
+  assert.equal(paused.run.state, "paused");
+  assert.equal(paused.run.agents[0]?.state, "completed");
+  assert.equal(readFileSync(marker, "utf8"), "x");
   await shutdown();
   assert.equal((await store.load()).run.state, "interrupted");
   assert.equal(readFileSync(marker, "utf8"), "x");
@@ -374,7 +380,7 @@ void test("a real paused run survives shutdown, replays completed shell work, an
   for (let attempt = 0; attempt < 1_000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal((await store.load()).run.state, "completed");
   assert.equal(readFileSync(marker, "utf8"), "xy");
-  assert.equal(secondSessions, 1);
+  assert.equal(secondSessions, 0);
 });
 
 void test("production Pi seam installs child tools and registers native steering", async () => {

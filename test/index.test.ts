@@ -1795,7 +1795,7 @@ void test("navigator Pause and Resume actions round-trip persisted state and ref
   const command = commands[0]?.handler;
   assert.ok(workflow && command);
   let customCalls = 0;
-  const context = { cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { if (message.startsWith("Paused workflow")) writeFileSync(releasePath, "release"); }, confirm: async () => true, select: async (_prompt: string, options: string[]) => options[0] ?? "Close", custom: async (factory: (tui: { requestRender(): void; terminal: { rows: number } }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => { customCalls += 1; const component = factory({ requestRender() {}, terminal: { rows: 20 } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {}); const dashboard = component.render(200).join("\\n"); const action = customCalls === 1 ? "Pause" : customCalls === 2 ? "Close" : customCalls === 3 ? "Resume" : "Close"; assert.match(dashboard, new RegExp(action)); component.handleInput?.(action === "Close" ? "tui.select.cancel" : "tui.select.confirm"); component.dispose?.(); return action === "Close" ? undefined : action; } } };
+  const context = { cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { if (message.startsWith("Paused workflow")) writeFileSync(releasePath, "release"); }, confirm: async () => true, select: async (_prompt: string, options: string[]) => options[0] ?? "Close", custom: async (factory: (tui: { requestRender(): void; terminal: { rows: number } }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => { customCalls += 1; const component = factory({ requestRender() {}, terminal: { rows: 20 } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {}); const dashboard = component.render(200).join("\\n"); const action = customCalls === 1 ? "Pause" : customCalls === 2 ? "Close" : customCalls === 3 ? "Resume" : "Close"; assert.match(dashboard, new RegExp(action)); if (customCalls === 2) assert.match(dashboard, /\b(?:pausing|paused)\b/); if (customCalls === 3) assert.match(dashboard, /\bpaused\b/); if (customCalls === 4) assert.match(dashboard, /\b(?:running|completed)\b/); component.handleInput?.(action === "Close" ? "tui.select.cancel" : "tui.select.confirm"); component.dispose?.(); return action === "Close" ? undefined : action; } } };
   const result = await workflow.execute("id", { name: "navigator-pause-resume", script: `await shell(${JSON.stringify(blocked)}); await shell(${JSON.stringify(after)}); return true;` }, new AbortController().signal, undefined, context);
   const runId = (JSON.parse((result as { content: [{ text: string }] }).content[0].text) as { runId: string }).runId;
   await waitForIssue105(() => existsSync(startPath));
@@ -1829,6 +1829,60 @@ void test("invalid and duplicate lifecycle controls fail with typed errors witho
   await raced.pause();
   await Promise.all([raced.resume(), raced.terminal("stopped")]);
   assert.equal(raced.state, "stopped");
+});
+void test("registered workflow command controls reject races and cancel queued work", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-command-controls-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const starts: string[] = [];
+  const releases = new Map<string, () => void>();
+  let sessionCount = 0;
+  const createSession = async (input: SessionInput): Promise<NativeSession> => {
+    const label = input.sessionLabel.split(":")[1] ?? "unknown";
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    releases.set(label, release);
+    return {
+      sessionId: `${label}-${String(++sessionCount)}`, sessionFile: `/sessions/${label}.jsonl`,
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+      prompt: async () => { starts.push(label); await gate; }, abort: async () => { release(); }, steer: async () => {}, dispose() {},
+    };
+  };
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  const running = workflow.execute("id", { name: "command-controls", script: `await agent("first", {label:"first"}); const values = await Promise.all([agent("second", {label:"second"}), agent("third", {label:"third"})]); return values;`, concurrency: 1, foreground: true }, new AbortController().signal, undefined, context);
+  await waitForIssue105(() => starts.includes("first"));
+  const runId = (await listRunIds(cwd, "session", home))[0];
+  assert.ok(runId);
+  const store = new RunStore(cwd, "session", runId, home);
+  const invoke = (action: string) => command(`${action} ${runId}`, context);
+  const duplicatePause = await Promise.allSettled([invoke("pause"), invoke("pause")]);
+  assert.equal(duplicatePause.filter(({ status }) => status === "fulfilled").length, 1);
+  const duplicatePauseFailure = duplicatePause.find((result) => result.status === "rejected");
+  assert.ok(duplicatePauseFailure && duplicatePauseFailure.reason instanceof WorkflowError && duplicatePauseFailure.reason.code === "RESUME_INCOMPATIBLE");
+  assert.equal((await store.load()).run.state, "pausing");
+  await assert.rejects(invoke("resume"), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
+  releases.get("first")?.();
+  await waitForIssue105(async () => (await store.load()).run.state === "paused");
+  assert.deepEqual(starts, ["first"]);
+  const duplicateResume = await Promise.allSettled([invoke("resume"), invoke("resume")]);
+  assert.equal(duplicateResume.filter(({ status }) => status === "fulfilled").length, 1);
+  const duplicateResumeFailure = duplicateResume.find((result) => result.status === "rejected");
+  assert.ok(duplicateResumeFailure && duplicateResumeFailure.reason instanceof WorkflowError && duplicateResumeFailure.reason.code === "RESUME_INCOMPATIBLE");
+  await waitForIssue105(() => starts.includes("second"));
+  await waitForIssue105(async () => (await store.loadOwnership()).some(({ label }) => label === "third"));
+  const stopRace = await Promise.allSettled([invoke("pause"), invoke("stop")]);
+  assert.equal(stopRace[1].status, "fulfilled");
+  await assert.rejects(running);
+  const stopped = await store.load();
+  assert.equal(stopped.run.state, "stopped");
+  assert.deepEqual(starts, ["first", "second"]);
+  assert.equal(stopped.run.agents.find((agent) => agent.name === "third")?.state, "cancelled");
 });
 
 void test("loads markdown agent roles only from canonical global and project directories", () => {
