@@ -28,15 +28,19 @@ A workflow can fan out across specialized agents, combine their results, and res
 
 ```js
 const reviews = await parallel("review", {
-  correctness: () => agent("Review the current changes for correctness issues."),
-  security: () => agent("Review the current changes for security risks.", {
-    role: "security-specialist",
-  }),
+  correctness: () =>
+    agent("Review the current changes for correctness issues."),
+  security: () =>
+    agent("Review the current changes for security risks.", {
+      role: "security-specialist",
+    }),
   tests: () => agent("Review the current changes for missing test coverage."),
 });
 
 const summary = await agent(
-  prompt("Deduplicate and prioritize these findings:\n\n{reviews}", { reviews }),
+  prompt("Deduplicate and prioritize these findings:\n\n{reviews}", {
+    reviews,
+  }),
 );
 
 return summary;
