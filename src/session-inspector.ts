@@ -215,7 +215,7 @@ export async function loadSessionReport(path: string, home = homedir()): Promise
     const args = call.arguments;
     const agents = loaded ? await Promise.all(loaded.run.agents.map(agentReport)) : [];
     const models = mergedModels(agents.flatMap(({ attempts }) => attempts.map(({ models: attemptModels }) => attemptModels)));
-    const name = typeof args.name === "string" ? args.name : typeof args.workflow === "string" ? args.workflow : loaded?.run.workflowName ?? "workflow";
+    const name = loaded?.run.workflowName ?? (typeof args.workflow === "string" ? args.workflow : typeof args.name === "string" ? args.name : "workflow");
     const description = typeof args.description === "string" ? args.description : loaded?.snapshot.metadata.description;
     const script = typeof args.script === "string" && args.script.trim() ? args.script : loaded?.snapshot.script;
     let staticCalls: StaticWorkflowCall[] = [];

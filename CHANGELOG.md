@@ -10,7 +10,7 @@
 
 ### Highlights
 
-- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ name: "run-name", workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
+- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
 - Added the headless CLI: `run` launches registered functions, `export` creates executable POSIX launchers, and `transcript` renders saved sessions. Schema-derived flags, JSON input, trust overrides, and `--` passthrough are supported.
 - Added the host-mediated `shell(command, options)` primitive with deterministic workflow identity, timeout and environment options, worktree-aware execution, and structured results.
 - Added reusable worktrees. `withWorktree` callbacks receive a frozen `{ path, branch }` reference, and `parentRunId` can borrow matching named worktrees from a terminal run.
