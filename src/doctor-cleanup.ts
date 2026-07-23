@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -9,7 +10,10 @@ import { acquireSessionLease, hasLiveSessionLease, projectSessionsDirectory, Run
 
 const TERMINAL_STATES = new Set<RunState>(["completed", "failed", "stopped"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
-const REQUIRED_RUN_FILES = ["state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json"] as const;
+const REQUIRED_RUN_FILES = ["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"] as const;
+const OPTIONAL_RUN_FILES = new Set(["result.json"]);
+const RUN_DIRECTORIES = new Set(["worktrees"]);
+const RUN_FILES = new Set<string>([...REQUIRED_RUN_FILES, ...OPTIONAL_RUN_FILES]);
 const AGENT_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
 const SCHEDULER_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
 const BUDGET_DIMENSIONS = new Set(["tokens", "costUsd", "durationMs", "agentLaunches"]);
@@ -90,10 +94,45 @@ function validateRunRecord(run: PersistedRun): void {
   validateBudgetEvents(value.budgetEvents);
   if (value.events !== undefined) { if (!Array.isArray(value.events)) throw new Error("Persisted run events are invalid"); for (const event of value.events) if (!object(event) || typeof event.type !== "string" || typeof event.message !== "string") throw new Error("Persisted run event is invalid"); }
 }
-function validateSnapshot(snapshot: unknown): void { if (!object(snapshot) || typeof snapshot.script !== "string" || !snapshot.script || !jsonValue(snapshot.args) || !object(snapshot.metadata) || typeof snapshot.metadata.name !== "string" || !snapshot.metadata.name || (snapshot.metadata.description !== undefined && typeof snapshot.metadata.description !== "string") || !object(snapshot.settings) || !Number.isSafeInteger(snapshot.settings.concurrency) || Number(snapshot.settings.concurrency) < 1 || Number(snapshot.settings.concurrency) > 16 || !Array.isArray(snapshot.models) || snapshot.models.some((modelName) => typeof modelName !== "string") || !Array.isArray(snapshot.tools) || snapshot.tools.some((tool) => typeof tool !== "string") || !Array.isArray(snapshot.agentTypes) || snapshot.agentTypes.some((agentType) => typeof agentType !== "string") || !Array.isArray(snapshot.schemas)) throw new Error("Persisted launch snapshot is invalid"); if (snapshot.identityVersion !== undefined) positiveInteger(snapshot.identityVersion, "Persisted snapshot identity version"); if (snapshot.launchKind !== undefined && !["inline", "function"].includes(snapshot.launchKind as string)) throw new Error("Persisted snapshot launch kind is invalid"); if (snapshot.launchKind === "function" && (typeof snapshot.functionName !== "string" || !snapshot.functionName)) throw new Error("Persisted snapshot function name is invalid"); optionalString(snapshot.functionName, "Persisted snapshot function name"); if (snapshot.modelAliases !== undefined) validateModelAliases(snapshot.modelAliases); if (snapshot.settings.modelAliases !== undefined) validateModelAliases(snapshot.settings.modelAliases); resourceExclusions(snapshot.settings.disabledAgentResources, "Persisted snapshot disabled resources"); if (snapshot.roles !== undefined) { if (!object(snapshot.roles)) throw new Error("Persisted snapshot roles are invalid"); for (const [name, definition] of Object.entries(snapshot.roles)) agentDefinition(definition, `Persisted snapshot role ${name}`); } if (snapshot.projectRoles !== undefined) stringList(snapshot.projectRoles, "Persisted snapshot project roles"); for (const [index, schema] of snapshot.schemas.entries()) validateSchema(schema, `Persisted snapshot schema[${String(index)}]`); }
+function validateSnapshot(snapshot: unknown): void {
+  if (!object(snapshot) || typeof snapshot.script !== "string" || !snapshot.script || !jsonValue(snapshot.args) || !object(snapshot.metadata) || typeof snapshot.metadata.name !== "string" || !snapshot.metadata.name || (snapshot.metadata.description !== undefined && typeof snapshot.metadata.description !== "string") || !object(snapshot.settings) || !Number.isSafeInteger(snapshot.settings.concurrency) || Number(snapshot.settings.concurrency) < 1 || Number(snapshot.settings.concurrency) > 16 || !Array.isArray(snapshot.models) || snapshot.models.some((modelName) => typeof modelName !== "string") || !Array.isArray(snapshot.tools) || snapshot.tools.some((tool) => typeof tool !== "string") || !Array.isArray(snapshot.agentTypes) || snapshot.agentTypes.some((agentType) => typeof agentType !== "string") || !Array.isArray(snapshot.schemas)) throw new Error("Persisted launch snapshot is invalid");
+  if (snapshot.identityVersion !== undefined) positiveInteger(snapshot.identityVersion, "Persisted snapshot identity version");
+  if (snapshot.launchKind !== undefined && !["inline", "function"].includes(snapshot.launchKind as string)) throw new Error("Persisted snapshot launch kind is invalid");
+  if (snapshot.launchKind === "function" && (typeof snapshot.functionName !== "string" || !snapshot.functionName)) throw new Error("Persisted snapshot function name is invalid");
+  optionalString(snapshot.functionName, "Persisted snapshot function name");
+  optionalString(snapshot.settingsPath, "Persisted snapshot settings path");
+  validateBudget(snapshot.budget);
+  if (snapshot.modelAliases !== undefined) validateModelAliases(snapshot.modelAliases);
+  if (snapshot.settings.modelAliases !== undefined) validateModelAliases(snapshot.settings.modelAliases);
+  resourceExclusions(snapshot.settings.disabledAgentResources, "Persisted snapshot disabled resources");
+  if (snapshot.roles !== undefined) { if (!object(snapshot.roles)) throw new Error("Persisted snapshot roles are invalid"); for (const [name, definition] of Object.entries(snapshot.roles)) agentDefinition(definition, `Persisted snapshot role ${name}`); }
+  if (snapshot.projectRoles !== undefined) stringList(snapshot.projectRoles, "Persisted snapshot project roles");
+  for (const [index, schema] of snapshot.schemas.entries()) validateSchema(schema, `Persisted snapshot schema[${String(index)}]`);
+}
 function validateJournal(value: unknown): void { if (!object(value) || !object(value.completed) || (value.awaiting !== undefined && !object(value.awaiting)) || (value.decisions !== undefined && !object(value.decisions))) throw new Error("Persisted workflow journal is invalid"); for (const operation of Object.values(value.completed)) if (!object(operation) || typeof operation.path !== "string" || !operation.path || !jsonValue(operation.value)) throw new Error("Persisted completed operation is invalid"); for (const checkpoint of Object.values(value.awaiting ?? {})) if (!object(checkpoint) || typeof checkpoint.path !== "string" || !checkpoint.path || typeof checkpoint.name !== "string" || !checkpoint.name || typeof checkpoint.prompt !== "string" || !jsonValue(checkpoint.context)) throw new Error("Persisted awaiting checkpoint is invalid"); for (const decision of Object.values(value.decisions ?? {})) { if (!object(decision) || decision.kind !== "budget" || typeof decision.proposalId !== "string" || !decision.proposalId || typeof decision.runId !== "string" || !decision.runId || !object(decision.previous) || !object(decision.proposed) || !Number.isSafeInteger(decision.budgetVersion) || Number(decision.budgetVersion) < 1) throw new Error("Persisted budget decision is invalid"); validateUsage(decision.consumed, "Persisted budget decision usage"); validateBudget(decision.previous); validateBudget(decision.proposed); } }
-async function validateRunArtifacts(store: RunStore): Promise<readonly { sourceRunId: string }[]> {
+function validateSystemPrompts(value: unknown): void {
+  if (!object(value) || value.version !== 1 || !Array.isArray(value.entries)) throw new Error("Persisted system prompts are invalid");
+  for (const [index, entry] of value.entries.entries()) {
+    const label = `system-prompts.entries[${String(index)}]`;
+    if (!object(entry) || typeof entry.sessionId !== "string" || !entry.sessionId || !Number.isSafeInteger(entry.attempt) || Number(entry.attempt) < 1 || !Number.isSafeInteger(entry.turn) || Number(entry.turn) < 1 || typeof entry.prompt !== "string" || typeof entry.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.sha256) || createHash("sha256").update(entry.prompt).digest("hex") !== entry.sha256) throw new Error(`${label} is invalid`);
+  }
+}
+async function validateRunDirectory(store: RunStore): Promise<void> {
+  const entries = await readdir(store.directory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (RUN_DIRECTORIES.has(entry.name)) { if (!entry.isDirectory() || entry.isSymbolicLink()) throw new Error(`Run artifact is not a regular directory: ${join(store.directory, entry.name)}`); continue; }
+    if (!RUN_FILES.has(entry.name)) throw new Error(`Run inventory contains an unrecognized artifact: ${join(store.directory, entry.name)}`);
+    if (!entry.isFile() || entry.isSymbolicLink()) throw new Error(`Run artifact is not a regular file: ${join(store.directory, entry.name)}`);
+  }
+}
+async function validateRunArtifacts(store: RunStore, workflowScript: string, state: RunState): Promise<readonly { sourceRunId: string }[]> {
+  await validateRunDirectory(store);
   for (const name of REQUIRED_RUN_FILES) await requiredFile(join(store.directory, name));
+  if (await readFile(join(store.directory, "workflow.js"), "utf8") !== workflowScript) throw new Error("Persisted workflow source does not match its launch snapshot");
+  validateSystemPrompts(await jsonFile(join(store.directory, "system-prompts.json")));
+  const result = await jsonFile(join(store.directory, "result.json")).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
+  if (result === undefined && state === "completed") throw new Error("Completed run result is missing");
+  if (result !== undefined && !jsonValue(result)) throw new Error("Persisted workflow result is invalid");
   validateJournal(await jsonFile(join(store.directory, "journal.json")));
   const rawOwnership = await jsonFile(join(store.directory, "ownership.json"));
   if (!Array.isArray(rawOwnership)) throw new Error("Persisted ownership records are invalid");
@@ -147,7 +186,7 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
       validateSnapshot(loaded.snapshot);
       if (loaded.run.parentRunId !== undefined) await store.validateParentRun(loaded.run.parentRunId);
       if (loaded.run.retry) await store.validateRetrySource();
-      const borrowed = await validateRunArtifacts(store);
+      const borrowed = await validateRunArtifacts(store, loaded.snapshot.script, loaded.run.state);
       const afterState = await stat(join(store.directory, "state.json"));
       if (beforeState.mtimeMs !== afterState.mtimeMs) throw new Error("Persisted state changed while scanning");
       const dependencies = new Set<string>();

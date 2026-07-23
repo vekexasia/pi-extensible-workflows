@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ function fixture(): { home: string; cwd: string } { const home = mkdtempSync(joi
 async function makeRun(paths: { home: string; cwd: string }, runId: string, state: RunState, now: number, extra: Record<string, unknown> = {}, sessionId = "session-a"): Promise<RunStore> {
   const store = new RunStore(paths.cwd, sessionId, runId, paths.home);
   await store.create({ id: runId, workflowName: "cleanup", cwd: paths.cwd, sessionId, state, agents: [], nativeSessions: [], ...extra }, snapshot);
+  if (state === "completed") await store.saveResult(null);
   const old = now - 100 * DAY_MS;
   utimesSync(join(store.directory, "state.json"), old / 1000, old / 1000);
   return store;
@@ -183,4 +184,28 @@ void test("doctor cleanup reports parent dependency cycles as session failures",
   assert.equal(report.failures.length, 1);
   assert.match(report.failures[0]?.message ?? "", /cycle/i);
   assert.deepEqual(report.deleted, []);
+});
+
+void test("doctor cleanup fails closed for missing or corrupt persisted artifacts", async () => {
+  const now = 1_000_000_000_000;
+  const mutations: readonly { file: string; content?: string }[] = [
+    { file: "snapshot.json", content: JSON.stringify({ ...snapshot, budget: "broken" }) },
+    { file: "workflow.js" },
+    { file: "system-prompts.json" },
+    { file: "system-prompts.json", content: JSON.stringify({ version: 2, entries: [] }) },
+    { file: "result.json" },
+    { file: "result.json", content: "{" },
+  ];
+  for (const mutation of mutations) {
+    const paths = fixture();
+    const corrupt = await makeRun(paths, "corrupt-artifact", "completed", now);
+    const sibling = await makeRun(paths, "sibling", "completed", now);
+    const path = join(corrupt.directory, mutation.file);
+    if (mutation.content === undefined) rmSync(path); else writeFileSync(path, mutation.content);
+    const report = await doctorCleanup({ ...paths, olderThanDays: 90, yes: true, now });
+    assert.equal(report.failures.length, 1, mutation.file);
+    assert.deepEqual(report.deleted, [], mutation.file);
+    assert.equal(existsSync(corrupt.directory), true, mutation.file);
+    assert.equal(existsSync(sibling.directory), true, mutation.file);
+  }
 });
