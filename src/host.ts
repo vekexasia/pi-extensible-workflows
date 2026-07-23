@@ -1899,7 +1899,8 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           const labels = navigatorRunLabels(sorted);
           const terminalStates = new Set(["completed", "failed", "stopped"]);
           const hasCompleted = sorted.some(({ loaded: { run } }) => run.state === "completed");
-          const pickerOptions = [...labels, ...(herdrPaneId() ? ["Inspect session in pane"] : []), "Model aliases", "Close", ...(hasCompleted ? ["Delete all completed"] : [])];
+          const hasFailed = sorted.some(({ loaded: { run } }) => run.state === "failed");
+          const pickerOptions = [...labels, ...(herdrPaneId() ? ["Inspect session in pane"] : []), "Model aliases", "Close", ...(hasCompleted ? ["Delete all completed"] : []), ...(hasFailed ? ["Delete all failed"] : [])];
           const runChoice = await ctx.ui.select("Workflows\n", pickerOptions);
           if (!runChoice || runChoice === "Close") return;
           if (runChoice === "Inspect session in pane") {
@@ -1918,6 +1919,13 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
               if (entry.loaded.run.state === "completed") { await entry.store.delete(true); runs.delete(entry.store.runId); terminalRunStates.delete(entry.store.runId); }
             }
             ctx.ui.notify("Deleted all completed workflow runs.", "info"); stores = await loadStores(); continue;
+          }
+          if (runChoice === "Delete all failed") {
+            if (!await ctx.ui.confirm("Delete failed runs?", "Delete all failed workflow runs and their artifacts? This cannot be undone.")) continue;
+            for (const entry of sorted) {
+              if (entry.loaded.run.state === "failed") { await entry.store.delete(true); runs.delete(entry.store.runId); terminalRunStates.delete(entry.store.runId); }
+            }
+            ctx.ui.notify("Deleted all failed workflow runs.", "info"); stores = await loadStores(); continue;
           }
           const runIndex = labels.indexOf(runChoice);
           if (runIndex < 0) return;

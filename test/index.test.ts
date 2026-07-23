@@ -1451,6 +1451,39 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.equal(existsSync(storeB.directory), true);
   assert.equal(existsSync(storeC.directory), true);
 });
+void test("navigator bulk deletes only failed runs after confirmation", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-failed-bulk-"));
+  const cwd = join(home, "project");
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "bulk", description: "bulk" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const states = ["failed", "failed", "completed", "stopped", "running", "interrupted", "budget_exhausted"] as const;
+  const stores = await Promise.all(states.map(async (state, index) => {
+    const store = new RunStore(cwd, "session", `bulk-${String(index)}`, home);
+    await store.create({ id: store.runId, workflowName: "bulk", cwd, sessionId: "session", state, agents: [], nativeSessions: [] }, snapshot);
+    return store;
+  }));
+  const failedArtifact = await stores[0]?.saveResult({ owned: true });
+  assert.ok(failedArtifact && existsSync(failedArtifact));
+  const commands: Array<{ handler: (args: string, ctx: never) => Promise<void> }> = [];
+  const selections: string[][] = [];
+  const notifications: string[] = [];
+  let selectCall = 0;
+  let confirmCall = 0;
+  const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] };
+  workflowExtension(pi as never, home);
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (_prompt: string, options: string[]) => { selections.push(options); selectCall += 1; return selectCall < 3 ? "Delete all failed" : "Close"; }, confirm: async (title: string, message: string) => { confirmCall += 1; if (confirmCall === 1) { assert.equal(title, "Delete failed runs?"); assert.match(message, /cannot be undone/); assert.equal(existsSync(stores[0]?.directory ?? ""), true); assert.equal(existsSync(stores[1]?.directory ?? ""), true); } return confirmCall === 2; } } };
+  const command = commands[0]?.handler;
+  assert.ok(command);
+  await command("", ctx as never);
+  assert.ok(selections[0]?.includes("Delete all failed"));
+  assert.ok(selections[1]?.includes("Delete all failed"));
+  assert.ok(!selections[2]?.includes("Delete all failed"));
+  assert.equal(confirmCall, 2);
+  assert.equal(existsSync(stores[0]?.directory ?? ""), false);
+  assert.equal(existsSync(stores[1]?.directory ?? ""), false);
+  assert.equal(existsSync(failedArtifact), false);
+  for (const store of stores.slice(2)) assert.equal(existsSync(store.directory), true);
+  assert.ok(notifications.some((message) => message.includes("Deleted all failed workflow runs.")));
+});
 
 void test("navigator reviews each pending checkpoint before answering", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-review-"));
