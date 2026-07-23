@@ -461,6 +461,9 @@ async function diagnosticNamedWorktrees(store: RunStore, run: PersistedRun): Pro
   }
   return [...names];
 }
+function incompleteRetryPaths(paths: readonly string[], completedPaths: readonly string[]): string[] {
+  return [...new Set(paths)].filter((path) => !completedPaths.some((completedPath) => completedPath === path || completedPath.startsWith(`${path}/`)));
+}
 async function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMetadata, error: unknown, run: PersistedRun): Promise<WorkflowFailureDiagnostics> {
   const rawFailedAt = error && typeof error === "object" ? (error as { failedAt?: unknown }).failedAt : undefined;
   const failedAt = typeof rawFailedAt === "string" && rawFailedAt ? rawFailedAt : null;
@@ -497,7 +500,7 @@ async function createWorkflowFailureDiagnostics(store: RunStore, metadata: Workf
     sourceRunId: run.id,
     action: `workflow_retry({ runId: ${JSON.stringify(run.id)} })`,
     completedPaths,
-    incompletePaths: [...new Set([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])])],
+    incompletePaths: incompleteRetryPaths([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])], completedPaths),
     namedWorktrees,
     warning: "Retry re-executes incomplete operations; external side effects before failure are not guaranteed exactly once.",
   } : undefined;
@@ -1437,7 +1440,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       await sourceStore.validateNamedWorktrees();
       for (const name of loaded.run.retry?.namedWorktrees ?? []) await sourceStore.resolveNamedWorktree(name);
       const completedPaths = (await sourceStore.replayableOperations()).map(({ path }) => path);
-      const incompletePaths = [...(loaded.run.retry?.incompletePaths ?? []), ...loaded.run.agents.filter((agent) => agent.state !== "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])))];
+      const incompletePaths = incompleteRetryPaths([...(loaded.run.retry?.incompletePaths ?? []), ...loaded.run.agents.filter((agent) => agent.state !== "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])))], completedPaths);
       const namedWorktrees = [...new Set([...(loaded.run.retry?.namedWorktrees ?? []), ...(await sourceStore.worktrees()).filter(({ owner }) => owner.startsWith(`${operationPath("worktree", "named")}/`)).map(({ owner }) => decodeURIComponent(owner.split("/").at(-1) ?? owner))])];
       const budget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
       const childRunId = randomUUID();
