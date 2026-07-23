@@ -47,7 +47,7 @@
   <span class="tok-property">"workflow"</span><span class="tok-punctuation">:</span> <span class="tok-string">"releaseCheck"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">"args"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span> <span class="tok-property">"commit"</span><span class="tok-punctuation">:</span> <span class="tok-string">"HEAD"</span> <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call; the model-visible foreground result also reports its completed <code>runId</code>. Pass <code>parentRunId</code> with a terminal run ID to reuse matching explicitly named <code>withWorktree</code> scopes from that run. The source must be in the same project and Pi session; unmatched names create ordinary worktrees.</p>
+        <p>Runs are backgrounded by default. Set <code>foreground: true</code> when the final JSON value must be returned in the same tool call; the model-visible foreground result also reports its completed <code>runId</code>. Pass <code>parentRunId</code> with a terminal run ID only to reuse matching explicitly named <code>withWorktree</code> scopes. To recover a failed run, call <code>workflow_retry({ runId })</code> with the explicit failed source ID; the child replays only completed structural operations and executes incomplete work. Retry is distinct from per-agent <code>retries</code> and <code>workflow_resume</code>, and external side effects before failure are not guaranteed exactly once.</p>
       </section>
       <section id="script-contract">
         <h2>Script and argument contract</h2>
@@ -124,8 +124,9 @@
       <section id="recovery">
         <h2>Failure, retry, resume, and cancellation</h2>
         <ul>
-          <li><strong>Failure:</strong> catch workflow-source failures as ordinary <code>Error</code> values and inspect <code>code</code> and <code>message</code>. Host tool calls reject with <code>WorkflowError</code>; finalized failures expose bounded JSON diagnostics with the run ID, failed branch, completed siblings, and state/journal artifact paths. Background follow-ups include the same diagnostics.</li>
-          <li><strong>Retry:</strong> set <code>retries</code> only for safe, repeatable agent work. Each retry gets a fresh Pi session but preserves filesystem changes.</li>
+          <li><strong>Failure:</strong> catch workflow-source failures as ordinary <code>Error</code> values and inspect <code>code</code> and <code>message</code>. Host tool calls reject with <code>WorkflowError</code>; finalized failures expose bounded JSON diagnostics with the run ID, failed branch, completed siblings, retryable paths, named worktrees, and state/journal artifact paths. Background follow-ups include the same diagnostics and warn that external side effects are not exactly-once.</li>
+          <li><strong>Retry:</strong> call <code>workflow_retry({ runId })</code> only for a persisted <code>failed</code> run. It creates a linked child with cumulative usage and journal replay; the failed parent remains immutable. Do not use <code>parentRunId</code> as a retry control.</li>
+          <li><strong>Agent retry:</strong> set <code>retries</code> only for safe, repeatable agent work. Each attempt gets a fresh Pi session but preserves filesystem changes.</li>
           <li><strong>Resume:</strong> provider limits pause native work; Pi shutdown marks active runs <code>interrupted</code>. Reopen the original Pi session and explicitly resume. A <code>budget_exhausted</code> run can resume through <code>workflow_resume</code> with retained historical usage and an acceptable budget; completed, failed, and stopped runs remain non-resumable.</li>
           <li><strong>Cancellation:</strong> stopping a run is immediate, cascades to owned agents, and cannot be undone. A cancelled workflow reports <code>CANCELLED</code> or a stopped run state.</li>
         </ul>

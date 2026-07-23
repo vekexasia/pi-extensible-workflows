@@ -75,7 +75,8 @@ export interface WorkflowWorktreeCreatedEvent extends WorkflowEventBase { owner:
 export interface WorkflowWorktreeReference { readonly path: string; readonly branch: string }
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: string; message: string }
-export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
+export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
+export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; retry?: WorkflowRetryProvenance; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 4;
 export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline" | "function"; functionName?: string; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
@@ -133,6 +134,7 @@ export interface WorkflowFailureDiagnostics {
   failedAgent?: WorkflowFailureAgent;
   completedSiblingAgents?: readonly WorkflowSiblingAgent[];
   completedSiblingPaths: readonly (readonly string[])[];
+  retry?: { sourceRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[]; warning: string };
   artifacts: { runDirectory: string; statePath: string; journalPath: string };
 }
 
@@ -1159,7 +1161,7 @@ export function formatWorkflowPreview(args: { script?: unknown; workflow?: unkno
 }
 export const WORKFLOW_TOOL_LABEL = "Workflow";
 export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
-export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Every launch requires an explicit non-empty name; use workflow only to select a registered function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID, and parentRunId reuses matching named worktrees from a terminal run.";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Every launch requires an explicit non-empty name; use workflow only to select a registered function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID. Use workflow_retry with an explicit failed run ID to replay completed structural operations; parentRunId only reuses named worktrees.";
 export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
   name: Type.String({ minLength: 1, description: "Explicit name for this workflow run" }),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
@@ -1171,6 +1173,7 @@ export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
   budget: Type.Optional(Type.Unknown({ description: "Optional aggregate soft and hard run budgets" })),
   parentRunId: Type.Optional(Type.String({ description: "Terminal run whose named worktrees may be reused" })),
 });
+export const WORKFLOW_RETRY_PARAMETERS = Type.Object({ runId: Type.String({ description: "Explicit failed workflow run ID" }) });
 
 function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
   if (!node) return false;
@@ -2124,12 +2127,21 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
       structuralPath: agent.structuralPath.slice(0, 8).map((part) => utf8Prefix(part, 128)),
     })),
     completedSiblingPaths: value.completedSiblingPaths.slice(0, 16).map((path) => path.slice(0, 8).map((part) => utf8Prefix(part, 128))),
+    ...(value.retry ? { retry: { sourceRunId: utf8Prefix(value.retry.sourceRunId, 128), completedPaths: value.retry.completedPaths.slice(0, 16).map((path) => utf8Prefix(path, 256)), incompletePaths: value.retry.incompletePaths.slice(0, 16).map((path) => utf8Prefix(path, 256)), namedWorktrees: value.retry.namedWorktrees.slice(0, 16).map((name) => utf8Prefix(name, 128)), warning: utf8Prefix(value.retry.warning, 512) } } : {}),
     artifacts: { runDirectory: utf8Prefix(value.artifacts.runDirectory, 1024), statePath: utf8Prefix(value.artifacts.statePath, 1024), journalPath: utf8Prefix(value.artifacts.journalPath, 1024) },
   };
   const size = () => Buffer.byteLength(JSON.stringify(bounded));
   while (size() > DIAGNOSTIC_LIMIT_BYTES) {
     if (bounded.completedSiblingAgents?.length || bounded.completedSiblingPaths.length) {
       bounded = { ...bounded, completedSiblingAgents: bounded.completedSiblingAgents?.slice(0, -1) ?? [], completedSiblingPaths: bounded.completedSiblingPaths.slice(0, -1) };
+      continue;
+    }
+    if (bounded.retry && (bounded.retry.completedPaths.length || bounded.retry.incompletePaths.length || bounded.retry.namedWorktrees.length)) {
+      const retry = { ...bounded.retry };
+      if (retry.completedPaths.length) retry.completedPaths = retry.completedPaths.slice(0, -1);
+      else if (retry.incompletePaths.length) retry.incompletePaths = retry.incompletePaths.slice(0, -1);
+      else retry.namedWorktrees = retry.namedWorktrees.slice(0, -1);
+      bounded = { ...bounded, retry };
       continue;
     }
     if (bounded.failedAgent?.sessionFile) { const failedAgent = { ...bounded.failedAgent }; delete failedAgent.sessionFile; bounded = { ...bounded, failedAgent }; continue; }
@@ -2174,10 +2186,19 @@ function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMet
     structuralPath: [...(agent.structuralPath ?? [])],
   } satisfies WorkflowSiblingAgent));
   const completedSiblingPaths = completedSiblingAgents.map((agent) => [...agent.structuralPath]);
+  const completedPaths = run.retry?.completedPaths ?? run.agents.filter((agent) => agent.state === "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])));
+  const retry = run.state === "failed" ? {
+    sourceRunId: run.id,
+    completedPaths,
+    incompletePaths: run.retry?.incompletePaths ?? (failedAt ? [failedAt] : []),
+    namedWorktrees: run.retry?.namedWorktrees ?? [],
+    warning: "Retry re-executes incomplete operations; external side effects before failure are not guaranteed exactly once.",
+  } : undefined;
   return boundedWorkflowFailureDiagnostics({
     runId: run.id, workflowName: metadata.name, state: run.state, failedAt,
     error: { code: errorCode(error) ?? "INTERNAL_ERROR", message: errorText(error) || "The workflow failed without an error message." },
     ...(failedAgent ? { failedAgent } : {}), completedSiblingAgents, completedSiblingPaths,
+    ...(retry ? { retry } : {}),
     artifacts: { runDirectory: store.directory, statePath: join(store.directory, "state.json"), journalPath: join(store.directory, "journal.json") },
   });
 }
@@ -2186,7 +2207,8 @@ export function formatWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiag
   const failedAgent = diagnostic.failedAgent ? `${diagnostic.failedAgent.label ?? diagnostic.failedAgent.id}${diagnostic.failedAgent.role ? ` role=${diagnostic.failedAgent.role}` : ""} attempt=${String(diagnostic.failedAgent.attempt)} path=${diagnostic.failedAgent.structuralPath.join(" > ") || "(root)"}${diagnostic.failedAgent.sessionFile ? ` session=${diagnostic.failedAgent.sessionFile}` : ""}` : "(not persisted)";
   const siblingAgents = diagnostic.completedSiblingAgents;
   const siblings = siblingAgents ? siblingAgents.map((agent) => `${agent.label ?? agent.id}${agent.role ? ` role=${agent.role}` : ""} path=${agent.structuralPath.join(" > ") || "(root)"}`).join(", ") || "(none)" : diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
-  return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling ${siblingAgents ? "agents" : "paths"}: ${siblings}`, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
+  const retry = diagnostic.retry ? [`  Retry: workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`, `  Replayable completed paths: ${diagnostic.retry.completedPaths.join(", ") || "(none)"}`, `  Incomplete paths: ${diagnostic.retry.incompletePaths.join(", ") || "(unknown)"}`, `  Named worktrees: ${diagnostic.retry.namedWorktrees.join(", ") || "(none)"}`, `  Warning: ${diagnostic.retry.warning}`] : [];
+  return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling ${siblingAgents ? "agents" : "paths"}: ${siblings}`, ...retry, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
 }
 
 function serializeWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string { return JSON.stringify(diagnostic); }
@@ -2880,7 +2902,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   };
   const refreshPausedRunAliases = async (run: NonNullable<ReturnType<typeof runs.get>>, context?: { model: { provider: string; id: string } | undefined; modelRegistry: { getAll?: () => Array<{ provider: string; id: string }>; getAvailable?: () => Array<{ provider: string; id: string }> } | undefined }) => {
     const loaded = await run.store.load();
-    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
+    const active = new Set(pi.getActiveTools().filter((tool) => !["workflow", "workflow_respond", "workflow_stop", "workflow_resume", "workflow_retry", "workflow_catalog"].includes(tool)));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
     const settingsPath = workflowSettingsPath(extensionAgentDir);
@@ -2903,13 +2925,14 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
   };
   const coldResumeRun = async (run: NonNullable<ReturnType<typeof runs.get>>, hasUI: boolean, ui: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, trustedProject: boolean, context?: { model: { provider: string; id: string } | undefined; modelRegistry: { getAll?: () => Array<{ provider: string; id: string }>; getAvailable?: () => Array<{ provider: string; id: string }> } | undefined }) => {
     const loaded = await run.store.load();
+    await run.store.validateRetrySource();
     await run.store.validateBorrowedWorktrees();
     if (loaded.snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
     if (loaded.snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow role definitions are missing from the launch snapshot");
     if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
     const missingRole = loaded.snapshot.agentTypes.find((role) => !loaded.snapshot.roles?.[role]);
     if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
-    const active = new Set(pi.getActiveTools().filter((tool) => tool !== "workflow" && tool !== "workflow_respond" && tool !== "workflow_stop" && tool !== "workflow_catalog"));
+    const active = new Set(pi.getActiveTools().filter((tool) => !["workflow", "workflow_respond", "workflow_stop", "workflow_resume", "workflow_retry", "workflow_catalog"].includes(tool)));
     const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
     if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
     const settingsPath = workflowSettingsPath(extensionAgentDir);
@@ -3033,6 +3056,102 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     await coldResumeRun(run, false, {}, true);
     return { state: "running" };
   };
+  const retryReservations = new Set<string>();
+  const retryWorkflowRun = async (runId: string, context: unknown): Promise<{ runId: string; parentRunId: string; state: "running" }> => {
+    if (typeof runId !== "string" || !runId.trim()) throw new WorkflowError("RESUME_INCOMPATIBLE", "workflow_retry requires an explicit run ID");
+    const host = object(context) ? context : {};
+    const cwd = typeof host.cwd === "string" ? host.cwd : undefined;
+    const sessionManager = object(host.sessionManager) ? host.sessionManager : undefined;
+    const sessionId = typeof sessionManager?.getSessionId === "function" ? String(Reflect.apply(sessionManager.getSessionId, sessionManager, [])) : undefined;
+    if (!cwd || !sessionId) throw new WorkflowError("RESUME_INCOMPATIBLE", "workflow_retry requires the current project and Pi session");
+    await ensureSessionLease(cwd, sessionId);
+    const sourceStore = new RunStore(cwd, sessionId, runId, home);
+    let loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> };
+    try { loaded = await sourceStore.load(); } catch (error) { throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot load failed source run ${runId}: ${errorText(error)}`); }
+    if (loaded.run.state !== "failed") throw new WorkflowError("RESUME_INCOMPATIBLE", `Only failed workflow runs can be retried; source is ${loaded.run.state}`);
+    if (loaded.run.retry && (typeof loaded.run.retry.sourceRunId !== "string" || !loaded.run.retry.sourceRunId || typeof loaded.run.retry.lineageRootRunId !== "string" || !loaded.run.retry.lineageRootRunId || !Array.isArray(loaded.run.retry.completedPaths) || loaded.run.retry.completedPaths.some((path) => typeof path !== "string") || !Array.isArray(loaded.run.retry.incompletePaths) || loaded.run.retry.incompletePaths.some((path) => typeof path !== "string") || !Array.isArray(loaded.run.retry.namedWorktrees) || loaded.run.retry.namedWorktrees.some((name) => typeof name !== "string"))) throw new WorkflowError("RESUME_INCOMPATIBLE", "The source retry provenance is incomplete");
+    const lineageRootRunId = loaded.run.retry?.lineageRootRunId ?? loaded.run.id;
+    if (retryReservations.has(lineageRootRunId)) throw new WorkflowError("RESUME_INCOMPATIBLE", `An active retry already owns lineage ${lineageRootRunId}`);
+    const activeStates = new Set<RunState>(["queued", "running", "pausing", "paused", "awaiting_input", "interrupted", "budget_exhausted"]);
+    for (const candidateId of await listRunIds(cwd, sessionId, home)) {
+      if (candidateId === runId) continue;
+      const candidate = new RunStore(cwd, sessionId, candidateId, home);
+      try {
+        const candidateRun = (await candidate.load()).run;
+        if (activeStates.has(candidateRun.state) && candidateRun.retry?.lineageRootRunId === lineageRootRunId) throw new WorkflowError("RESUME_INCOMPATIBLE", `An active retry child already exists for source lineage ${lineageRootRunId}`);
+      } catch (error) {
+        if (error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE") throw error;
+      }
+    }
+    retryReservations.add(lineageRootRunId);
+    let childStarted = false;
+    try {
+      const trustedProject = projectTrusted(context);
+      await sourceStore.validateRetrySource();
+      await sourceStore.validateBorrowedWorktrees();
+      if (loaded.snapshot.identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
+      if (loaded.snapshot.roles === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow role definitions are missing from the launch snapshot");
+      if ((loaded.snapshot.projectRoles?.length ?? 0) > 0 && !trustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot restore project roles in an untrusted project");
+      const missingRole = loaded.snapshot.agentTypes.find((role) => !loaded.snapshot.roles?.[role]);
+      if (missingRole) throw new WorkflowError("RESUME_INCOMPATIBLE", `Role definition is missing from the launch snapshot: ${missingRole}`);
+      const active = new Set<string>(pi.getActiveTools().filter((tool) => !["workflow", "workflow_respond", "workflow_stop", "workflow_resume", "workflow_retry", "workflow_catalog"].includes(tool)));
+      const missing = loaded.snapshot.tools.filter((tool) => tool !== "workflow_catalog").find((tool) => !active.has(tool));
+      if (missing) throw new WorkflowError("RESUME_INCOMPATIBLE", `Required tool is unavailable: ${missing}`);
+      const settingsPath = workflowSettingsPath(extensionAgentDir);
+      const currentSettings = loadSettings(settingsPath);
+      resolveAgentResourcePolicy(cwd, trustedProject, settingsPath);
+      const currentAliases = currentSettings.modelAliases ?? {};
+      const previousAliases = loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ?? {};
+      const modelRegistry = contextHostCapabilities(context).modelRegistry;
+      const knownModels = new Set((modelRegistry?.getAll?.() ?? modelRegistry?.getAvailable?.() ?? []).map((model) => `${model.provider}/${model.id}`));
+      const hostModel = object(host.model) && typeof host.model.provider === "string" && typeof host.model.id === "string" ? { provider: host.model.provider, id: host.model.id } : { provider: "", id: "" };
+      if (hostModel.provider && hostModel.id) knownModels.add(`${hostModel.provider}/${hostModel.id}`);
+      const resumeModels = modelRegistry ? knownModels : new Set([...loaded.snapshot.models, ...knownModels]);
+      const resumeAliases = { ...previousAliases, ...currentAliases };
+      const script = launchScriptForSnapshot(loaded.snapshot, registry);
+      preflight(script, { models: resumeModels, tools: active, agentTypes: new Set(loaded.snapshot.agentTypes), modelAliases: resumeAliases, knownModels: resumeModels, settingsPath, skipModelAvailability: true }, loaded.snapshot.schemas, loaded.snapshot.metadata, true);
+      const completedPaths = (await sourceStore.replayableOperations()).map(({ path }) => path);
+      const incompletePaths = [...(loaded.run.retry?.incompletePaths ?? []), ...loaded.run.agents.filter((agent) => agent.state !== "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])))];
+      const namedWorktrees = [...new Set([...(loaded.run.retry?.namedWorktrees ?? []), ...(await sourceStore.worktrees()).filter(({ owner }) => owner.startsWith(`${operationPath("worktree", "named")}/`)).map(({ owner }) => decodeURIComponent(owner.split("/").at(-1) ?? owner))])];
+      const budget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
+      const childRunId = randomUUID();
+      const childStore = new RunStore(cwd, sessionId, childRunId, home);
+      const childSnapshot = createLaunchSnapshot(loaded.snapshot);
+      const childBudget = new WorkflowBudgetRuntime(budget, loaded.run.budgetVersion ?? 1, loaded.run.usage, loaded.run.budgetEvents);
+      const childInitialBudget = childBudget.snapshot();
+      const retry: WorkflowRetryProvenance = { sourceRunId: loaded.run.id, lineageRootRunId, completedPaths, incompletePaths, namedWorktrees };
+      await childStore.create({ id: childRunId, workflowName: loaded.snapshot.metadata.name, cwd, sessionId, state: "interrupted", parentRunId: loaded.run.id, retry, agents: [], nativeSessions: [], ...(budget ? { budget } : {}), budgetVersion: loaded.run.budgetVersion ?? 1, ...childInitialBudget }, childSnapshot);
+      const fallbackModel: ModelSpec = { provider: hostModel.provider, model: hostModel.id, thinking: pi.getThinkingLevel() };
+      const model = modelSpec(loaded.snapshot.models[0] ?? "", fallbackModel);
+      const lifecycle = lifecycleFor(childStore, "interrupted", childBudget, loaded.snapshot.metadata);
+      const abortController = new AbortController();
+      const providerErrorRecovery = createProviderErrorRecovery(context, resumeModels, () => { abortController.abort(); });
+      const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
+      const childRun = { executor: new WorkflowAgentExecutor({ cwd, agentDir: extensionAgentDir, model, tools: new Set(loaded.snapshot.tools.filter((tool) => active.has(tool) || tool === "workflow_catalog")), availableModels: resumeModels, knownModels: resumeModels, modelAliases: currentAliases, settingsPath, agentDefinitions: loaded.snapshot.roles ?? {}, runStore: childStore, providerPause, agentSetupHooks: registry.agentSetupHooks(), agentResourcePolicy: () => resolveAgentResourcePolicy(cwd, projectTrusted(context), settingsPath) }, createSession), store: childStore, metadata: loaded.snapshot.metadata, model, lifecycle, budget: childBudget, abortController, projectTrusted: () => projectTrusted(context), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) };
+      runs.set(childRunId, childRun);
+      scheduler.addRun(childRunId, loaded.snapshot.settings.concurrency, () => { childBudget.checkAgentLaunch(); });
+      await eventPublisher.runStarted(childStore, loaded.snapshot.metadata);
+      await coldResumeRun(childRun, false, {}, trustedProject, { model: hostModel, modelRegistry: modelRegistry ? { getAll: () => [...(modelRegistry.getAll?.() ?? [])], getAvailable: () => [...(modelRegistry.getAvailable?.() ?? [])] } : undefined });
+      const completion = runs.get(childRunId)?.completion;
+      if (completion) {
+        childStarted = true;
+        void completion.then(() => { retryReservations.delete(lineageRootRunId); }, () => { retryReservations.delete(lineageRootRunId); });
+      }
+      return { runId: childRunId, parentRunId: loaded.run.id, state: "running" };
+    } finally {
+      if (!childStarted) retryReservations.delete(lineageRootRunId);
+    }
+  };
+  pi.registerTool({
+    name: "workflow_retry",
+    label: "Workflow Retry",
+    description: "Retry a failed workflow run by replaying its completed structural operations",
+    parameters: WORKFLOW_RETRY_PARAMETERS,
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try { const result = await retryWorkflowRun(params.runId, ctx); return { content: [{ type: "text" as const, text: JSON.stringify(result) }], details: result }; }
+      catch (error) { throw mainAgentError(error); }
+    },
+  });
   pi.registerTool({
     name: "workflow_resume",
     label: "Workflow Resume",
@@ -3122,7 +3241,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
       const knownModels = new Set((modelRegistry?.getAll?.() ?? modelRegistry?.getAvailable?.() ?? [ctx.model]).map((model) => `${model.provider}/${model.id}`));
       knownModels.add(rootModelName);
       const availableModels = knownModels;
-      const rootTools = pi.getActiveTools().filter((name) => name !== "workflow" && name !== "workflow_respond" && name !== "workflow_stop" && name !== "workflow_catalog");
+      const rootTools = pi.getActiveTools().filter((name) => !["workflow", "workflow_respond", "workflow_stop", "workflow_resume", "workflow_retry", "workflow_catalog"].includes(name));
       const trustedProject = projectTrusted(ctx);
       if (typeof ctx.cwd === "string") resolveAgentResourcePolicy(ctx.cwd, trustedProject, settingsPath);
       const validated = validateWorkflowLaunchWithRegistry({ ...params, args: params.args }, { cwd: ctx.cwd, agentDir: extensionAgentDir, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases: defaults.modelAliases ?? {}, knownModels, settingsPath }, registry);
