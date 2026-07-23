@@ -369,9 +369,10 @@ Focus on correctness and regressions.</code></pre>
 /workflow pause &lt;run-id&gt;
 /workflow resume &lt;run-id&gt;
 /workflow stop &lt;run-id&gt;
-/workflow approve &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
-/workflow reject &lt;run-id&gt; &lt;checkpoint-or-proposal-id&gt;
+/workflow approve &lt;run-id&gt; &lt;checkpoint-name&gt;
+/workflow reject &lt;run-id&gt; &lt;checkpoint-name&gt;
 /workflow delete &lt;run-id&gt;</code></pre>
+        <p><code>approve</code> and <code>reject</code> are checkpoint-only controls. For budget proposals, use <code>workflow_respond</code> with the exact <code>proposalId</code> or the navigator's budget controls.</p>
         <p>The navigator discovers only runs from the exact current cwd and Pi session. It exposes <code>Model aliases</code> even when no runs exist, groups agents by structural scope, and shows budget status and adjustment controls only when relevant. In a Herdr-managed session, it can open the aggregate inspector and fork agent attempts into Pi sessions in a pane targeted by <code>HERDR_PANE_ID</code>; running forks require confirmation and use read-only tools. Pause is cooperative, stop is immediate and irreversible, and delete is available only for terminal runs after confirmation.</p>
         <p>Invocation options override settings defaults, and the session-wide active-agent ceiling is 16. Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>CONFIG_ERROR</code>, <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, settings, or script issue before retrying.</p>
       </section>
