@@ -241,14 +241,17 @@ function textBlock(text: string) {
   };
 }
 
+const ANSI_SGR = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`);
 export function truncateWorkflowProgress(text: string, width: number): string[] {
   const safeWidth = Math.max(1, width);
   return text.split("\n").flatMap((line) => {
     if (!line) return [""];
     const visualLines = truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, safeWidth, 0).visualLines;
     if (visualLines.length <= 1) return [visualLines[0]?.trimEnd() ?? ""];
-    const prefix = (truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, Math.max(1, safeWidth - 1), 0).visualLines[0] ?? "").trimEnd();
-    return [`${prefix}…`];
+    if (safeWidth === 1) return [ANSI_SGR.test(line) ? "…\u001b[0m" : "…"];
+    const prefix = (truncateToVisualLines(line, Number.MAX_SAFE_INTEGER, safeWidth - 1, 0).visualLines[0] ?? "").trimEnd();
+    const truncated = `${prefix}…`;
+    return [ANSI_SGR.test(line) ? `${truncated}\u001b[0m` : truncated];
   });
 }
 function themeWorkflowProgressStyles(theme: Theme): WorkflowProgressStyles {
