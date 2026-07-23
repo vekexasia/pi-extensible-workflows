@@ -451,7 +451,16 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
   }
   return bounded;
 }
-
+async function diagnosticNamedWorktrees(store: RunStore, run: PersistedRun): Promise<readonly string[]> {
+  const names = new Set<string>();
+  try {
+    for (const name of await store.validNamedWorktrees()) names.add(name);
+  } catch { /* Do not block failure delivery on an invalid worktree record. */ }
+  for (const name of run.retry?.namedWorktrees ?? []) {
+    try { await store.resolveNamedWorktree(name); names.add(name); } catch { /* Do not advertise stale inherited worktrees. */ }
+  }
+  return [...names];
+}
 async function createWorkflowFailureDiagnostics(store: RunStore, metadata: WorkflowMetadata, error: unknown, run: PersistedRun): Promise<WorkflowFailureDiagnostics> {
   const rawFailedAt = error && typeof error === "object" ? (error as { failedAt?: unknown }).failedAt : undefined;
   const failedAt = typeof rawFailedAt === "string" && rawFailedAt ? rawFailedAt : null;
@@ -483,11 +492,12 @@ async function createWorkflowFailureDiagnostics(store: RunStore, metadata: Workf
   let journalCompletedPaths: readonly string[] = [];
   try { journalCompletedPaths = (await store.replayableOperations()).map(({ path }) => path); } catch { /* Preserve failure diagnostics when retry history is unavailable. */ }
   const completedPaths = run.retry ? [...new Set([...run.retry.completedPaths, ...journalCompletedPaths])] : journalCompletedPaths.length ? journalCompletedPaths : run.agents.filter((agent) => agent.state === "completed").map((agent) => operationPath("agent", ...(agent.structuralPath ?? [])));
+  const namedWorktrees = await diagnosticNamedWorktrees(store, run);
   const retry = run.state === "failed" ? {
     sourceRunId: run.id,
     completedPaths,
     incompletePaths: [...new Set([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])])],
-    namedWorktrees: run.retry?.namedWorktrees ?? [],
+    namedWorktrees,
     warning: "Retry re-executes incomplete operations; external side effects before failure are not guaranteed exactly once.",
   } : undefined;
   return boundedWorkflowFailureDiagnostics({
