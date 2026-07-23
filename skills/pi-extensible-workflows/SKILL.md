@@ -4,30 +4,49 @@ description: Use when the task is complex enough to require multiple subagents o
 ---
 
 # pi-extensible-workflows
+
 Use `workflow` only for genuinely multi-agent orchestration; one agent uses ordinary tools or `Agent` directly. Give phases distinct responsibilities and keep result flow explicit.
 
 ## Example
-```js
-const reportSchema = { type: "object", properties: { summary: { type: "string" }, findings: { type: "array", items: { type: "string" } } }, required: ["summary", "findings"], additionalProperties: false };
 
+```js
+const reportSchema = {
+  type: "object",
+  properties: {
+    summary: { type: "string" },
+    findings: { type: "array", items: { type: "string" } },
+  },
+  required: ["summary", "findings"],
+  additionalProperties: false,
+};
 
 const reports = await parallel("research", {
-  first: () => agent("Research the first target.", { role: "scout", outputSchema: reportSchema }),
-  second: () => agent("Research the second target.", { role: "scout", outputSchema: reportSchema }),
+  first: () =>
+    agent("Research the first target.", {
+      role: "scout",
+      outputSchema: reportSchema,
+    }),
+  second: () =>
+    agent("Research the second target.", {
+      role: "scout",
+      outputSchema: reportSchema,
+    }),
 });
 
-return agent(
-  prompt("Review these reports:\n\n{reports}", { reports }),
-  { role: "reviewer", outputSchema: reportSchema },
-);
+return agent(prompt("Review these reports:\n\n{reports}", { reports }), {
+  role: "reviewer",
+  outputSchema: reportSchema,
+});
 ```
 
 Inline launches require a non-empty `name`. Registered function launches must omit `name`; they use `workflow` as the run name:
+
 ```json
 { "workflow": "workflowName", "args": { "issue": 42 } }
 ```
+
 Inside the workflow, read `args.issue` (`args` is `null` when omitted). `workflow_stop` requires the exact run ID; foreground results retain their value and completed `runId`, while background launches return `runId` immediately. A terminal `parentRunId` reuses matching named `withWorktree` scopes but does not replay journal results. For an explicitly failed run, use the exact `runId` from failure diagnostics with `workflow_retry({ runId })`: diagnostics list replayable and incomplete paths, artifacts, and valid named worktrees; the tool creates a linked child, replays completed agent, shell, function, and checkpoint operations, and executes incomplete work. Retry versus per-agent `retries` and `workflow_resume` is always explicit; external side effects before failure are not guaranteed exactly once.
-Inspect tool `workflow_catalog` result at least once before creating the first workflow for a task. 
+Inspect tool `workflow_catalog` result at least once before creating the first workflow for a task.
 
 Workflow JavaScript has no imports, filesystem, network, process, or timers. Delegate that work to agents. `shell(command, options)` is the trusted host RPC for deterministic gates: it inherits the workflow or active-worktree cwd, merges string `env` overrides, and returns `{ exitCode, stdout, stderr }`; nonzero exits are results, but launch failures and timeouts fail with `SHELL_FAILED`.
 
@@ -37,20 +56,24 @@ Example use of `shell`:
 // ... other code
 const testRes = await shell("yarn test", { env: { CI: "1" } });
 if (testRes.exitCode === 0) {
-   // success path
-   return {...}
+  // success path
+  return {...}
 }
 ```
 
 Most of the times using `shell()` to perform mutations is an antipattern. Use it mainly for verifications or idempotent actions.
 
 ## `agent()` options
+
 ```typescript
 export interface AgentOptions {
-  label?: string; model?: string; role?: string; tools?: string[];
-  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; 
-  outputSchema?: JsonSchema; 
-  retries?: number; 
+  label?: string;
+  model?: string;
+  role?: string;
+  tools?: string[];
+  thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  outputSchema?: JsonSchema;
+  retries?: number;
   timeoutMs?: number | null;
   [key: string]: JsonValue;
 }
@@ -61,24 +84,34 @@ Extensions may add JSON-compatible agent options such as `advisor: true`; core k
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
 
 ## Passing agent results
+
 Use independent `agent(prompt, options)` calls and pass each completed result explicitly to the next prompt. This keeps workflow execution deterministic and makes replay state local to each call:
+
 ```js
 const findings = await agent("Inspect the implementation.");
-const fix = await agent(prompt("Propose the smallest fix from these findings:\n\n{findings}", { findings }));
+const fix = await agent(
+  prompt("Propose the smallest fix from these findings:\n\n{findings}", {
+    findings,
+  }),
+);
 return { findings, fix };
 ```
 
 ## Worktrees
+
 Use `withWorktree(name, callback)` for top-level agents that collaborate in one explicitly named worktree scope:
+
 ```js
 const result = await withWorktree("issue", async ({ path, branch }) => {
   const report = await agent("Implement the issue");
   return { path, branch, report };
 });
 ```
+
 Entering the scope materializes its worktree before the callback. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:
+
 ```js
 const results = await parallel("implementation", {
   api: () => withWorktree("api", () => agent("Implement the API")),
@@ -89,6 +122,7 @@ const results = await parallel("implementation", {
 Registered extension functions receive `withWorktree` in context and can compose other registered functions with `context.invoke("reviewRepository", { focus: "security" })`. Their public inputs and outputs remain JSON; callbacks cannot cross the extension boundary.
 
 ## Rules
+
 - Use `log(messageString)` for brief operator status.
 - A role owns execution policy: with `role`, do not set `model`, `thinking`, or `tools`; only task options such as `outputSchema`, retries, timeout, or a `withWorktree` scope may accompany it.
 - Use `parallel()` for independent tasks with different flows and `pipeline()` when every keyed item follows the same ordered stages; do not duplicate identical chains in `parallel()`. Signatures are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; keys are stable task, item, and stage names.
