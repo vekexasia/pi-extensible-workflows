@@ -76,7 +76,8 @@ export interface WorkflowWorktreeReference { readonly path: string; readonly bra
 export interface AgentRecord { id: string; name: string; label?: string; path: string; state: AgentState; parentId?: string; structuralPath?: readonly string[]; parentBreadcrumb?: string; worktreeOwner?: string; role?: string; requestedModel?: string; model: ModelSpec; tools: readonly string[]; attempts: number; attemptDetails?: readonly AgentAttemptSummary[]; accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }; toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[]; activity?: AgentActivity | undefined }
 export interface WorkflowRunEvent { type: string; message: string }
 export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
-export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; retry?: WorkflowRetryProvenance; phase?: string; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
+export interface WorkflowPhaseRecord { phase: string; afterAgent: number }
+export interface RunRecord { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; parentRunId?: string; retry?: WorkflowRetryProvenance; phase?: string; phaseHistory?: readonly WorkflowPhaseRecord[]; agents: readonly AgentRecord[]; error?: WorkflowErrorShape; budget?: WorkflowBudget; budgetVersion?: number; usage?: WorkflowBudgetUsage; budgetEvents?: readonly BudgetEvent[]; events?: readonly WorkflowRunEvent[] }
 export const LAUNCH_SNAPSHOT_IDENTITY_VERSION = 4;
 export interface LaunchSnapshot { identityVersion?: number; launchKind?: "inline" | "function"; functionName?: string; script: string; args: JsonValue; metadata: WorkflowMetadata; settings: WorkflowSettings; budget?: WorkflowBudget; settingsPath?: string; modelAliases?: Readonly<Record<string, string>>; models: readonly string[]; tools: readonly string[]; agentTypes: readonly string[]; roles?: Readonly<Record<string, AgentDefinition>>; projectRoles?: readonly string[]; schemas: readonly JsonSchema[] }
 export interface PreflightCapabilities { models: ReadonlySet<string>; tools: ReadonlySet<string>; agentTypes: ReadonlySet<string>; modelAliases?: Readonly<Record<string, string>>; knownModels?: ReadonlySet<string>; settingsPath?: string; skipModelAvailability?: boolean }
@@ -1885,8 +1886,8 @@ function agentGroupLabel(agents: readonly AgentRecord[]): string {
   const breadcrumbs = [...new Set(agents.map((agent) => agent.parentBreadcrumb).filter((value): value is string => Boolean(value)))];
   return [...(structural.length ? [structural.join(" > ")] : []), ...(breadcrumbs.length === 1 ? breadcrumbs : breadcrumbs.length ? [breadcrumbs.join(" | ")] : [])].join(" > ") || "Agents";
 }
-function agentGroups(agents: readonly AgentRecord[]): AgentGroup[] {
-  const byId = new Map(agents.map((agent) => [agent.id, agent]));
+function agentGroups(agents: readonly AgentRecord[], allAgents: readonly AgentRecord[] = agents): AgentGroup[] {
+  const byId = new Map(allAgents.map((agent) => [agent.id, agent]));
   const groups = new Map<string, { agents: Array<{ agent: AgentRecord; index: number; depth: number }> }>();
   for (const [index, agent] of agents.entries()) {
     let depth = 0;
@@ -1898,8 +1899,8 @@ function agentGroups(agents: readonly AgentRecord[]): AgentGroup[] {
   }
   return [...groups].map(([, group]) => ({ label: agentGroupLabel(group.agents.map(({ agent }) => agent)), entries: group.agents }));
 }
-function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => string): string[] {
-  const groups = agentGroups(agents);
+function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { agent: AgentRecord; index: number; depth: number }, grouped: boolean) => string, allAgents: readonly AgentRecord[] = agents): string[] {
+  const groups = agentGroups(agents, allAgents);
   const grouped = groups.length > 1 || groups.some(({ label }) => label !== "Agents");
   return groups.flatMap((group) => [
     ...(grouped ? [`  ${group.label}`] : []),
@@ -1909,16 +1910,26 @@ function renderGroupedAgents(agents: readonly AgentRecord[], render: (entry: { a
 export function formatWorkflowProgress(run: PersistedRun, spinner = "◇"): string {
   const done = run.agents.filter((agent) => SETTLED_AGENT_STATES.has(agent.state)).length;
   const lines = [`${run.state === "completed" ? "✓" : run.state === "failed" || run.state === "stopped" ? "✗" : run.state === "budget_exhausted" ? "!" : run.state === "running" ? spinner : "◆"} Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`];
-  if (run.phase) lines.push(`  Phase: ${run.phase}`);
   lines.push(...formatCompactBudgetStatus(run).map((line) => `  ${line}`));
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
-  lines.push(...renderGroupedAgents(run.agents, ({ agent, index, depth }, grouped) => {
+  const renderAgents = (agents: readonly AgentRecord[], offset: number, nested: boolean) => renderGroupedAgents(agents, ({ agent, index, depth }, grouped) => {
     const icon = agent.state === "completed" ? "✓" : agent.state === "failed" || agent.state === "cancelled" ? "✗" : agent.state === "running" ? spinner : "○";
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
     const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner);
     const name = grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId);
-    return `${indent}#${String(index + 1)} ${icon} ${name} [${agent.state}]${activity ? ` ${activity}` : ""}`;
-  }));
+    return `${indent}#${String(offset + index + 1)} ${icon} ${name} [${agent.state}]${activity ? ` ${activity}` : ""}`;
+  }, run.agents).map((line) => nested ? `  ${line}` : line);
+  const phases = run.phaseHistory?.length ? run.phaseHistory : run.phase ? [{ phase: run.phase, afterAgent: 0 }] : [];
+  let renderedAgents = 0;
+  let nested = false;
+  for (const phase of phases) {
+    const boundary = Math.max(renderedAgents, Math.min(run.agents.length, phase.afterAgent));
+    lines.push(...renderAgents(run.agents.slice(renderedAgents, boundary), renderedAgents, nested));
+    lines.push(`  [Phase: ${phase.phase}]`);
+    renderedAgents = boundary;
+    nested = true;
+  }
+  lines.push(...renderAgents(run.agents.slice(renderedAgents), renderedAgents, nested));
   return lines.join("\n");
 }
 
@@ -2653,6 +2664,28 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
     await eventPublisher.budget(store, metadata, persisted);
     return persisted;
   };
+  const phaseBridge = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle) => {
+    let cursor = 0;
+    let executionPhase: string | undefined;
+    return async (phase: string): Promise<void> => {
+      if (phase === executionPhase) return;
+      executionPhase = phase;
+      await scheduler.flush();
+      await lifecycle.enter();
+      try {
+        let previousPhase: string | undefined;
+        const persisted = await persistRunState(store, metadata, (current) => {
+          previousPhase = current.phase;
+          const history = current.phaseHistory ?? [];
+          if (history[cursor]?.phase === phase) { cursor += 1; return { ...current, phase }; }
+          cursor = history.length + 1;
+          return { ...current, phase, phaseHistory: [...history, { phase, afterAgent: current.agents.length }] };
+        });
+        await eventPublisher.phase(store, metadata, previousPhase, phase);
+        runs.get(store.runId)?.update?.(workflowToolUpdate(persisted));
+      } finally { await lifecycle.leave(); }
+    };
+  };
   const persistWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<WorktreeReference> => {
     const existing = (await store.worktrees()).some((worktree) => worktree.owner === owner);
     const worktree = await store.worktree(owner);
@@ -3005,7 +3038,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
         await run.store.complete(path, outcome.value);
         return outcome.value;
       } finally { await run.lifecycle.leave(); }
-      }, worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: async (phase) => { await run.lifecycle.enter(); try { let previousPhase: string | undefined; const persisted = await persistRunState(run.store, run.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; }); await eventPublisher.phase(run.store, run.metadata, previousPhase, phase); runs.get(run.store.runId)?.update?.(workflowToolUpdate(persisted)); } finally { await run.lifecycle.leave(); } }, log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
+      }, worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, false, hasUI ? ui : undefined), phase: phaseBridge(run.store, run.metadata, run.lifecycle), log: logBridge(run.lifecycle, run.metadata.name) }, run.store, runContext, variables, registry), controller.signal);
     run.execution = execution;
     const completion = execution.result.then(async (value) => {
       await scheduler.flush();
@@ -3310,15 +3343,7 @@ export default function workflowExtension(pi: ExtensionAPI, home?: string, clipb
           await store.complete(path, outcome.value);
           return outcome.value;
         } finally { await lifecycle.leave(); }
-      }, worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: async (phase) => {
-        await lifecycle.enter();
-        try {
-          let previousPhase: string | undefined;
-          const persisted = await persistRunState(store, checked.metadata, (current) => { previousPhase = current.phase; return { ...current, phase }; });
-          await eventPublisher.phase(store, checked.metadata, previousPhase, phase);
-          runs.get(runId)?.update?.(workflowToolUpdate(persisted));
-        } finally { await lifecycle.leave(); }
-      }, log: logBridge(lifecycle, checked.metadata.name) }, store, runContext, variables, registry), runController.signal);
+      }, worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, Boolean(params.foreground), params.foreground && ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(lifecycle, checked.metadata.name) }, store, runContext, variables, registry), runController.signal);
       (runs.get(runId) as NonNullable<ReturnType<typeof runs.get>>).execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {

@@ -620,7 +620,7 @@ void test("navigator uses persisted labels and model fallbacks across views", ()
 });
 
 void test("streams foreground workflow progress into its tool card", async () => {
-  type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string } } };
+  type Update = { content: Array<{ type: string; text: string }>; details: { run: { state: string; phase?: string; phaseHistory?: Array<{ phase: string; afterAgent: number }> } } };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-progress-"));
   workflowExtension({
@@ -630,10 +630,31 @@ void test("streams foreground workflow progress into its tool card", async () =>
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   const updates: Update[] = [];
-  const result = await tool.execute("id", { name: "progress", script: `phase('work'); return true;`, foreground: true }, new AbortController().signal, (update: Update) => { updates.push(update); }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
+  const result = await tool.execute("id", { name: "progress", script: `phase('work'); phase('summary'); return true;`, foreground: true }, new AbortController().signal, (update: Update) => { updates.push(update); }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
   assert.ok(updates.some(({ details }) => details.run.phase === "work"));
+  assert.deepEqual(result.details.run.phaseHistory, [{ phase: "work", afterAgent: 0 }, { phase: "summary", afterAgent: 0 }]);
   assert.equal(updates.at(-1)?.details.run.state, "completed");
   assert.match(formatWorkflowProgress(result.details.run), /✓ Workflow: progress/);
+});
+
+void test("workflow progress places every phase at its agent boundary", () => {
+  const run = { id: "run", workflowName: "phased", cwd: "/repo", sessionId: "session", state: "completed", phase: "summary", phaseHistory: [
+    { phase: "develop", afterAgent: 0 },
+    { phase: "handoff", afterAgent: 2 },
+    { phase: "review", afterAgent: 2 },
+    { phase: "summary", afterAgent: 3 },
+  ], agents: [
+    { id: "run:1", name: "developer", path: "run:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:2", name: "reviewer", path: "run:2", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+    { id: "run:3", name: "scout", path: "run:3", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
+  ], nativeSessions: [] } as Parameters<typeof formatWorkflowProgress>[0];
+  const rendered = formatWorkflowProgress(run);
+  const position = (text: string) => rendered.indexOf(text);
+  assert.ok(position("[Phase: develop]") < position("#1"));
+  assert.ok(position("#2") < position("[Phase: handoff]"));
+  assert.ok(position("[Phase: handoff]") < position("[Phase: review]"));
+  assert.ok(position("[Phase: review]") < position("#3"));
+  assert.ok(position("#3") < position("[Phase: summary]"));
 });
 
 void test("foreground workflow reports parallel agent activities together", { timeout: 5000 }, async () => {
@@ -668,7 +689,7 @@ void test("foreground workflow reports parallel agent activities together", { ti
   let combined = false;
   let resolveReported!: () => void;
   const reported = new Promise<void>((resolve) => { resolveReported = resolve; });
-  const execution = tool.execute("id", { name: "parallel-progress", script: `return Promise.all([agent("one", {label:"first"}), agent("two", {label:"second"})]);`, foreground: true }, new AbortController().signal, (update: Update) => {
+  const execution = tool.execute("id", { name: "parallel-progress", script: `phase("work"); const results = await Promise.all([agent("one", {label:"first"}), agent("two", {label:"second"})]); phase("summary"); return results;`, foreground: true }, new AbortController().signal, (update: Update) => {
     const activities = update.details.run.agents.flatMap(({ activity }) => activity?.kind === "tool" ? [activity.text] : []);
     for (const activity of activities) seen.add(activity);
     if (activities.length === 2) combined = true;
@@ -676,8 +697,9 @@ void test("foreground workflow reports parallel agent activities together", { ti
   }, { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   await reported;
   release();
-  await execution;
+  const result = await execution as { details: { run: Parameters<typeof formatWorkflowProgress>[0] } };
   assert.equal(combined, true);
+  assert.deepEqual(result.details.run.phaseHistory, [{ phase: "work", afterAgent: 0 }, { phase: "summary", afterAgent: 2 }]);
 });
 
 void test("workflow progress keeps each agent to one line with latest tool", () => {
