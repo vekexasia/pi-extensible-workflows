@@ -40,7 +40,7 @@
 - Fixed fullscreen flashing, shell process-tree cleanup, shell RPC size boundaries, running-attempt fork classification, and exported launchers without a global CLI installation.
 - Borrowed worktree bindings are persisted, lineage-checked, and fail closed when invalid. Borrowed worktrees are never deleted with the borrowing run.
 - Global and trusted-project roles now propagate consistently through CLI launches, nested agents, and cold resume.
-- Updated the README, developer and agent documentation, and bundled workflow skill for the CLI, trust model, shell gates, worktree reuse, and v4 snapshot contract.
+- Updated the README, developer and agent documentation, and bundled workflow skill for the CLI, trust model, shell gates, worktree reuse, and v5 snapshot contract.
 
 ### Verification
 
