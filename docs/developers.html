@@ -38,11 +38,14 @@
       <section id="installation">
         <h2>Installation and trust</h2>
         <p>Use Node.js 22.19 or newer. pi-extensible-workflows is a trusted Pi extension: installing it gives the extension the same filesystem and process access as Pi. Only install it from a source you trust, and open and trust the project in Pi before running <code>doctor</code>.</p>
-        <pre><code class="language-shell"><span class="tok-command">npm</span> ci
+        <p>For source installation and local development, clone the repository and change into its directory first:</p>
+        <pre><code class="language-shell"><span class="tok-command">git</span> clone https://github.com/vekexasia/pi-extensible-workflows.git
+<span class="tok-command">cd</span> pi-extensible-workflows
+<span class="tok-command">npm</span> ci
 <span class="tok-command">npm</span> run check
-<span class="tok-command">pi</span> install /absolute/path/to/pi-extensible-workflows</code></pre>
+<span class="tok-command">pi</span> install "$PWD"</code></pre>
         <p>For a one-session trial without changing Pi settings:</p>
-        <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension /absolute/path/to/pi-extensible-workflows/src/index.ts</code></pre>
+        <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension "$PWD/src/index.ts"</code></pre>
         <p>The package declares Pi AI, Pi coding agent, and TypeBox as peer dependencies. The repository development setup currently pins the Pi packages to 0.80.9.</p>
       </section>
       <section id="settings">
