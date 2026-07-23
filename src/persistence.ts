@@ -708,33 +708,19 @@ export class RunStore {
     };
     const names = new Set<string>();
     const rawRecords = await load(join(this.directory, "worktrees.json"));
-    const rawBindings = await load(join(this.directory, "borrowed-worktrees.json"));
-    const bindings: BorrowedWorktreeBinding[] = [];
-    const seenBindings = new Set<string>();
-    const invalidBindingNames = new Set<string>();
-    for (const record of Array.isArray(rawBindings) ? rawBindings : []) {
-      if (!record || typeof record !== "object") continue;
-      const candidate = record as Partial<BorrowedWorktreeBinding>;
-      const candidateName = typeof candidate.name === "string" ? candidate.name : undefined;
-      if (candidateName && seenBindings.has(candidateName)) invalidBindingNames.add(candidateName);
-      else if (candidateName) seenBindings.add(candidateName);
-      if (candidateName && invalidBindingNames.has(candidateName) || typeof candidate.name !== "string" || !candidate.name.trim() || candidate.name !== candidate.name.trim() || typeof candidate.sourceRunId !== "string" || !candidate.sourceRunId || typeof candidate.owner !== "string" || candidate.owner !== this.namedWorktreeOwner(candidate.name)) {
-        if (candidateName) invalidBindingNames.add(candidateName);
-        continue;
-      }
-      bindings.push({ name: candidate.name, sourceRunId: candidate.sourceRunId, owner: candidate.owner });
-    }
-    const validBindings = bindings.filter((binding) => !invalidBindingNames.has(binding.name));
-    const boundOwners = new Set(validBindings.map((binding) => binding.owner));
+    let bindings: readonly BorrowedWorktreeBinding[];
+    try { bindings = await this.borrowedWorktreeRecords(); }
+    catch (error) { if (error instanceof WorkflowError && error.code === "WORKTREE_FAILED") return []; throw error; }
+    const boundOwners = new Set(bindings.map((binding) => binding.owner));
     for (const record of Array.isArray(rawRecords) ? rawRecords : []) {
       if (!record || typeof record !== "object") continue;
       const owner = (record as Partial<WorktreeReference>).owner;
       if (typeof owner !== "string") continue;
       const name = this.worktreeName(owner);
-      if (!name || owner !== this.namedWorktreeOwner(name) || invalidBindingNames.has(name) || boundOwners.has(owner)) continue;
+      if (!name || owner !== this.namedWorktreeOwner(name) || boundOwners.has(owner)) continue;
       try { await this.ownedWorktree(owner); names.add(name); } catch { /* Do not advertise stale or invalid records. */ }
     }
-    for (const binding of validBindings) {
+    for (const binding of bindings) {
       try { await this.resolveBorrowedWorktree(binding, new Set([this.runId])); names.add(binding.name); } catch { /* Do not advertise stale inherited records. */ }
     }
     return [...names];

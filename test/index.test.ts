@@ -153,6 +153,46 @@ void test("workflow_retry links children, replays parallel branches, inherits bu
   assert.deepEqual((await sourceStore.load()).run.usage, sourceUsage);
   assert.equal((await sourceStore.load()).run.state, "failed");
 });
+void test("failed retry children retain inherited and newly created named worktrees without duplicates", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-named-union-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd);
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  const script = `return parallel("named", { inherited: () => withWorktree("inherited", async () => agent("inherited")), fresh: () => withWorktree("fresh", async () => agent("fresh")) });`;
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "named-retry", description: "named retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent"], agentTypes: [], roles: {}, schemas: [] });
+  const root = new RunStore(cwd, "session", "root", home);
+  await root.create({ id: "root", workflowName: "named-retry", cwd, sessionId: "session", state: "failed", agents: [], nativeSessions: [] }, snapshot);
+  const inheritedOwner = structuralPath("worktree", "named", "inherited");
+  await root.worktree(inheritedOwner);
+  const source = new RunStore(cwd, "session", "source", home);
+  await source.create({ id: "source", workflowName: "named-retry", cwd, sessionId: "session", state: "failed", parentRunId: "root", retry: { sourceRunId: "root", lineageRootRunId: "root", completedPaths: [], incompletePaths: [], namedWorktrees: ["inherited"] }, agents: [], nativeSessions: [] }, snapshot);
+  await source.worktree(inheritedOwner);
+  await source.worktree(structuralPath("worktree", "named", "fresh"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const createSession = async (input: SessionInput): Promise<NativeSession> => ({
+    sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {},
+  });
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["agent", "workflow"] } as never, home, async () => {}, createSession);
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(retry);
+  const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  const started = await retry.execute("retry-named-union", { runId: "source" }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  let child: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child = (await new RunStore(cwd, "session", childId, home).load()).run;
+    if (child.state === "completed" || child.state === "failed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(child?.state, "completed");
+  assert.deepEqual(child.retry?.namedWorktrees, ["inherited", "fresh"]);
+});
 void test("workflow_retry rejects concurrent children for one mutable retry lineage", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-concurrency-"));
   let sessions = 0;
@@ -2823,8 +2863,8 @@ void test("foreground failure diagnostics advertise valid named worktrees", asyn
       if (input.sessionLabel.includes(":bad:")) {
         badAttempts += 1;
         partialPath = join(input.cwd, "partial.txt");
-        writeFileSync(partialPath, "partial");
-        if (failBad) { failBad = false; throw new Error("named worktree failure"); }
+        if (failBad) { writeFileSync(partialPath, "partial"); failBad = false; throw new Error("named worktree failure"); }
+        assert.equal(existsSync(partialPath), true);
         assert.equal(readFileSync(partialPath, "utf8"), "partial");
       }
     },
@@ -2840,6 +2880,7 @@ void test("foreground failure diagnostics advertise valid named worktrees", asyn
   assert.ok(patched);
   const diagnostic = JSON.parse((patched as { content: Array<{ text: string }> }).content[0]?.text ?? "null") as WorkflowFailureDiagnostics;
   assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
   assert.deepEqual(diagnostic.retry.namedWorktrees, ["diagnostic-tree"]);
   const retry = tools.find(({ name }) => name === "workflow_retry");
   assert.ok(retry);
@@ -2900,6 +2941,7 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.deepEqual(diagnostic.completedSiblingPaths, [["reviewers", "good"]]);
   assert.match(formatWorkflowFailureDiagnostics(diagnostic), /Completed sibling agents: good path=reviewers > good/);
   assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
   assert.ok(diagnostic.retry.sourceRunId);
   assert.ok(diagnostic.retry.completedPaths.length > 0);
   assert.ok(diagnostic.retry.incompletePaths.length > 0);
@@ -2979,6 +3021,7 @@ void test("background failure diagnostics drive workflow_retry with the advertis
   assert.ok(diagnosticMessage);
   const diagnostic = JSON.parse(diagnosticMessage.slice(diagnosticMessage.indexOf("{"))) as WorkflowFailureDiagnostics;
   assert.ok(diagnostic.retry);
+  assert.equal(diagnostic.retry.action, `workflow_retry({ runId: ${JSON.stringify(diagnostic.retry.sourceRunId)} })`);
   assert.deepEqual(diagnostic.retry.namedWorktrees, ["background-tree"]);
   const started = await retry.execute("background-retry-child", { runId: diagnostic.retry.sourceRunId }, undefined, undefined, context) as { content: Array<{ text: string }> };
   const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;

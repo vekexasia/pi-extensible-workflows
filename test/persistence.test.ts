@@ -310,6 +310,23 @@ void test("does not advertise non-canonical named worktree owners", async () => 
   assert.deepEqual(await store.validNamedWorktrees(), []);
   await assert.rejects(store.resolveNamedWorktree("banana"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
 });
+void test("does not advertise owned named worktrees when borrowed bindings are malformed", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-invalid-borrowed-bindings-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  await store.worktree(structuralPath("worktree", "named", "banana"));
+  writeFileSync(join(store.directory, "borrowed-worktrees.json"), JSON.stringify({ invalid: true }));
+  assert.deepEqual(await store.validNamedWorktrees(), []);
+  await assert.rejects(store.resolveNamedWorktree("banana"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+});
 
 void test("reuses named worktrees through durable follow-up bindings without deleting borrowed checkouts", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-borrowed-worktree-"));
