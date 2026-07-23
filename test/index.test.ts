@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext } from "../src/index.js";
+import workflowExtension, { budgetRelaxed, createLaunchSnapshot, DEFAULT_SETTINGS, ERROR_CODES, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowFailure, formatWorkflowFailureDiagnostics, formatWorkflowPreview, formatWorkflowProgress, inspectWorkflowScript, loadAgentDefinitions, loadSettings, mergeBudget, parseRoleMarkdown, preflight, registerWorkflowExtension, resolveAgentResourcePolicy, resolveModelReference, resumeBudgetAllowed, RPC_LIMIT_BYTES, RunLifecycle, RunStore, runWorkflow, saveModelAliases, structuralPath, validateBudget, validateBudgetPatch, validateCheckpoint, validateModelAliases, WorkflowAgentExecutor, WorkflowBudgetRuntime, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, WorkflowRegistry, type JsonValue, type PersistedRun, type WorkflowExtension, type WorkflowFailureDiagnostics, type WorkflowFunctionContext } from "../src/index.js";
 import type { NativeSession, SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 
@@ -69,7 +69,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
     on(name: string, candidate: unknown) { if (name === "resources_discover") discover = candidate as typeof discover; },
   };
   workflowExtension(pi as never);
-  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_stop", "workflow_resume", "workflow"]);
+  assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_stop", "workflow_retry", "workflow_resume", "workflow"]);
   assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
@@ -84,6 +84,42 @@ void test("registers the workflow tool, command, and conditional skill", async (
   await assert.rejects(tool.execute("id", { workflow: "missing", name: "missing-run" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
   await assert.rejects(tool.execute("id", { workflow: "missing", name: " " }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
+});
+void test("workflow_retry links a child and replays completed parallel branches", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-tool-"));
+  let sessions = 0;
+  let fail = true;
+  const createSession = async (): Promise<NativeSession> => {
+    const attempt = ++sessions;
+    return { sessionId: `retry-session-${String(attempt)}`, sessionFile: `/sessions/retry-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 }, cost: 0 }), prompt: async () => { if (fail && attempt === 2) throw new Error("first retry source failure"); }, steer: async () => {}, dispose() {} };
+  };
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] } as never, home, async () => {}, createSession);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  assert.ok(workflow && retry);
+  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  await assert.rejects(workflow.execute("source", { name: "retry-source", script: `return parallel("branches", { good: () => agent("good"), bad: () => agent("bad") });`, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
+  const sourceId = (await listRunIds(home, "session", home))[0];
+  assert.ok(sourceId);
+  assert.equal((await new RunStore(home, "session", sourceId, home).load()).run.state, "failed");
+  fail = false;
+  const result = await retry.execute("retry", { runId: sourceId }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const started = JSON.parse(result.content[0]?.text ?? "null") as { runId: string; parentRunId: string; state: string };
+  assert.equal(started.parentRunId, sourceId);
+  assert.equal(started.state, "running");
+  let child: PersistedRun | undefined;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child = (await new RunStore(home, "session", started.runId, home).load()).run;
+    if (child.state === "completed") break;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(child);
+  assert.equal(child.state, "completed");
+  assert.equal(child.parentRunId, sourceId);
+  assert.ok(child.retry);
+  assert.deepEqual(child.retry.completedPaths.length, 1);
+  assert.equal(sessions, 3);
 });
 void test("probes optional Pi host capabilities while preserving model registry fallbacks", async () => {
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];

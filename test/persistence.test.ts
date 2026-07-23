@@ -190,6 +190,25 @@ void test("journals stable structural paths and replays only completed operation
   assert.equal(await store.replay(structuralPath("interrupted-parent")), undefined);
   await assert.rejects(store.complete(path, null), (error: unknown) => error instanceof WorkflowError && error.code === "DUPLICATE_NAME");
 });
+void test("replays only completed operations from a failed retry lineage", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-journal-"));
+  const cwd = join(home, "project");
+  const source = new RunStore(cwd, "session-a", "run-a", home);
+  await source.create({ ...run(cwd), state: "failed" }, snapshot);
+  const agentPath = structuralPath("agent", "parallel", "good");
+  await source.complete(agentPath, "done");
+  const checkpoint = { path: structuralPath("checkpoint", "ship"), name: "ship", prompt: "Ship?", context: null };
+  await source.awaitCheckpoint(checkpoint);
+  await source.answerCheckpoint("ship", true);
+  const child = new RunStore(cwd, "session-a", "run-b", home);
+  await child.create({ id: "run-b", workflowName: "x", cwd, sessionId: "session-a", state: "interrupted", parentRunId: "run-a", retry: { sourceRunId: "run-a", lineageRootRunId: "run-a", completedPaths: [agentPath, checkpoint.path], incompletePaths: ["agent/parallel/bad"], namedWorktrees: [] }, agents: [], nativeSessions: [] }, snapshot);
+  assert.deepEqual(await child.replay(agentPath), { path: agentPath, value: "done" });
+  assert.deepEqual(await child.replay(checkpoint.path), { path: checkpoint.path, value: true });
+  assert.equal(await child.replay(structuralPath("agent", "parallel", "bad")), undefined);
+  assert.equal(await child.awaitCheckpoint(checkpoint), true);
+  assert.deepEqual(await child.awaitingCheckpoints(), []);
+  assert.deepEqual((await source.load()).run.state, "failed");
+});
 
 void test("persists awaiting checkpoints and atomically accepts only the first answer", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-"));

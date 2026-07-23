@@ -308,11 +308,33 @@ export class RunStore {
   }
 
   async replay(path: string): Promise<CompletedOperation | undefined> {
+    const operations = await this.replayableOperations();
+    return operations.find((operation) => operation.path === path);
+  }
+
+  async replayableOperations(): Promise<readonly CompletedOperation[]> {
+    return this.replayableOperationsFrom(new Set());
+  }
+
+  private async replayableOperationsFrom(seen: Set<string>): Promise<readonly CompletedOperation[]> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    const nextSeen = new Set(seen);
+    nextSeen.add(this.runId);
     await this.journalWrite;
-    return (await json<Journal>(join(this.directory, "journal.json"))).completed[path];
+    const loaded = await this.load();
+    const operations = new Map<string, CompletedOperation>();
+    if (loaded.run.retry?.sourceRunId) {
+      const source = await this.sourceRun(loaded.run.retry.sourceRunId);
+      for (const operation of await source.replayableOperationsFrom(nextSeen)) operations.set(operation.path, operation);
+    }
+    const journal = await json<Journal>(join(this.directory, "journal.json"));
+    for (const operation of Object.values(journal.completed)) operations.set(operation.path, operation);
+    return [...operations.values()].map((operation) => structuredClone(operation));
   }
 
   async awaitCheckpoint(checkpoint: AwaitingCheckpoint): Promise<boolean | undefined> {
+    const replayed = await this.replay(checkpoint.path);
+    if (replayed) return replayed.value as boolean;
     return this.updateJournal((journal) => {
       const completed = journal.completed[checkpoint.path];
       if (completed) return completed.value as boolean;
@@ -427,6 +449,22 @@ export class RunStore {
   }
 
   async validateParentRun(parentRunId: string): Promise<void> { await this.sourceRun(parentRunId); }
+  async validateRetrySource(): Promise<void> {
+    const validate = async (current: RunStore, seen: Set<string>): Promise<void> => {
+      if (seen.has(current.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+      const nextSeen = new Set(seen);
+      nextSeen.add(current.runId);
+      const loaded = await current.load();
+      const retry = loaded.run.retry;
+      if (!retry) return;
+      if (typeof retry.sourceRunId !== "string" || !retry.sourceRunId || retry.sourceRunId === current.runId || typeof retry.lineageRootRunId !== "string" || !retry.lineageRootRunId || !Array.isArray(retry.completedPaths) || retry.completedPaths.some((path) => typeof path !== "string") || !Array.isArray(retry.incompletePaths) || retry.incompletePaths.some((path) => typeof path !== "string") || !Array.isArray(retry.namedWorktrees) || retry.namedWorktrees.some((name) => typeof name !== "string")) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance is incomplete");
+      const source = await current.sourceRun(retry.sourceRunId);
+      if ((await source.load()).run.state !== "failed") throw new WorkflowError("RESUME_INCOMPATIBLE", `Retry source run ${retry.sourceRunId} is not failed`);
+      await validate(source, nextSeen);
+    };
+    try { await validate(this, new Set()); }
+    catch (error) { throw error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE" ? error : new WorkflowError("RESUME_INCOMPATIBLE", error instanceof Error ? error.message : String(error)); }
+  }
 
   private async ownedWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
     const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
