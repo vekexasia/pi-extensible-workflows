@@ -1147,15 +1147,15 @@ export function registeredWorkflowFunctions(): Readonly<Record<string, WorkflowF
 
 
 export function formatWorkflowPreview(args: { script?: unknown; workflow?: unknown; name?: unknown; description?: unknown }): string {
-  const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : typeof args.workflow === "string" && args.workflow.trim() ? args.workflow : "workflow";
+  const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "workflow";
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}${typeof args.workflow === "string" ? "\nRegistered function" : ""}`;
   return [`workflow ${name}`, typeof args.description === "string" && args.description.trim() ? args.description.trim() : ""].filter(Boolean).join("\n");
 }
 export const WORKFLOW_TOOL_LABEL = "Workflow";
 export const WORKFLOW_TOOL_DESCRIPTION = "Run a deterministic JavaScript workflow";
-export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Inline scripts require a name; registered functions use their function name. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID, and parentRunId reuses matching named worktrees from a terminal run.";
+export const WORKFLOW_TOOL_PROMPT_SNIPPET = "Run a deterministic, resumable JavaScript workflow that orchestrates subagents. Every launch requires an explicit non-empty name; use workflow only to select a registered function. Runs in the background by default; completion arrives as a follow-up message. Foreground results include the completed run ID, and parentRunId reuses matching named worktrees from a terminal run.";
 export const WORKFLOW_TOOL_PARAMETERS = Type.Object({
-  name: Type.Optional(Type.String({ description: "Workflow name for inline scripts" })),
+  name: Type.String({ minLength: 1, description: "Explicit name for this workflow run" }),
   description: Type.Optional(Type.String({ description: "Optional human-readable workflow description" })),
   script: Type.Optional(Type.String({ description: "Immutable workflow source without metadata" })),
   workflow: Type.Optional(Type.String({ description: "Registered reusable function as an unqualified name" })),
@@ -1229,7 +1229,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
 }
 
 export interface WorkflowValidationParameters {
-  name?: string;
+  name: string;
   description?: string;
   script?: string;
   workflow?: string;
@@ -1265,14 +1265,14 @@ export function validateWorkflowLaunch(params: WorkflowValidationParameters, con
 function validateWorkflowLaunchWithRegistry(params: WorkflowValidationParameters, context: WorkflowValidationContext, registry: WorkflowRegistryApi): ValidatedWorkflowLaunch {
   if (Object.prototype.hasOwnProperty.call(params, "maxAgentLaunches")) fail("INVALID_METADATA", "maxAgentLaunches has been removed; use budget.agentLaunches");
   if (params.script !== undefined && params.workflow !== undefined) fail("INVALID_METADATA", "Provide either script or workflow, not both");
+  const workflowName = typeof params.name === "string" ? params.name.trim() : "";
+  if (!workflowName) fail("INVALID_METADATA", "Workflow launches require a non-empty name");
   const functionName = typeof params.workflow === "string" ? params.workflow : undefined;
   const fn = functionName === undefined ? undefined : registry.function(functionName);
   const args = params.args === undefined ? null : params.args;
   if (functionName !== undefined && fn && (!object(args) || !jsonValue(args) || !Value.Check(fn.input, args))) fail("RESULT_INVALID", `Invalid input for ${functionName}`);
   const script = functionName !== undefined && fn ? functionLaunchScript(functionName) : typeof params.script === "string" && params.script.trim() ? params.script : "";
   if (!script) fail("INVALID_SYNTAX", "Provide script or registered function");
-  const workflowName = functionName ?? (typeof params.name === "string" && params.name.trim() ? params.name.trim() : "");
-  if (!workflowName) fail("INVALID_METADATA", "Inline workflows require name");
   const metadata = validateWorkflowMetadata({ name: workflowName, ...(typeof params.description === "string" ? { description: params.description } : fn?.description ? { description: fn.description } : {}) });
   const globalAgentDefinitions = loadAgentDefinitions(context.cwd, context.agentDir, false);
   const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};

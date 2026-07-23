@@ -4,17 +4,17 @@
 
 ### Highlights
 
-- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
+- Added schema-validated registered functions. Register reusable workflows under `functions`, launch them directly with `{ name: "run-name", workflow: "name", args: {...} }`, or compose them with `context.invoke()`.
 - Added the headless CLI: `run` launches registered functions, `export` creates executable POSIX launchers, and `transcript` renders saved sessions. Schema-derived flags, JSON input, trust overrides, and `--` passthrough are supported.
 - Added the host-mediated `shell(command, options)` primitive with deterministic workflow identity, timeout and environment options, worktree-aware execution, and structured results.
 - Added reusable worktrees. `withWorktree` callbacks receive a frozen `{ path, branch }` reference, and `parentRunId` can borrow matching named worktrees from a terminal run.
 - Added bounded structured failure diagnostics, provider-failure recovery in the TUI, and Herdr pane inspection and attempt forking.
 
 ### Breaking changes
-
+- `workflow` now requires an explicit non-empty `name` for every launch, including registered functions; `workflow` selects the function and no longer names the run.
 - Removed registered workflow scripts: `WorkflowExtension.workflows`, `WorkflowScriptDefinition`, `registry.workflow()` / `workflows()`, and `registeredWorkflowDefinitions()`.
   - Migrate each workflow to `functions.<name>` with `description`, `input`, `output`, and `run(input, context)`.
-  - Launch it with `{ workflow: "name", args: {...} }`.
+  - Launch it with `{ name: "run-name", workflow: "name", args: {...} }`.
 - Changed `workflow_catalog` to return a compact index by default and removed its `workflows` collection.
   - Use the default call for discovery and `{ "name": "entry" }` for full details.
   - Host integrations should use `workflowCatalogIndex()`, `workflowCatalogDetail()`, or `registeredWorkflowFunctions()`.

@@ -52,8 +52,8 @@ void test("workflow call preview summarizes inline and registered functions safe
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
   assert.match(preview, /^workflow review\nReview code/m);
   assert.doesNotMatch(preview, /^(Phases|Steps|Agents|Models|Roles|Tools|Extensions):/m);
-  assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow audit\nRegistered function");
-  assert.equal(formatWorkflowPreview({ script: "", workflow: "audit" }), "workflow audit\nRegistered function");
+  assert.equal(formatWorkflowPreview({ workflow: "audit" }), "workflow workflow\nRegistered function");
+  assert.equal(formatWorkflowPreview({ name: "audit-run", workflow: "audit" }), "workflow audit-run\nRegistered function");
   assert.equal(formatWorkflowPreview({ script: "not javascript", name: "review" }), "workflow review");
 });
 
@@ -81,7 +81,8 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.ok(existsSync(join(skillPath, "pi-extensible-workflows", "SKILL.md")));
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "return true", workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  await assert.rejects(tool.execute("id", { workflow: "missing" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
+  await assert.rejects(tool.execute("id", { workflow: "missing", name: "missing-run" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
+  await assert.rejects(tool.execute("id", { workflow: "missing", name: " " }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   await assert.rejects(tool.execute("id", { script: "" }, undefined, undefined, { model: undefined }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
 });
 void test("probes optional Pi host capabilities while preserving model registry fallbacks", async () => {
@@ -464,7 +465,7 @@ void test("registered extension functions can run by name", async () => {
   registerWorkflowExtension(reuseExtension);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
-  const result = await execute("id", { workflow: "hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
+  const result = await execute("id", { name: "hello-run", workflow: "hello", args: { name: "Andrea" }, foreground: true }, new AbortController().signal, undefined, { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-reuse-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } });
   assert.equal(result.content[0]?.text, '"Andrea"');
 });
 void test("direct function launches enforce input and output schemas", async () => {
@@ -474,8 +475,10 @@ void test("direct function launches enforce input and output schemas", async () 
   const execute = tools.find(({ name }) => name === "workflow")?.execute;
   assert.ok(execute);
   const context = { cwd: mkdtempSync(join(tmpdir(), "pi-extensible-workflows-function-schema-")), model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  await assert.rejects(execute("id", { workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
-  await assert.rejects(execute("id", { workflow: "badResult", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(execute("id", { workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(execute("id", { name: " ", workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await assert.rejects(execute("id", { name: "needs-value", workflow: "needsValue", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  await assert.rejects(execute("id", { name: "bad-result", workflow: "badResult", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
 });
 void test("inline workflow args cross the production tool boundary and omitted args become null", async () => {
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }> }> }> = [];
