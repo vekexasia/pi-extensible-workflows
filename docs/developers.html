@@ -356,12 +356,13 @@ Focus on correctness and regressions.</code></pre>
         <h2>Operations and debugging</h2>
         <h3>Doctor and inspector</h3>
         <pre><code class="language-shell"><span class="tok-command">npx</span> pi-extensible-workflows doctor
+<span class="tok-command">npx</span> pi-extensible-workflows doctor cleanup [--older-than-days &lt;days&gt;] [--yes]
 <span class="tok-command">npx</span> pi-extensible-workflows inspect [session-id]
 <span class="tok-command">npx</span> pi-extensible-workflows transcript &lt;session-file&gt;
 <span class="tok-command">npx</span> pi-extensible-workflows run &lt;workflow-name&gt; [workflow arguments]
 <span class="tok-command">npx</span> pi-extensible-workflows export &lt;workflow-name&gt; [--name &lt;command&gt;] [--output &lt;path&gt;] [--force]
 <span class="tok-command">npm</span> run inspect -- [session-id]</code></pre>
-        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered functions. It exits nonzero only for errors. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
+        <p><code>doctor</code> is read-only and checks Pi trust and resources, active tools, models, roles, settings, extension load failures, and registered functions. It exits nonzero only for errors. <code>doctor cleanup</code> is separate, explicit, and dry-run-first: it previews terminal runs older than 90 days across the current project's stored sessions and deletes only with <code>--yes</code>, protecting active, corrupt, leased, and dependency-linked runs. <code>inspect</code> opens the read-only terminal inspector; the detail view includes agents, retries, models, costs, prompts, and the syntax-highlighted workflow script. <code>transcript</code> renders the existing session transcript format to stdout.</p>
         <p><code>run</code> accepts flat workflow arguments plus <code>--approve</code> or <code>--no-approve</code> trust overrides. The generated <code>export</code> launcher forwards later arguments to <code>run</code>. Before <code>--</code>, these are launcher options; <code>--</code> ends launcher option parsing and passes later tokens to workflow input.</p>
         <h3><code>/workflow</code> controls</h3>
         <pre><code class="language-text">/workflow doctor

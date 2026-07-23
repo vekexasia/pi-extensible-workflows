@@ -35,8 +35,11 @@ export function projectStorageKey(cwd: string): string {
   return `${slug}-${createHash("sha256").update(exact).digest("hex").slice(0, 12)}`;
 }
 
+export function projectSessionsDirectory(cwd: string, home = homedir()): string {
+  return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions");
+}
 export function runsDirectory(cwd: string, sessionId: string, home = homedir()): string {
-  return join(home, ".pi", "workflows", "projects", projectStorageKey(cwd), "sessions", safePart(sessionId), "runs");
+  return join(projectSessionsDirectory(cwd, home), safePart(sessionId), "runs");
 }
 
 const SESSION_OWNER_FILE = "owner.json";
@@ -51,6 +54,16 @@ async function processAlive(pid: number, startedAt?: number): Promise<boolean> {
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; }
   }
   return true;
+}
+export async function hasLiveSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<boolean> {
+  const path = join(runsDirectory(cwd, sessionId, home), SESSION_OWNER_FILE);
+  let owner: unknown;
+  try { owner = JSON.parse(await readFile(path, "utf8")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw error; }
+  if (!owner || typeof owner !== "object" || Array.isArray(owner)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an invalid ownership lease`);
+  const candidate = owner as Partial<SessionOwner>;
+  if (typeof candidate.pid !== "number" || !Number.isInteger(candidate.pid) || candidate.pid < 1 || typeof candidate.token !== "string" || !candidate.token || typeof candidate.startedAt !== "number" || !Number.isFinite(candidate.startedAt)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an invalid ownership lease`);
+  return processAlive(candidate.pid, candidate.startedAt);
 }
 
 function sameOwner(left: unknown, right: unknown): boolean {
@@ -528,6 +541,27 @@ export class RunStore {
     if (!resolved) throw new WorkflowError("WORKTREE_FAILED", `Missing named worktree ${name}`);
     return resolved;
   }
+  async validateDeletionWorktrees(): Promise<void> {
+    try {
+      const records = await json<unknown[]>(join(this.directory, "worktrees.json"));
+      if (!Array.isArray(records)) throw new Error("Worktree records are invalid");
+      const owners = new Set<string>();
+      const paths = new Set<string>();
+      records.forEach((record) => {
+        if (!record || typeof record !== "object" || typeof (record as Partial<WorktreeReference>).owner !== "string") throw new Error("Invalid worktree record");
+        const owner = (record as Partial<WorktreeReference>).owner as string;
+        if (owners.has(owner)) throw new Error(`Duplicate worktree record for ${owner}`);
+        owners.add(owner);
+        const reference = this.structuralWorktree(owner, record);
+        paths.add(resolve(reference.path));
+      });
+      const entries = await readdir(join(this.directory, "worktrees"), { withFileTypes: true }).catch((error: unknown) => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as import("node:fs").Dirent[]; throw error; });
+      for (const entry of entries) if (!entry.isDirectory() || entry.isSymbolicLink() || !paths.has(resolve(join(this.directory, "worktrees", entry.name)))) throw new Error(`Unrecorded worktree artifact: ${join(this.directory, "worktrees", entry.name)}`);
+    } catch (error) {
+      throw new WorkflowError("WORKTREE_FAILED", error instanceof Error ? error.message : String(error));
+    }
+  }
+
 
   async validateBorrowedWorktrees(): Promise<void> {
     try {

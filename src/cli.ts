@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
+import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
 import workflowExtension, { formatWorkflowProgress, truncateWorkflowProgress, workflowCatalog, type JsonSchema, type JsonValue, type WorkflowProgressStyles } from "./index.js";
 import { runSessionInspector, transcriptFileLines } from "./session-inspector.js";
 import type { PersistedRun } from "./persistence.js";
@@ -158,6 +159,26 @@ function launcherHelpLines(): string[] {
 }
 function workflowUsage(): string { return [`Usage: pi-extensible-workflows run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
 function exportUsage(): string { return [`Usage: pi-extensible-workflows export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
+export function parseDoctorCleanupArgs(rawArgs: readonly string[]): Required<Pick<DoctorCleanupOptions, "olderThanDays" | "yes">> {
+  let olderThanDays = 90;
+  let yes = false;
+  let seenDays = false;
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const token = rawArgs[index] as string;
+    if (token === "--yes") { yes = true; continue; }
+    const inline = token.startsWith("--older-than-days=") ? token.slice("--older-than-days=".length) : undefined;
+    if (token === "--older-than-days" || inline !== undefined) {
+      if (seenDays) throw new Error("--older-than-days may only be provided once");
+      const raw = inline ?? rawArgs[++index];
+      if (raw === undefined || !/^[1-9]\d*$/.test(raw)) throw new Error("older-than-days must be a positive integer");
+      const parsed = Number(raw);
+      if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error("older-than-days must be a positive integer");
+      olderThanDays = parsed; seenDays = true; continue;
+    }
+    throw new Error(`Unknown cleanup option: ${token}`);
+  }
+  return { olderThanDays, yes };
+}
 function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustOverride?: boolean } {
   const args: string[] = [];
   let trustOverride: boolean | undefined;
@@ -414,6 +435,16 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
     const report = await doctor(options);
     write(formatDoctorReport(report));
     return doctorExitCode(report);
+  }
+  if (args[0] === "doctor" && args[1] === "cleanup") {
+    if (args.slice(2).some((arg) => arg === "--help" || arg === "-h")) { write("Usage: pi-extensible-workflows doctor cleanup [--older-than-days <days>] [--yes]\n"); return 0; }
+    try {
+      const parsed = parseDoctorCleanupArgs(args.slice(2));
+      const cleanupOptions: DoctorCleanupOptions = { ...parsed, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) };
+      const report = await doctorCleanup(cleanupOptions);
+      write(formatDoctorCleanupReport(report));
+      return doctorCleanupExitCode(report);
+    } catch (error) { stderr(`Error: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
   }
   if (args[0] === "inspect" && args.length <= 2) {
     try { await (options.inspect ?? runSessionInspector)(args[1]); return 0; }

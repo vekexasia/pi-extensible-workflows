@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+- Added explicit dry-run-first `doctor cleanup` with age-gated, lease-aware, dependency-safe deletion of old terminal workflow runs.
+
 ## [3.0.0] - 2026-07-23
 
 ### Breaking changes
