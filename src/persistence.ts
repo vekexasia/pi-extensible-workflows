@@ -195,17 +195,36 @@ export function atomicWriteFile(path: string, content: string, sync = false): Pr
   if (sync) {
     try {
       writeFileSync(temporary, content, { encoding: "utf8", mode: 0o600 });
-      renameSync(temporary, path);
+      retryRenameSync(temporary, path);
     } catch (error) {
       try { rmSync(temporary, { force: true }); } catch { /* Preserve the original write error. */ }
       throw error;
     }
     return;
   }
-  return writeFile(temporary, content, { encoding: "utf8", mode: 0o600 }).then(() => rename(temporary, path)).catch(async (error: unknown) => {
+  return writeFile(temporary, content, { encoding: "utf8", mode: 0o600 }).then(() => retryRename(temporary, path)).catch(async (error: unknown) => {
     try { await rm(temporary, { force: true }); } catch { /* Preserve the original write error. */ }
     throw error;
   });
+}
+
+function retryRenameSync(temporary: string, path: string): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { renameSync(temporary, path); return; }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EPERM" || attempt === 2) throw err;
+    }
+  }
+}
+
+async function retryRename(temporary: string, path: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { await rename(temporary, path); return; }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EPERM" || attempt === 2) throw err;
+      await new Promise(r => setTimeout(r, 50));
+    }
+  }
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
