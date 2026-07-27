@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -558,7 +558,7 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
         if (!usage) return;
         streamCost += usage.cost;
         reportProgress(`${input.case.id}: parent turn complete, ${String(usage.totalTokens)} tokens, $${streamCost.toFixed(4)} total`);
-        if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+        if (streamCost > input.maxCost && !budgetExceeded) { budgetExceeded = true; void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); controller.abort(); }
         return;
       }
       if (event.type === "turn_end") {
@@ -583,7 +583,7 @@ async function runPiCapture(input: CaptureCaseInput, cwd: string, home: string, 
   child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
   child.once("error", (error: Error) => { spawnError = error.message; });
   const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
-  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
+  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); controller.abort(); }, input.case.timeoutMs);
   const exitCode = await close; if (timer) clearTimeout(timer);
   if (lineBuffer) inspectLine(lineBuffer);
   if (killPromise) processGroupTerminated ||= await killPromise;
@@ -634,14 +634,14 @@ async function runSemanticJudge(input: CaptureCaseInput, calls: readonly Capture
       const measured = usageFrom(event.message);
       if (measured) usage = addUsage(usage, { input: measured.input, output: measured.output, cacheRead: measured.cacheRead, cacheWrite: measured.cacheWrite, totalTokens: measured.totalTokens, cost: measured.cost, models: [{ model: measured.model, cost: measured.cost }] });
       if (Array.isArray(event.message.content)) raw = event.message.content.flatMap((part) => isObject(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : []).join("\n");
-      if (usage.cost > maxCost && !budgetExceeded) { budgetExceeded = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }
+      if (usage.cost > maxCost && !budgetExceeded) { budgetExceeded = true; void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); controller.abort(); }
     } catch { /* Ignore diagnostics in the JSON stream. */ }
   };
   child.stdout.on("data", (chunk: Buffer) => { lineBuffer += chunk.toString(); const lines = lineBuffer.split("\n"); lineBuffer = lines.pop() ?? ""; for (const line of lines) if (line) inspectLine(line); });
   child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
   child.once("error", (error: Error) => { spawnError = error.message; });
   const close = new Promise<number | null>((resolve) => { child.once("close", resolve); });
-  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); }, input.case.timeoutMs);
+  const timer = input.case.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; void requestKill().then((terminated) => { processGroupTerminated ||= terminated; }); controller.abort(); }, input.case.timeoutMs);
   const exitCode = await close; if (timer) clearTimeout(timer); if (lineBuffer) inspectLine(lineBuffer); if (killPromise) processGroupTerminated ||= await killPromise;
   return { raw, usage, exitCode, timedOut, budgetExceeded, processGroupTerminated, stoppedIntentionally: false, stderr, ...(spawnError ? { error: spawnError } : {}) };
 }
@@ -793,7 +793,7 @@ export async function captureEvalCase(input: CaptureCaseInput): Promise<EvalCase
 export interface IsolatedProcessOptions { childPath: string; timeoutMs?: number; env?: NodeJS.ProcessEnv; onStderr?: (chunk: string) => void }
 export interface IsolatedProcessResult<T> { value?: T; timedOut: boolean; exitCode: number | null; processGroupTerminated: boolean; stderr: string; error?: string }
 export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedProcessOptions): Promise<IsolatedProcessResult<T>> {
-  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-case-")); const inputPath = join(root, "input.json"); const outputPath = join(root, "output.json");
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-workflow-eval-case-"))); const inputPath = join(root, "input.json"); const outputPath = join(root, "output.json");
   try {
     writeFileSync(inputPath, `${JSON.stringify({ payload, outputPath })}\n`, { mode: 0o600 });
     const controller = new AbortController();
@@ -802,7 +802,7 @@ export async function runIsolatedProcess<T>(payload: unknown, options: IsolatedP
     child.stderr.on("data", (chunk: Buffer) => { const text = chunk.toString(); stderr = `${stderr}${text}`.slice(-64_000); options.onStderr?.(text); });
     child.once("error", (error: Error) => { processError = error.message; });
     const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
-    const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; controller.abort(); killPromise ??= killProcessGroup(child); void killPromise.then((terminated) => { processGroupTerminated ||= terminated; }); }, options.timeoutMs);
+    const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => { timedOut = true; killPromise ??= killProcessGroup(child); controller.abort(); void killPromise.then((terminated) => { processGroupTerminated ||= terminated; }); }, options.timeoutMs);
     const exitCode = await close; if (timer) clearTimeout(timer);
     if (killPromise) processGroupTerminated ||= await killPromise;
     if (!existsSync(outputPath)) return { timedOut, exitCode, processGroupTerminated, stderr, ...(processError ? { error: processError } : {}) };

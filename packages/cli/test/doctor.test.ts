@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -23,7 +23,7 @@ function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
 }
 
 function fixture(): { root: string; cwd: string; agentDir: string; settingsPath: string } {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-doctor-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-doctor-")));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -292,6 +292,26 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   await store.delete(true);
   assert.equal(existsSync(first.path), false);
   assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", first.branch], { stdio: "ignore" }));
+});
+void test("creates snapshot worktrees from a symlinked repository cwd without rewriting the persisted cwd", { skip: process.platform === "win32" }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlinked-worktree-"));
+  const repo = join(home, "repo");
+  const alias = join(home, "repo-alias");
+  const repoCwd = join(repo, "packages", "app");
+  const cwd = join(alias, "packages", "app");
+  mkdirSync(repoCwd, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repoCwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  symlinkSync(repo, alias, "dir");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const worktree = await store.worktree("agent");
+  assert.equal(worktree.cwd, join(worktree.path, "packages", "app"));
+  assert.equal((await store.load()).run.cwd, cwd);
 });
 void test("does not advertise non-canonical named worktree owners", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-non-canonical-named-worktree-"));

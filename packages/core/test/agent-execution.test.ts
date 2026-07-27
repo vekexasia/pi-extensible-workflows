@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -1280,7 +1280,11 @@ void test("isolates role resource exclusions and reapplies them on retries", asy
   assert.deepEqual(basePolicy.effective, { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] });
 });
 void test("filters disabled native extensions before factories and skills before session registration", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-loader-"));
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-loader-"));
+  const physicalRoot = join(fixtureRoot, "physical");
+  const rootDir = join(fixtureRoot, "alias");
+  mkdirSync(physicalRoot);
+  symlinkSync(physicalRoot, rootDir, process.platform === "win32" ? "junction" : "dir");
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
   const projectExtensions = join(cwd, ".pi", "extensions");
@@ -1290,7 +1294,7 @@ void test("filters disabled native extensions before factories and skills before
   mkdirSync(join(agentDir, "extensions"), { recursive: true });
   writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
   writeFileSync(join(agentDir, "auth.json"), "{}");
-  const disabledExtension = join(agentDir, "extensions", "disabled.ts");
+  const disabledExtension = join(agentDir, "extensions", "disabled (1).ts");
   const allowedExtension = join(agentDir, "extensions", "allowed.ts");
   const disabledMarker = join(rootDir, "disabled-extension-ran");
   const allowedMarker = join(rootDir, "allowed-extension-ran");
@@ -1398,7 +1402,7 @@ void test("loads workflow SYSTEM.md with project trust and precedence", async ()
   }
 });
 void test("applies ordered minimatch resource exclusions and records concrete matches", async () => {
-  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-globs-"));
+  const rootDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-globs-")));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
   mkdirSync(join(agentDir, "extensions"), { recursive: true });

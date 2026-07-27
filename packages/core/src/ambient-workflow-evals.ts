@@ -292,8 +292,8 @@ export async function runAmbientPiProcess(input: AmbientPiProcessInput): Promise
       totalCost += usageCost(event.message);
       if (totalCost > input.maxCost && !budgetExceeded) {
         budgetExceeded = true;
-        controller.abort();
         void requestKill().then((terminated) => { processGroupTerminated ||= terminated; });
+        controller.abort();
       }
     } catch { /* Ignore non-JSON diagnostics in print mode. */ }
   };
@@ -310,8 +310,8 @@ export async function runAmbientPiProcess(input: AmbientPiProcessInput): Promise
   const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
   const timer = setTimeout(() => {
     timedOut = true;
-    controller.abort();
     void requestKill().then((terminated) => { processGroupTerminated ||= terminated; });
+    controller.abort();
   }, input.timeoutMs);
   const exitCode = await close;
   clearTimeout(timer);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
@@ -3025,7 +3025,7 @@ void test("accepts role system prompt override metadata", () => {
   assert.throws(() => parseRoleMarkdown("---\noverrideSystemPrompt: yes\n---\nbody", true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
 void test("strict role resource exclusions normalize relative and portable paths", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-resources-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-resources-")));
   const rolePath = join(root, "roles", "reviewer.md");
   const extension = join(root, "role-extension.ts");
   mkdirSync(join(root, "roles"), { recursive: true });
@@ -3199,7 +3199,7 @@ void test("matches Windows extension paths using portable glob separators", () =
   assert.deepEqual(disabledResources(["C:\\agent\\extensions\\**\\*.ts", `!${allowed}`], [disabled, allowed]), [disabled]);
 });
 void test("canonicalizes symlinked extension glob prefixes", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlink-globs-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlink-globs-")));
   const path = join(root, "settings.json");
   const realExtensions = join(root, "real", "extensions");
   mkdirSync(realExtensions, { recursive: true });

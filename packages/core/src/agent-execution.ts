@@ -140,6 +140,12 @@ function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 function canonicalSourcePath(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
+function canonicalExtensionSelector(selector: string): string {
+  const negated = selector.startsWith("!");
+  const body = negated ? selector.slice(1) : selector;
+  if (!existsSync(body) && /[*?\x5b\x5d{}()]/.test(body)) return selector;
+  return `${negated ? "!" : ""}${canonicalSourcePath(body)}`;
+}
 const WORKFLOW_DIRECTORY = "pi-extensible-workflows";
 function workflowSystemPromptPath(cwd: string, agentDir: string, projectTrusted: boolean): string | undefined {
   const projectPath = join(cwd, ".pi", WORKFLOW_DIRECTORY, "SYSTEM.md");
@@ -168,9 +174,11 @@ export async function createLocalPiSession(input: SessionInput): Promise<PiSessi
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
     const resolved = await packageManager.resolve();
     const discoveredExtensions = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalSourcePath(path)))];
-    const excludedExtensions = new Set(disabledResources(policy.effective.extensions, discoveredExtensions));
+    const extensionSelectors = policy.effective.extensions.map((selector) => ({ original: selector, matching: canonicalExtensionSelector(selector) }));
+    const excludedExtensions = new Set(disabledResources(extensionSelectors.map(({ matching }) => matching), discoveredExtensions));
     const extensionPaths = discoveredExtensions.filter((path) => !excludedExtensions.has(path));
-    Object.assign(policy, { excludedExtensions: [...excludedExtensions], unmatchedExtensions: unmatchedResourcePatterns(policy.effective.extensions, discoveredExtensions) });
+    const unmatchedExtensions = extensionSelectors.filter(({ matching }) => unmatchedResourcePatterns([matching], discoveredExtensions).length > 0).map(({ original }) => original);
+    Object.assign(policy, { excludedExtensions: [...excludedExtensions], unmatchedExtensions });
     const skillPaths = [...new Set(resolved.skills.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => path))];
     const updateSkillMatches = (skills: readonly { name: string }[]): Set<string> => {
       const names = [...new Set(skills.map(({ name }) => name))];
