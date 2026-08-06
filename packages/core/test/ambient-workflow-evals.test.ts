@@ -93,11 +93,21 @@ appendFileSync(join(process.cwd(), "src/score.js"), "\\n// edited only in this w
 
     const third = createAmbientCaseWorktree(repository, "timeout");
     const slowPi = join(fakeRoot, "slow-pi.mjs");
-    writeFileSync(slowPi, "#!/usr/bin/env node\nsetInterval(() => {}, 1_000);\n");
+    const grandchildPidFile = join(fakeRoot, "grandchild.pid");
+    writeFileSync(slowPi, `#!/usr/bin/env node\nimport { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(grandchildPidFile)}, String(grandchild.pid));\nsetInterval(() => {}, 1000);\n`);
     chmodSync(slowPi, 0o755);
-    const timeout = await runAmbientPiProcess({ worktree: third.path, sessionDir: join(repository.root, "sessions", "timeout"), prompt: "ignored", provider: "fake", model: "model", piCommand: slowPi, timeoutMs: 50, maxCost: 1 });
+    const timeout = await runAmbientPiProcess({ worktree: third.path, sessionDir: join(repository.root, "sessions", "timeout"), prompt: "ignored", provider: "fake", model: "model", piCommand: slowPi, timeoutMs: 1_000, maxCost: 1 });
     assert.equal(timeout.timedOut, true);
     assert.equal(timeout.processGroupTerminated, true);
+    assert.equal(existsSync(grandchildPidFile), true, "the fake pi never spawned its grandchild before the timeout");
+    const grandchildPid = Number(readFileSync(grandchildPidFile, "utf8"));
+    assert.ok(Number.isInteger(grandchildPid) && grandchildPid > 0);
+    let grandchildAlive = true;
+    for (let attempt = 0; attempt < 200 && grandchildAlive; attempt += 1) {
+      try { process.kill(grandchildPid, 0); await new Promise((resolve) => setTimeout(resolve, 10)); } catch { grandchildAlive = false; }
+    }
+    if (grandchildAlive) try { process.kill(grandchildPid, "SIGKILL"); } catch { /* Already gone. */ }
+    assert.equal(grandchildAlive, false, "the detached process group survived the timeout");
     assert.equal(removeAmbientCaseWorktree(repository, third), true);
     assert.equal(existsSync(third.path), false);
   } finally {
