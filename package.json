@@ -10,13 +10,15 @@
     "packages/extensions/*"
   ],
   "pi": {
-    "extensions": ["./packages/core/src/index.ts"]
+    "extensions": [
+      "./packages/core/src/index.ts"
+    ]
   },
   "scripts": {
-    "build": "npm run build --workspace=packages/core && npm run build --workspace=packages/cli && npm run build --workspace=packages/extensions/herdr && npm run build --workspace=packages/extensions/subagents",
+    "build": "npm run build --workspace=packages/core && npm run build --workspace=packages/cli && npm run build --workspace=packages/extensions/herdr && npm run build --workspace=packages/extensions/subagents && npm run build --workspace=packages/extensions/widget",
     "inspect": "npm run inspect --workspace=packages/cli",
-    "lint": "npm run lint --workspace=packages/core && npm run lint --workspace=packages/cli && npm run lint --workspace=packages/extensions/herdr && npm run lint --workspace=packages/extensions/subagents",
-    "test": "npm run test --workspace=packages/core && npm run test --workspace=packages/cli && npm run test --workspace=packages/extensions/herdr && npm run test --workspace=packages/extensions/subagents && npm run test:template",
+    "lint": "npm run lint --workspace=packages/core && npm run lint --workspace=packages/cli && npm run lint --workspace=packages/extensions/herdr && npm run lint --workspace=packages/extensions/subagents && npm run lint --workspace=packages/extensions/widget",
+    "test": "npm run test --workspace=packages/core && npm run test --workspace=packages/cli && npm run test --workspace=packages/extensions/herdr && npm run test --workspace=packages/extensions/subagents && npm run test --workspace=packages/extensions/widget && npm run test:template",
     "test:run": "npm run test:run --workspace=packages/core && npm run test:herdr --workspace=packages/core && npm run test:run --workspace=packages/cli",
     "test:template": "node --test --test-timeout=10000 --test-force-exit packages/core/examples/workflow-extension-template/extension.test.mjs",
     "acceptance": "npm run acceptance --workspace=packages/core",

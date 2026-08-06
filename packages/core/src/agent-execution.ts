@@ -209,6 +209,30 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
 
 interface LocalPiSessionHandle { readonly session: PiSession; shutdown(reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> }
 export async function createLocalPiSession(input: SessionInput): Promise<PiSession> { return (await createLocalPiSessionHandle(input)).session; }
+/**
+ * Hands the runtime the providers that extensions registered while loading.
+ *
+ * An extension that adds models (a proxy front-end, a gateway) registers them
+ * from its factory, and the loader parks those registrations on the extension
+ * runtime rather than applying them. Pi's own session assembly drains that
+ * queue; a workflow agent builds its runtime here by hand, so without this the
+ * models an extension provides stay unknown and every agent asking for one
+ * fails with UNKNOWN_MODEL.
+ */
+function flushExtensionProviders(resourceLoader: DefaultResourceLoader, modelRuntime: ModelRuntime): void {
+  const { runtime } = resourceLoader.getExtensions();
+  for (const { name, config } of runtime.pendingProviderRegistrations) {
+    // A provider that cannot be registered must not stop the agent from
+    // starting: the model it offers may not be the one this agent asked for.
+    try { modelRuntime.registerProvider(name, config); } catch { /* Reported when the model itself turns out to be missing. */ }
+  }
+  runtime.pendingProviderRegistrations = [];
+  for (const { provider } of runtime.pendingNativeProviderRegistrations) {
+    try { modelRuntime.registerNativeProvider(provider); } catch { /* Same. */ }
+  }
+  runtime.pendingNativeProviderRegistrations = [];
+}
+
 async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: SessionStartEvent): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
@@ -217,8 +241,6 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
   const manager = input.sessionManager ?? (input.sessionPath ? SessionManager.open(input.sessionPath, join(agentDir, "sessions"), input.cwd) : input.agentDir ? SessionManager.create(input.cwd, join(agentDir, "sessions")) : SessionManager.create(input.cwd));
   if (!input.sessionPath) manager.appendSessionInfo(input.sessionLabel);
   const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
-  const model = modelRuntime.getModel(input.model.provider, input.model.model);
-  if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const customTools = [...(input.customTools ?? []), ...(input.resultTool ? [input.resultTool] : [])];
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
   let settingsManager: SettingsManager;
@@ -268,6 +290,10 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
+  flushExtensionProviders(resourceLoader, modelRuntime);
+  await modelRuntime.refresh({ allowNetwork: false });
+  const model = modelRuntime.getModel(input.model.provider, input.model.model);
+  if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
   const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(sessionStartEvent ? { sessionStartEvent } : {}), sessionManager: manager });
   const nativeDispose = session.dispose.bind(session);
   let disposal: Promise<void> | undefined;
