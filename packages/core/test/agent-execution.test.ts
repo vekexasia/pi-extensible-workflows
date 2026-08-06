@@ -2274,3 +2274,32 @@ void test("preserves terminal progress when usage becomes unavailable", async ()
   assert.equal(terminal.persist, true);
   assert.deepEqual(terminal.accounting, { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 });
 });
+void test("models registered by an extension are available to the agent", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-provider-"));
+  const agentDir = join(rootDir, "agent");
+  const cwd = join(rootDir, "project");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  // No provider on disk: the only route to this model is the extension below,
+  // which is the whole point — an extension that supplies models (a proxy
+  // front-end, a gateway) registers them while its resources load, and the
+  // loader parks those registrations rather than applying them.
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+
+  const extensionFactory: NonNullable<SessionInput["extensionFactories"]>[number] = (pi) => {
+    pi.registerProvider("proxied", {
+      baseUrl: "http://127.0.0.1:1/v1",
+      api: "openai-completions",
+      apiKey: "fixture",
+      models: [{ id: "proxied-model", name: "Proxied model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_024, maxTokens: 128 }],
+    });
+  };
+
+  try {
+    const session = await createLocalPiSession({ cwd, agentDir, model: { provider: "proxied", model: "proxied-model" }, tools: [], sessionLabel: "extension-provider", extensionFactories: [extensionFactory] });
+    await session.dispose();
+  } finally {
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
