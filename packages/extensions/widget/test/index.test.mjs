@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import widget, { renderReceipt } from "../dist/index.js";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import widget, { renderReceipt, __navigationForTests } from "../dist/index.js";
 import {
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
   WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT,
@@ -15,7 +16,9 @@ import {
 // Stands in for Pi's theme. `bg` wraps rather than colours so a test can see
 // which row was highlighted without matching escape codes.
 const theme = {
-  fg: (_colour, text) => text,
+  // Real themes emit a colour and a full reset; the reset is what used to eat
+  // the selection background, so the stand-in reproduces it.
+  fg: (_colour, text) => `\u001b[38;5;12m${text}\u001b[0m`,
   bold: (text) => text,
   bg: (_colour, text) => `\u0001${text}\u0001`,
 };
@@ -315,12 +318,15 @@ void test("a quiet agent is flagged early, a stalled one more loudly", () => {
   const oldTranscript = join(root, "old.jsonl");
   writeFileSync(oldTranscript, "{}\n");
   utimesSync(oldTranscript, new Date(Date.now() - 4 * 60_000), new Date(Date.now() - 4 * 60_000));
-  const sessions = [{ transport: "local", sessionId: "s", locator: { sessionFile: oldTranscript } }];
+  const session = { transport: "local", sessionId: "s", locator: { sessionFile: oldTranscript } };
 
   const quiet = writeRun(join(root, "run-1"), {
     ...state,
-    agentSessions: sessions,
-    agents: [{ ...state.agents[0], lastEventAt: Date.now() - 4 * 60_000 }],
+    agents: [{
+      ...state.agents[0],
+      lastEventAt: Date.now() - 4 * 60_000,
+      attemptDetails: [{ attempt: 1, transport: "local", session }],
+    }],
   });
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: quiet, sessionId: "session-1" });
   assert.match(host.frames.at(-1).map(plain).join("\n"), /quiet 04:0\d/, "the silence is shown with its length");
@@ -332,8 +338,15 @@ void test("a quiet agent is flagged early, a stalled one more loudly", () => {
 
   const stalled = writeRun(join(root, "run-2"), {
     ...state,
-    agentSessions: [{ transport: "local", sessionId: "s2", locator: { sessionFile: deadTranscript } }],
-    agents: [{ ...state.agents[0], lastEventAt: Date.now() - 11 * 60_000 }],
+    agents: [{
+      ...state.agents[0],
+      lastEventAt: Date.now() - 11 * 60_000,
+      attemptDetails: [{
+        attempt: 1,
+        transport: "local",
+        session: { transport: "local", sessionId: "s2", locator: { sessionFile: deadTranscript } },
+      }],
+    }],
   });
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: stalled, sessionId: "session-1" });
   assert.match(host.frames.at(-1).map(plain).join("\n"), /stalled 11:0\d/, "a stalled agent says so");
@@ -486,8 +499,15 @@ void test("a busy agent is not called quiet just because the run state is stale"
   const state = runState();
   const stale = {
     ...state,
-    agentSessions: [{ transport: "local", sessionId: "s", locator: { sessionFile: transcript } }],
-    agents: [{ ...state.agents[0], lastEventAt: Date.now() - 8 * 60_000 }],
+    agents: [{
+      ...state.agents[0],
+      lastEventAt: Date.now() - 8 * 60_000,
+      attemptDetails: [{
+        attempt: 1,
+        transport: "local",
+        session: { transport: "local", sessionId: "s", locator: { sessionFile: transcript } },
+      }],
+    }],
   };
   const directory = writeRun(join(root, "run-1"), stale);
 
@@ -539,9 +559,11 @@ void test("a busy screen still produces a frame Pi will not truncate", () => {
   }
 
   const frame = host.frames.at(-1);
-  assert.ok(frame.length <= 20, `the frame stays within its row budget, got ${frame.length}`);
-  // Side rules only: no lid, no floor. Every row carries one on each edge.
-  for (const line of frame) assert.match(plain(line), /^│.*│$/, `a rule on both edges, got: ${plain(line)}`);
+  assert.ok(frame.length <= 10, `the frame stays within its row budget, got ${frame.length}`);
+  // A lid on the title row, side rules between, a floor to close it.
+  assert.match(plain(frame[0]), /^╭.*╮$/, `the lid rides the title row, got: ${plain(frame[0])}`);
+  assert.match(plain(frame.at(-1)), /^╰─+╯$/, `the box closes, got: ${plain(frame.at(-1))}`);
+  for (const line of frame.slice(1, -1)) assert.match(plain(line), /^│.*│$/, `a rule on both edges, got: ${plain(line)}`);
 
   // Folding must not hide the work that is actually happening.
   const text = frame.map(plain).join("\n");
@@ -637,191 +659,423 @@ void test("a foreground run leaves no receipt either", async () => {
 });
 
 
-void test("the widget sits below the editor and walks its rows on ↓", () => {
-  // Focus is taken only from an empty editor, on the one key that has nothing
-  // else to do there, and handed back the moment anything is typed. A widget
-  // that held the keyboard any longer would be one you had to fight past.
-  const root = mkdtempSync(join(tmpdir(), "widget-focus-"));
+
+
+
+
+
+
+
+void test("every colour comes from the theme", () => {
+  // Hardcoded 24-bit escapes look right on one terminal and wrong on a
+  // 256-colour or light theme, and ignore whatever the reader chose. Rendering
+  // with a theme that paints nothing must therefore produce no colour at all.
+  const root = mkdtempSync(join(tmpdir(), "widget-theme-"));
   const host = harness();
   host.start();
+
+  const directory = writeRun(join(root, "run-1"), runState());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+  const colourless = { fg: (_colour, text) => text, bold: (text) => text, bg: (_colour, text) => text };
+  const frame = host.widgets.at(-1)(host.tui, colourless).render(WIDTH);
+
+  const coloured = frame.filter((line) => line.includes("\u001b["));
+  assert.deepEqual(coloured, [], "a theme that paints nothing leaves no escapes behind");
+
+  host.shutdown();
+});
+
+void test("one busy agent does not vouch for a silent one", () => {
+  // Silence used to be measured across every session in the run, so the newest
+  // write anywhere made every agent look alive. Two agents, one working and one
+  // that stopped, then read identically — and the one that stopped is the whole
+  // reason to look.
+  const root = mkdtempSync(join(tmpdir(), "widget-per-agent-"));
+
+  const busy = join(root, "busy.jsonl");
+  const silent = join(root, "silent.jsonl");
+  writeFileSync(busy, "{}\n");
+  writeFileSync(silent, "{}\n");
+  const longAgo = new Date(Date.now() - 5 * 60_000);
+  utimesSync(silent, longAgo, longAgo);
+
+  const state = runState();
+  const attempt = (file) => [{
+    attempt: 1,
+    transport: "local",
+    session: { transport: "local", sessionId: file, locator: { sessionFile: file } },
+  }];
 
   const directory = writeRun(join(root, "run-1"), {
-    ...runState(),
-    phaseHistory: [{ phase: "discover", afterAgent: 0 }, { phase: "plan", afterAgent: 1 }],
+    ...state,
+    phaseHistory: [{ phase: "work", afterAgent: 0 }],
     agents: [
-      { ...runState().agents[0], state: "completed" },
-      { ...runState().agents[0], id: "a2", name: "planner", state: "running" },
+      { ...state.agents[0], id: "a1", name: "worker", lastEventAt: Date.now(), attemptDetails: attempt(busy) },
+      { ...state.agents[0], id: "a2", name: "waiter", lastEventAt: Date.now() - 5 * 60_000, attemptDetails: attempt(silent) },
     ],
   });
+
+  const host = harness();
+  host.start();
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
 
-  assert.equal(host.placements.at(-1), "belowEditor", "below the editor, not above it");
+  const frame = host.frames.at(-1).map(plain);
+  const worker = frame.find((line) => line.includes("worker"));
+  const waiter = frame.find((line) => line.includes("waiter"));
+  assert.ok(!worker.includes("quiet"), "the working agent is not flagged");
+  assert.match(waiter, /quiet 05:0\d/, "the silent one is, on its own transcript");
 
-  // Captured from a live session: with the kitty keyboard protocol, which Pi
-  // negotiates, an arrow arrives parameterised rather than as a bare `\x1b[B`.
-  // `:1` is the press, `:3` its release, and `:2` the repeat while held — the
-  // counts in that capture came in `:1`/`:3` pairs with a long `:2` run.
-  const DOWN = "\u001b[1;1:1B";
-  const DOWN_RELEASE = "\u001b[1;1:3B";
-  const DOWN_REPEAT = "\u001b[1;1:2B";
-  const UP = "\u001b[1;1:1A";
-  const ESC = "\u001b";
+  host.shutdown();
+});
 
-  // With text in the editor, ↓ belongs to the editor.
-  host.setEditorText("some text");
-  assert.equal(host.key(DOWN), false, "a keystroke meant for the editor is left alone");
+void test("agents nest under their parent, by the label the workflow gave them", () => {
+  // A spawned agent drawn as a sibling hides who asked for it, and its cost
+  // reads as a peer's rather than part of the parent's. The label is what the
+  // workflow called this one; the name is the role it was built from, which
+  // two agents can share.
+  const root = mkdtempSync(join(tmpdir(), "widget-nest-"));
+  const state = runState();
+  const base = state.agents[0];
+
+  const directory = writeRun(join(root, "run-1"), {
+    ...state,
+    phaseHistory: [{ phase: "work", afterAgent: 0 }],
+    agents: [
+      { ...base, id: "p", name: "developer", label: "developer (api)", state: "running" },
+      { ...base, id: "c", name: "reviewer", parentId: "p", state: "running" },
+    ],
+  });
+
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+  const frame = host.frames.at(-1).map(plain);
+  const parent = frame.findIndex((line) => line.includes("developer (api)"));
+  const child = frame.findIndex((line) => line.includes("reviewer"));
+
+  assert.ok(parent >= 0, "the label is used, not the bare role name");
+  assert.ok(child > parent, "the child is drawn under its parent");
+
+  const indent = (line) => line.length - line.replace(/^│\s+/, "").length;
+  assert.ok(indent(frame[child]) > indent(frame[parent]), "and indented beneath it");
+
+  host.shutdown();
+});
+
+void test("with scrolling off the widget claims no keys at all", () => {
+  // The behaviour is finished but withheld until there is something to do
+  // once inside. While it is off, `↓` and the shortcut must reach whatever
+  // else wants them — a widget that swallows keys to offer nothing back is
+  // worse than one that stays out of the way.
+  __navigationForTests.enabled = false;
+
+  const root = mkdtempSync(join(tmpdir(), "widget-off-"));
+  const host = harness();
+  host.start();
+
+  const directory = writeRun(join(root, "run-1"), runState());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+  assert.equal(host.shortcuts.size, 0, "no shortcut is registered");
 
   host.setEditorText("");
-  assert.equal(host.key(DOWN), true, "↓ on an empty editor takes focus");
-  assert.equal(host.key(DOWN_RELEASE), true, "the release half is swallowed, not acted on");
-  assert.equal(host.key(DOWN), true, "and moves down");
-  assert.equal(host.key(DOWN_REPEAT), true, "holding the key keeps moving");
-  assert.equal(host.key(UP), true, "and back up");
+  assert.equal(host.key("\u001b[1;1:1B"), false, "↓ passes through untouched");
 
-  // The bare form still works where a terminal speaks the older protocol.
-  assert.equal(host.key("\u001b[B"), true, "the unparameterised arrow is understood too");
-
-  const rendered = host.widgets.at(-1)(host.tui, theme).render(WIDTH);
-  const selected = rendered.filter((line) => line.includes("\u0001"));
-  assert.equal(selected.length, 1, "exactly one row is lit");
-
-  assert.equal(host.key(ESC), true, "escape gives the keyboard back");
-  assert.equal(host.key("x"), false, "and typing reaches the editor again");
+  const frame = host.frames.at(-1).map(plain);
+  assert.ok(!frame[0].includes("alt+o"), "and nothing is promised in the title");
 
   host.shutdown();
 });
 
-void test("the highlight covers the whole selected row, text included", () => {
-  // A row is assembled from coloured pieces, each ending in a full reset, and
-  // a full reset clears the background too. Painted without care the highlight
-  // survives only on the indent and the tree stem, and dies behind every piece
-  // of text — a stripe rather than a selection.
-  const root = mkdtempSync(join(tmpdir(), "widget-highlight-"));
+void test("the shortcut scrolls the widget through a tree too tall to show", () => {
+  // Ten rows do not stretch to five runs three phases deep, and what is folded
+  // away at rest is chosen by the widget, not the reader. Scrolling is how the
+  // rest is reached — entered by shortcut alone, since `↓` on an empty editor
+  // belongs to whichever picker opens next.
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-scroll-"));
   const host = harness();
   host.start();
 
-  const directory = writeRun(join(root, "run-1"), runState());
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  host.setEditorText("");
-  // Down onto the run header, which carries the dimmed figures on its right.
-  host.key("\u001b[1;1:1B");
-  host.key("\u001b[1;1:1B");
-
-  const lit = host.widgets.at(-1)(host.tui, theme).render(WIDTH).find((line) => line.includes("\u0001"));
-  assert.ok(lit, "a row is lit");
-
-  // Between the markers the background must never be cancelled: a full reset
-  // in there is exactly the bug.
-  const inside = lit.slice(lit.indexOf("\u0001") + 1, lit.indexOf("\u0001", lit.indexOf("\u0001") + 1));
-  assert.ok(!inside.includes("\u001b[0m"), `no full reset inside the highlight, got: ${JSON.stringify(inside)}`);
-  assert.ok(inside.includes("\u001b[39m"), "colours are still ended, just without clearing the background");
-
-  host.shutdown();
-});
-
-void test("an open menu keeps the arrow keys", () => {
-  // Every command picker leaves the editor empty while it waits for ↑/↓ —
-  // precisely the condition this widget uses to claim the key. Claiming it
-  // anyway meant `/workflow` opened a menu you could not move through.
-  const root = mkdtempSync(join(tmpdir(), "widget-menu-"));
-  const host = harness();
-  host.start();
-
-  const directory = writeRun(join(root, "run-1"), runState());
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  const DOWN = "\u001b[1;1:1B";
-  host.setEditorText("");
-
-  host.tui.openMenu();
-  assert.equal(host.key(DOWN), false, "the menu keeps ↓");
-
-  host.tui.closeMenu();
-  assert.equal(host.key(DOWN), true, "and the widget takes it once the menu is gone");
-
-  // A menu opening while the widget is focused takes the keyboard back.
-  host.tui.openMenu();
-  assert.equal(host.key(DOWN), false, "a menu opening over the widget wins");
-
-  // An overlay counts the same way.
-  host.tui.closeMenu();
-  host.tui.overlay = true;
-  assert.equal(host.key(DOWN), false, "an overlay keeps the keys too");
-
-  host.shutdown();
-});
-
-void test("the shortcut focuses the widget when the arrow cannot", () => {
-  // `↓` has to defer to anything else on screen, so there has to be a way in
-  // that does not — otherwise the widget is unreachable exactly when a menu
-  // happens to be open. Registering it through Pi also means it can be rebound
-  // in keybindings.json.
-  const root = mkdtempSync(join(tmpdir(), "widget-shortcut-"));
-  const host = harness();
-  host.start();
-
-  const directory = writeRun(join(root, "run-1"), runState());
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  const shortcut = [...host.shortcuts.values()][0];
-  assert.ok(shortcut, "a shortcut is registered");
-
-  shortcut.handler();
-  const lit = host.widgets.at(-1)(host.tui, theme).render(WIDTH).filter((line) => line.includes("\u0001"));
-  assert.equal(lit.length, 1, "the shortcut lights a row");
-
-  shortcut.handler();
-  const dark = host.widgets.at(-1)(host.tui, theme).render(WIDTH).filter((line) => line.includes("\u0001"));
-  assert.equal(dark.length, 0, "and pressing it again gives the keyboard back");
-
-  host.shutdown();
-});
-
-void test("the title row says how to get in", () => {
-  const root = mkdtempSync(join(tmpdir(), "widget-hint-"));
-  const host = harness();
-  host.start();
-
-  const directory = writeRun(join(root, "run-1"), runState());
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  assert.match(plain(host.frames.at(-1)[0]), /↓ or alt\+o/, "the way in is on the title row");
-
-  host.setEditorText("");
-  host.key("\u001b[1;1:1B");
-  const inside = host.widgets.at(-1)(host.tui, theme).render(WIDTH);
-  assert.match(plain(inside[0]), /↑↓ move · esc back/, "and the keys change once inside");
-
-  host.shutdown();
-});
-
-void test("focus is recognised across a duplicated TUI package", () => {
-  // npm may install a second copy of the TUI package beside the widget, so the
-  // editor Pi hands over is an instance of a *different* Editor class than any
-  // the widget could import. An identity check answers "not an editor" for the
-  // editor itself, and the widget then believes a menu is permanently open:
-  // `↓` stops working and the shortcut lights a row that vanishes on the next
-  // keystroke. Recognition by capability is immune to it.
-  const root = mkdtempSync(join(tmpdir(), "widget-dup-tui-"));
-  const host = harness();
-  host.start();
-
-  const directory = writeRun(join(root, "run-1"), runState());
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  // An editor from a foreign copy of the package: same shape, unrelated class.
-  class ForeignEditor {
-    getText() { return ""; }
-    addToHistory() { /* nothing */ }
+  const state = runState();
+  for (const id of ["run-1", "run-2", "run-3", "run-4", "run-5"]) {
+    const directory = writeRun(join(root, id), {
+      ...state,
+      id,
+      workflowName: `flow-${id}`,
+      phaseHistory: [
+        { phase: "fetch", afterAgent: 0 },
+        { phase: "build", afterAgent: 0 },
+        { phase: "verify", afterAgent: 0 },
+      ],
+    });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
   }
-  host.tui.focus = new ForeignEditor();
 
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  const shortcut = [...host.shortcuts.values()][0];
+  assert.ok(shortcut, "the shortcut is registered");
+
+  const resting = draw();
+  assert.ok(resting.length <= 10, `the frame keeps its budget, got ${resting.length}`);
+  assert.ok(resting.some((line) => line.includes("more")), "and says how much is hidden");
+
+  // `↓` is left alone until the shortcut says otherwise.
   host.setEditorText("");
-  assert.equal(host.key("\u001b[1;1:1B"), true, "↓ still works with a foreign editor focused");
+  assert.equal(host.key("\u001b[1;1:1B"), false, "↓ is not claimed at rest");
 
-  const lit = host.widgets.at(-1)(host.tui, theme).render(WIDTH).filter((line) => line.includes("\u0001"));
-  assert.equal(lit.length, 1, "and the row stays lit");
+  shortcut.handler();
+  assert.equal(host.key("\u001b[1;1:1B"), true, "and is claimed while scrolling");
+  const scrolled = draw();
+  assert.notDeepEqual(scrolled, resting, "the window moved");
+  assert.ok(scrolled.length <= 10, "still within budget");
+  assert.match(scrolled[0], /↑↓ scroll · esc/, "the keys are named while scrolling");
+
+  // Escape gives the keyboard back, and the arrow with it.
+  assert.equal(host.key("\u001b"), true, "escape is taken");
+  assert.equal(host.key("\u001b[1;1:1B"), false, "and ↓ is free again");
+
+  host.shutdown();
+});
+
+
+void test("scrolling is visibly a mode: coloured rules, a scrollbar and a way out", () => {
+  // Entering a mode that looks identical to not being in it is how a keypress
+  // goes somewhere unexpected. The rules change colour, a scrollbar says where
+  // the window sits, and the title names the key that leaves.
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-mode-"));
+  const host = harness();
+  host.start();
+
+  const state = runState();
+  for (const id of ["run-1", "run-2", "run-3", "run-4", "run-5"]) {
+    const directory = writeRun(join(root, id), {
+      ...state,
+      id,
+      workflowName: `flow-${id}`,
+      phaseHistory: [
+        { phase: "fetch", afterAgent: 0 },
+        { phase: "build", afterAgent: 0 },
+        { phase: "verify", afterAgent: 0 },
+      ],
+    });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+
+  // A theme that names the colour it was asked for, so the role is checkable.
+  // Each role gets a distinct real colour code, so the choice is checkable
+  // without adding width — an invented marker would push the line past the
+  // terminal and be truncated, which is the stand-in's fault, not the widget's.
+  const codes = { accent: "\u001b[34m", warning: "\u001b[33m" };
+  const named = {
+    fg: (colour, text) => `${codes[colour] ?? "\u001b[39m"}${text}\u001b[0m`,
+    bold: (text) => text,
+    bg: (_colour, text) => text,
+  };
+  // Wide enough for the title and the hint together; the hint gives way to the
+  // title on a narrow terminal, which is its own behaviour.
+  const draw = () => host.widgets.at(-1)(host.tui, named).render(100);
+
+  const resting = draw();
+  assert.ok(resting[0].startsWith("\u001b[34m╭"), "at rest the rules are the ordinary accent");
+  assert.match(plain(resting[0]), /alt\+o to scroll/, "and the way in is named");
+  assert.ok(!resting.some((line) => line.includes("█")), "no scrollbar until it means something");
+
+  [...host.shortcuts.values()][0].handler();
+  const scrolling = draw();
+  assert.ok(scrolling[0].startsWith("\u001b[33m╭"), "scrolling recolours the rules");
+  assert.match(plain(scrolling[0]), /esc to exit/, "and names the way out");
+  assert.ok(scrolling.some((line) => line.includes("█")), "the thumb shows where the window sits");
+  assert.ok(scrolling.some((line) => line.includes("░")), "against the track it moves along");
+
+  host.shutdown();
+});
+
+/** Builds a host with `count` runs of three phases each — more tree than frame. */
+function tallTree(count = 5) {
+  const root = mkdtempSync(join(tmpdir(), "widget-tall-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < count; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), {
+      ...runState(),
+      id,
+      workflowName: `flow-${String(index)}`,
+      phaseHistory: [
+        { phase: "one", afterAgent: 0 },
+        { phase: "two", afterAgent: 0 },
+        { phase: "three", afterAgent: 0 },
+      ],
+    });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  return host;
+}
+
+void test("scrolling reaches the last row and stops there, with nothing banked past the end", () => {
+  // The failure this guards is invisible rather than loud: presses past the end
+  // raise an offset no row can show, and every one has to be paid back with an
+  // ↑ that appears to do nothing. Overscroll far, then check that a single ↑
+  // moves the screen.
+  __navigationForTests.enabled = true;
+  const host = tallTree();
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  [...host.shortcuts.values()][0].handler();
+
+  for (let press = 0; press < 40; press += 1) host.key("\u001b[1;1:1B");
+  const bottom = draw();
+  assert.ok(bottom.some((line) => line.includes("three")), "the last phase of the last run is reachable");
+  assert.ok(bottom.some((line) => line.includes("above")), "and the marker counts what is behind, not ahead");
+
+  host.key("\u001b[1;1:1A");
+  assert.notDeepEqual(draw(), bottom, "one ↑ after overscrolling moves the window");
+
+  host.shutdown();
+});
+
+void test("entering scroll mode shows the top of the tree, not the resting selection", () => {
+  // At rest the widget picks rows by rank, so what it shows is not contiguous
+  // and the gaps are unmarked. Entering on that view makes the first press look
+  // like a jump: the reader is not moving a window, they are swapping views.
+  __navigationForTests.enabled = true;
+  const host = tallTree();
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+
+  // Contiguity is the point: the resting view drops rows silently, so a window
+  // that merely starts at the top is not enough — the rows after it must be
+  // the ones that really follow. Scrolling to the end collects every row of
+  // the tree in order; entering must show that sequence's first rows exactly.
+  [...host.shortcuts.values()][0].handler();
+  const entered = draw().slice(1, -1);
+
+  const walked = [];
+  for (let press = 0; press < 40; press += 1) {
+    for (const line of draw().slice(1, -1)) if (!line.includes("…") && !walked.includes(line)) walked.push(line);
+    host.key("\u001b[1;1:1B");
+  }
+
+  assert.deepEqual(
+    entered.filter((line) => !line.includes("…")),
+    walked.slice(0, entered.filter((line) => !line.includes("…")).length),
+    "the window opens on the first rows of the tree, in the order it walks them",
+  );
+
+  host.shutdown();
+});
+
+void test("the scrollbar thumb tracks the window it describes", () => {
+  // A thumb that reaches the bottom while rows remain, or lingers at the top
+  // after the window moved, is worse than no thumb: it is a wrong answer to
+  // the only question it is asked.
+  __navigationForTests.enabled = true;
+  const host = tallTree();
+  const thumb = () => {
+    const rows = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain).slice(1, -1);
+    const first = rows.findIndex((line) => line.endsWith("█"));
+    const last = rows.map((line) => line.endsWith("█")).lastIndexOf(true);
+    return { first, last, rows: rows.length };
+  };
+  [...host.shortcuts.values()][0].handler();
+
+  const top = thumb();
+  assert.equal(top.first, 0, "at the top of the tree the thumb starts at the top");
+  assert.ok(top.last < top.rows - 1, "and does not already fill the track");
+
+  for (let press = 0; press < 40; press += 1) host.key("\u001b[1;1:1B");
+  const bottom = thumb();
+  assert.equal(bottom.last, bottom.rows - 1, "at the end of the tree it reaches the bottom");
+  assert.ok(bottom.first > top.first, "having travelled there");
+
+  // And only there. A thumb clamped short of the window's own limit reaches
+  // the bottom while the content still has a row to give — a wrong answer to
+  // the one question it is asked. The track is coarser than a row, so the
+  // check is that the thumb is still moving where the window still moves:
+  // rewind to the top, then step down watching both.
+  for (let press = 0; press < 60; press += 1) host.key("\u001b[1;1:1A");
+  const body = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain).slice(1, -1).join("\n");
+  let previousBody = body();
+  let previousThumb = thumb();
+  let contentMovedAfterThumbStopped = false;
+  for (let press = 0; press < 40; press += 1) {
+    host.key("\u001b[1;1:1B");
+    const nextBody = body();
+    const nextThumb = thumb();
+    if (nextBody !== previousBody && previousThumb.last === previousThumb.rows - 1) {
+      contentMovedAfterThumbStopped = true;
+    }
+    previousBody = nextBody;
+    previousThumb = nextThumb;
+  }
+  assert.ok(!contentMovedAfterThumbStopped, "the window never moves after the thumb claims the bottom");
+
+  host.shutdown();
+});
+
+void test("lines are measured in terminal cells, not JavaScript characters", () => {
+  // Pi-tui rejects a line wider than the width it handed out — it throws, it
+  // does not wrap — and it counts display cells. A CJK ideograph is one
+  // character and two cells, so measuring with `.length` under-counts by half
+  // and hands the TUI a fatal line. Widths are checked with pi-tui's own
+  // measure, because agreeing approximately is the same as not agreeing.
+  const root = mkdtempSync(join(tmpdir(), "widget-cells-"));
+  const host = harness();
+  host.start();
+
+  const names = ["数据处理工作流程测试用例名称很长", "deploy 🚀🚀🚀🚀🚀🚀🚀🚀 prod", "ノード・ビルド・検証"];
+  names.forEach((workflowName, index) => {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), {
+      ...runState(),
+      id,
+      workflowName,
+      phaseHistory: [{ phase: "検証", afterAgent: 0 }, { phase: "two", afterAgent: 0 }],
+    });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  });
+
+  const widget = host.widgets.at(-1)(host.tui, theme);
+  for (let width = 1; width <= 120; width += 1) {
+    for (const line of widget.render(width)) {
+      assert.ok(
+        visibleWidth(line) <= width,
+        `render(${String(width)}) returned a line ${String(visibleWidth(line))} cells wide`,
+      );
+    }
+  }
+
+  host.shutdown();
+});
+
+void test("a run header survives however many checkpoints are waiting", () => {
+  // Checkpoints share the top rank because they need an answer, so ranking
+  // alone lets a few early ones spend the budget before a later run's header
+  // is reached. A run missing its detail is terse; a run missing its header is
+  // invisible, and the widget exists to say what is running.
+  const root = mkdtempSync(join(tmpdir(), "widget-headers-"));
+  const host = harness();
+  host.start();
+
+  for (let index = 0; index < 8; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  for (let index = 0; index < 7; index += 1) {
+    host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+      runId: `run-${String(index)}`,
+      state: "awaiting",
+      name: `approve-${String(index)}`,
+    });
+  }
+
+  const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  for (let index = 0; index < 8; index += 1) {
+    assert.ok(frame.some((line) => line.includes(`flow-${String(index)}`)), `flow-${String(index)} is still on screen`);
+  }
 
   host.shutdown();
 });

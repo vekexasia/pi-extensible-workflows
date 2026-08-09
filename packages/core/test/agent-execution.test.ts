@@ -5,7 +5,8 @@ import { join, resolve } from "node:path";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
-import { createLocalPiSession, FairAgentScheduler, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
+import type { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createLocalPiSession, FairAgentScheduler, flushExtensionProviders, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
 import { WorkflowError, roleNameOf, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
 import type { AgentResourcePolicy } from "../src/types.js";
@@ -2302,4 +2303,27 @@ void test("models registered by an extension are available to the agent", async 
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
+});
+
+void test("a provider that fails to register has its reason kept, not swallowed", () => {
+  // Swallowing the failure leaves "Unknown model: acme/fast", which reads as a
+  // typo in a model name and sends the reader to the wrong file. Why the models
+  // are missing is the useful half of the message.
+  const runtime = {
+    pendingProviderRegistrations: [{ name: "acme", config: {} }],
+    pendingNativeProviderRegistrations: [{ provider: {} }],
+  };
+  const resourceLoader = { getExtensions: () => ({ runtime }) } as unknown as DefaultResourceLoader;
+  const modelRuntime = {
+    registerProvider: () => { throw new Error("baseUrl is not a valid URL"); },
+    registerNativeProvider: () => { throw new Error("already registered"); },
+  } as unknown as ModelRuntime;
+
+  const failures = flushExtensionProviders(resourceLoader, modelRuntime);
+
+  assert.deepEqual(failures, ["acme: baseUrl is not a valid URL", "native provider: already registered"]);
+  // One bad provider must not strand the others: the queue is drained either
+  // way, so a second agent does not retry the same failures.
+  assert.deepEqual(runtime.pendingProviderRegistrations, []);
+  assert.deepEqual(runtime.pendingNativeProviderRegistrations, []);
 });

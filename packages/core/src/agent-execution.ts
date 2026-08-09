@@ -219,18 +219,30 @@ export async function createLocalPiSession(input: SessionInput): Promise<PiSessi
  * models an extension provides stay unknown and every agent asking for one
  * fails with UNKNOWN_MODEL.
  */
-function flushExtensionProviders(resourceLoader: DefaultResourceLoader, modelRuntime: ModelRuntime): void {
+export function flushExtensionProviders(resourceLoader: DefaultResourceLoader, modelRuntime: ModelRuntime): string[] {
   const { runtime } = resourceLoader.getExtensions();
+  const failures: string[] = [];
   for (const { name, config } of runtime.pendingProviderRegistrations) {
     // A provider that cannot be registered must not stop the agent from
     // starting: the model it offers may not be the one this agent asked for.
-    try { modelRuntime.registerProvider(name, config); } catch { /* Reported when the model itself turns out to be missing. */ }
+    // The reason is kept, though — if the model does turn out to be missing,
+    // "unknown model" alone sends the reader looking in the wrong place.
+    try {
+      modelRuntime.registerProvider(name, config);
+    } catch (error) {
+      failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   runtime.pendingProviderRegistrations = [];
   for (const { provider } of runtime.pendingNativeProviderRegistrations) {
-    try { modelRuntime.registerNativeProvider(provider); } catch { /* Same. */ }
+    try {
+      modelRuntime.registerNativeProvider(provider);
+    } catch (error) {
+      failures.push(`native provider: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   runtime.pendingNativeProviderRegistrations = [];
+  return failures;
 }
 
 async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: SessionStartEvent): Promise<LocalPiSessionHandle> {
@@ -290,10 +302,17 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
-  flushExtensionProviders(resourceLoader, modelRuntime);
+  const providerFailures = flushExtensionProviders(resourceLoader, modelRuntime);
   await modelRuntime.refresh({ allowNetwork: false });
   const model = modelRuntime.getModel(input.model.provider, input.model.model);
-  if (!model) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}`);
+  if (!model) {
+    // A provider that failed to register is the likeliest reason its models are
+    // missing, so the failure travels with the complaint rather than being
+    // swallowed — otherwise a misconfigured gateway reads as a typo in a model
+    // name.
+    const because = providerFailures.length > 0 ? ` (provider registration failed — ${providerFailures.join("; ")})` : "";
+    throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}${because}`);
+  }
   const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(sessionStartEvent ? { sessionStartEvent } : {}), sessionManager: manager });
   const nativeDispose = session.dispose.bind(session);
   let disposal: Promise<void> | undefined;

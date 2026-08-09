@@ -16,7 +16,7 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { isKeyRelease, Key, matchesKey } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord, AgentState, RunRecord, RunState } from "pi-extensible-workflows";
 import {
   WORKFLOW_AGENT_STALL_THRESHOLD_MS,
@@ -47,7 +47,15 @@ const REPAINT_MS = 125;
  * rather than a limit imposed from outside. What does not fit is folded away by
  * rank, so live work survives and finished work is dropped first.
  */
-const MAX_ROWS = 20;
+/**
+ * Rows the widget will occupy, border included.
+ *
+ * Ten is a deliberate ceiling rather than a technical one: the widget sits
+ * under the editor, and anything taller pushes the conversation off the top of
+ * a normal terminal to report on work that is, by definition, happening
+ * elsewhere. Deeper detail is a keypress away rather than always on screen.
+ */
+const MAX_ROWS = 10;
 
 /**
  * Key matching belongs to Pi, not here.
@@ -98,12 +106,50 @@ const SHELL_VISIBLE_MS = 5000;
  */
 const FOCUS_SHORTCUT = "alt+o";
 
-const BLUE = "\x1b[38;2;77;163;255m";
-const RED = "\x1b[38;2;235;87;87m";
-const GREEN = "\x1b[38;2;95;186;125m";
-const AMBER = "\x1b[38;2;222;158;65m";
-const DIM = "\x1b[38;2;120;120;120m";
+/**
+ * Whether the widget accepts the keyboard.
+ *
+ * Scrolling earns its keys: ten rows cannot hold five runs three phases deep,
+ * and what gets folded away at rest is the widget's choice rather than the
+ * reader's. The shortcut is the only way in — `↓` on an empty editor belongs
+ * to whichever picker opens next.
+ */
+const NAVIGATION_ENABLED = true;
+
+/**
+ * Overrides the switch above, for the tests that cover navigation.
+ *
+ * The behaviour is finished and tested; only its exposure is withheld. Letting
+ * the tests turn it on keeps that coverage alive rather than letting it rot
+ * while the feature waits.
+ */
+export const __navigationForTests = { enabled: NAVIGATION_ENABLED };
+
+/**
+ * Colours come from the active theme, never from here.
+ *
+ * A widget that spelled out its own 24-bit escapes would look right on the
+ * author's terminal and wrong on a 256-colour or light theme, and would ignore
+ * whatever the reader chose. `Theme.fg` resolves a named role against the
+ * theme in force, so the widget follows it.
+ *
+ * These names are the roles used, kept in one place so a colour decision is
+ * visible as a decision rather than scattered through the drawing code.
+ */
+const ROLE = {
+  live: "accent",
+  done: "success",
+  failed: "error",
+  warn: "warning",
+  quiet: "muted",
+} as const satisfies Record<string, Parameters<Theme["fg"]>[0]>;
 const RESET = "\x1b[0m";
+
+/**
+ * Paints text in a themed colour role. Falls back to the bare text when no
+ * theme is available, so a frame rendered outside the TUI is still legible.
+ */
+type Paint = (role: Parameters<Theme["fg"]>[0], text: string) => string;
 
 /**
  * States that mean work is still happening, derived from the core's own lists
@@ -185,11 +231,11 @@ function spinner(now: number): string {
 }
 
 /** Status mark for a finished-or-running unit of work. */
-function mark(state: string | undefined, now: number): string {
-  if (isAgentLive(state) && isRunLive(state)) return `${BLUE}${spinner(now)}${RESET}`;
-  if (state === "completed") return `${GREEN}✓${RESET}`;
-  if (state === "failed" || state === "budget_exhausted") return `${RED}✗${RESET}`;
-  return `${DIM}·${RESET}`;
+function mark(state: string | undefined, now: number, paint: Paint): string {
+  if (isAgentLive(state) && isRunLive(state)) return paint(ROLE.live, spinner(now));
+  if (state === "completed") return paint(ROLE.done, "✓");
+  if (state === "failed" || state === "budget_exhausted") return paint(ROLE.failed, "✗");
+  return paint(ROLE.quiet, "·");
 }
 
 function formatElapsed(ms: number): string {
@@ -213,39 +259,29 @@ function formatCost(cost: number | undefined): string {
   return cost < 0.01 ? `$${cost.toFixed(3)}` : `$${cost.toFixed(2)}`;
 }
 
-/** Visible width, ignoring ANSI colour codes, so the border lines up. */
+/**
+ * Visible width, measured the way the terminal measures it.
+ *
+ * Not the string's length: a CJK ideograph is one JavaScript character and two
+ * terminal cells, an emoji is often two characters and two cells, and a
+ * combining accent is a character that takes none. Pi-tui rejects a line wider
+ * than the width it handed out — it does not wrap, it throws — so the widget
+ * has to agree with it exactly, and the only way to agree exactly is to use
+ * its own measure.
+ */
 function visibleLength(text: string): number {
-  // eslint-disable-next-line no-control-regex
-  return text.replace(/\x1b\[[0-9;]*m/g, "").length;
+  return visibleWidth(text);
 }
 
 /**
  * Cuts a coloured line down to a visible width.
  *
- * Walks the string rather than slicing it: an escape sequence costs no columns
- * but plenty of characters, so a plain slice either cuts mid-escape — bleeding
- * colour into the border — or stops far short of the width it was given.
+ * Pi-tui's own truncation, for the same reason: it counts cells, keeps escape
+ * sequences whole rather than slicing through one and bleeding colour into the
+ * border, and never cuts a character in half.
  */
 function truncate(text: string, limit: number): string {
-  let out = "";
-  let visible = 0;
-  let index = 0;
-  while (index < text.length) {
-    // eslint-disable-next-line no-control-regex
-    const escape = /^\x1b\[[0-9;]*m/.exec(text.slice(index));
-    if (escape?.[0]) {
-      out += escape[0];
-      index += escape[0].length;
-      continue;
-    }
-    if (visible >= limit - 1) break;
-    const character = text[index];
-    if (character === undefined) break;
-    out += character;
-    visible += 1;
-    index += 1;
-  }
-  return `${out}…${RESET}`;
+  return `${truncateToWidth(text, limit, "…")}${RESET}`;
 }
 
 /**
@@ -275,18 +311,37 @@ function readRun(directory: string): Run | undefined {
  * hand, is appended to on every turn — if that file is growing, work is
  * happening, whatever the run state says.
  */
-function lastTranscriptWrite(run: Run): number | undefined {
+/**
+ * When an agent's own transcript was last written.
+ *
+ * The agent record carries the session for each attempt, so the file belongs
+ * to this agent alone. Taking the newest write across every session in the run
+ * — as a whole-run reading does — lets one busy agent vouch for a silent one:
+ * the pair look equally alive while only one of them is.
+ *
+ * Stat results are cached for the life of a frame. Without that the check is
+ * one stat per agent per repaint, several times a second, for a number that
+ * cannot have changed between two rows of the same frame.
+ */
+function lastTranscriptWrite(agent: AgentRecord, cache: Map<string, number | undefined>): number | undefined {
+  const details = agent.attemptDetails ?? [];
   let newest: number | undefined;
-  for (const session of run.agentSessions ?? []) {
-    const locator = session.locator as { sessionFile?: string } | undefined;
+  // Only this agent's attempts: a retry writes a new transcript, and the
+  // latest one is what says whether it is still moving.
+  for (const detail of details) {
+    const locator = detail.session?.locator as { sessionFile?: string } | undefined;
     const file = locator?.sessionFile;
     if (!file) continue;
-    try {
-      const { mtimeMs } = statSync(file);
-      if (newest === undefined || mtimeMs > newest) newest = mtimeMs;
-    } catch {
-      // The transcript moved or was cleaned up; other sessions may still answer.
+    if (!cache.has(file)) {
+      try {
+        cache.set(file, statSync(file).mtimeMs);
+      } catch {
+        // The transcript moved or was cleaned up; another attempt may answer.
+        cache.set(file, undefined);
+      }
     }
+    const mtime = cache.get(file);
+    if (mtime !== undefined && (newest === undefined || mtime > newest)) newest = mtime;
   }
   return newest;
 }
@@ -298,9 +353,9 @@ function lastTranscriptWrite(run: Run): number | undefined {
  * are a spinner that does not stop. Silence separates them — but it has to be
  * measured against the transcript, not the run state.
  */
-function agentSilentFor(agent: AgentRecord, run: Run, now: number): number | undefined {
+function agentSilentFor(agent: AgentRecord, now: number, cache: Map<string, number | undefined>): number | undefined {
   if (!isAgentLive(agent.state)) return undefined;
-  const last = Math.max(agent.lastEventAt ?? 0, lastTranscriptWrite(run) ?? 0);
+  const last = Math.max(agent.lastEventAt ?? 0, lastTranscriptWrite(agent, cache) ?? 0);
   if (last === 0) return undefined;
   const silent = now - last;
   return silent >= QUIET_MS ? silent : undefined;
@@ -312,14 +367,16 @@ function agentSilentFor(agent: AgentRecord, run: Run, now: number): number | und
  * A phase of pure shell work has no agents, so without this it draws as a bare
  * name with nothing under it and reads as stalled.
  */
-function phaseShellRow(run: Run, phaseIndex: number, now: number): string | undefined {
+function phaseShellRow(run: Run, phaseIndex: number, now: number): { label: string; elapsed: string } | undefined {
   const entry = run.activeShellsByPhase?.find((item) => item.phaseIndex === phaseIndex);
   const active = entry?.active ?? 0;
   if (active <= 0) return undefined;
   const startedAt = entry?.startedAt;
   if (startedAt === undefined || now - startedAt < SHELL_VISIBLE_MS) return undefined;
   const label = active === 1 ? "1 command" : `${String(active)} commands`;
-  return `${label}${DIM} · ${formatElapsed(now - startedAt)}${RESET}`;
+  // The elapsed time is returned apart from the label so it can join the other
+  // figures against the right-hand rule instead of trailing the text.
+  return { label, elapsed: formatElapsed(now - startedAt) };
 }
 
 /** The worst budget threshold a run has crossed, and on which dimensions. */
@@ -380,8 +437,25 @@ interface Row {
    * Held to the right edge, they form a column.
    */
   right?: string;
-  /** 2 = run header (never folded), 1 = live or failed, 0 = finished detail. */
+  /** 2 = a run header or something needing an answer, 1 = live or failed work, 0 = finished detail. */
   rank: number;
+  /**
+   * Set on the one row that stands for a whole run.
+   *
+   * Rank alone cannot protect it: a checkpoint needs an answer and so shares
+   * the top rank, and enough of them would spend the budget before a later
+   * run's header is reached. A run missing its header is not a terse run, it
+   * is an invisible one.
+   */
+  header?: boolean;
+  /**
+   * A stable name for a row that can be folded shut, and the key of the row it
+   * hangs from. Together they let the cursor walk a tree rather than a list:
+   * collapsing a phase hides its agents, collapsing a run hides everything
+   * under it, and the choice survives the repaint that follows.
+   */
+  key?: string;
+  parent?: string;
 }
 
 /**
@@ -389,10 +463,48 @@ interface Row {
  * leaving a marker in their place. Run headers always survive: losing one hides
  * a whole run rather than a detail of it.
  */
-function collapse(rows: readonly Row[], budget: number): Row[] {
+/**
+ * The furthest the window may travel: the offset whose window ends on the last
+ * row of the tree.
+ *
+ * One number, used by the window, by the scrollbar and by the key handler
+ * alike. Three separate clamps is how the thumb reaches the bottom while the
+ * content still has rows to give, and how presses past the end pile up an
+ * offset nothing can see — paid back later as arrow presses that do nothing.
+ */
+function maxOffset(total: number, budget: number): number {
+  return Math.max(0, total - (budget - 1));
+}
+
+function collapse(rows: readonly Row[], budget: number, paint: Paint, offset: number, scrolling: boolean): Row[] {
   if (rows.length <= budget) return [...rows];
 
+  // Scrolling: a window onto the tree, with the count of what lies past the
+  // bottom edge. Reading it is a matter of moving the window rather than
+  // deciding for the reader which rows deserve the space.
+  //
+  // The window is used from the moment scrolling starts, offset zero included.
+  // Entering at the resting view instead would show a set of rows picked by
+  // rank — non-contiguous, with the gaps unmarked — and the first press would
+  // then jump to a different set entirely rather than moving by one row.
+  if (scrolling) {
+    const start = Math.min(offset, maxOffset(rows.length, budget));
+    const window = rows.slice(start, start + budget - 1);
+    const below = rows.length - start - window.length;
+    const out = [...window];
+    out.push({ rank: 0, text: paint(ROLE.quiet, below > 0 ? `… ${String(below)} more` : `… ${String(start)} above`) });
+    return out;
+  }
+
+  // At rest: keep the rows that say most, since nobody is steering. Run
+  // headers first, then live or failed work, then finished detail.
+  //
+  // Headers are taken before anything else at the same rank, and taken whole:
+  // a run whose header is dropped vanishes from the widget entirely, while a
+  // run that loses its detail rows is merely terse. Ranking alone would let
+  // one early run's checkpoints spend the budget and hide a later run.
   const keep = new Set<number>();
+  for (const [index, row] of rows.entries()) if (row.rank === 2 && row.header === true) keep.add(index);
   for (const rank of [2, 1, 0]) {
     for (const [index, row] of rows.entries()) {
       if (row.rank === rank && keep.size < budget - 1) keep.add(index);
@@ -408,12 +520,14 @@ function collapse(rows: readonly Row[], budget: number): Row[] {
       hidden += 1;
     }
   }
-  if (hidden > 0) out.push({ rank: 0, text: `${DIM}… ${String(hidden)} more${RESET}` });
+  if (hidden > 0) out.push({ rank: 0, text: paint(ROLE.quiet, `… ${String(hidden)} more`) });
   return out;
 }
 
+
+
 /** The whole widget frame, or undefined when nothing is running. */
-function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: number, theme?: Theme): string[] | undefined {
+function renderFrame(runs: readonly Run[], now: number, width: number, offset = 0, theme?: Theme, scrolling = false, sizeOut: { rows: number } = { rows: 0 }): string[] | undefined {
   // Only live background runs.
   //
   // A finished run leaves its own receipt in the transcript, so holding it
@@ -428,16 +542,23 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
   const live = runs.filter((run) => isRunLive(run.state) && run.delivery?.mode !== "foreground");
   if (live.length === 0) return undefined;
 
+  const paint: Paint = (role, text) => (theme ? theme.fg(role, text) : text);
+  // One stat per transcript per frame, not per agent per repaint.
+  const mtimes = new Map<string, number | undefined>();
+
   const rows: Row[] = [];
   for (const run of live) {
     const stats = [formatTokens(run.usage?.tokens), formatCost(run.usage?.costUsd)]
       .filter(Boolean)
       .join(" · ");
     const budget = budgetWarning(run);
+    const runKey = `run:${run.id ?? ""}`;
     rows.push({
       rank: 2,
-      text: `${mark(run.state, now)} ${run.workflowName ?? "workflow"}${
-        budget ? `${AMBER}  ${budget}${RESET}` : ""
+      header: true,
+      key: runKey,
+      text: `${mark(run.state, now, paint)} ${run.workflowName ?? "workflow"}${
+        budget ? `  ${paint(ROLE.warn, budget)}` : ""
       }`,
       right: `${stats ? `${stats} · ` : ""}${formatElapsed(now - run.startedAt)}`,
     });
@@ -447,7 +568,8 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
     if (run.waiting) {
       rows.push({
         rank: 2,
-        text: `  ${AMBER}◆${RESET} waiting: ${run.waiting.name}`,
+        parent: runKey,
+        text: `  ${paint(ROLE.warn, "◆")} waiting: ${run.waiting.name}`,
         right: formatElapsed(now - run.waiting.since),
       });
     }
@@ -469,9 +591,12 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
       }
       const phaseStats = [formatTokens(tokens), formatCost(cost)].filter(Boolean).join(" · ");
 
+      const phaseKey = `${runKey}/phase:${String(index)}`;
       rows.push({
         rank: liveAgents || failed ? 1 : 0,
-        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now)} ${slice.phase}`,
+        key: phaseKey,
+        parent: runKey,
+        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint)} ${slice.phase}`,
         ...(phaseStats ? { right: phaseStats } : {}),
       });
 
@@ -483,12 +608,28 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
       if (shell) {
         rows.push({
           rank: 1,
-          text: `${stem} ${slice.agents.length === 0 ? "╰─" : "├─"} ${mark("running", now)} ${shell}`,
+          parent: phaseKey,
+          text: `${stem} ${slice.agents.length === 0 ? "╰─" : "├─"} ${mark("running", now, paint)} ${shell.label}`,
+          right: shell.elapsed,
         });
       }
 
-      slice.agents.forEach((agent, agentIndex) => {
-        const lastAgent = agentIndex === slice.agents.length - 1;
+      // Agents nest: one may spawn another, and drawing them as siblings hides
+      // who asked for what — a child's cost then reads as a peer's rather than
+      // part of the parent's total.
+      const children = new Map<string, AgentRecord[]>();
+      const roots: AgentRecord[] = [];
+      const inSlice = new Set(slice.agents.map((agent) => agent.id));
+      for (const agent of slice.agents) {
+        const parent = agent.parentId;
+        if (parent !== undefined && inSlice.has(parent)) {
+          children.set(parent, [...(children.get(parent) ?? []), agent]);
+        } else {
+          roots.push(agent);
+        }
+      }
+
+      const drawAgent = (agent: AgentRecord, prefix: string, lastAgent: boolean, parentKey: string): void => {
         const agentLive = isAgentLive(agent.state);
         const attempts = agent.attempts;
         const detail = [
@@ -505,58 +646,90 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
           .filter(Boolean)
           .join(" · ");
 
-        const silent = agentSilentFor(agent, run, now);
+        const silent = agentSilentFor(agent, now, mtimes);
+        const kids = children.get(agent.id) ?? [];
+        const agentKey = `${parentKey}/agent:${agent.id}`;
 
         rows.push({
           rank: agentLive || agent.state === "failed" ? 1 : 0,
-          text: `${stem} ${lastAgent ? "╰─" : "├─"} ${
+          parent: parentKey,
+          ...(kids.length > 0 ? { key: agentKey } : {}),
+          text: `${prefix}${lastAgent ? "╰─" : "├─"} ${
+
             silent === undefined
-              ? mark(agent.state, now)
-              : `${silent >= STALL_MS ? RED : AMBER}⚠${RESET}`
-          } ${agent.name}${
+              ? mark(agent.state, now, paint)
+              : paint(silent >= STALL_MS ? ROLE.failed : ROLE.warn, "⚠")
+          } ${
+            // The label is what the workflow called this agent — `reviewer #2`,
+            // `scout (api)` — where the name is the role it was built from. Two
+            // agents of one role are otherwise indistinguishable.
+            agent.label ?? agent.name
+          }${
             silent === undefined
               ? ""
-              : `${silent >= STALL_MS ? RED : AMBER}  ${
-                  silent >= STALL_MS ? "stalled" : "quiet"
-                } ${formatElapsed(silent)}${RESET}`
+              : `  ${paint(
+                  silent >= STALL_MS ? ROLE.failed : ROLE.warn,
+                  `${silent >= STALL_MS ? "stalled" : "quiet"} ${formatElapsed(silent)}`,
+                )}`
           }`,
           right: detail,
         });
+
+        kids.forEach((child, childIndex) => {
+          drawAgent(child, `${prefix}${lastAgent ? "   " : "  │"}`, childIndex === kids.length - 1, agentKey);
+        });
+      };
+
+      roots.forEach((agent, agentIndex) => {
+        drawAgent(agent, `${stem} `, agentIndex === roots.length - 1, phaseKey);
       });
     });
   }
 
-  const accent = BLUE;
+  // The rules change colour while scrolling, so it is obvious at a glance that
+  // the arrows are going here and not to the editor.
+  const accent = (text: string): string => paint(scrolling ? ROLE.warn : ROLE.live, text);
   const title = live.length === 1 ? "Workflow" : `Workflows · ${String(live.length)} runs`;
-  const body = collapse(rows, MAX_ROWS - 2);
+  sizeOut.rows = rows.length;
+  const body = collapse(rows, MAX_ROWS - 2, paint, offset, scrolling);
 
   // Width budget: the rule takes a column and a space on each side, so the
   // text has four fewer than the widget is given. Every piece is measured
   // against `inner` so the right-hand rule lands in one column on every row.
   const inner = Math.max(20, width - 4);
 
-  // The selected row is lit the way the rest of Pi lights a selection, from
-  // the active theme rather than a colour picked here — a widget that invented
-  // its own highlight would look wrong the moment the theme changed.
-  //
-  // The row is assembled from coloured pieces, each ending in a full reset, and
-  // a full reset clears the background along with the foreground. Painted
-  // naïvely, the highlight therefore survives only on the stretches with no
-  // colour in them — the indent and the tree stem — and dies behind every piece
-  // of text. Swapping the inner resets for a foreground-only reset keeps the
-  // background alive across the whole row.
-  const FG_RESET = "\u001b[39m";
-  const highlight = (text: string): string =>
-    theme ? theme.bg("selectedBg", text.replaceAll(RESET, FG_RESET)) : text;
 
-  // Side rules only, no lid and no floor.
-  //
-  // The box is not a thing in its own right — it is a margin note against the
-  // conversation, and two horizontal rules spend two of the few lines it is
-  // worth to say so. The title rides the first row instead, where it is read
-  // in the same glance as the run beneath it.
+  // Side rules below the lid, and no floor: the box opens downward into the
+  // editor rather than closing on itself, which is one more line kept for the
+  // run.
+  // A scrollbar on the right rule, drawn only when there is more tree than
+  // frame. Without it the window's position is a guess: three rows of a
+  // twenty-row tree look the same near the top as near the bottom.
+  const total = rows.length;
+  const shown = body.length;
+  const scrollbar = (index: number): string | undefined => {
+    if (!scrolling || total <= shown) return undefined;
+    // The thumb is positioned against how far the window can travel, not
+    // against the height of the tree. Dividing by the tree instead puts the
+    // thumb at the bottom while the window still has a row to give, which is
+    // the one thing a scrollbar must never say.
+    // The window shows `shown - 1` rows of the tree: the last line of the
+    // frame is the marker counting what is out of sight, which belongs to the
+    // scrollbar's question rather than to the tree it measures.
+    const visible = shown - 1;
+    const limit = maxOffset(total, MAX_ROWS - 2);
+    const start = Math.min(offset, limit);
+    // The thumb spans the visible share of the tree, at least one row, and
+    // never the whole track while rows remain out of sight.
+    const size = Math.min(shown - 1, Math.max(1, Math.round((visible / total) * shown)));
+    // Floor, not round: rounding up on the second-to-last step parks the thumb
+    // at the bottom while the window still has a row to travel. The bottom is
+    // reserved for the bottom, and reached only by landing on the limit.
+    const top = limit === 0 ? 0 : start >= limit ? shown - size : Math.floor((start / limit) * (shown - size));
+    return index >= top && index < top + size ? "█" : "░";
+  };
+
   const lines = body.map((row, index) => {
-    const selected = index === cursor;
     // The numbers hold the right edge; the name gives way when the two would
     // meet. A truncated workflow name is still recognisable, where a truncated
     // cost is a different number.
@@ -565,23 +738,37 @@ function renderFrame(runs: readonly Run[], now: number, width: number, cursor?: 
     const room = Math.max(0, inner - rightWidth);
     const left = visibleLength(row.text) > room ? truncate(row.text, room) : row.text;
     const gap = Math.max(0, inner - visibleLength(left) - (right === "" ? 0 : visibleLength(right)));
-    const text = right === "" ? left + " ".repeat(gap) : `${left}${" ".repeat(gap)}${DIM}${right}${RESET}`;
-    const rule = `${accent}│${RESET}`;
-    return selected ? `${rule}${highlight(` ${text} `)}${rule}` : `${rule} ${text} ${rule}`;
+    const text = right === "" ? left + " ".repeat(gap) : `${left}${" ".repeat(gap)}${paint(ROLE.quiet, right)}`;
+    const rule = accent("│");
+    const bar = scrollbar(index);
+    return `${rule} ${text} ${bar === undefined ? rule : accent(bar)}`;
   });
 
-  // The title carries the same colour as the rules it sits between: one mark
-  // in the margin, not a heading competing with the runs under it. The way in
-  // rides with it — a shortcut nobody can see is a shortcut nobody uses — and
-  // gives way to the title if the terminal is too narrow for both.
-  const hint = cursor === undefined ? `↓ or ${FOCUS_SHORTCUT}` : "↑↓ move · esc back";
-  const room = inner - visibleLength(title);
-  const withHint =
-    room >= visibleLength(hint) + 2
-      ? `${title}${" ".repeat(room - visibleLength(hint))}${hint}`
-      : `${title}${" ".repeat(Math.max(0, room))}`;
-  const heading = `${accent}│ ${withHint} │${RESET}`;
-  return [heading, ...lines];
+  // A lid that costs no line of its own.
+  //
+  // The title row carries the top rule through it — `╭─ Workflow ─── hint ─╮` —
+  // rather than sitting under a separate run of dashes. In ten rows a line
+  // spent on decoration is a line not spent on the run, and the box still
+  // reads as closed at the top.
+  // Nothing is promised while navigation is switched off: a hint for keys
+  // that do nothing is worse than no hint.
+  const hint = !__navigationForTests.enabled ? "" : scrolling ? "↑↓ scroll · esc to exit" : `${FOCUS_SHORTCUT} to scroll`;
+  const label = ` ${title} `;
+  const tail = hint === "" ? "" : ` ${hint} `;
+  const spare = inner + 2 - visibleLength(label) - visibleLength(tail);
+  const heading =
+    spare >= 2
+      ? accent(`╭${label}${"─".repeat(spare)}${tail}╮`)
+      : accent(`╭${label}${"─".repeat(Math.max(0, inner + 2 - visibleLength(label)))}╮`);
+  // A floor to close the box.
+  //
+  // Without it the side rules simply stop, and a frame that shrinks — a phase
+  // folded away, a run finished — leaves the tail of the taller one behind on
+  // screen, since Pi redraws differentially and the rows below are no longer
+  // its business. The closing rule gives the eye somewhere to stop and the
+  // redraw something to overwrite.
+  const foot = accent(`╰${"─".repeat(inner + 2)}╯`);
+  return [heading, ...lines, foot];
 }
 
 /** Everything worth keeping about a run once it is over. */
@@ -629,7 +816,9 @@ function receiptFor(run: Run): Receipt {
     agents: agents.map((agent, index) => {
       const calls = countToolCalls(run, index);
       return {
-        name: agent.name,
+        // What the workflow called it, falling back to the role it was built
+        // from. Two agents of one role are otherwise indistinguishable.
+        name: agent.label ?? agent.name,
         state: agent.state,
         // Model and thinking level together: a role picks both, and the model
         // name alone does not say whether it reasoned cheaply or deeply.
@@ -762,9 +951,13 @@ export default function widget(pi: ExtensionAPI): void {
    * time would be a widget you had to fight to write past.
    */
   let focused = false;
-  let cursor = 0;
   /** Rows in the last frame, so the cursor cannot leave it. */
   let rowCount = 0;
+  /** Keys of rows the reader has folded shut, kept across repaints. */
+  /** How far the window has been scrolled down the tree. */
+  let offset = 0;
+  /** Rows the tree had in the last frame, so scrolling cannot run off its end. */
+  const size = { rows: 0 };
   /**
    * The TUI the widget was last built against, kept only to ask whether
    * something else currently owns the keyboard.
@@ -857,11 +1050,18 @@ export default function widget(pi: ExtensionAPI): void {
         host = tui;
         return {
           render: (width: number): string[] => {
+            // The layout is composed against a floor of twenty columns, because
+            // a tree drawn narrower than that is unreadable anyway — but what
+            // leaves this function is measured against the width Pi actually
+            // gave. A pane narrower than the floor gets a cut frame; it does
+            // not get a crash, and pi-tui treats an over-wide line as fatal.
             const usable = Math.max(20, width);
-            const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? cursor : undefined, theme) ?? [];
-            rowCount = frame.length - 1;
+            const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size) ?? [];
+            // The keys track the body rows exactly, so they say how far the
+            // cursor may travel — the lid and the floor are not rows to land on.
+            rowCount = size.rows;
             return frame.map((line) =>
-              visibleLength(line) > usable ? truncate(line, usable) : line,
+              visibleLength(line) > width ? truncate(line, width) : line,
             );
           },
           invalidate: (): void => {
@@ -936,6 +1136,13 @@ export default function widget(pi: ExtensionAPI): void {
     };
     if (!runId || !runDirectory || !eventSession) return;
     refresh(runId, runDirectory, eventSession);
+    // A run can end without a completed or failed event: stopping it, running
+    // it out of budget or losing it to an interrupt all arrive as a state
+    // change. Reading the state rather than the event name means every ending
+    // leaves a receipt — and an interrupted run is exactly the one whose cost
+    // is worth having a record of.
+    const run = runs.get(runId);
+    if (run && !isRunLive(run.state)) receipt(runId);
     tick();
   };
 
@@ -1005,6 +1212,16 @@ export default function widget(pi: ExtensionAPI): void {
 
     // Replay what the session already recorded so a reload cannot write the
     // same run into the transcript twice.
+    //
+    // The caches go with it. A reload may be entering a different session
+    // entirely, and runs left over from the last one would be drawn as though
+    // they were this session's; `seen` holds modification times that no longer
+    // describe anything, so a run whose file changed while the session was
+    // away would be judged unchanged and never re-read.
+    runs.clear();
+    seen.clear();
+    focused = false;
+    offset = 0;
     receipted.clear();
     try {
       for (const entry of sessionContext.sessionManager.getEntries()) {
@@ -1024,19 +1241,17 @@ export default function widget(pi: ExtensionAPI): void {
 
     // Keyboard access, taken as lightly as possible.
     //
-    // Keyboard access, taken as lightly as possible.
-    //
     // The handler sees every keystroke before the editor does, so it declines
-    // all but a few. `↓` on an empty editor is the natural way in — the same
-    // gesture Claude Code uses for its agent dock — but an empty editor is also
-    // what every picker and dialog leaves behind while it waits for arrows, so
-    // the key is only claimed once the TUI confirms nothing else is focused.
-    // The shortcut is the way in that never has to share.
-    unsubscribes.push(
-      sessionContext.ui.onTerminalInput((data: string) => {
-        if (!showing) return undefined;
+    // all but a few, and only while scrolling. `↓` on an empty editor would be
+    // the comfortable way in, but an empty editor is what every picker and
+    // dialog leaves behind while it waits for arrows — so the way in is the
+    // shortcut alone, which never has to share.
+    if (__navigationForTests.enabled) {
+      unsubscribes.push(
+        sessionContext.ui.onTerminalInput((data: string) => {
+          if (!showing) return undefined;
 
-        if (focused) {
+          if (focused) {
           // Something opened over the widget while it held the keyboard — a
           // command picker, a dialog. It has the better claim.
           if (somethingElseHasTheKeyboard()) {
@@ -1047,40 +1262,31 @@ export default function widget(pi: ExtensionAPI): void {
           // reach the editor, but do not move twice for one press.
           if (isKeyRelease(data)) return { consume: true };
           if (matchesKey(data, Key.up)) {
-            cursor = Math.max(0, cursor - 1);
+            offset = Math.max(0, offset - 1);
             return { consume: true };
           }
           if (matchesKey(data, Key.down)) {
-            cursor = Math.min(Math.max(0, rowCount - 1), cursor + 1);
+            // Stops where the window stops. Counting rows instead would let
+            // presses past the last row bank an offset nothing on screen can
+            // show, and every one of them would have to be paid back with an
+            // ↑ that appears to do nothing.
+            offset = Math.min(maxOffset(rowCount, MAX_ROWS - 2), offset + 1);
             return { consume: true };
           }
           if (matchesKey(data, Key.escape) || data === "q") {
+              focused = false;
+              return { consume: true };
+            }
+            // Anything else is someone typing: hand the keyboard back and let
+            // the keystroke through, so a thought is never lost to a panel.
             focused = false;
-            return { consume: true };
+            return undefined;
           }
-          // Anything else is someone typing: hand the keyboard back and let
-          // the keystroke through, so a thought is never lost to a panel.
-          focused = false;
-          return undefined;
-        }
 
-        if (isKeyRelease(data)) return undefined;
-        if (!matchesKey(data, Key.down)) return undefined;
-        // A menu is open, or focus has left the editor: the arrows are not
-        // ours to take.
-        if (somethingElseHasTheKeyboard()) return undefined;
-        let empty = false;
-        try {
-          empty = sessionContext.ui.getEditorText().trim() === "";
-        } catch {
-          // No editor to consult; leave the key alone.
-        }
-        if (!empty) return undefined;
-        focused = true;
-        cursor = 0;
-        return { consume: true };
-      }),
-    );
+          return undefined;
+        }),
+      );
+    }
 
     tick();
   });
@@ -1088,12 +1294,12 @@ export default function widget(pi: ExtensionAPI): void {
   // A way in that never competes. `↓` is the comfortable gesture but it is
   // shared with every picker; the shortcut answers whatever else is on screen,
   // and Pi lets it be rebound in `keybindings.json` like any other.
-  pi.registerShortcut(FOCUS_SHORTCUT, {
-    description: "Focus the workflow widget",
+  if (__navigationForTests.enabled) pi.registerShortcut(FOCUS_SHORTCUT, {
+    description: "Scroll the workflow widget",
     handler: () => {
       if (!showing) return;
       focused = !focused;
-      cursor = 0;
+      offset = 0;
     },
   });
 
