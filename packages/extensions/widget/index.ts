@@ -1,16 +1,17 @@
 /**
- * Live workflow widget: a tree of the runs happening right now, drawn above the
- * editor, and a durable receipt in the transcript once each one finishes.
+ * Live workflow widget: a tree of the runs happening right now, drawn below the
+ * editor, and a durable receipt in the transcript once each one reaches a
+ * terminal state.
  *
  * The split is deliberate. The widget answers "what is happening" and holds
- * nothing that has already happened — a finished run disappears from it at
- * once. The transcript entry answers "what did that cost and who did it", and
- * keeps the answer for the life of the session rather than for a minute.
+ * nothing that has reached a final state — resumable interruptions remain visible.
+ * The transcript entry answers "what did that cost and who did it", and keeps the
+ * answer for the life of the session rather than for a minute.
  *
  * Run state arrives as workflow events; the numbers behind it (tokens, cost,
  * per-agent accounting) live only in the run's state.json, so an event is a
- * signal to re-read rather than the data itself. Between events nothing is
- * read: the repaint timer only turns the spinner and advances the clocks.
+ * signal to re-read rather than the data itself. The repaint timer checks for
+ * changed state files without reparsing unchanged runs.
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -18,6 +19,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord, AgentState, RunRecord, RunState } from "pi-extensible-workflows";
+import { listRunIds, RunStore } from "pi-extensible-workflows/persistence";
 import {
   WORKFLOW_AGENT_STALL_THRESHOLD_MS,
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
@@ -28,6 +30,7 @@ import {
   WORKFLOW_RUN_FAILED_EVENT,
   WORKFLOW_RUN_STARTED_EVENT,
   WORKFLOW_RUN_STATE_CHANGED_EVENT,
+  object,
 } from "pi-extensible-workflows";
 
 const KEY = "piewf-widget";
@@ -159,17 +162,13 @@ type Paint = (role: Parameters<Theme["fg"]>[0], text: string) => string;
  * — the safe direction, since drawing a finished run costs a stale row while
  * missing a live one loses the display entirely.
  */
-const DONE_RUN = new Set<RunState>([
-  "completed",
-  "failed",
-  "stopped",
-  "interrupted",
-  "budget_exhausted",
-]);
+const TERMINAL_RUN = new Set<RunState>(["completed", "failed", "stopped"]);
 const DONE_AGENT = new Set<AgentState>(["completed", "failed", "cancelled"]);
 
+const isRunTerminal = (state: string | undefined): boolean =>
+  state !== undefined && TERMINAL_RUN.has(state as RunState);
 const isRunLive = (state: string | undefined): boolean =>
-  state !== undefined && !DONE_RUN.has(state as RunState);
+  state !== undefined && !isRunTerminal(state);
 const isAgentLive = (state: string | undefined): boolean =>
   state !== undefined && !DONE_AGENT.has(state as AgentState);
 
@@ -197,11 +196,15 @@ interface Run extends Partial<RunRecord> {
 }
 
 interface ReceiptAgent {
+  id?: string;
+  parentId?: string;
   name: string;
   state: string;
   model?: string;
   role?: string;
   requestedModel?: string;
+  tools?: readonly string[];
+  /** Accepted for rendering older receipt entries; new receipts persist granted tools. */
   toolCalls?: number;
   input: number;
   output: number;
@@ -231,8 +234,8 @@ function spinner(now: number): string {
 }
 
 /** Status mark for a finished-or-running unit of work. */
-function mark(state: string | undefined, now: number, paint: Paint): string {
-  if (isAgentLive(state) && isRunLive(state)) return paint(ROLE.live, spinner(now));
+function mark(state: string | undefined, now: number, paint: Paint, runState?: string): string {
+  if (state === "running" && (runState === undefined || runState === "running")) return paint(ROLE.live, spinner(now));
   if (state === "completed") return paint(ROLE.done, "✓");
   if (state === "failed" || state === "budget_exhausted") return paint(ROLE.failed, "✗");
   return paint(ROLE.quiet, "·");
@@ -284,6 +287,45 @@ function truncate(text: string, limit: number): string {
   return `${truncateToWidth(text, limit, "…")}${RESET}`;
 }
 
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function optionalNumber(value: unknown): boolean {
+  return value === undefined || finiteNumber(value);
+}
+
+function renderableAgent(value: unknown): boolean {
+  if (!object(value) || typeof value.name !== "string" || typeof value.state !== "string" || !object(value.model) || typeof value.model.model !== "string" || !Array.isArray(value.tools) || !value.tools.every((tool) => typeof tool === "string")) return false;
+  if (value.model.thinking !== undefined && typeof value.model.thinking !== "string") return false;
+  for (const key of ["id", "label", "parentId", "role", "requestedModel"] as const) if (value[key] !== undefined && typeof value[key] !== "string") return false;
+  for (const key of ["attempts", "startedAt", "durationMs", "lastEventAt"] as const) if (!optionalNumber(value[key])) return false;
+  const accounting = value.accounting;
+  if (accounting !== undefined && (!object(accounting) || !["input", "output", "cacheRead", "cacheWrite", "cost"].every((key) => optionalNumber(accounting[key])))) return false;
+  const attemptDetails = value.attemptDetails;
+  if (attemptDetails !== undefined && (!Array.isArray(attemptDetails) || attemptDetails.some((detail) => !object(detail)))) return false;
+  return true;
+}
+
+function renderableRun(value: unknown): value is Partial<RunRecord> {
+  if (!object(value) || typeof value.state !== "string") return false;
+  if (value.workflowName !== undefined && typeof value.workflowName !== "string") return false;
+  if (value.id !== undefined && typeof value.id !== "string") return false;
+  if (value.sessionId !== undefined && typeof value.sessionId !== "string") return false;
+  if (value.agents !== undefined && (!Array.isArray(value.agents) || value.agents.some((agent) => !renderableAgent(agent)))) return false;
+  const history = value.phaseHistory;
+  if (history !== undefined && (!Array.isArray(history) || history.some((entry) => !object(entry) || typeof entry.phase !== "string" || !finiteNumber(entry.afterAgent)))) return false;
+  const usage = value.usage;
+  if (usage !== undefined && (!object(usage) || !["tokens", "costUsd", "durationMs", "agentLaunches"].every((key) => optionalNumber(usage[key])))) return false;
+  const delivery = value.delivery;
+  if (delivery !== undefined && (!object(delivery) || typeof delivery.mode !== "string" || typeof delivery.state !== "string")) return false;
+  const budgetEvents = value.budgetEvents;
+  if (budgetEvents !== undefined && (!Array.isArray(budgetEvents) || budgetEvents.some((event) => !object(event) || typeof event.type !== "string" || !Array.isArray(event.dimensions) || !event.dimensions.every((dimension) => typeof dimension === "string")))) return false;
+  const shellActivity = value.activeShellsByPhase;
+  if (shellActivity !== undefined && (!Array.isArray(shellActivity) || shellActivity.some((entry) => !object(entry) || !finiteNumber(entry.phaseIndex) || !finiteNumber(entry.active) || !optionalNumber(entry.startedAt)))) return false;
+  return true;
+}
+
 /**
  * Reads one run's state.json.
  *
@@ -294,8 +336,10 @@ function truncate(text: string, limit: number): string {
  */
 function readRun(directory: string): Run | undefined {
   try {
-    const state = JSON.parse(readFileSync(join(directory, "state.json"), "utf8")) as Partial<RunRecord>;
-    return { ...state, directory, startedAt: statSync(directory).birthtimeMs };
+    const state: unknown = JSON.parse(readFileSync(join(directory, "state.json"), "utf8"));
+    if (!renderableRun(state)) return undefined;
+    const startedAt = statSync(directory).birthtimeMs;
+    return { ...state, directory, startedAt };
   } catch {
     // A run mid-write, or a directory without state yet.
     return undefined;
@@ -354,7 +398,7 @@ function lastTranscriptWrite(agent: AgentRecord, cache: Map<string, number | und
  * measured against the transcript, not the run state.
  */
 function agentSilentFor(agent: AgentRecord, now: number, cache: Map<string, number | undefined>): number | undefined {
-  if (!isAgentLive(agent.state)) return undefined;
+  if (agent.state !== "running") return undefined;
   const last = Math.max(agent.lastEventAt ?? 0, lastTranscriptWrite(agent, cache) ?? 0);
   if (last === 0) return undefined;
   const silent = now - last;
@@ -400,19 +444,28 @@ function budgetWarning(run: Run): string | undefined {
 function agentTokens(agent: AgentRecord): number {
   const accounting = agent.accounting;
   if (!accounting) return 0;
-  return accounting.input + accounting.output + accounting.cacheWrite;
+  return accounting.input + accounting.output;
 }
 
 /** Phase names in the order they opened, with the agents that ran in each. */
-function phaseSlices(run: Run): { phase: string; agents: readonly AgentRecord[] }[] {
+type PhaseSlice = { phase: string; agents: readonly AgentRecord[]; phaseIndex?: number };
+
+function phaseSlices(run: Run): PhaseSlice[] {
   const history = run.phaseHistory ?? [];
   const agents = run.agents ?? [];
-  return history.map((entry, index) => {
-    const from = entry.afterAgent;
+  if (history.length === 0) return agents.length === 0 ? [] : [{ phase: "unphased", agents }];
+
+  const bound = (value: number): number => Math.max(0, Math.min(value, agents.length));
+  const slices: PhaseSlice[] = [];
+  const first = bound(history[0]?.afterAgent ?? 0);
+  if (first > 0) slices.push({ phase: "unphased", agents: agents.slice(0, first) });
+  history.forEach((entry, index) => {
+    const from = bound(entry.afterAgent);
     const next = history[index + 1];
-    const to = next ? next.afterAgent : agents.length;
-    return { phase: entry.phase, agents: agents.slice(from, to) };
+    const to = next === undefined ? agents.length : bound(next.afterAgent);
+    slices.push({ phase: entry.phase, phaseIndex: index, agents: agents.slice(from, to) });
   });
+  return slices;
 }
 
 /**
@@ -460,8 +513,8 @@ interface Row {
 
 /**
  * Folds the least interesting rows away once the tree outgrows its budget,
- * leaving a marker in their place. Run headers always survive: losing one hides
- * a whole run rather than a detail of it.
+ * leaving a marker in their place. Run headers are prioritized so every visible
+ * run retains its title without exceeding the frame budget.
  */
 /**
  * The furthest the window may travel: the offset whose window ends on the last
@@ -473,6 +526,7 @@ interface Row {
  * offset nothing can see — paid back later as arrow presses that do nothing.
  */
 function maxOffset(total: number, budget: number): number {
+  if (total <= budget) return 0;
   return Math.max(0, total - (budget - 1));
 }
 
@@ -482,46 +536,39 @@ function collapse(rows: readonly Row[], budget: number, paint: Paint, offset: nu
   // Scrolling: a window onto the tree, with the count of what lies past the
   // bottom edge. Reading it is a matter of moving the window rather than
   // deciding for the reader which rows deserve the space.
-  //
-  // The window is used from the moment scrolling starts, offset zero included.
-  // Entering at the resting view instead would show a set of rows picked by
-  // rank — non-contiguous, with the gaps unmarked — and the first press would
-  // then jump to a different set entirely rather than moving by one row.
   if (scrolling) {
     const start = Math.min(offset, maxOffset(rows.length, budget));
     const window = rows.slice(start, start + budget - 1);
     const below = rows.length - start - window.length;
-    const out = [...window];
-    out.push({ rank: 0, text: paint(ROLE.quiet, below > 0 ? `… ${String(below)} more` : `… ${String(start)} above`) });
-    return out;
+    return [
+      ...window,
+      { rank: 0, text: paint(ROLE.quiet, below > 0 ? `… ${String(below)} more` : `… ${String(start)} above`) },
+    ];
   }
 
-  // At rest: keep the rows that say most, since nobody is steering. Run
-  // headers first, then live or failed work, then finished detail.
-  //
-  // Headers are taken before anything else at the same rank, and taken whole:
-  // a run whose header is dropped vanishes from the widget entirely, while a
-  // run that loses its detail rows is merely terse. Ranking alone would let
-  // one early run's checkpoints spend the budget and hide a later run.
+  // At rest: keep the rows that say most, since nobody is steering. Reserve
+  // one body row for the marker unless headers alone fill the budget.
   const keep = new Set<number>();
-  for (const [index, row] of rows.entries()) if (row.rank === 2 && row.header === true) keep.add(index);
+  const headerCount = rows.filter((row) => row.rank === 2 && row.header === true).length;
+  const reserveMarker = headerCount !== budget;
+  const capacity = reserveMarker ? Math.max(0, budget - 1) : budget;
+  for (const [index, row] of rows.entries()) {
+    if (row.rank === 2 && row.header === true && keep.size < capacity) keep.add(index);
+  }
   for (const rank of [2, 1, 0]) {
     for (const [index, row] of rows.entries()) {
-      if (row.rank === rank && keep.size < budget - 1) keep.add(index);
+      if (row.rank === rank && keep.size < capacity) keep.add(index);
     }
   }
 
   const out: Row[] = [];
   let hidden = 0;
   for (const [index, row] of rows.entries()) {
-    if (keep.has(index)) {
-      out.push(row);
-    } else {
-      hidden += 1;
-    }
+    if (keep.has(index)) out.push(row);
+    else hidden += 1;
   }
-  if (hidden > 0) out.push({ rank: 0, text: paint(ROLE.quiet, `… ${String(hidden)} more`) });
-  return out;
+  if (hidden > 0 && reserveMarker) out.push({ rank: 0, text: paint(ROLE.quiet, `… ${String(hidden)} more`) });
+  return out.slice(0, budget);
 }
 
 
@@ -557,7 +604,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
       rank: 2,
       header: true,
       key: runKey,
-      text: `${mark(run.state, now, paint)} ${run.workflowName ?? "workflow"}${
+      text: `${mark(run.state, now, paint, run.state)} ${run.workflowName ?? "workflow"}${
         budget ? `  ${paint(ROLE.warn, budget)}` : ""
       }`,
       right: `${stats ? `${stats} · ` : ""}${formatElapsed(now - run.startedAt)}`,
@@ -581,7 +628,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         (agent) => isAgentLive(agent.state),
       );
       const failed = slice.agents.some((agent) => agent.state === "failed");
-      const phaseState = liveAgents ? "running" : failed ? "failed" : "completed";
+      const phaseState = failed ? "failed" : liveAgents && run.state === "running" ? "running" : run.state === "running" ? "completed" : run.state;
 
       let cost = 0;
       let tokens = 0;
@@ -596,7 +643,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
         rank: liveAgents || failed ? 1 : 0,
         key: phaseKey,
         parent: runKey,
-        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint)} ${slice.phase}`,
+        text: `  ${last ? "╰─" : "├─"} ${mark(phaseState, now, paint, run.state)} ${slice.phase}`,
         ...(phaseStats ? { right: phaseStats } : {}),
       });
 
@@ -604,12 +651,12 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
 
       // A phase running only shell commands has no agents under it, so without
       // this it reads as a name with nothing happening beneath it.
-      const shell = phaseShellRow(run, index, now);
+      const shell = slice.phaseIndex === undefined ? undefined : phaseShellRow(run, slice.phaseIndex, now);
       if (shell) {
         rows.push({
           rank: 1,
           parent: phaseKey,
-          text: `${stem} ${slice.agents.length === 0 ? "╰─" : "├─"} ${mark("running", now, paint)} ${shell.label}`,
+          text: `${stem} ${slice.agents.length === 0 ? "╰─" : "├─"} ${mark("running", now, paint, run.state)} ${shell.label}`,
           right: shell.elapsed,
         });
       }
@@ -657,7 +704,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
           text: `${prefix}${lastAgent ? "╰─" : "├─"} ${
 
             silent === undefined
-              ? mark(agent.state, now, paint)
+              ? mark(agent.state, now, paint, run.state)
               : paint(silent >= STALL_MS ? ROLE.failed : ROLE.warn, "⚠")
           } ${
             // The label is what the workflow called this agent — `reviewer #2`,
@@ -772,36 +819,27 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
 }
 
 /** Everything worth keeping about a run once it is over. */
-/**
- * How many tool calls an agent made, counted from its transcript.
- *
- * `toolCalls` on the agent record is empty on disk — it is filled in memory and
- * only persisted at moments that have usually passed by the time a run ends.
- * The transcript is the durable record: every turn is appended as it happens.
- */
-function countToolCalls(run: Run, index: number): number | undefined {
-  const session = (run.agentSessions ?? [])[index];
-  const locator = session?.locator as { sessionFile?: string } | undefined;
-  const file = locator?.sessionFile;
-  if (!file) return undefined;
-  try {
-    let calls = 0;
-    for (const line of readFileSync(file, "utf8").split("\n")) {
-      if (line === "") continue;
-      const entry = JSON.parse(line) as { type?: string; message?: { content?: readonly { type?: string }[] } };
-      if (entry.type !== "message") continue;
-      for (const part of entry.message?.content ?? []) if (part.type === "toolCall") calls += 1;
+function receiptError(run: Run, fallback: { message?: string } | undefined): string | undefined {
+  if (run.error?.message) return run.error.message;
+  if (run.state !== "failed") return undefined;
+  if (fallback?.message) return fallback.message;
+  for (const agent of run.agents ?? []) {
+    for (const detail of [...(agent.attemptDetails ?? [])].reverse()) {
+      if (detail.error?.message) return detail.error.message;
     }
-    return calls;
-  } catch {
-    // The transcript was cleaned up, or is mid-write. A missing count is
-    // better than a wrong one.
-    return undefined;
   }
+  return undefined;
 }
-
-function receiptFor(run: Run): Receipt {
-  const agents = run.agents ?? [];
+function receiptFor(run: Run, fallback?: { message?: string }): Receipt {
+  const slices = phaseSlices(run);
+  const agents = slices.flatMap((slice) => slice.agents);
+  let boundary = 0;
+  const phaseBoundaries = slices.map((slice) => {
+    const current = boundary;
+    boundary += slice.agents.length;
+    return current;
+  });
+  const error = receiptError(run, fallback);
   return {
     runId: run.id ?? "",
     workflow: run.workflowName ?? "workflow",
@@ -809,41 +847,35 @@ function receiptFor(run: Run): Receipt {
     costUsd: run.usage?.costUsd ?? 0,
     tokens: run.usage?.tokens ?? 0,
     durationMs: run.usage?.durationMs ?? 0,
-    phases: (run.phaseHistory ?? []).map((entry) => entry.phase),
-    // Agents carry no phase of their own; phaseHistory records how many had
-    // finished when each phase opened, so these offsets are what tie them.
-    phaseBoundaries: (run.phaseHistory ?? []).map((entry) => entry.afterAgent),
-    agents: agents.map((agent, index) => {
-      const calls = countToolCalls(run, index);
-      return {
-        // What the workflow called it, falling back to the role it was built
-        // from. Two agents of one role are otherwise indistinguishable.
-        name: agent.label ?? agent.name,
-        state: agent.state,
-        // Model and thinking level together: a role picks both, and the model
-        // name alone does not say whether it reasoned cheaply or deeply.
-        ...(agent.model.model
-          ? {
-              model: `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
-            }
-          : {}),
-        ...(agent.role ? { role: agent.role } : {}),
-        ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}),
-        // What the agent actually did, not what it was allowed to do. The
-        // permitted toolbox is a property of the role and says nothing about
-        // this particular run; the number of calls says how hard it worked.
-        ...(calls === undefined ? {} : { toolCalls: calls }),
-        // Cache reads dwarf real input and cost almost nothing, so the split is
-        // what explains a cheap run that looks enormous.
-        input: agent.accounting?.input ?? 0,
-        output: agent.accounting?.output ?? 0,
-        cacheRead: agent.accounting?.cacheRead ?? 0,
-        costUsd: agent.accounting?.cost ?? 0,
-        durationMs: agent.durationMs ?? 0,
-        attempts: agent.attempts,
-      };
-    }),
-    ...(run.error?.message ? { error: run.error.message } : {}),
+    phases: slices.map(({ phase }) => phase),
+    phaseBoundaries,
+    agents: agents.map((agent) => ({
+      id: agent.id,
+      ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
+      // What the workflow called it, falling back to the role it was built
+      // from. Two agents of one role are otherwise indistinguishable.
+      name: agent.label ?? agent.name,
+      state: agent.state,
+      // Model and thinking level together: a role picks both, and the model
+      // name alone does not say whether it reasoned cheaply or deeply.
+      ...(agent.model.model
+        ? {
+            model: `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
+          }
+        : {}),
+      ...(agent.role ? { role: agent.role } : {}),
+      ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}),
+      tools: [...agent.tools],
+      // Cache reads dwarf real input and cost almost nothing, so the split is
+      // what explains a cheap run that looks enormous.
+      input: agent.accounting?.input ?? 0,
+      output: agent.accounting?.output ?? 0,
+      cacheRead: agent.accounting?.cacheRead ?? 0,
+      costUsd: agent.accounting?.cost ?? 0,
+      durationMs: agent.durationMs ?? 0,
+      attempts: agent.attempts,
+    })),
+    ...(error === undefined ? {} : { error }),
   };
 }
 
@@ -890,8 +922,18 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
     );
 
     const stem = last ? "  " : "│ ";
-    agents.forEach((agent, agentIndex) => {
-      const lastAgent = agentIndex === agents.length - 1;
+    const inPhase = new Set(agents.flatMap((agent) => agent.id === undefined ? [] : [agent.id]));
+    const children = new Map<string, ReceiptAgent[]>();
+    const roots: ReceiptAgent[] = [];
+    for (const agent of agents) {
+      if (agent.parentId !== undefined && inPhase.has(agent.parentId)) {
+        children.set(agent.parentId, [...(children.get(agent.parentId) ?? []), agent]);
+      } else {
+        roots.push(agent);
+      }
+    }
+
+    const drawAgent = (agent: ReceiptAgent, prefix: string, lastAgent: boolean): void => {
       const detail = [
         agent.model ?? "",
         formatCost(agent.costUsd),
@@ -904,18 +946,20 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
         .join(" · ");
 
       lines.push(
-        `${stem} ${lastAgent ? "╰─" : "├─"} ${glyph(agent.state)} ${agent.name} ${theme.fg("muted", detail)}`,
+        `${prefix}${lastAgent ? "╰─" : "├─"} ${glyph(agent.state)} ${agent.name} ${theme.fg("muted", detail)}`,
       );
 
-      const under = `${stem} ${lastAgent ? "  " : "│ "}   `;
+      const under = `${prefix}${lastAgent ? "  " : "│ "}   `;
       const meta = [
         agent.role ? `role ${agent.role}` : "",
         agent.requestedModel && agent.requestedModel !== agent.model
           ? `via ${agent.requestedModel}`
           : "",
-        agent.toolCalls === undefined
-          ? ""
-          : `${String(agent.toolCalls)} ${agent.toolCalls === 1 ? "call" : "calls"}`,
+        agent.tools?.length
+          ? agent.tools.join(" ")
+          : agent.toolCalls === undefined
+            ? ""
+            : `${String(agent.toolCalls)} ${agent.toolCalls === 1 ? "call" : "calls"}`,
       ].filter(Boolean);
       if (meta.length > 0) lines.push(theme.fg("muted", `${under}${meta.join(" · ")}`));
 
@@ -925,6 +969,15 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
         agent.cacheRead ? `cache ${formatTokens(agent.cacheRead)}` : "",
       ].filter(Boolean);
       if (split.length > 0) lines.push(theme.fg("muted", `${under}${split.join(" · ")}`));
+
+      const kids = agent.id === undefined ? [] : children.get(agent.id) ?? [];
+      kids.forEach((child, childIndex) => {
+        drawAgent(child, under, childIndex === kids.length - 1);
+      });
+    };
+
+    roots.forEach((agent, agentIndex) => {
+      drawAgent(agent, `${stem} `, agentIndex === roots.length - 1);
     });
   });
 
@@ -942,6 +995,7 @@ export default function widget(pi: ExtensionAPI): void {
   let timer: NodeJS.Timeout | undefined;
   /** True while a frame is on screen, so it is only cleared when there is one. */
   let showing = false;
+  let renderFailed = false;
 
   /**
    * Whether the widget holds the keyboard, and which row is under the cursor.
@@ -963,7 +1017,7 @@ export default function widget(pi: ExtensionAPI): void {
    * something else currently owns the keyboard.
    */
   let host: TuiHandle | undefined;
-
+  let inputUnsubscribe: (() => void) | undefined;
   /**
    * Whether some other component is holding the keyboard.
    *
@@ -999,13 +1053,69 @@ export default function widget(pi: ExtensionAPI): void {
   const seen = new Map<string, number>();
   /** Runs already written to the transcript, so each is recorded once. */
   const receipted = new Set<string>();
+  /** Terminal completed/failed state events wait for their dedicated event. */
+  const awaitingDedicatedReceipt = new Set<string>();
+  const failureEvents = new Map<string, { message: string }>();
+  let sessionGeneration = 0;
 
   const sessionId = (): string | undefined => context?.sessionManager.getSessionId();
+  const resetNavigation = (): void => {
+    focused = false;
+    offset = 0;
+    rowCount = 0;
+    size.rows = 0;
+    host = undefined;
+  };
+  const hide = (): void => {
+    if (showing) {
+      try { context?.ui.setWidget(KEY, undefined); } catch { /* A failed repaint is already being cleared. */ }
+    }
+    showing = false;
+    renderFailed = false;
+    inputUnsubscribe?.();
+    inputUnsubscribe = undefined;
+    resetNavigation();
+  };
+  const handleInput = (data: string): { consume?: boolean } | undefined => {
+    if (!showing || !focused) return undefined;
+    if (somethingElseHasTheKeyboard()) {
+      focused = false;
+      offset = 0;
+      return undefined;
+    }
+    if (maxOffset(rowCount, MAX_ROWS - 2) === 0) {
+      focused = false;
+      offset = 0;
+      return undefined;
+    }
+    if (isKeyRelease(data)) return { consume: true };
+    if (matchesKey(data, Key.up)) {
+      offset = Math.max(0, offset - 1);
+      return { consume: true };
+    }
+    if (matchesKey(data, Key.down)) {
+      offset = Math.min(maxOffset(rowCount, MAX_ROWS - 2), offset + 1);
+      return { consume: true };
+    }
+    if (matchesKey(data, Key.escape) || data === "q") {
+      focused = false;
+      offset = 0;
+      return { consume: true };
+    }
+    focused = false;
+    offset = 0;
+    return undefined;
+  };
+  const installInput = (): void => {
+    if (!showing || !__navigationForTests.enabled || inputUnsubscribe || !context?.hasUI) return;
+    inputUnsubscribe = context.ui.onTerminalInput(handleInput);
+  };
+
 
   /** Re-read one run's state. Called on events, never on the repaint timer. */
   const refresh = (runId: string, directory: string, runSessionId: string): void => {
     // A run filed under another session belongs to another window's widget.
-    if (runSessionId !== sessionId()) return;
+    if (runSessionId !== sessionId() || receipted.has(runId)) return;
     const run = readRun(directory);
     if (!run) return;
     // A pending checkpoint is known only from events, so it has to survive a
@@ -1016,24 +1126,37 @@ export default function widget(pi: ExtensionAPI): void {
 
   const receipt = (runId: string): void => {
     if (receipted.has(runId)) return;
-    const run = runs.get(runId);
-    if (!run) return;
+    const current = runs.get(runId);
+    if (!current) return;
+    // Events are signals, not the receipt's data. Read the final atomic state
+    // again so a completion event cannot capture the preceding running state.
+    const persisted = readRun(current.directory);
+    if (!persisted || !isRunTerminal(persisted.state)) return;
+    const run = current.waiting ? { ...persisted, waiting: current.waiting } : persisted;
     receipted.add(runId);
     runs.delete(runId);
+    seen.delete(runId);
+    const failure = failureEvents.get(runId);
+    failureEvents.delete(runId);
     // A foreground run already left its own summary in the transcript, put
     // there by the workflow tool call that waited for it. A second account of
     // the same run directly beneath the first is noise.
     if (run.delivery?.mode === "foreground") return;
-    pi.appendEntry<Receipt>(ENTRY_TYPE, receiptFor(run));
+    pi.appendEntry<Receipt>(ENTRY_TYPE, receiptFor(run, failure));
   };
 
+
   const paint = (): void => {
-    if (!context?.hasUI) return;
-    if (!renderFrame([...runs.values()], Date.now(), 80)) {
-      if (showing) {
-        context.ui.setWidget(KEY, undefined);
-        showing = false;
-      }
+    if (!context?.hasUI) {
+      hide();
+      return;
+    }
+    if (renderFailed) {
+      hide();
+      return;
+    }
+    if (![...runs.values()].some((run) => isRunLive(run.state) && run.delivery?.mode !== "foreground")) {
+      hide();
       return;
     }
 
@@ -1043,6 +1166,10 @@ export default function widget(pi: ExtensionAPI): void {
     // and checked against another, and Pi treats an over-wide line as fatal
     // rather than wrapping it. Every row is clamped again on the way out, so
     // the worst case is a clipped row instead of a crashed session.
+    // Below the editor, where a running job belongs: it is something to
+    // glance down at, not something standing between the conversation and
+    // the place you type.
+    showing = true;
     context.ui.setWidget(
       KEY,
       (tui: TuiHandle, theme: Theme) => {
@@ -1050,31 +1177,44 @@ export default function widget(pi: ExtensionAPI): void {
         host = tui;
         return {
           render: (width: number): string[] => {
-            // The layout is composed against a floor of twenty columns, because
-            // a tree drawn narrower than that is unreadable anyway — but what
-            // leaves this function is measured against the width Pi actually
-            // gave. A pane narrower than the floor gets a cut frame; it does
-            // not get a crash, and pi-tui treats an over-wide line as fatal.
-            const usable = Math.max(20, width);
-            const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size) ?? [];
-            // The keys track the body rows exactly, so they say how far the
-            // cursor may travel — the lid and the floor are not rows to land on.
-            rowCount = size.rows;
-            return frame.map((line) =>
-              visibleLength(line) > width ? truncate(line, width) : line,
-            );
+            try {
+              // The layout is composed against a floor of twenty columns, because
+              // a tree drawn narrower than that is unreadable anyway — but what
+              // leaves this function is measured against the width Pi actually
+              // gave. A pane narrower than the floor gets a cut frame; it does
+              // not get a crash, and pi-tui treats an over-wide line as fatal.
+              const usable = Math.max(20, width);
+              const frame = renderFrame([...runs.values()], Date.now(), usable, focused ? offset : 0, theme, focused, size);
+              if (frame === undefined) {
+                renderFailed = true;
+                inputUnsubscribe?.();
+                inputUnsubscribe = undefined;
+                resetNavigation();
+                return [];
+              }
+              // The keys track the body rows exactly, so they say how far the
+              // cursor may travel — the lid and the floor are not rows to land on.
+              rowCount = size.rows;
+              offset = Math.min(offset, maxOffset(rowCount, MAX_ROWS - 2));
+              return frame.map((line) =>
+                visibleLength(line) > width ? truncate(line, width) : line,
+              );
+            } catch {
+              renderFailed = true;
+              inputUnsubscribe?.();
+              inputUnsubscribe = undefined;
+              resetNavigation();
+              return [];
+            }
           },
           invalidate: (): void => {
             // Nothing is cached between frames; every render reads current state.
           },
         };
       },
-      // Below the editor, where a running job belongs: it is something to
-      // glance down at, not something standing between the conversation and
-      // the place you type.
       { placement: "belowEditor" },
     );
-    showing = true;
+    installInput();
   };
 
   /**
@@ -1088,28 +1228,36 @@ export default function widget(pi: ExtensionAPI): void {
    */
   const rescan = (): void => {
     for (const [runId, run] of runs) {
+      if (receipted.has(runId)) {
+        runs.delete(runId);
+        seen.delete(runId);
+        continue;
+      }
       try {
         const mtime = statSync(join(run.directory, "state.json")).mtimeMs;
         if (mtime === seen.get(runId)) continue;
         seen.set(runId, mtime);
         const fresh = readRun(run.directory);
-        if (fresh) runs.set(runId, run.waiting ? { ...fresh, waiting: run.waiting } : fresh);
+        if (fresh) {
+          runs.set(runId, run.waiting ? { ...fresh, waiting: run.waiting } : fresh);
+          if (isRunTerminal(fresh.state) && !awaitingDedicatedReceipt.has(runId)) receipt(runId);
+        }
       } catch {
         // The run's directory went away, or is mid-write. Keep what we have.
       }
     }
   };
 
-  const tick = (): void => {
+  function tick(): void {
     try {
       rescan();
       paint();
     } catch {
       // A failed repaint is a skipped frame, never fatal: a widget that dies
       // quietly is indistinguishable from one that was never drawn.
-      showing = false;
+      hide();
     }
-  };
+  }
 
   // The transcript entry: appendEntry carries the data, this renders it. It
   // returns a plain component rather than importing pi-tui's Text, because
@@ -1128,21 +1276,20 @@ export default function widget(pi: ExtensionAPI): void {
     };
   });
 
-  const onRunEvent = (event: unknown): void => {
-    const { runId, runDirectory, sessionId: eventSession } = event as {
+  const onRunEvent = (event: unknown, terminal = false, deferReceipt = false): void => {
+    const { runId, runDirectory, sessionId: eventSession, error } = event as {
       runId?: string;
       runDirectory?: string;
       sessionId?: string;
+      error?: { message?: unknown };
     };
-    if (!runId || !runDirectory || !eventSession) return;
+    if (!runId || !runDirectory || !eventSession || eventSession !== sessionId()) return;
+    if (receipted.has(runId)) return;
+    if (deferReceipt) awaitingDedicatedReceipt.add(runId);
+    if (terminal) awaitingDedicatedReceipt.delete(runId);
+    if (typeof error?.message === "string") failureEvents.set(runId, { message: error.message });
     refresh(runId, runDirectory, eventSession);
-    // A run can end without a completed or failed event: stopping it, running
-    // it out of budget or losing it to an interrupt all arrive as a state
-    // change. Reading the state rather than the event name means every ending
-    // leaves a receipt — and an interrupted run is exactly the one whose cost
-    // is worth having a record of.
-    const run = runs.get(runId);
-    if (run && !isRunLive(run.state)) receipt(runId);
+    if (terminal) receipt(runId);
     tick();
   };
 
@@ -1151,7 +1298,6 @@ export default function widget(pi: ExtensionAPI): void {
 
   for (const name of [
     WORKFLOW_RUN_STARTED_EVENT,
-    WORKFLOW_RUN_STATE_CHANGED_EVENT,
     WORKFLOW_AGENT_STATE_CHANGED_EVENT,
     WORKFLOW_PHASE_CHANGED_EVENT,
     WORKFLOW_BUDGET_EVENT,
@@ -1159,14 +1305,26 @@ export default function widget(pi: ExtensionAPI): void {
     unsubscribes.push(pi.events.on(name, onRunEvent));
   }
 
+  unsubscribes.push(pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event: unknown) => {
+    const state = (event as { state?: unknown }).state;
+    onRunEvent(event, state === "stopped", state === "completed" || state === "failed");
+  }));
+  for (const name of [WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT]) {
+    unsubscribes.push(pi.events.on(name, (event: unknown) => {
+      onRunEvent(event, true);
+    }));
+  }
   unsubscribes.push(
     pi.events.on(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, (event: unknown) => {
-      const { runId, name, state } = event as {
+      const { runId, runDirectory, sessionId: eventSession, name, state } = event as {
         runId?: string;
+        runDirectory?: string;
+        sessionId?: string;
         name?: string;
         state?: string;
       };
-      if (!runId) return;
+      if (!runId || !runDirectory || !eventSession || eventSession !== sessionId()) return;
+      refresh(runId, runDirectory, eventSession);
       const run = runs.get(runId);
       if (!run) return;
       if (state === "awaiting") {
@@ -1182,47 +1340,51 @@ export default function widget(pi: ExtensionAPI): void {
     }),
   );
 
-  for (const name of [WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT]) {
-    unsubscribes.push(
-      pi.events.on(name, (event: unknown) => {
-        const { runId } = event as { runId?: string };
-        onRunEvent(event);
-        // The terminal state lands in state.json just after the event, so the
-        // receipt is taken on the next tick rather than this one.
-        if (runId) setTimeout(() => { receipt(runId); tick(); }, 100).unref();
-      }),
-    );
-  }
 
   const stop = (): void => {
+    sessionGeneration += 1;
     if (timer) clearInterval(timer);
     timer = undefined;
-    if (showing) context?.ui.setWidget(KEY, undefined);
-    showing = false;
-    focused = false;
+    failureEvents.clear();
+    hide();
+    runs.clear();
+    seen.clear();
+    receipted.clear();
+    awaitingDedicatedReceipt.clear();
     for (const unsubscribe of unsubscribes.splice(0)) unsubscribe();
   };
 
+  const reconcile = async (sessionContext: ExtensionContext, generation: number): Promise<void> => {
+    if (typeof sessionContext.cwd !== "string" || !sessionContext.cwd) {
+      if (generation === sessionGeneration) tick();
+      return;
+    }
+    const currentSessionId = sessionContext.sessionManager.getSessionId();
+    const runIds = await listRunIds(sessionContext.cwd, currentSessionId);
+    if (generation !== sessionGeneration || context !== sessionContext) return;
+    for (const runId of runIds) {
+      if (generation !== sessionGeneration || context !== sessionContext) return;
+      if (receipted.has(runId)) continue;
+      const directory = new RunStore(sessionContext.cwd, currentSessionId, runId).directory;
+      const run = readRun(directory);
+      if (!run || run.sessionId !== currentSessionId || run.delivery?.mode === "foreground") continue;
+      const waiting = runs.get(runId)?.waiting;
+      runs.set(runId, waiting ? { ...run, waiting } : run);
+      try { seen.set(runId, statSync(join(directory, "state.json")).mtimeMs); } catch { /* Retry on the next event if the state is mid-write. */ }
+      if (isRunTerminal(run.state) && !awaitingDedicatedReceipt.has(runId)) receipt(runId);
+    }
+    if (generation === sessionGeneration) tick();
+  };
 
   pi.on("session_start", (_event, sessionContext) => {
     context = sessionContext;
-    // The core drops every extension widget when a session starts or reloads,
-    // so nothing of this instance is on screen at this point.
-    showing = false;
-
-    // Replay what the session already recorded so a reload cannot write the
-    // same run into the transcript twice.
-    //
-    // The caches go with it. A reload may be entering a different session
-    // entirely, and runs left over from the last one would be drawn as though
-    // they were this session's; `seen` holds modification times that no longer
-    // describe anything, so a run whose file changed while the session was
-    // away would be judged unchanged and never re-read.
+    const generation = ++sessionGeneration;
+    hide();
+    failureEvents.clear();
     runs.clear();
     seen.clear();
-    focused = false;
-    offset = 0;
     receipted.clear();
+    awaitingDedicatedReceipt.clear();
     try {
       for (const entry of sessionContext.sessionManager.getEntries()) {
         const custom = entry as { type?: string; customType?: string; data?: { runId?: string } };
@@ -1235,60 +1397,13 @@ export default function widget(pi: ExtensionAPI): void {
 
     if (!timer) {
       timer = setInterval(tick, REPAINT_MS);
-      // Never hold the process open for the sake of a status line.
       timer.unref();
     }
 
-    // Keyboard access, taken as lightly as possible.
-    //
-    // The handler sees every keystroke before the editor does, so it declines
-    // all but a few, and only while scrolling. `↓` on an empty editor would be
-    // the comfortable way in, but an empty editor is what every picker and
-    // dialog leaves behind while it waits for arrows — so the way in is the
-    // shortcut alone, which never has to share.
-    if (__navigationForTests.enabled) {
-      unsubscribes.push(
-        sessionContext.ui.onTerminalInput((data: string) => {
-          if (!showing) return undefined;
-
-          if (focused) {
-          // Something opened over the widget while it held the keyboard — a
-          // command picker, a dialog. It has the better claim.
-          if (somethingElseHasTheKeyboard()) {
-            focused = false;
-            return undefined;
-          }
-          // The tail of a keystroke already acted on. Swallow it so it cannot
-          // reach the editor, but do not move twice for one press.
-          if (isKeyRelease(data)) return { consume: true };
-          if (matchesKey(data, Key.up)) {
-            offset = Math.max(0, offset - 1);
-            return { consume: true };
-          }
-          if (matchesKey(data, Key.down)) {
-            // Stops where the window stops. Counting rows instead would let
-            // presses past the last row bank an offset nothing on screen can
-            // show, and every one of them would have to be paid back with an
-            // ↑ that appears to do nothing.
-            offset = Math.min(maxOffset(rowCount, MAX_ROWS - 2), offset + 1);
-            return { consume: true };
-          }
-          if (matchesKey(data, Key.escape) || data === "q") {
-              focused = false;
-              return { consume: true };
-            }
-            // Anything else is someone typing: hand the keyboard back and let
-            // the keystroke through, so a thought is never lost to a panel.
-            focused = false;
-            return undefined;
-          }
-
-          return undefined;
-        }),
-      );
-    }
-
     tick();
+    void reconcile(sessionContext, generation).catch(() => {
+      if (generation === sessionGeneration) tick();
+    });
   });
 
   // A way in that never competes. `↓` is the comfortable gesture but it is
@@ -1297,7 +1412,11 @@ export default function widget(pi: ExtensionAPI): void {
   if (__navigationForTests.enabled) pi.registerShortcut(FOCUS_SHORTCUT, {
     description: "Scroll the workflow widget",
     handler: () => {
-      if (!showing) return;
+      if (!showing || maxOffset(rowCount, MAX_ROWS - 2) === 0) {
+        focused = false;
+        offset = 0;
+        return;
+      }
       focused = !focused;
       offset = 0;
     },

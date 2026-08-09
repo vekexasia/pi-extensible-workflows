@@ -4,8 +4,10 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { Compile } from "typebox/compile";
-import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type SessionStartEvent, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ModelRegistry, SessionStartEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
 type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+type HerdrModelContext = { readonly model: ExtensionContext["model"]; readonly modelRegistry: ModelRegistry | undefined };
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 type LocalSessionShutdownReason = "quit" | "resume";
 export interface PiSession {
@@ -15,6 +17,7 @@ export interface PiSession {
   getSessionStats(): { tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; cost: number };
   readonly systemPrompt?: string;
   readonly model?: { provider: string; model?: string; id?: string } | undefined;
+  readonly herdrModelContext?: HerdrModelContext;
   readonly thinkingLevel?: string;
   readonly agent?: { state: { tools: readonly { name: string }[] }; subscribe?(listener: (event: unknown) => void | Promise<void>): () => void };
   readonly herdrResourcePaths?: { extensions: readonly string[]; skills: readonly string[] };
@@ -238,7 +241,7 @@ export function flushExtensionProviders(resourceLoader: DefaultResourceLoader, m
     try {
       modelRuntime.registerNativeProvider(provider);
     } catch (error) {
-      failures.push(`native provider: ${error instanceof Error ? error.message : String(error)}`);
+      failures.push(`${provider.id || "native provider"}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   runtime.pendingNativeProviderRegistrations = [];
@@ -347,6 +350,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     getToolDefinitions: () => session.getAllTools().map(({ name, description, parameters, promptGuidelines }) => ({ name, description, parameters, ...(promptGuidelines ? { promptGuidelines } : {}) })),
     preparePrompt: (text: string) => preparePiPrompt(session as unknown as PiSession, text),
     getResourceInspection: resourceInspection,
+    herdrModelContext: { model: session.model, modelRegistry: session.extensionRunner.getModelRegistry() },
     herdrResourcePaths: resourcePaths,
     herdrContextFiles: resourceLoader.getAgentsFiles().agentsFiles,
   }) as unknown as PiSession;
@@ -548,6 +552,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
     reference,
     getHerdrResourcePaths: () => native.herdrResourcePaths,
     getHerdrContextFiles: () => native.herdrContextFiles,
+    getHerdrModelContext: () => native.herdrModelContext,
     getState: () => Object.freeze(workflowAgentState(native, prepared)),
     getSessionStats: () => workflowAgentStats(native.getSessionStats()),
     getLastAssistant: () => latestUsableAssistant(native.messages),

@@ -44,7 +44,8 @@ import type {
 type HerdrSettings = Pick<WorkflowSettings, "extensions">;
 type HerdrConfig = NonNullable<NonNullable<HerdrSettings["extensions"]>["herdr"]>;
 type HerdrResourcePaths = { extensions: readonly string[]; skills: readonly string[] };
-type HerdrSession = Omit<WorkflowAgentSession, "getLastAssistant" | "abort"> & { getLastAssistant?(): WorkflowAgentMessage | undefined; abort(): Promise<void>; getHerdrResourcePaths?(): HerdrResourcePaths | undefined; getHerdrContextFiles?(): readonly ContextFile[] | undefined };
+type HerdrModelContext = { readonly model: ExtensionContext["model"]; readonly modelRegistry: ModelRegistry | undefined };
+type HerdrSession = Omit<WorkflowAgentSession, "getLastAssistant" | "abort"> & { getLastAssistant?(): WorkflowAgentMessage | undefined; abort(): Promise<void>; getHerdrResourcePaths?(): HerdrResourcePaths | undefined; getHerdrContextFiles?(): readonly ContextFile[] | undefined; getHerdrModelContext?(): HerdrModelContext | undefined };
 type SessionReference = Parameters<HerdrAgentReporter["reportSession"]>[0];
 type ToolCallContent = { type: "toolCall"; name?: string };
 type LifecycleState = "idle" | "working" | "blocked";
@@ -133,16 +134,24 @@ async function createBridgeContext(session: HerdrSession, prepared: Readonly<Pre
   const reference = session.reference;
   const path = sessionPath(reference);
   const sessionManager = path && existsSync(path) ? SessionManager.open(path, undefined, prepared.cwd) : SessionManager.inMemory(prepared.cwd, { id: reference.sessionId });
-  const directory = prepared.agentDir ?? agentDir();
-  const modelRuntime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: join(directory, "models.json") });
-  const modelRegistry = new ModelRegistry(modelRuntime);
-  const model = modelRegistry.find(prepared.model.provider, prepared.model.model);
+  const shared = session.getHerdrModelContext?.();
+  let fallbackRegistry: ModelRegistry | undefined;
+  if (shared?.modelRegistry === undefined) {
+    const directory = prepared.agentDir ?? agentDir();
+    const modelRuntime = await ModelRuntime.create({ authPath: join(directory, "auth.json"), modelsPath: join(directory, "models.json") });
+    fallbackRegistry = new ModelRegistry(modelRuntime);
+  }
+  const modelRegistry = shared?.modelRegistry ?? fallbackRegistry;
+  if (modelRegistry === undefined) throw new Error("Herdr cannot bridge tools without the local model registry.");
+  const model = shared?.model ?? modelRegistry.find(prepared.model.provider, prepared.model.model);
   const runner = new ExtensionRunner([], createExtensionRuntime(), prepared.cwd, sessionManager, modelRegistry);
   runner.setUIContext(undefined, "tui");
   const baseContext = runner.createContext();
   return (signal, abort) => new Proxy(baseContext, {
     get(target, property, receiver) {
-      if (property === "model") return model;
+      const current = session.getHerdrModelContext?.();
+      if (property === "model") return current?.model ?? model;
+      if (property === "modelRegistry") return current?.modelRegistry ?? modelRegistry;
       if (property === "thinkingLevel") return prepared.model.thinking;
       if (property === "isIdle") return () => false;
       if (property === "isProjectTrusted") return () => prepared.resourcePolicy?.projectTrusted ?? true;

@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import widget, { renderReceipt, __navigationForTests } from "../dist/index.js";
+import { RunStore } from "pi-extensible-workflows/persistence";
 import {
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
   WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT,
   WORKFLOW_RUN_COMPLETED_EVENT,
+  WORKFLOW_RUN_FAILED_EVENT,
   WORKFLOW_RUN_STARTED_EVENT,
   WORKFLOW_RUN_STATE_CHANGED_EVENT,
 } from "pi-extensible-workflows";
@@ -60,7 +62,8 @@ function runState(overrides = {}) {
 }
 
 /** A stand-in for the extension host, capturing everything the widget draws. */
-function harness(sessionId = "session-1") {
+function harness(sessionId = "session-1", options = {}) {
+  let sessionEntries = options.entries ?? [];
   const handlers = new Map();
   const events = new Map();
   const frames = [];
@@ -101,7 +104,8 @@ function harness(sessionId = "session-1") {
 
   const context = {
     hasUI: true,
-    sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
+    cwd: options.cwd,
+    sessionManager: { getSessionId: () => sessionId, getEntries: () => sessionEntries },
     // The widget registers a factory so it is built at the width the TUI is
     // about to draw with. Render it the way the host does, at a fixed width.
     ui: {
@@ -138,6 +142,8 @@ function harness(sessionId = "session-1") {
       return false;
     },
     get renderer() { return renderer; },
+    setEntries: (entries) => { sessionEntries = entries; },
+    reload: () => handlers.get("session_start")(undefined, context),
     start: () => handlers.get("session_start")(undefined, context),
     shutdown: () => handlers.get("session_shutdown")(undefined, context),
     emit: (name, event) => { for (const handler of events.get(name) ?? []) handler(event); },
@@ -164,6 +170,83 @@ void test("draws a tree for a live run and clears it once the run is over", () =
   host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
   assert.equal(host.frames.at(-1), undefined, "a finished run leaves the widget at once");
 
+  host.shutdown();
+});
+
+void test("isolates malformed state from healthy runs", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-malformed-state-"));
+  const healthy = writeRun(join(root, "healthy"), runState({ id: "healthy", workflowName: "healthy" }));
+  const malformed = writeRun(join(root, "malformed"), runState({ id: "malformed", workflowName: "malformed", agents: [null] }));
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "healthy", runDirectory: healthy, sessionId: "session-1" });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "malformed", runDirectory: malformed, sessionId: "session-1" });
+
+  assert.match(host.frames.at(-1).map(plain).join("\n"), /healthy/);
+  assert.doesNotMatch(host.frames.at(-1).map(plain).join("\n"), /malformed/);
+  host.shutdown();
+});
+
+void test("paused and resumable run states use non-running glyphs", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-status-glyphs-"));
+  const host = harness();
+  host.start();
+  for (const state of ["paused", "awaiting_input", "interrupted", "budget_exhausted"]) {
+    const directory = writeRun(join(root, state), runState({ id: state, workflowName: state, state }));
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: state, runDirectory: directory, sessionId: "session-1" });
+    const header = host.frames.at(-1).map(plain).find((line) => line.includes(` ${state} `));
+    assert.ok(header);
+    const expected = state === "budget_exhausted" ? "✗" : "·";
+    assert.match(header, new RegExp(`${expected} ${state} `), `${state} is not active`);
+    assert.doesNotMatch(header, /[⣷⣯⣟⡿⢿⣽⣻]/, `${state} does not spin`);
+  }
+
+  const budgetHeader = host.frames.at(-1).map(plain).find((line) => line.includes(" budget_exhausted "));
+  assert.match(budgetHeader, /✗ budget_exhausted /);
+  host.shutdown();
+});
+
+void test("live per-agent totals exclude cache-write tokens", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-token-total-"));
+  const directory = writeRun(join(root, "run-1"), runState({
+    agents: [{ ...runState().agents[0], accounting: { input: 10, output: 5, cacheRead: 20, cacheWrite: 10_000, cost: 0.01 } }],
+    usage: { tokens: 15, costUsd: 0.01 },
+  }));
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+  const body = host.frames.at(-1).map(plain).join("\n");
+  assert.match(body, /fixture-model:medium · 15t/);
+  assert.doesNotMatch(body, /fixture-model:medium · 10\.0kt/);
+  host.shutdown();
+});
+
+void test("ignores checkpoint events from another session and refreshes missing runs", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-checkpoint-scope-"));
+  const directory = writeRun(join(root, "run-1"), runState());
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "other", name: "foreign", state: "awaiting" });
+  assert.ok(host.frames.every((frame) => frame === undefined));
+
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "local", state: "awaiting" });
+  assert.match(host.frames.at(-1).map(plain).join("\n"), /waiting: local/);
+  host.shutdown();
+});
+
+void test("a render failure is cleared on the next tick", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-render-cleanup-"));
+  const directory = writeRun(join(root, "run-1"), runState());
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const factory = host.widgets.at(-1);
+  const broken = factory(host.tui, { ...theme, fg: () => { throw new Error("render failed"); } });
+  assert.deepEqual(broken.render(WIDTH), []);
+
+  host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  assert.equal(host.widgets.at(-1), undefined, "the empty factory is unregistered");
   host.shutdown();
 });
 
@@ -233,6 +316,125 @@ void test("the receipt shows phases, per-agent models, effort and the token spli
     runId: "run-1", workflow: "smoke", state: "completed", costUsd: 0, tokens: 0, durationMs: 0,
     phases: [], phaseBoundaries: [], agents: [],
   }, true, theme).join("\n"), /run run-1/);
+});
+
+void test("resumable runs stay visible until a later terminal state", async () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-resumable-"));
+  const host = harness();
+  host.start();
+  const directories = new Map();
+  for (const [index, state] of ["interrupted", "budget_exhausted"].entries()) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), runState({ id, state, workflowName: state }));
+    directories.set(id, directory);
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 150));
+  assert.equal(host.entries.length, 0);
+  assert.match(host.frames.at(-1).map(plain).join("\n"), /interrupted|budget_exhausted/);
+
+  const directory = directories.get("run-0");
+  writeRun(directory, runState({ id: "run-0", state: "completed", workflowName: "interrupted" }));
+  host.emit(WORKFLOW_RUN_STATE_CHANGED_EVENT, { runId: "run-0", runDirectory: directory, sessionId: "session-1", state: "completed" });
+  assert.equal(host.entries.length, 0, "the state event alone is not the completion receipt");
+  host.emit(WORKFLOW_RUN_COMPLETED_EVENT, { runId: "run-0", runDirectory: directory, sessionId: "session-1" });
+  await new Promise((resolve) => globalThis.setImmediate(resolve));
+  assert.equal(host.entries.length, 1);
+  assert.equal(host.entries[0].data.state, "completed");
+  host.shutdown();
+});
+
+void test("failed receipts fall back to a failed attempt error", async () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-attempt-error-"));
+  const host = harness();
+  host.start();
+  const base = runState().agents[0];
+  const directory = writeRun(join(root, "run-1"), runState({
+    state: "failed",
+    agents: [{
+      ...base,
+      state: "failed",
+      attemptDetails: [{
+        attempt: 1,
+        transport: "local",
+        accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        setup: { model: { provider: "fixture", model: "model" }, tools: [], hookNames: [], cwd: root },
+        error: { code: "AGENT_FAILED", message: "attempt error" },
+      }],
+    }],
+  }));
+  host.emit(WORKFLOW_RUN_FAILED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 150));
+  assert.equal(host.entries[0].data.error, "attempt error");
+  host.shutdown();
+});
+
+void test("failed receipts use stable persisted and attempt errors", async () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-failure-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), runState());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  writeRun(directory, runState({
+    state: "failed",
+    error: { code: "AGENT_FAILED", message: "persisted error" },
+    agents: [{ ...runState().agents[0], state: "failed", attemptDetails: [{ attempt: 1, setup: { model: { provider: "fixture", model: "model" }, tools: [], hookNames: [], cwd: root }, transport: "local", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, error: { code: "AGENT_FAILED", message: "attempt error" } }] }],
+  }));
+  host.emit(WORKFLOW_RUN_FAILED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1", error: { code: "AGENT_FAILED", message: "event error" } });
+  assert.equal(host.entries.length, 1);
+  assert.equal(host.entries[0].data.error, "persisted error");
+  host.shutdown();
+});
+
+void test("receipts retain unphased nested agents and granted tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-unphased-"));
+  const base = runState().agents[0];
+  const directory = writeRun(join(root, "run-1"), runState({
+    state: "completed",
+    phaseHistory: [],
+    agents: [
+      { ...base, id: "parent", name: "parent", state: "completed", tools: ["read", "grep"] },
+      { ...base, id: "child", name: "child", parentId: "parent", state: "completed", tools: ["find"], attemptDetails: [{ session: { locator: { sessionFile: join(root, "missing.jsonl") } }, error: { code: "AGENT_FAILED", message: "attempt error" } }] },
+    ],
+  }));
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_COMPLETED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 150));
+  const receipt = host.entries[0].data;
+  assert.deepEqual(receipt.phases, ["unphased"]);
+  assert.deepEqual(receipt.phaseBoundaries, [0]);
+  assert.deepEqual(receipt.agents.map(({ name, parentId, tools, toolCalls }) => ({ name, parentId, tools, toolCalls })), [
+    { name: "parent", parentId: undefined, tools: ["read", "grep"], toolCalls: undefined },
+    { name: "child", parentId: "parent", tools: ["find"], toolCalls: undefined },
+  ]);
+  const body = renderReceipt(receipt, false, theme).map(plain).join("\n");
+  assert.ok(body.indexOf("parent") < body.indexOf("child"));
+  assert.match(body, /read grep/);
+  assert.match(body, /find/);
+  host.shutdown();
+});
+
+void test("reload reconciles on-disk runs and recovers missed receipts", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "widget-reload-cwd-"));
+  const background = new RunStore(cwd, "session-1", "reload-background");
+  const foreground = new RunStore(cwd, "session-1", "reload-foreground");
+  writeRun(background.directory, runState({ id: "reload-background", workflowName: "recovered", cwd, delivery: { mode: "background", state: "pending" } }));
+  writeRun(foreground.directory, runState({ id: "reload-foreground", workflowName: "foreground", cwd, delivery: { mode: "foreground", state: "attached" } }));
+  const host = harness("session-1", { cwd });
+  host.start();
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 150));
+  assert.match(host.frames.at(-1).map(plain).join("\n"), /recovered/);
+  assert.doesNotMatch(host.frames.at(-1).map(plain).join("\n"), /foreground/);
+
+  writeRun(background.directory, runState({ id: "reload-background", workflowName: "recovered", cwd, state: "completed", delivery: { mode: "background", state: "pending" } }));
+  host.reload();
+  await new Promise((resolve) => globalThis.setTimeout(resolve, 150));
+  assert.equal(host.entries.length, 1);
+  assert.equal(host.entries[0].data.runId, "reload-background");
+  host.shutdown();
+  rmSync(background.directory, { recursive: true, force: true });
+  rmSync(foreground.directory, { recursive: true, force: true });
 });
 
 void test("the border lines up at every width the TUI asks for", () => {
@@ -354,6 +556,25 @@ void test("a quiet agent is flagged early, a stalled one more loudly", () => {
   host.shutdown();
 });
 
+void test("only running agents can become quiet", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-quiet-states-"));
+  const state = runState();
+  const oldTranscript = join(root, "old.jsonl");
+  writeFileSync(oldTranscript, "{}\n");
+  utimesSync(oldTranscript, new Date(Date.now() - 5 * 60_000), new Date(Date.now() - 5 * 60_000));
+  const attemptDetails = [{ attempt: 1, transport: "local", session: { locator: { sessionFile: oldTranscript } } }];
+  const agents = ["queued", "paused", "retrying", "waiting_for_child"].map((agentState, index) => ({
+    ...state.agents[0], id: `agent-${String(index)}`, name: agentState, state: agentState, lastEventAt: Date.now() - 5 * 60_000, attemptDetails,
+  }));
+  const directory = writeRun(join(root, "run-1"), { ...state, phaseHistory: [{ phase: "work", afterAgent: 0 }], agents });
+  const host = harness();
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const body = host.frames.at(-1).map(plain).join("\n");
+  assert.doesNotMatch(body, /quiet|stalled/);
+  host.shutdown();
+});
+
 void test("a retry is visible while it is happening, not only in the receipt", () => {
   const root = mkdtempSync(join(tmpdir(), "widget-retry-"));
   const state = runState();
@@ -417,24 +638,22 @@ void test("a checkpoint waiting on a person is shown, and clears when answered",
   host.start();
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
 
-  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", name: "merge the MR?", state: "awaiting" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "merge the MR?", state: "awaiting" });
   assert.match(host.frames.at(-1).map(plain).join("\n"), /waiting: merge the MR\?/, "the question is shown");
 
   // A re-read of the state file must not lose it: disk knows nothing of checkpoints.
   host.emit(WORKFLOW_RUN_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
   assert.match(host.frames.at(-1).map(plain).join("\n"), /waiting: merge the MR\?/, "it survives a state re-read");
 
-  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", name: "merge the MR?", state: "approved" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "merge the MR?", state: "approved" });
   assert.doesNotMatch(host.frames.at(-1).map(plain).join("\n"), /waiting/, "answering clears it");
 
   host.shutdown();
 });
 
-void test("the receipt counts what an agent did, not what it was allowed to do", () => {
-  // The permitted toolbox is a property of the role, identical on every run
-  // that uses it, and an agent with no role inherits sixty-odd names that say
-  // nothing while pushing the rest of the receipt off the screen. The number
-  // of calls is what differs from run to run.
+void test("older receipts still render their tool-call counts", () => {
+  // Receipts written before granted tools were persisted contain only a call
+  // count; keep those transcript entries readable.
   const lines = renderReceipt(
     {
       runId: "run-1",
@@ -840,6 +1059,43 @@ void test("the shortcut scrolls the widget through a tree too tall to show", () 
   host.shutdown();
 });
 
+void test("alt+o does not enter or bank scrolling when the tree fits", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-fit-scroll-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), runState({
+    agents: [],
+    phaseHistory: Array.from({ length: 7 }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
+  }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const shortcut = [...host.shortcuts.values()][0];
+  const before = host.widgets.at(-1)(host.tui, theme).render(WIDTH);
+  shortcut.handler();
+  assert.equal(host.key("\u001b[1;1:1B"), false);
+  assert.deepEqual(host.widgets.at(-1)(host.tui, theme).render(WIDTH), before);
+  host.shutdown();
+});
+
+void test("scroll mode yields arrows when a repaint leaves a fitting tree", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-scroll-shrink-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), runState({
+    phaseHistory: Array.from({ length: 10 }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
+    agents: [],
+  }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  [...host.shortcuts.values()][0].handler();
+  assert.equal(host.key("\u001b[1;1:1B"), true);
+
+  writeRun(directory, runState({ agents: [], phaseHistory: [{ phase: "phase-0", afterAgent: 0 }] }));
+  host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  assert.equal(host.key("\u001b[1;1:1B"), false);
+  host.shutdown();
+});
+
 
 void test("scrolling is visibly a mode: coloured rules, a scrollbar and a way out", () => {
   // Entering a mode that looks identical to not being in it is how a keypress
@@ -1067,6 +1323,8 @@ void test("a run header survives however many checkpoints are waiting", () => {
   for (let index = 0; index < 7; index += 1) {
     host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
       runId: `run-${String(index)}`,
+      runDirectory: join(root, `run-${String(index)}`),
+      sessionId: "session-1",
       state: "awaiting",
       name: `approve-${String(index)}`,
     });
@@ -1077,5 +1335,22 @@ void test("a run header survives however many checkpoints are waiting", () => {
     assert.ok(frame.some((line) => line.includes(`flow-${String(index)}`)), `flow-${String(index)} is still on screen`);
   }
 
+  host.shutdown();
+});
+
+void test("marks hidden rows when run headers exceed the body budget", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-header-budget-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < 9; index += 1) {
+    const id = `run-${String(index)}`;
+    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+
+  const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  assert.ok(frame.length <= 10, "the strict frame budget still wins");
+  assert.ok(frame.some((line) => line.includes("more")), "hidden headers are accounted for");
+  assert.ok(!frame.some((line) => line.includes("flow-8")), "not every header is claimed to fit");
   host.shutdown();
 });

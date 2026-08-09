@@ -934,17 +934,22 @@ void test("relays generated tool bridge results, errors, and updates", async () 
   };
   const workspaces = { open: async (_run, request) => { const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1]; runCommand = commandFile ? readFileSync(commandFile, "utf8") : request.command; return { workspaceId: "workspace", tabId: "tab", paneId: "pane" }; } };
   const calls = [];
-  const tool = { name: "bridge", label: "Bridge", description: "Bridge", parameters: { type: "object", properties: {}, additionalProperties: false }, async execute(toolCallId, params, _signal, onUpdate) {
+  let bridgeContext;
+  const tool = { name: "bridge", label: "Bridge", description: "Bridge", parameters: { type: "object", properties: {}, additionalProperties: false }, async execute(toolCallId, params, _signal, onUpdate, context) {
+    bridgeContext = context;
     calls.push({ toolCallId, params });
     if (params.mode === "error") throw new Error("tool failed");
     onUpdate({ state: "working" });
     return { content: [{ type: "text", text: "tool result" }] };
   } };
   const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "parent" }, runner, workspaces });
-  const agent = { transport: { id: "local", async createSession(value) { return { reference: { transport: "local", sessionId: "session", locator: { sessionFile: "/tmp/herdr-test.jsonl" } }, getState: () => ({ model: value.model, tools: value.tools }), getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), abort: async () => {}, dispose: async () => {} }; } } };
+  const resolvedModel = { provider: "inline-only", id: "inline-model" };
+  const resolvedRegistry = { find: (provider, model) => provider === resolvedModel.provider && model === resolvedModel.id ? resolvedModel : undefined };
+  // The shared registry can arrive before the live session exposes its model.
+  const agent = { transport: { id: "local", async createSession(value) { return { reference: { transport: "local", sessionId: "session", locator: { sessionFile: "/tmp/herdr-test.jsonl" } }, getState: () => ({ model: value.model, tools: value.tools }), getHerdrModelContext: () => ({ model: undefined, modelRegistry: resolvedRegistry }), getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), abort: async () => {}, dispose: async () => {} }; } } };
   const controller = new AbortController();
   herdr.agentSetupHooks.fullyInspectable.setup(agent, { identity: { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 }, run: { runId: "run", workflow: { name: "flow" } }, signal: controller.signal });
-  const prepared = { cwd: "/repo", model: { provider: "fake", model: "model" }, tools: [], customTools: [tool], initialPrompt: "work", sessionLabel: "flow:review", piRuntime };
+  const prepared = { cwd: "/repo", model: { provider: "inline-only", model: "inline-model" }, tools: [], customTools: [tool], initialPrompt: "work", sessionLabel: "flow:review", piRuntime };
   const session = await agent.transport.createSession(prepared, { attempt: 1, signal: controller.signal });
   try {
     assert.ok(runCommand);
@@ -959,7 +964,56 @@ void test("relays generated tool bridge results, errors, and updates", async () 
     assert.deepEqual(result, { content: [{ type: "text", text: "tool result" }] });
     assert.deepEqual(updates, [{ state: "working" }]);
     assert.deepEqual(calls, [{ toolCallId: "success-call", params: { mode: "success" } }]);
+    assert.equal(bridgeContext.model, resolvedModel);
+    assert.equal(bridgeContext.modelRegistry, resolvedRegistry);
     await assert.rejects(registered[0].execute("error-call", { mode: "error" }, controller.signal, () => {}), /tool failed/);
     assert.deepEqual(calls.at(-1), { toolCallId: "error-call", params: { mode: "error" } });
   } finally { controller.abort(); await session.dispose(); await rm(root, { recursive: true, force: true }); }
+});
+
+void test("bridges a custom tool with a model supplied only by an inline extension", async () => {
+  const root = mkdtempSync(join(tmpdir(), "herdr-inline-provider-"));
+  const agentDir = join(root, "agent");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensions: { herdr: { enableFullyInspectableMode: true } } }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  let runCommand;
+  const runner = async (args) => {
+    if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
+    if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "working" } } });
+    return "";
+  };
+  const workspaces = { open: async (_run, request) => { const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1]; runCommand = commandFile ? readFileSync(commandFile, "utf8") : request.command; return { workspaceId: "workspace", tabId: "tab", paneId: "pane" }; } };
+  let bridgeContext;
+  const tool = { name: "bridge", label: "Bridge", description: "Bridge", parameters: { type: "object", properties: {}, additionalProperties: false }, async execute(_id, _params, _signal, _onUpdate, context) { bridgeContext = context; return { content: [{ type: "text", text: "ok" }] }; } };
+  const extensionFactory = (pi) => {
+    pi.registerProvider("inline-only", {
+      baseUrl: "http://127.0.0.1:1/v1",
+      api: "openai-completions",
+      apiKey: "fixture",
+      models: [{ id: "inline-model", name: "Inline model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_024, maxTokens: 128 }],
+    });
+  };
+  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "parent" }, runner, workspaces });
+  const agent = { transport: { id: "local", createSession: (prepared, context) => localAgentTransport.createSession(prepared, context) } };
+  const controller = new AbortController();
+  herdr.agentSetupHooks.fullyInspectable.setup(agent, { identity: { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 }, run: { runId: "run", workflow: { name: "flow" } }, signal: controller.signal });
+  const prepared = { cwd: root, agentDir, model: { provider: "inline-only", model: "inline-model" }, tools: [], customTools: [tool], extensionFactories: [extensionFactory], initialPrompt: "work", sessionLabel: "flow:review", piRuntime };
+  const session = await agent.transport.createSession(prepared, { attempt: 1, signal: controller.signal });
+  try {
+    assert.ok(runCommand);
+    const extensionPath = /--extension '([^']*pi-herdr-tools-[^']+\.mjs)'/.exec(runCommand)?.[1];
+    assert.ok(extensionPath);
+    const bridgeModule = await import(pathToFileURL(extensionPath).href);
+    let registered;
+    bridgeModule.default({ registerTool(candidate) { registered = candidate; } });
+    await registered.execute("inline-call", {}, controller.signal, () => {});
+    assert.equal(bridgeContext.model?.provider, "inline-only");
+    assert.equal(bridgeContext.model?.id, "inline-model");
+    assert.deepEqual(bridgeContext.modelRegistry.find("inline-only", "inline-model"), bridgeContext.model);
+  } finally {
+    controller.abort();
+    await session.dispose();
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -2285,7 +2285,6 @@ void test("models registered by an extension are available to the agent", async 
   // which is the whole point — an extension that supplies models (a proxy
   // front-end, a gateway) registers them while its resources load, and the
   // loader parks those registrations rather than applying them.
-  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
   writeFileSync(join(agentDir, "auth.json"), "{}");
 
   const extensionFactory: NonNullable<SessionInput["extensionFactories"]>[number] = (pi) => {
@@ -2298,13 +2297,35 @@ void test("models registered by an extension are available to the agent", async 
   };
 
   try {
-    const session = await createLocalPiSession({ cwd, agentDir, model: { provider: "proxied", model: "proxied-model" }, tools: [], sessionLabel: "extension-provider", extensionFactories: [extensionFactory] });
+    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "proxied", model: "proxied-model" }, tools: [], sessionLabel: "extension-provider", extensionFactories: [extensionFactory] }, {} as never);
     await session.dispose();
   } finally {
     rmSync(rootDir, { recursive: true, force: true });
   }
 });
 
+void test("includes failed extension provider registration in createLocalPiSession UNKNOWN_MODEL", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-failure-integration-"));
+  const agentDir = join(rootDir, "agent");
+  const cwd = join(rootDir, "project");
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  let session: Awaited<ReturnType<typeof createLocalPiSession>> | undefined;
+  const extensionFactory: NonNullable<SessionInput["extensionFactories"]>[number] = (pi) => {
+    pi.registerProvider("broken", { models: [{ id: "broken-model", name: "Broken model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_024, maxTokens: 128 }] });
+  };
+
+  try {
+    await assert.rejects(
+      async () => { session = await createLocalPiSession({ cwd, agentDir, model: { provider: "broken", model: "missing" }, tools: [], sessionLabel: "provider-failure", extensionFactories: [extensionFactory] }); },
+      (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("provider registration failed") && error.message.includes("broken"),
+    );
+  } finally {
+    await session?.dispose();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
 void test("a provider that fails to register has its reason kept, not swallowed", () => {
   // Swallowing the failure leaves "Unknown model: acme/fast", which reads as a
   // typo in a model name and sends the reader to the wrong file. Why the models
@@ -2326,4 +2347,11 @@ void test("a provider that fails to register has its reason kept, not swallowed"
   // way, so a second agent does not retry the same failures.
   assert.deepEqual(runtime.pendingProviderRegistrations, []);
   assert.deepEqual(runtime.pendingNativeProviderRegistrations, []);
+});
+
+void test("names a native provider in registration diagnostics", () => {
+  const runtime = { pendingProviderRegistrations: [], pendingNativeProviderRegistrations: [{ provider: { id: "native-acme" } }] };
+  const resourceLoader = { getExtensions: () => ({ runtime }) } as unknown as DefaultResourceLoader;
+  const modelRuntime = { registerNativeProvider: () => { throw new Error("native failure"); } } as unknown as ModelRuntime;
+  assert.deepEqual(flushExtensionProviders(resourceLoader, modelRuntime), ["native-acme: native failure"]);
 });
