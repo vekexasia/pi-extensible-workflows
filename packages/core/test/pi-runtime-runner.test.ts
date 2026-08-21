@@ -26,10 +26,27 @@ function sessionFor(prompt: SessionPrompt, options: { tools?: readonly string[];
 function requestFor(signal: AbortSignal, overrides: Omit<Partial<RuntimeAgentRunRequest>, "signal"> = {}): RuntimeAgentRunRequest {
   return { task: "work", cwd: "/repo", model: { provider: "test", model: "model" }, enabledTools: [], customTools: [], run: { id: "run", namespaceId: "host", workflowName: "flow" }, agent: { id: "worker", structuralPath: ["worker"] }, signal, ...overrides };
 }
-function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = { cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker" }, transport: AgentTransport = { id: "local", async createSession() { return session; } }, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"]) {
+function defaultResultTool(tool: PreparedAgentSession["resultTool"]): boolean {
+  if (!tool) return false;
+  const parameters = tool.parameters as { type?: unknown; properties?: unknown; required?: unknown; additionalProperties?: unknown };
+  const properties = parameters.properties as { result?: { type?: unknown } } | undefined;
+  return parameters.type === "object" && parameters.additionalProperties === false && Array.isArray(parameters.required) && parameters.required.length === 1 && parameters.required[0] === "result" && properties !== undefined && Object.keys(properties).length === 1 && properties.result?.type === "string";
+}
+function assistantText(message: WorkflowAgentMessage | undefined): string | undefined {
+  if (!message || !Array.isArray(message.content)) return undefined;
+  const text = message.content.filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("");
+  return text;
+}
+function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = { cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker" }, transport?: AgentTransport, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"], autoResult = true) {
   const controller = new AbortController();
   const context: AgentTransportContext = { run: { cwd: "/repo", sessionId: "host", runId: "run", workflow: { name: "flow" }, args: null, signal: controller.signal }, identity: { structuralPath: ["worker"], callSite: "worker", occurrence: 1 }, attempt: 1, signal: controller.signal };
-  return { runner: createPiRuntimeAgentRunner({ transport, prepared, context, handoff: createLiveSessionHandoff(), ...(callbacks ? { callbacks } : {}) }), controller };
+  const baseTransport = transport ?? { id: "local", async createSession() { return session; } };
+  const effectiveTransport = !autoResult ? baseTransport : { id: baseTransport.id, async createSession(preparedForSession: Readonly<PreparedAgentSession>, transportContext: AgentTransportContext) {
+    const current = await baseTransport.createSession(preparedForSession, transportContext);
+    if (!defaultResultTool(preparedForSession.resultTool)) return current;
+    return { ...current, async prompt(text: string) { const response = await current.prompt(text); const value = assistantText(response.assistant); const hasToolCall = Array.isArray(response.assistant?.content) && response.assistant.content.some((part) => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "toolCall"); if (value !== undefined && !hasToolCall) await preparedForSession.resultTool?.execute("test-result", { result: value }, undefined, undefined, testExtensionContext); return response; } };
+  } };
+  return { runner: createPiRuntimeAgentRunner({ transport: effectiveTransport, prepared, context, handoff: createLiveSessionHandoff(), ...(callbacks ? { callbacks } : {}) }), controller };
 }
 void test("Pi runtime runner owns one complete session invocation", async () => {
   let prompts = 0;
@@ -45,16 +62,51 @@ void test("Pi runtime runner owns one complete session invocation", async () => 
     async abort() {},
     async dispose() { disposals += 1; },
   };
-  const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession() { return session; } };
-  const controller = new AbortController();
-  const context: AgentTransportContext = { run: { cwd: "/repo", sessionId: "host", runId: "run", workflow: { name: "flow" }, args: null, signal: controller.signal }, identity: { structuralPath: ["worker"], callSite: "worker", occurrence: 1 }, attempt: 1, signal: controller.signal };
-  const prepared: PreparedAgentSession = { cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker" };
-  const runner = createPiRuntimeAgentRunner({ transport, prepared, context, handoff: createLiveSessionHandoff() });
-  const request = { task: "work", cwd: "/repo", model: prepared.model, enabledTools: [], customTools: [], run: { id: "run", namespaceId: "host", workflowName: "flow" }, agent: { id: "worker", structuralPath: ["worker"] }, signal: controller.signal } as const;
-  const result = await runner.run(request);
+  const { runner, controller } = runnerFor(session);
+  const result = await runner.run(requestFor(controller.signal));
   assert.equal(result.value, "done");
   assert.equal(prompts, 1);
   assert.equal(disposals, 1);
+});
+
+void test("Pi runtime runner preserves an explicit unstructured result after asynchronous search notifications append empty turns", async () => {
+  const search = { role: "assistant" as const, content: [{ type: "toolCall" as const, id: "search", name: "web_search", arguments: {} }] };
+  const resultMessage: WorkflowAgentMessage = { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { result: "recommendation" } }] };
+  const empty = { role: "assistant" as const, content: [{ type: "text" as const, text: "" }] };
+  let current: WorkflowAgentMessage = search;
+  let preparedWithResult: Readonly<PreparedAgentSession> | undefined;
+  const session = sessionFor(async (_text, emit) => {
+    emit({ type: "message_end", message: search });
+    const tool = preparedWithResult?.resultTool;
+    if (!tool) throw new Error("unstructured workflow_result tool is missing");
+    current = resultMessage;
+    const invalid = await tool.execute("invalid", { result: 7 }, undefined, undefined, testExtensionContext);
+    assert.equal((invalid as { isError?: boolean }).isError, true);
+    await tool.execute("result", { result: "recommendation" }, undefined, undefined, testExtensionContext);
+    const duplicate = await tool.execute("duplicate", { result: "other" }, undefined, undefined, testExtensionContext);
+    assert.equal((duplicate as { isError?: boolean }).isError, true);
+    emit({ type: "tool_execution_end", toolCallId: "result", toolName: "workflow_result", isError: false });
+    emit({ type: "message_end", message: resultMessage });
+    current = empty;
+    emit({ type: "message_end", message: empty });
+    emit({ type: "message_end", message: empty });
+    return { assistant: empty };
+  }, { lastAssistant: () => current });
+  const transport: AgentTransport = { id: "local", async createSession(prepared) { preparedWithResult = prepared; return session; } };
+  const { runner, controller } = runnerFor(session, undefined, transport);
+  const result = await runner.run(requestFor(controller.signal));
+  assert.equal(result.value, "recommendation");
+});
+
+void test("Pi runtime runner rejects an unstructured agent that omits workflow_result", async () => {
+  const prompts: string[] = [];
+  const plain: WorkflowAgentMessage = { role: "assistant", content: [{ type: "text", text: "plain response" }] };
+  const session = sessionFor(async (prompt) => { prompts.push(prompt); return { assistant: plain }; }, { lastAssistant: () => plain });
+  const { runner, controller } = runnerFor(session, undefined, undefined, undefined, false);
+  await assert.rejects(runner.run(requestFor(controller.signal)), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  assert.equal(prompts.length, 3);
+  assert.match(prompts[1] ?? "", /Submit the final result/);
+  assert.match(prompts[2] ?? "", /Repair/);
 });
 
 void test("Pi tool mapping keeps the native context and error flag", async () => {

@@ -749,6 +749,11 @@ function resolvePiRuntime(): PiRuntimeResolution {
 const piRuntimeResolution = resolvePiRuntime();
 const piRuntime = piRuntimeResolution.runtime;
 const piRuntimeError = piRuntimeResolution.error;
+function workflowAgentPrompt(task: string, options: AgentExecutionOptions, attempt: number, previousError?: string): string {
+  const basePrompt = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", options.schema ? "Call workflow_result exactly once with the final result matching its schema. Do not return prose as the final result." : "Call workflow_result exactly once with { result: \"final response\" } to submit the final response. Do not return prose as the final result.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? previousError ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
+  const instruction = options.budget?.instruction();
+  return `${basePrompt}\n\nTask:\n${task}${instruction ? `\n\n${instruction}` : ""}`;
+}
 function preparedAgentSession(input: SessionInput, initialPrompt?: string): Readonly<PreparedAgentSession> {
   const systemPromptPath = input.systemPrompt === undefined ? workflowSystemPromptPath(input.cwd, input.agentDir ?? getAgentDir(), input.resourcePolicy?.projectTrusted ?? true) : undefined;
   const prepared = {
@@ -765,7 +770,7 @@ function agentSetupSummary(setup: AgentSetup, hookNames: readonly string[]): Age
   return { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { resourceSelectors: resourcePolicySummary(setup.sessionInput.resourcePolicy, setup.sessionInput.tools) } : {}) };
 }
 export type PreparedAgentSetup = { setup: AgentSetup; summary: AgentSetupSummary; failure?: { error: unknown; hook?: string } };
-async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false): Promise<PreparedAgentSetup> {
+async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false, previousError?: string): Promise<PreparedAgentSetup> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
   const baseResourcePolicy = await root.agentResourcePolicy?.();
@@ -829,7 +834,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
     setup.prepared = preparedAgentSession(setup.sessionInput, task);
     return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error } };
   }
-  setup.prepared = preparedAgentSession(setup.sessionInput, task);
+  setup.prepared = preparedAgentSession(setup.sessionInput, inspection ? task : workflowAgentPrompt(setup.prompt, options, attempt, previousError));
   return { setup, summary: agentSetupSummary(setup, hookNames) };
 }
 export async function prepareAgentSetupForInspection(root: AgentExecutionRoot, task: string, options: AgentExecutionOptions, transport: AgentTransport): Promise<PreparedAgentSetup> {
@@ -974,7 +979,7 @@ export class WorkflowAgentExecutor {
 
       try {
         setupFailed = true;
-        const prepared = await prepareAgentSetup(this.root, this.transport, task, options, resolved, cwd, attempt, attemptSignal, customTools, resultTool);
+        const prepared = await prepareAgentSetup(this.root, this.transport, task, options, resolved, cwd, attempt, attemptSignal, customTools, resultTool, false, attempts.at(-1)?.error?.message);
         setup = prepared.setup;
         const attemptSetup = prepared.setup;
         setupSummary = prepared.summary;
@@ -1036,14 +1041,11 @@ export class WorkflowAgentExecutor {
             },
           },
         });
-        const basePrompt = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? attempts.at(-1)?.error?.message ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
-        const instruction = options.budget?.instruction();
-        const promptText = `${basePrompt}\n\nTask:\n${setup.prompt}${instruction ? `\n\n${instruction}` : ""}`;
         const runtimeRun = { id: transportBase.run.runId, namespaceId: transportBase.run.sessionId, workflowName: transportBase.run.workflow.name };
         const providerRecovery = options.providerErrorRecovery;
         const runtimeAgent = { id: transportBase.identity.callSite, structuralPath: [...transportBase.identity.structuralPath], ...(options.parent ? { parentId: options.parent } : {}) };
         const runtimeRequest = {
-          task: promptText,
+          task: setup.prepared.initialPrompt ?? setup.prompt,
           cwd: setup.prepared.cwd,
           model: { ...setup.prepared.model },
           enabledTools: [...setup.prepared.tools],

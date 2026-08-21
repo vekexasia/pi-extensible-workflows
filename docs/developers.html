@@ -194,7 +194,7 @@
   <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"openai-codex/gpt-5.6-sol:high"</span><span class="tok-punctuation">,</span>
   <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">],</span>
 <span class="tok-punctuation">}</span>);</code></pre>
-        <p>Results are bare values. With <code>outputSchema</code>, the native agent submits the schema through <code>workflow_result</code>; prose is not parsed as structured output. The serialized result and every worker RPC value must fit within 10 MB.</p>
+        <p>Results are bare values. Every agent submits its final result through <code>workflow_result</code>; unstructured agents submit <code>{ result: "..." }</code> and return the contained string, while <code>outputSchema</code> agents submit a schema-valid value. Prose is not parsed as a result. The serialized result and every worker RPC value must fit within 10 MB.</p>
         <h3>Composition</h3>
         <pre><code class="language-javascript"><span class="tok-keyword">const</span> reports = <span class="tok-keyword">await</span> <span class="tok-function">parallel</span>(<span class="tok-string">"review"</span>, <span class="tok-punctuation">{</span>
   <span class="tok-property">api</span><span class="tok-punctuation">:</span> () <span class="tok-keyword">=&gt;</span> <span class="tok-function">agent</span>(<span class="tok-string">"Inspect the API"</span>),

@@ -8,6 +8,12 @@ import { WorkflowError, type AgentTransport, type AgentTransportContext, type Js
 
 const providerContinuationPrompt = "The provider error was transient. Continue the task from your current state.";
 const handoffContinuationPrompt = "Continue the task from the current session state.";
+const defaultResultSchema: RuntimeJsonSchema = {
+  type: "object",
+  properties: { result: { type: "string" } },
+  required: ["result"],
+  additionalProperties: false,
+};
 
 type PiRuntimeAgentRunnerCallbacks = {
   readonly onSession?: (session: WorkflowAgentSession, handoff: LiveSessionHandoff, prepared: Readonly<PreparedAgentSession>) => void | Promise<void>;
@@ -50,11 +56,6 @@ function hasToolCall(message: unknown): boolean {
 
 function isEmptyAbortedAssistant(message: WorkflowAgentMessage | undefined): boolean { return message?.stopReason === "aborted" && Array.isArray(message.content) && message.content.length === 0; }
 function isTerminalAssistant(message: WorkflowAgentMessage | undefined): boolean { return Boolean(message) && message?.stopReason !== "aborted" && !hasToolCall(message); }
-function text(message: WorkflowAgentMessage | undefined): string {
-  if (!message || !Array.isArray(message.content)) return "";
-  return message.content.filter((part: unknown): part is { type: "text"; text: string } => typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string").map((part) => part.text).join("");
-}
-
 function runtimeUsage(session: WorkflowAgentSession): RuntimeUsage {
   const stats = session.getSessionStats();
   const values = [stats.tokens.input, stats.tokens.output, stats.tokens.cacheRead, stats.tokens.cacheWrite, stats.cost];
@@ -69,6 +70,10 @@ function providerFailure(session: WorkflowAgentSession, message: WorkflowAgentMe
 }
 
 function runtimeValue(value: JsonValue): RuntimeJsonValue { return value; }
+function unstructuredResult(value: RuntimeJsonValue | undefined): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.result !== "string") return undefined;
+  return value.result;
+}
 function remaining(timeoutMs: number | null | undefined, started: number): number | null | undefined { return timeoutMs === null || timeoutMs === undefined ? timeoutMs : Math.max(1, timeoutMs - (Date.now() - started)); }
 function providerLimited(error: unknown): boolean {
   if (!error || typeof error !== "object") return false;
@@ -174,8 +179,8 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
     let session: WorkflowAgentSession | undefined;
     let structuredResult: RuntimeJsonValue | undefined;
     let resultAccepted = false;
-    const resultSchema = request.resultSchema ? Compile(request.resultSchema) : undefined;
-    const resultTool = prepared.resultTool ?? (resultSchema ? defineTool({
+    const resultSchema = Compile(request.resultSchema ?? defaultResultSchema);
+    const resultTool = prepared.resultTool ?? defineTool({
       name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: resultSchema.Type(),
       async execute(_id: string, value: unknown) {
         if (!resultSchema.Check(value) || !jsonValue(value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
@@ -185,7 +190,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         if (currentSession) void currentSession.abort().catch(() => undefined);
         return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
       },
-    }) : undefined);
+    });
     const preparedForSession = preparedForRuntimeRequest(prepared, request.customTools, request.signal, (value) => { structuredResult = value; }, resultTool);
     const callbacks = this.#options.callbacks;
     const handoff = this.#options.handoff;
@@ -294,7 +299,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         if (isTurnBoundaryStart(observedEvent.type) || (observedEvent.type === "message_start" && observedEvent.message?.role === "assistant")) beginTurn();
         if (observedEvent.type === "message_end" && observedEvent.message?.role === "assistant") {
           acceptAssistant(observedEvent.message);
-          const final = !hasToolCall(observedEvent.message) || (request.resultSchema !== undefined && hasResult());
+          const final = !hasToolCall(observedEvent.message) || hasResult();
           completeTurn(final, !final);
         }
         if (observation.report) report(() => observation.progress);
@@ -360,23 +365,21 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
       beginTurn(false);
       throwIfTurnPolicyFailed();
       await promptAndRecover(request.task, true);
-      completeTurn(request.resultSchema !== undefined ? hasResult() : !hasToolCall(lastAssistant), false, true);
+      completeTurn(hasResult() || !hasToolCall(lastAssistant), false, true);
       if (turnPolicyFailure) throw turnPolicyFailure;
-      if (request.resultSchema !== undefined) {
-        if (!hasResult()) {
-          beginTurn(false);
-          throwIfTurnPolicyFailed();
-          await promptAndRecover("Submit the final result now by calling workflow_result exactly once. Do not return prose.", true);
-          completeTurn(true, false, true);
-        }
-        if (!hasResult()) {
-          beginTurn(false);
-          throwIfTurnPolicyFailed();
-          await promptAndRecover("Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", true);
-          completeTurn(true, false, true);
-        }
-        if (!hasResult()) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
+      if (!hasResult()) {
+        beginTurn(false);
+        throwIfTurnPolicyFailed();
+        await promptAndRecover("Submit the final result now by calling workflow_result exactly once. Do not return prose.", true);
+        completeTurn(true, false, true);
       }
+      if (!hasResult()) {
+        beginTurn(false);
+        throwIfTurnPolicyFailed();
+        await promptAndRecover("Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", true);
+        completeTurn(true, false, true);
+      }
+      if (!hasResult()) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
       await callbacks?.onBeforeComplete?.();
       report(() => createdAdapter.snapshot(true));
       await flushProgress();
@@ -385,7 +388,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
       unsubscribe();
       createdAdapter.dispose();
       adapter = undefined;
-      const value = request.resultSchema === undefined ? runtimeValue(text(lastAssistant)) : structuredResult;
+      const value = request.resultSchema === undefined ? unstructuredResult(structuredResult) : structuredResult;
       if (value === undefined) throw new WorkflowError("RESULT_INVALID", "Agent did not submit a valid workflow_result after one repair");
       const result: RuntimeAgentRunResult = { value, usage: runtimeUsage(session), reference: { transport: session.reference.transport, ...(session.reference.locator === undefined ? {} : { locator: runtimeValue(session.reference.locator) }) } };
       successfulInvocation = true;
