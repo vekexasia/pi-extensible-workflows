@@ -119,6 +119,7 @@ export interface RuntimeAgentRunRequest {
   readonly enabledTools: readonly string[];
   /** Tools owned by the runtime runner; host-specific adapters may map them at session creation. */
   readonly customTools: readonly RuntimeTool[];
+  /** Explicit result schema; omitted agents use the default string workflow_result schema. */
   readonly resultSchema?: RuntimeJsonSchema;
   readonly run: RuntimeRunIdentity;
   readonly agent: RuntimeAgentIdentity;
@@ -138,7 +139,7 @@ export interface RuntimeAgentReference {
 }
 
 export interface RuntimeAgentRunResult {
-  /** Final text, or the accepted schema value when resultSchema was requested. */
+  /** The accepted workflow_result string for unstructured agents, or schema value when resultSchema was requested. */
   readonly value: RuntimeJsonValue;
   readonly usage: RuntimeUsage;
   readonly reference?: RuntimeAgentReference;

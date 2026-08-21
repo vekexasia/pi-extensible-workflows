@@ -120,6 +120,45 @@ async function createRespondingLocalSession(extensionFactories: NonNullable<Sess
   }
 }
 async function settlesWithin(promise: Promise<unknown>, timeoutMs = 2_000): Promise<boolean> { return await new Promise((resolve) => { const timer = setTimeout(() => { resolve(false); }, timeoutMs); promise.then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); resolve(true); }); }); }
+void test("instructs unstructured agents to submit workflow_result", async () => {
+  let prompt = "";
+  let resultParameters: unknown;
+  const executor = new WorkflowAgentExecutor(root, testTransport(async (input) => {
+    assert.ok(input.resultTool);
+    resultParameters = input.resultTool.parameters;
+    return { sessionId: "unstructured-result", messages: [assistant("done")], getSessionStats: sessionStats, async prompt(text) { prompt = text; }, dispose() {} };
+  }));
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow" })).value, "done");
+  assert.match(prompt, /Call workflow_result exactly once/);
+  assert.deepEqual(resultParameters, { type: "object", properties: { result: { type: "string" } }, required: ["result"], additionalProperties: false });
+});
+void test("passes the generated workflow prompt to an eager transport", async () => {
+  let launchPrompt = "";
+  const transport = {
+    id: "eager",
+    async createSession(prepared: Readonly<import("../src/types.js").PreparedAgentSession>) {
+      launchPrompt = prepared.initialPrompt ?? "";
+      return {
+        reference: { transport: "eager", sessionId: "eager-1" },
+        getState: () => ({ model: prepared.model, tools: prepared.tools }),
+        getSessionStats: sessionStats,
+        getLastAssistant: () => undefined,
+        subscribe() { return () => undefined; },
+        async prompt() {
+          assert.ok(prepared.resultTool);
+          await executeTool(prepared.resultTool, "result", { result: "done" });
+          return { assistant: { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { result: "done" } }] } };
+        },
+        async steer() {},
+        async abort() {},
+        async dispose() {},
+      };
+    },
+  } satisfies import("../src/types.js").AgentTransport;
+  const result = await new WorkflowAgentExecutor({ ...root, agentSetupHooks: [{ name: "replace", priority: 1, setup(agent) { agent.transport = transport; } }] }, localAgentTransport).execute("work", { label: "worker", workflowName: "flow" });
+  assert.equal(result.value, "done");
+  assert.match(launchPrompt, /Call workflow_result exactly once/);
+});
 void test("uses a transport-neutral session and persists its final reference shape", async () => {
   const events: string[] = [];
   const transport = {
@@ -133,7 +172,7 @@ void test("uses a transport-neutral session and persists its final reference sha
         getSessionStats: sessionStats,
         getLastAssistant: () => undefined,
         subscribe(listener: (event: import("../src/types.js").WorkflowAgentSessionEvent) => void) { listener({ type: "state_changed", state: { model: prepared.model, tools: prepared.tools } }); return () => undefined; },
-        async prompt() { events.push("prompt"); return { assistant: { role: "assistant", content: [{ type: "text", text: "transport result" }] } }; },
+        async prompt() { events.push("prompt"); assert.ok(prepared.resultTool); await executeTool(prepared.resultTool, "result", { result: "transport result" }); return { assistant: { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { result: "transport result" } }] } }; },
         async steer() {},
         async abort() {},
         async dispose() { events.push("dispose"); },
@@ -244,7 +283,7 @@ void test("reruns setup hooks and reselects the transport for ordinary retries",
         getSessionStats: sessionStats,
         getLastAssistant: () => undefined,
         subscribe() { return () => undefined; },
-        async prompt() { if (fail) throw new Error("retry"); return { assistant: { role: "assistant", content: [{ type: "text", text: "done" }] } }; },
+        async prompt() { if (fail) throw new Error("retry"); assert.ok(prepared.resultTool); await executeTool(prepared.resultTool, "result", { result: "done" }); return { assistant: { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { result: "done" } }] } }; },
         async steer() {},
         async abort() {},
         async dispose() {},
@@ -398,7 +437,7 @@ void test("prepares the resolved workflow system prompt path for external transp
         getLastAssistant: () => undefined,
         getSessionStats: sessionStats,
         subscribe: () => () => {},
-        async prompt() { return { assistant: assistant("done") }; },
+        async prompt() { assert.ok(value.resultTool); await executeTool(value.resultTool, "result", { result: "done" }); return { assistant: { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { result: "done" } }] } }; },
         async steer() {},
         async abort() {},
         async dispose() {},
@@ -676,7 +715,7 @@ void test("preserves a prior report after an empty aborted assistant turn", asyn
         getSessionStats: sessionStats,
         getLastAssistant: () => report,
         subscribe() { return () => undefined; },
-        async prompt() { return { assistant: aborted }; },
+        async prompt() { assert.ok(prepared.resultTool); await executeTool(prepared.resultTool, "result", { result: "report" }); return { assistant: aborted }; },
         async steer() {},
         async abort() {},
         async dispose() {},
@@ -810,11 +849,13 @@ void test("does not overwrite a terminal result with a post-handoff assistant", 
   let triggerHandoff: (() => void) | undefined;
   let handoffPromise: Promise<void> | undefined;
   let prompts = 0;
-  const executor = new WorkflowAgentExecutor(root, testTransport(async () => ({
+  const executor = new WorkflowAgentExecutor(root, testTransport(async ({ resultTool }) => ({
     transport: "local", session: { transport: "local", sessionId: "handoff-defense", locator: { sessionFile: "/sessions/handoff-defense.jsonl" } }, messages, getSessionStats: sessionStats,
     subscribe(next) { listener = next; return () => { listener = undefined; }; },
     async prompt() {
       prompts += 1;
+      assert.ok(resultTool);
+      await executeTool(resultTool, "result", { result: "original report" });
       listener?.(malformedEvent());
       triggerHandoff?.();
       listener?.(messageEnd(completed));
@@ -894,7 +935,7 @@ void test("does not deadlock or fail when an async subscriber rejects a handed-o
     async abort() { releasePromptSettlement(); },
     async dispose() {},
   };
-  const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession() { return session; } };
+  const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession(prepared) { return { ...session, async prompt() { assert.ok(prepared.resultTool); await executeTool(prepared.resultTool, "result", { result: "completed" }); return await session.prompt(); } }; } };
   const executor = new WorkflowAgentExecutor(root, transport);
   const execution = executor.execute("work", { label: "worker", workflowName: "flow", onAttempt: (attempt) => {
     if (!attempt.liveSession || !attempt.handoff) return;
