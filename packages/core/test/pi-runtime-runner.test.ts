@@ -57,6 +57,25 @@ void test("Pi runtime runner owns one complete session invocation", async () => 
   assert.equal(disposals, 1);
 });
 
+void test("Pi runtime runner preserves a text fallback after asynchronous search notifications append empty turns", async () => {
+  const search = { role: "assistant" as const, content: [{ type: "toolCall" as const, id: "search", name: "web_search", arguments: {} }] };
+  const report = { role: "assistant" as const, content: [{ type: "text" as const, text: "recommendation" }] };
+  const empty = { role: "assistant" as const, content: [{ type: "text" as const, text: "" }] };
+  let current: WorkflowAgentMessage = search;
+  const session = sessionFor(async (_text, emit) => {
+    emit({ type: "message_end", message: search });
+    current = report;
+    emit({ type: "message_end", message: report });
+    current = empty;
+    emit({ type: "message_end", message: empty });
+    emit({ type: "message_end", message: empty });
+    return { assistant: report };
+  }, { lastAssistant: () => current });
+  const { runner, controller } = runnerFor(session);
+  const result = await runner.run(requestFor(controller.signal));
+  assert.equal(result.value, "recommendation");
+});
+
 void test("Pi tool mapping keeps the native context and error flag", async () => {
   const definition = defineTool({
     name: "failed", label: "Failed", description: "Fail", parameters: Type.Object({}),
