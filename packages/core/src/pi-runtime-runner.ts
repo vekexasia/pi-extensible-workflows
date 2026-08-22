@@ -1,5 +1,4 @@
-import { Compile } from "typebox/compile";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { createPiRuntimeSessionAdapter, isTurnBoundaryStart, isTurnEnd, normalizePiMessage, type PiRuntimeSessionAdapter } from "./pi-runtime-adapter.js";
 import type { RuntimeAgentProgress, RuntimeAgentProviderFailure, RuntimeAgentProviderRecovery, RuntimeAgentRunRequest, RuntimeAgentRunResult, RuntimeAgentRunner, RuntimeJsonSchema, RuntimeJsonValue, RuntimeTool, RuntimeToolCall, RuntimeUsage } from "./runtime/agent-runner.js";
 import { RuntimeAgentProviderError } from "./runtime/agent-runner.js";
@@ -8,12 +7,6 @@ import { WorkflowError, type AgentTransport, type AgentTransportContext, type Js
 
 const providerContinuationPrompt = "The provider error was transient. Continue the task from your current state.";
 const handoffContinuationPrompt = "Continue the task from the current session state.";
-const defaultResultSchema: RuntimeJsonSchema = {
-  type: "object",
-  properties: { result: { type: "string" } },
-  required: ["result"],
-  additionalProperties: false,
-};
 
 type PiRuntimeAgentRunnerCallbacks = {
   readonly onSession?: (session: WorkflowAgentSession, handoff: LiveSessionHandoff, prepared: Readonly<PreparedAgentSession>) => void | Promise<void>;
@@ -178,19 +171,8 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
     if (request.cwd !== prepared.cwd || request.model.provider !== prepared.model.provider || request.model.model !== prepared.model.model || request.model.thinking !== prepared.model.thinking || request.enabledTools.length !== prepared.tools.length || request.enabledTools.some((tool, index) => tool !== prepared.tools[index])) throw new WorkflowError("INTERNAL_ERROR", "Pi runtime request does not match the prepared session");
     let session: WorkflowAgentSession | undefined;
     let structuredResult: RuntimeJsonValue | undefined;
-    let resultAccepted = false;
-    const resultSchema = Compile(request.resultSchema ?? defaultResultSchema);
-    const resultTool = prepared.resultTool ?? defineTool({
-      name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: resultSchema.Type(),
-      async execute(_id: string, value: unknown) {
-        if (!resultSchema.Check(value) || !jsonValue(value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
-        if (resultAccepted) return { content: [{ type: "text" as const, text: "Result has already been accepted." }], details: {}, isError: true };
-        resultAccepted = true;
-        const currentSession = session;
-        if (currentSession) void currentSession.abort().catch(() => undefined);
-        return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
-      },
-    });
+    const resultTool = prepared.resultTool;
+    if (!resultTool) throw new WorkflowError("INTERNAL_ERROR", "Workflow agent session is missing its workflow_result tool");
     const preparedForSession = preparedForRuntimeRequest(prepared, request.customTools, request.signal, (value) => { structuredResult = value; }, resultTool);
     const callbacks = this.#options.callbacks;
     const handoff = this.#options.handoff;

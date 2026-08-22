@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- Require every workflow agent to submit its result through `workflow_result`. Unstructured agents use `{ result: string }`, return that string to their parent, and fail with `RESULT_INVALID` after the existing two result prompts when they do not submit one. Eager transports now receive the runtime-generated workflow prompt when their session is created.
+
 ### New capabilities
 - Trajectory now publishes current-session durable subagents as first-class publisher state, including live progress, attempts, transcripts, results, failures, worktrees, and resolved tools.
 

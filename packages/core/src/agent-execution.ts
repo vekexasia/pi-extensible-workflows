@@ -53,6 +53,7 @@ import { createToolTimingExtension } from "./tool-timing.js";
 import { normalizePiMessage, normalizePiSessionEvent, runtimeProgressToAgentProgress } from "./pi-runtime-adapter.js";
 import { createPiRuntimeAgentRunner, isRuntimeAgentProviderError, normalizePiRuntimeError } from "./pi-runtime-runner.js";
 import type { RuntimeAgentProgress, RuntimeUsage } from "./runtime/agent-runner.js";
+import { defaultWorkflowResultSchema } from "./runtime/workflow-result.js";
 import { validateAgentOptions, validateSchema } from "./validation.js";
 import type { RunStore } from "./persistence.js";
 type AgentExecutionRunStore = Pick<RunStore, "recordSystemPrompt" | "validateWorktree" | "worktree" | "snapshotWorktree">;
@@ -944,10 +945,10 @@ export class WorkflowAgentExecutor {
       let setupFailed = false;
       let completedAttempt: AgentAttempt | undefined;
       let attemptCallbackFailure: unknown;
-      const resultSchema = options.schema ? Compile(options.schema) : undefined;
+      const resultSchema = Compile(options.schema ?? defaultWorkflowResultSchema);
       let resultAccepted = false;
-      const resultTool = resultSchema ? defineTool({
-        name: "workflow_result", label: "Workflow Result", description: "Submit the terminal structured workflow result", parameters: resultSchema.Type(),
+      const resultTool = defineTool({
+        name: "workflow_result", label: "Workflow Result", description: "Submit the terminal workflow result", parameters: resultSchema.Type(),
         async execute(_id: string, value: unknown) {
           if (!resultSchema.Check(value) || !jsonValue(value)) return { content: [{ type: "text" as const, text: "Result does not match the required schema." }], details: {}, isError: true };
           if (resultAccepted) return { content: [{ type: "text" as const, text: "Result has already been accepted." }], details: {}, isError: true };
@@ -956,7 +957,7 @@ export class WorkflowAgentExecutor {
           if (currentSession) void currentSession.abort().catch(() => undefined);
           return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
         },
-      }) : undefined;
+      });
       let lastKnownAccounting: AgentAccounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
       const accountingFromRuntime = (usage: RuntimeUsage, active: WorkflowAgentSession): AgentAccounting => {
         const input = usage.input;

@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Compile } from "typebox/compile";
 import { createLiveSessionHandoff } from "../src/session-handoff.js";
 import { createRuntimeHandoffAdapter } from "../src/pi-runtime-adapter.js";
 import { createPiRuntimeAgentRunner, runtimeToolFromPiDefinition } from "../src/pi-runtime-runner.js";
-import type { RuntimeAgentRunRequest, RuntimeTool } from "../src/runtime/agent-runner.js";
+import type { RuntimeAgentRunRequest, RuntimeJsonSchema, RuntimeTool } from "../src/runtime/agent-runner.js";
+import { defaultWorkflowResultSchema } from "../src/runtime/workflow-result.js";
 import { WorkflowError, type AgentTransport, type AgentTransportContext, type PreparedAgentSession, type WorkflowAgentMessage, type WorkflowAgentSession, type WorkflowAgentSessionEvent, type WorkflowAgentTurnResult } from "../src/types.js";
 import { testExtensionContext } from "./support.js";
 type SessionPrompt = (text: string, emit: (event: WorkflowAgentSessionEvent) => void) => Promise<WorkflowAgentTurnResult>;
@@ -26,24 +28,30 @@ function sessionFor(prompt: SessionPrompt, options: { tools?: readonly string[];
 function requestFor(signal: AbortSignal, overrides: Omit<Partial<RuntimeAgentRunRequest>, "signal"> = {}): RuntimeAgentRunRequest {
   return { task: "work", cwd: "/repo", model: { provider: "test", model: "model" }, enabledTools: [], customTools: [], run: { id: "run", namespaceId: "host", workflowName: "flow" }, agent: { id: "worker", structuralPath: ["worker"] }, signal, ...overrides };
 }
-function defaultResultTool(tool: PreparedAgentSession["resultTool"]): boolean {
-  if (!tool) return false;
-  const parameters = tool.parameters as { type?: unknown; properties?: unknown; required?: unknown; additionalProperties?: unknown };
-  const properties = parameters.properties as { result?: { type?: unknown } } | undefined;
-  return parameters.type === "object" && parameters.additionalProperties === false && Array.isArray(parameters.required) && parameters.required.length === 1 && parameters.required[0] === "result" && properties !== undefined && Object.keys(properties).length === 1 && properties.result?.type === "string";
+function preparedWithResultTool(parameters: RuntimeJsonSchema = defaultWorkflowResultSchema): Readonly<PreparedAgentSession> {
+  const schema = Compile(parameters);
+  let accepted = false;
+  return {
+    cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker",
+    resultTool: defineTool({ name: "workflow_result", label: "Workflow Result", description: "Submit the terminal workflow result", parameters: schema.Type(), async execute(_id, value) {
+      if (!schema.Check(value) || accepted) return { content: [{ type: "text" as const, text: "Result rejected." }], details: {}, isError: true };
+      accepted = true;
+      return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
+    } }),
+  };
 }
 function assistantText(message: WorkflowAgentMessage | undefined): string | undefined {
   if (!message || !Array.isArray(message.content)) return undefined;
   const text = message.content.filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("");
   return text;
 }
-function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = { cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker" }, transport?: AgentTransport, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"], autoResult = true) {
+function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = preparedWithResultTool(), transport?: AgentTransport, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"], autoResult = true) {
   const controller = new AbortController();
   const context: AgentTransportContext = { run: { cwd: "/repo", sessionId: "host", runId: "run", workflow: { name: "flow" }, args: null, signal: controller.signal }, identity: { structuralPath: ["worker"], callSite: "worker", occurrence: 1 }, attempt: 1, signal: controller.signal };
   const baseTransport = transport ?? { id: "local", async createSession() { return session; } };
   const effectiveTransport = !autoResult ? baseTransport : { id: baseTransport.id, async createSession(preparedForSession: Readonly<PreparedAgentSession>, transportContext: AgentTransportContext) {
     const current = await baseTransport.createSession(preparedForSession, transportContext);
-    if (!defaultResultTool(preparedForSession.resultTool)) return current;
+    if (!preparedForSession.resultTool) return current;
     return { ...current, async prompt(text: string) { const response = await current.prompt(text); const value = assistantText(response.assistant); const hasToolCall = Array.isArray(response.assistant?.content) && response.assistant.content.some((part) => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "toolCall"); if (value !== undefined && !hasToolCall) await preparedForSession.resultTool?.execute("test-result", { result: value }, undefined, undefined, testExtensionContext); return response; } };
   } };
   return { runner: createPiRuntimeAgentRunner({ transport: effectiveTransport, prepared, context, handoff: createLiveSessionHandoff(), ...(callbacks ? { callbacks } : {}) }), controller };
@@ -226,7 +234,8 @@ void test("continues locally when a live handoff fails before takeover", async (
   assert.equal(result.value, "continued");
   assert.deepEqual(prompts, ["work", "Continue the task from the current session state."]);
 });
-void test("Pi runtime runner maps a neutral result schema to a Pi result tool", async () => {
+void test("Pi runtime runner uses the executor's prepared structured result tool", async () => {
+  const resultSchema: RuntimeJsonSchema = { type: "object", properties: { answer: { type: "number" } } };
   let preparedWithResult: PreparedAgentSession | undefined;
   const message: WorkflowAgentMessage = { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { answer: 11 } }] };
   const session = sessionFor(async (_text, emit) => {
@@ -237,14 +246,14 @@ void test("Pi runtime runner maps a neutral result schema to a Pi result tool", 
     return { assistant: message };
   }, {});
   const transport: AgentTransport = { id: "local", async createSession(prepared) { preparedWithResult = prepared; return session; } };
-  const { runner, controller } = runnerFor(session, undefined, transport);
-  const result = await runner.run(requestFor(controller.signal, { resultSchema: { type: "object", properties: { answer: { type: "number" } } } }));
+  const { runner, controller } = runnerFor(session, preparedWithResultTool(resultSchema), transport);
+  const result = await runner.run(requestFor(controller.signal, { resultSchema }));
   assert.deepEqual(result.value, { answer: 11 });
 });
 void test("Pi runtime runner ignores an empty provider error after accepting workflow_result", async () => {
+  const resultSchema: RuntimeJsonSchema = { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false };
   let preparedWithResult: PreparedAgentSession | undefined;
   let prompts = 0;
-  let aborts = 0;
   let providerErrors = 0;
   const providerAbort: WorkflowAgentMessage = { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" };
   const session = sessionFor(async () => {
@@ -254,15 +263,15 @@ void test("Pi runtime runner ignores an empty provider error after accepting wor
     if (!tool) throw new Error("result tool is missing");
     await tool.execute("result", { answer: 7 }, undefined, undefined, testExtensionContext);
     return { assistant: providerAbort };
-  }, { abort: async () => { aborts += 1; } });
+  }, {});
   const transport: AgentTransport = { id: "local", async createSession(prepared) { preparedWithResult = prepared; return session; } };
-  const { runner, controller } = runnerFor(session, undefined, transport);
+  const { runner, controller } = runnerFor(session, preparedWithResultTool(resultSchema), transport);
   const result = await runner.run(requestFor(controller.signal, {
-    resultSchema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false },
+    resultSchema,
     onProviderError: async () => { providerErrors += 1; return "retry"; },
   }));
   assert.deepEqual(result.value, { answer: 7 });
-  assert.deepEqual({ prompts, aborts, providerErrors }, { prompts: 1, aborts: 1, providerErrors: 0 });
+  assert.deepEqual({ prompts, providerErrors }, { prompts: 1, providerErrors: 0 });
 });
 void test("Pi runtime runner leaves retry ownership with its caller", async () => {
   let sessions = 0;
@@ -273,7 +282,7 @@ void test("Pi runtime runner leaves retry ownership with its caller", async () =
     const current = sessions;
     return sessionFor(async () => { prompts += 1; if (current === 1) throw new Error("first attempt"); return { assistant: { role: "assistant", content: [{ type: "text", text: "done" }] } }; }, { dispose: async () => { disposals += 1; } });
   } };
-  const prepared: PreparedAgentSession = { cwd: "/repo", model: { provider: "test", model: "model" }, tools: [], sessionLabel: "worker" };
+  const prepared: PreparedAgentSession = preparedWithResultTool();
   const { runner, controller } = runnerFor(sessionFor(async () => ({ assistant: { role: "assistant", content: [{ type: "text", text: "unused" }] } }), {}), prepared, transport);
   await assert.rejects(runner.run(requestFor(controller.signal)), /first attempt/);
   const result = await runner.run(requestFor(controller.signal));
@@ -365,7 +374,7 @@ void test("Pi runtime runner persists tool progress and live state", async () =>
     emit({ type: "message_end", message });
     return { assistant: message };
   }, { tools: ["read"] });
-  const { runner, controller } = runnerFor(session, { cwd: "/repo", model: { provider: "test", model: "model" }, tools: ["read"], sessionLabel: "worker" });
+  const { runner, controller } = runnerFor(session, { ...preparedWithResultTool(), tools: ["read"] });
   await runner.run(requestFor(controller.signal, { enabledTools: ["read"], onProgress: (progress) => { updates.push({ toolCalls: progress.toolCalls, state: progress.state ? { tools: progress.state.tools } : undefined, persist: progress.persist }); } }));
   assert.ok(updates.some(({ toolCalls }) => toolCalls.some(({ state }) => state === "running")));
   assert.ok(updates.some(({ toolCalls }) => toolCalls.some(({ state }) => state === "completed")));
