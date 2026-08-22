@@ -768,7 +768,7 @@ function preparedAgentSession(input: SessionInput, initialPrompt?: string): Read
 }
 function agentSetupSummary(setup: AgentSetup, hookNames: readonly string[]): AgentSetupSummary {
   const model = setup.sessionInput.model;
-  return { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { resourceSelectors: resourcePolicySummary(setup.sessionInput.resourcePolicy, setup.sessionInput.tools) } : {}) };
+  return { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools, ...(setup.sessionInput.resultTool ? [setup.sessionInput.resultTool.name] : [])], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { resourceSelectors: resourcePolicySummary(setup.sessionInput.resourcePolicy, setup.sessionInput.tools) } : {}) };
 }
 export type PreparedAgentSetup = { setup: AgentSetup; summary: AgentSetupSummary; failure?: { error: unknown; hook?: string } };
 async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false, previousError?: string): Promise<PreparedAgentSetup> {
@@ -941,7 +941,7 @@ export class WorkflowAgentExecutor {
       };
       const releaseIfAttemptCancelled = (): void => { if (attemptSignal.aborted) releaseHandoff("attempt cancelled"); };
       let setup: AgentSetup | undefined;
-      let setupSummary: AgentSetupSummary = { hookNames: [], model: { ...resolved.model }, tools: [...resolved.tools], cwd };
+      let setupSummary: AgentSetupSummary = { hookNames: [], model: { ...resolved.model }, tools: [...resolved.tools, "workflow_result"], cwd };
       let setupFailed = false;
       let completedAttempt: AgentAttempt | undefined;
       let attemptCallbackFailure: unknown;
@@ -1101,7 +1101,7 @@ export class WorkflowAgentExecutor {
           }
           throw errorWithAttempts(typed, attempts);
         }
-        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED" || typed.code === "RESUME_INCOMPATIBLE") throw errorWithAttempts(typed, attempts);
+        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED" || typed.code === "RESUME_INCOMPATIBLE" || typed.code === "RESULT_INVALID") throw errorWithAttempts(typed, attempts);
         beforeRetry?.();
       }
     }

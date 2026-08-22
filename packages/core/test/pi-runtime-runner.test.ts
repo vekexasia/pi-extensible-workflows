@@ -10,6 +10,7 @@ import type { RuntimeAgentRunRequest, RuntimeJsonSchema, RuntimeTool } from "../
 import { defaultWorkflowResultSchema } from "../src/runtime/workflow-result.js";
 import { WorkflowError, type AgentTransport, type AgentTransportContext, type PreparedAgentSession, type WorkflowAgentMessage, type WorkflowAgentSession, type WorkflowAgentSessionEvent, type WorkflowAgentTurnResult } from "../src/types.js";
 import { testExtensionContext } from "./support.js";
+import { assistantText } from "./test-transport.js";
 type SessionPrompt = (text: string, emit: (event: WorkflowAgentSessionEvent) => void) => Promise<WorkflowAgentTurnResult>;
 function sessionFor(prompt: SessionPrompt, options: { tools?: readonly string[]; lastAssistant?: () => WorkflowAgentMessage | undefined; abort?: () => Promise<void>; steer?: (message: string) => Promise<void>; dispose?: () => Promise<void>; stats?: { tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; cost: number }; getStats?: () => { tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number }; cost: number } } ): WorkflowAgentSession {
   let listener: ((event: WorkflowAgentSessionEvent) => void) | undefined;
@@ -39,11 +40,6 @@ function preparedWithResultTool(parameters: RuntimeJsonSchema = defaultWorkflowR
       return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
     } }),
   };
-}
-function assistantText(message: WorkflowAgentMessage | undefined): string | undefined {
-  if (!message || !Array.isArray(message.content)) return undefined;
-  const text = message.content.filter((part): part is { type: "text"; text: string } => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string").map((part) => part.text).join("");
-  return text;
 }
 function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = preparedWithResultTool(), transport?: AgentTransport, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"], autoResult = true) {
   const controller = new AbortController();

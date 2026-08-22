@@ -13,6 +13,7 @@ import type { AgentResourcePolicy } from "../src/types.js";
 import type { RunStore } from "../src/persistence.js";
 import { testTransport, type TestPiSessionEvent } from "./test-transport.js";
 import { executeTool, executeToolUnchecked, testTransportContext } from "./support.js";
+import { defaultWorkflowResultSchema } from "../src/runtime/workflow-result.js";
 type TestEventMessage = NonNullable<TestPiSessionEvent["message"]>;
 type TestAssistantMessageEvent = NonNullable<TestPiSessionEvent["assistantMessageEvent"]>;
 function messageStart(message: TestEventMessage | undefined): TestPiSessionEvent { return { type: "message_start", ...(message === undefined ? {} : { message }) }; }
@@ -130,7 +131,7 @@ void test("instructs unstructured agents to submit workflow_result", async () =>
   }));
   assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow" })).value, "done");
   assert.match(prompt, /Call workflow_result exactly once/);
-  assert.deepEqual(resultParameters, { type: "object", properties: { result: { type: "string" } }, required: ["result"], additionalProperties: false });
+  assert.deepEqual(resultParameters, defaultWorkflowResultSchema);
 });
 void test("passes the generated workflow prompt to an eager transport", async () => {
   let launchPrompt = "";
@@ -158,6 +159,31 @@ void test("passes the generated workflow prompt to an eager transport", async ()
   const result = await new WorkflowAgentExecutor({ ...root, agentSetupHooks: [{ name: "replace", priority: 1, setup(agent) { agent.transport = transport; } }] }, localAgentTransport).execute("work", { label: "worker", workflowName: "flow" });
   assert.equal(result.value, "done");
   assert.match(launchPrompt, /Call workflow_result exactly once/);
+});
+void test("does not retry an agent that omits workflow_result", async () => {
+  let sessions = 0;
+  const prompts: string[] = [];
+  const plain = assistant("plain response");
+  const transport = {
+    id: "plain",
+    async createSession(prepared: Readonly<import("../src/types.js").PreparedAgentSession>) {
+      sessions += 1;
+      return {
+        reference: { transport: "plain", sessionId: `plain-${String(sessions)}` },
+        getState: () => ({ model: prepared.model, tools: prepared.tools }),
+        getSessionStats: sessionStats,
+        getLastAssistant: () => plain,
+        subscribe() { return () => undefined; },
+        async prompt(prompt: string) { prompts.push(prompt); return { assistant: plain }; },
+        async steer() {},
+        async abort() {},
+        async dispose() {},
+      };
+    },
+  } satisfies import("../src/types.js").AgentTransport;
+  await assert.rejects(new WorkflowAgentExecutor(root, transport).execute("work", { label: "worker", workflowName: "flow", retries: 1 }), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
+  assert.equal(sessions, 1);
+  assert.equal(prompts.length, 3);
 });
 void test("uses a transport-neutral session and persists its final reference shape", async () => {
   const events: string[] = [];
@@ -535,7 +561,7 @@ void test("returns final text and captures persisted native session accounting",
   assert.equal(result.value, "done");
   assert.equal(prompts.length, 1);
   assert.match(prompts[0] ?? "", /Workflow: flow[\s\S]*Phase: build[\s\S]*Parent: root[\s\S]*Task:\nDo work/);
-  assert.deepEqual(result.attempts[0], { attempt: 1, transport: "local", session: { transport: "local", sessionId: "s1", locator: { sessionFile: "/sessions/s1.jsonl" } }, result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash"], cwd: "/repo" } });
+  assert.deepEqual(result.attempts[0], { attempt: 1, transport: "local", session: { transport: "local", sessionId: "s1", locator: { sessionFile: "/sessions/s1.jsonl" } }, result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo" } });
 });
 
 void test("exposes native attempt metadata before the prompt completes", async () => {
@@ -546,7 +572,7 @@ void test("exposes native attempt metadata before the prompt completes", async (
   const exposure = new Promise<import("../src/agent-execution.js").AgentAttempt>((resolve) => { exposed = resolve; });
   const executor = new WorkflowAgentExecutor(root, testTransport(async () => ({ transport: "local", session: { transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: () => new Promise<void>((resolve) => { finish = resolve; promptStarted(); }), dispose() {} })));
   const running = executor.execute("work", { label: "worker", workflowName: "flow", onAttempt: (attempt) => { exposed(attempt); } });
-  assert.deepEqual(await exposure, { attempt: 1, transport: "local", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash"], cwd: "/repo" } });
+  assert.deepEqual(await exposure, { attempt: 1, transport: "local", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo" } });
   await started;
   finish();
   await running;
