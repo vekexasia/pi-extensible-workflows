@@ -121,7 +121,22 @@ void test("waits for Pi startup before reporting an exit", async () => {
     statusReports += 1;
     return JSON.stringify({ result: { agent: { agent_status: statusReports === 1 ? "working" : "idle" } } });
   };
-  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0 }), "exited");
+  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, exitGraceMs: 0 }), "exited");
+  assert.equal(processReports, 3);
+});
+void test("tolerates a transient process gap while Pi starts", async () => {
+  let processReports = 0;
+  let statusReports = 0;
+  const runner = async (args: readonly string[]): Promise<string> => {
+    if (args[0] === "pane") {
+      processReports += 1;
+      const running = processReports !== 2;
+      return JSON.stringify({ result: { process_info: { foreground_processes: running ? [{ name: "pi", argv: ["pi"] }] : [] } } });
+    }
+    statusReports += 1;
+    return JSON.stringify({ result: { agent: { agent_status: statusReports === 1 ? "working" : "idle" } } });
+  };
+  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0 }), "idle");
   assert.equal(processReports, 3);
 });
 void test("accepts Herdr-normalized Pi processes after exact startup", async () => {
@@ -131,10 +146,10 @@ void test("accepts Herdr-normalized Pi processes after exact startup", async () 
     if (args[1] !== "process-info") return "";
     processReports += 1;
     if (processReports === 1) return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, originatingEntrypoint], cmdline: `${process.execPath} ${originatingEntrypoint}` }] } } });
-    if (processReports === 2) return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"], cmdline: "pi" }] } } });
+    if (processReports === 2) return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv0: "pi" }] } } });
     return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
   };
-  assert.equal(await waitForHerdrPane("pane", runner, { originatingEntrypoint, intervalMs: 0 }), "exited");
+  assert.equal(await waitForHerdrPane("pane", runner, { originatingEntrypoint, intervalMs: 0, exitGraceMs: 0 }), "exited");
   assert.equal(processReports, 3);
 });
 

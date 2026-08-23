@@ -116,13 +116,14 @@ function hasPiProcess(value: unknown, originatingEntrypoint?: string): boolean {
   return processes.some((candidate) => {
     const process = record(candidate);
     const name = process?.name;
+    const argv0 = process?.argv0;
     const argv = process?.argv;
     const commandLine = process?.cmdline;
     if (originatingEntrypoint) {
       if (Array.isArray(argv) && argv.some((value) => value === originatingEntrypoint) || typeof commandLine === "string" && commandLine.includes(originatingEntrypoint)) return true;
-      return name === "pi" || Array.isArray(argv) && argv[0] === "pi";
+      return name === "pi" || argv0 === "pi" || Array.isArray(argv) && argv[0] === "pi";
     }
-    return name === "pi" || Array.isArray(argv) && argv[0] === "pi" || typeof commandLine === "string" && commandLine.includes("/bin/pi");
+    return name === "pi" || argv0 === "pi" || Array.isArray(argv) && argv[0] === "pi" || typeof commandLine === "string" && commandLine.includes("/bin/pi");
   });
 }
 function isHerdrStatus(value: unknown): value is HerdrAgentStatus { return value === "idle" || value === "working" || value === "blocked" || value === "unknown" || value === "done"; }
@@ -134,12 +135,14 @@ function herdrAgentStatus(value: unknown): HerdrPaneStatus | undefined {
   const state: HerdrAgentStatus = isHerdrStatus(rawState) ? rawState : "unknown";
   return { state };
 }
-export async function waitForHerdrPane(paneId: string, runner: HerdrCommandRunner = herdrCommandRunner, options: { signal?: AbortSignal; intervalMs?: number; startupTimeoutMs?: number; originatingEntrypoint?: string; onStatus?: (state: HerdrAgentStatus) => void | Promise<void> } = {}): Promise<"closed" | "exited" | "idle" | "aborted"> {
+export async function waitForHerdrPane(paneId: string, runner: HerdrCommandRunner = herdrCommandRunner, options: { signal?: AbortSignal; intervalMs?: number; startupTimeoutMs?: number; exitGraceMs?: number; originatingEntrypoint?: string; onStatus?: (state: HerdrAgentStatus) => void | Promise<void> } = {}): Promise<"closed" | "exited" | "idle" | "aborted"> {
   const intervalMs = options.intervalMs ?? 250;
   const startupTimeoutMs = options.startupTimeoutMs ?? 10000;
+  const exitGraceMs = options.exitGraceMs ?? 5000;
   const startedAt = Date.now();
   let sawPi = false;
   let sawWorking = false;
+  let missingSince: number | undefined;
   for (;;) {
     if (options.signal?.aborted) return "aborted";
     let piRunning: boolean;
@@ -148,8 +151,12 @@ export async function waitForHerdrPane(paneId: string, runner: HerdrCommandRunne
       piRunning = hasPiProcess(json(output), options.originatingEntrypoint);
     } catch { return "closed"; }
     if (!piRunning) {
-      if (sawPi) return "exited";
+      if (sawPi) {
+        missingSince ??= Date.now();
+        if (Date.now() - missingSince >= exitGraceMs) return "exited";
+      }
     } else {
+      missingSince = undefined;
       if (!sawPi) { sawPi = true; }
       try {
         const status = herdrAgentStatus(json(await runner(["agent", "get", paneId])));

@@ -136,6 +136,18 @@ function sessionPath(reference: WorkflowAgentSessionReference | undefined): stri
   return locator && typeof locator === "object" && !Array.isArray(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
 }
 
+function materializeSessionForHandoff(session: HerdrSession, prepared: Readonly<PreparedAgentSession>): void {
+  const path = sessionPath(session.reference);
+  if (!path || existsSync(path)) return;
+  const manager = SessionManager.inMemory(prepared.cwd, session.reference.sessionId ? { id: session.reference.sessionId } : undefined);
+  manager.appendSessionInfo(prepared.sessionLabel);
+  const header = manager.getHeader();
+  if (!header) throw new Error("Herdr cannot materialize a workflow session without a session header.");
+  const content = [header, ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+  try { writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
+  catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error; }
+}
+
 async function createBridgeContext(session: HerdrSession, prepared: Readonly<PreparedAgentSession>): Promise<(signal: AbortSignal, abort: () => void) => ExtensionContext> {
   const reference = session.reference;
   const path = sessionPath(reference);
@@ -380,6 +392,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
         try {
           if (session.suspendForHandoff) { await session.suspendForHandoff(); suspended = true; }
           else { await session.abort(); suspended = true; }
+          materializeSessionForHandoff(session, prepared);
           return await launchPane({ session, prepared, identity: context.identity, run: context.run, attempt: sessionContext.attempt, runner, fullyInspectable, env, signal: sessionContext.signal, prompt, workspaces, tuiIndex: context.tuiIndex, tuiLabel: context.tuiLabel });
         } catch (error) {
           if (suspended) { try { await session.resumeFromHandoff?.(); } catch { /* Preserve the pane launch failure. */ } }
