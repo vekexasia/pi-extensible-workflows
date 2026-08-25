@@ -30,7 +30,8 @@ test("the repository keeps the public package in the core workspace", () => {
     "./budget": "./dist/src/budget.js",
     "./validation": "./dist/src/validation.js",
     "./registry": "./dist/src/registry.js",
-    "./runtime": "./dist/src/runtime/index.js"
+    "./runtime": "./dist/src/runtime/index.js",
+    "./trajectory": "./dist/trajectory/index.js"
   });
   assert.equal(core.bin, undefined);
   assert.ok(core.files.includes("starter"));
