@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import extension, { breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
+import extension, { annotateHandoffAbort, breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
 import { WORKFLOW_BLOCKED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
 
 const piRuntime = { executable: process.execPath, entrypoint: "/originating/pi-coding-agent/dist/cli.js" };
@@ -192,10 +192,11 @@ void test("opens the active session after the handoff boundary and releases on p
   const promise = extension.agentAttemptActions.openLiveSession.run({ liveSession: session, prepared, handoff, attempt: { attempt: 1 }, agent: { label: "reviewer", structuralPath: ["review"], parentBreadcrumb: "flow" }, run: {}, signal: new AbortController().signal, ui: { setWorkingMessage(message) { workingMessages.push(message); } } });
   await Promise.resolve();
   assert.equal(calls.length, 0);
+  assert.deepEqual(workingMessages, ["reviewer: queued (waiting for a turn boundary)"]);
   handoff.observe({ type: "turn_end" });
   await promise;
   const runCall = calls.find(([command, subcommand]) => command === "pane" && subcommand === "run");
-  assert.deepEqual(workingMessages, ["reviewer: working", "reviewer: idle", undefined]);
+  assert.deepEqual(workingMessages, ["reviewer: queued (waiting for a turn boundary)", "reviewer: opening pane", "reviewer: working", "reviewer: idle", undefined]);
   assert.equal(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "run").length, 1);
   assert.ok(runCall);
   assert.ok(runCall[3].length < 4096);
@@ -241,7 +242,8 @@ void test("cancellation during live pane launch restores local ownership", async
   const extension = createHerdrExtension({ agentDir: root, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane" }, runner });
   const ownership = [];
   const session = { reference: { transport: "local", sessionId: "session", locator: { sessionFile: join(root, "session.jsonl") } }, abort: async () => ownership.push("abort"), suspendForHandoff: async () => ownership.push("suspend"), resumeFromHandoff: async () => ownership.push("resume"), getLastAssistant: () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }) };
-  const opening = extension.agentAttemptActions.openLiveSession.run({ liveSession: session, prepared: { cwd: process.cwd(), model: { provider: "openai", model: "gpt" }, tools: [], piRuntime }, handoff, attempt: { attempt: 1 }, agent: {}, run: {}, signal: controller.signal, ui: {} });
+  const workingMessages = [];
+  const opening = extension.agentAttemptActions.openLiveSession.run({ liveSession: session, prepared: { cwd: process.cwd(), model: { provider: "openai", model: "gpt" }, tools: [], piRuntime }, handoff, attempt: { attempt: 1 }, agent: {}, run: {}, signal: controller.signal, ui: { setWorkingMessage(message) { workingMessages.push(message); } } });
   handoff.observe({ type: "turn_end" });
   try {
     assert.equal(await settlesWithin(paneRunStarted), true, "pane launch should reach Herdr");
@@ -250,6 +252,8 @@ void test("cancellation during live pane launch restores local ownership", async
     assert.equal(await settlesWithin(opening), true, "cancellation should settle the handoff");
     await opening;
     assert.deepEqual(ownership, ["abort", "suspend", "resume"]);
+    assert.ok(workingMessages.length > 0);
+    assert.equal(workingMessages.at(-1), undefined, "cancelled handoff must clear the working message");
     assert.equal(handoff.transferred, false);
     assert.ok(calls.some(([command, subcommand]) => command === "pane" && subcommand === "close"));
   } finally {
@@ -1073,5 +1077,36 @@ void test("bridges a custom tool with a model supplied only by an inline extensi
     controller.abort();
     await session.dispose();
     await rm(root, { recursive: true, force: true });
+  }
+});
+void test("annotates the trailing handoff abort entry without masking genuine errors", () => {
+  const dir = mkdtempSync(join(tmpdir(), "herdr-annotate-"));
+  const file = join(dir, "session.jsonl");
+  const entry = (message) => JSON.stringify({ type: "message", message });
+  const userEntry = entry({ role: "user", content: [{ type: "text", text: "hi" }] });
+  const session = { reference: { transport: "local", sessionId: "s", locator: { sessionFile: file } } };
+  try {
+    // Deliberate handoff abort: relabelled, still abort-shaped for the core runner's /abort/i classification.
+    writeFileSync(file, `${userEntry}\n${entry({ role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" })}\n`);
+    annotateHandoffAbort(session);
+    const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[0]).message.role, "user");
+    const annotated = JSON.parse(lines[1]).message;
+    assert.notEqual(annotated.errorMessage, "This operation was aborted");
+    assert.match(annotated.errorMessage, /abort/i);
+    assert.equal(annotated.stopReason, "error");
+    // Genuine provider error: untouched.
+    writeFileSync(file, `${userEntry}\n${entry({ role: "assistant", content: [], stopReason: "error", errorMessage: "Provider exploded" })}\n`);
+    annotateHandoffAbort(session);
+    assert.equal(JSON.parse(readFileSync(file, "utf8").trim().split("\n").pop()).message.errorMessage, "Provider exploded");
+    // Abort-shaped but with content (a real partial turn): untouched.
+    writeFileSync(file, `${userEntry}\n${entry({ role: "assistant", content: [{ type: "text", text: "partial" }], stopReason: "error", errorMessage: "This operation was aborted" })}\n`);
+    annotateHandoffAbort(session);
+    assert.equal(JSON.parse(readFileSync(file, "utf8").trim().split("\n").pop()).message.errorMessage, "This operation was aborted");
+    // Missing file: no throw.
+    annotateHandoffAbort({ reference: { transport: "local", sessionId: "s", locator: { sessionFile: join(dir, "missing.jsonl") } } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
