@@ -58,6 +58,7 @@ function runtimeUsage(session: WorkflowAgentSession): RuntimeUsage {
 
 function providerFailure(session: WorkflowAgentSession, message: WorkflowAgentMessage | undefined): RuntimeAgentProviderFailure | undefined {
   if (message?.stopReason !== "error") return undefined;
+  if (message.errorMessage && /abort/i.test(message.errorMessage)) return undefined;
   const state = session.getState();
   return { provider: state.model.provider, model: state.model.model, error: message.errorMessage ?? "Workflow agent session ended with a terminal provider error" };
 }
@@ -319,7 +320,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         let promptError: unknown;
         try { await promptOnce(prompt, turnAlreadyStarted); }
         catch (error) { acceptAssistant(session?.getLastAssistant() ?? lastAssistant); promptFailed = true; promptError = error; }
-        const recovered = await recoverTerminal();
+        const recovered = runtimeHandoff.state === "local-running" || runtimeHandoff.state === "completed" ? await recoverTerminal() : false;
         const preHandoffAssistant = handoffBoundaryAssistant;
         handoffBoundaryAssistant = undefined;
         const handoffWasAttempted = runtimeHandoff.state !== "local-running";
