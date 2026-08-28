@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
-import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
 import { registerWorkflowExtension, WorkflowRegistry, type WorkflowExtension } from "pi-extensible-workflows";
 import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, type CliTestBundleExtension } from "./support.js";
 
@@ -440,7 +440,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(inspected, "session-a");
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  assert.equal(output, "Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   const bin = join(paths.root, "bin", "piewf");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
@@ -482,6 +482,23 @@ void test("CLI parser handles delimiter passthrough, negated booleans, and negat
   assert.equal(parseWorkflowCliArgs(booleanSchema, ["1", "--no-verbose"]).verbose, false);
   assert.deepEqual(parseWorkflowCliArgs(integerSchema, ["-7"]), { value: -7 });
   assert.deepEqual(parseWorkflowCliArgs(numberSchema, ["-1.5"]), { value: -1.5 });
+});
+void test("CLI script workflow parser derives names and accepts JSON input", () => {
+  assert.deepEqual(parseScriptWorkflowCliArgs(["--script", "packs/feature-implementation.js", "--input", '{"specPath":"specs/uart.md"}']), { help: false, scriptPath: "packs/feature-implementation.js", name: "feature-implementation", args: { specPath: "specs/uart.md" } });
+  assert.deepEqual(parseScriptWorkflowCliArgs(["--script=workflow.js", "--name=nightly", "--input=null"]), { help: false, scriptPath: "workflow.js", name: "nightly", args: null });
+  assert.deepEqual(parseScriptWorkflowCliArgs(["--script", "workflow.js", "--help"]), { help: true });
+  assert.throws(() => parseScriptWorkflowCliArgs([]), /Missing required option: --script/);
+  assert.throws(() => parseScriptWorkflowCliArgs(["--script", "workflow.js", "--unknown"]), /Unknown option/);
+  assert.throws(() => parseScriptWorkflowCliArgs(["--script", "workflow.js", "--name", " "]), /Missing value for --name/);
+});
+void test("headless CLI runs a file-backed workflow through the existing runtime", () => {
+  const paths = fixture();
+  writeFileSync(join(paths.cwd, "workflow.js"), "export const meta = { name: 'ignored' };\nreturn args.value;\n");
+  const result = runIsolatedCli(paths, 'placeholder: { description: "Placeholder", input: { type: "object", additionalProperties: false }, output: { type: "boolean" }, run: () => true }', ["run", "--script", "workflow.js", "--input", '{"value":"from-file"}']);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, '"from-file"\n');
+  assert.match(result.stderr, /Workflow: workflow/);
+  assert.match(result.stderr, /Run ID: [0-9a-f-]+/);
 });
 
 void test("exported launchers are executable and delegate unchanged arguments", async () => {

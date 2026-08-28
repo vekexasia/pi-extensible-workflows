@@ -27,7 +27,7 @@ pi install npm:@piewf/cli
 | --- | --- |
 | `pi-extensible-workflows` | The task needs workflows, the `reviewLoop` implementation-and-review starter, or one independent subagent run with a durable ID and lifecycle controls. |
 | `@piewf/herdr` | Core workflow agents need live handoff, completed-session inspection, or fully inspectable execution in Herdr. Core must also be loaded. |
-| `@piewf/cli` | A terminal needs doctor, inspection, headless registered-function execution, export, or bundle commands. |
+| `@piewf/cli` | A terminal needs doctor, inspection, headless registered-function or file-backed workflow execution, export, or bundle commands. |
 
 For local development:
 

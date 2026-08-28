@@ -2,7 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
@@ -177,7 +177,46 @@ function launcherHelpLines(): string[] {
     "  --".padEnd(28) + "End launcher option parsing; pass later tokens to workflow input",
   ];
 }
-function workflowUsage(): string { return [`Usage: piewf run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
+function workflowUsage(): string { return [`Usage: piewf run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
+function scriptWorkflowUsage(): string { return [`Usage: piewf run --script <path> [--name <workflow-name>] [--input <json>]`, "", "Options:", ...launcherHelpLines().slice(0, 2), "  -h, --help".padEnd(28) + "Show this help"].join("\n") + "\n"; }
+type ScriptWorkflowCliArgs = { help: true } | { help: false; scriptPath: string; name: string; args: JsonValue };
+function scriptWorkflowName(scriptPath: string): string {
+  const filename = basename(scriptPath);
+  const extension = extname(filename);
+  return extension ? filename.slice(0, -extension.length) : filename;
+}
+
+export function parseScriptWorkflowCliArgs(rawArgs: readonly string[]): ScriptWorkflowCliArgs {
+  let scriptPath: string | undefined;
+  let name: string | undefined;
+  let input: JsonValue | undefined;
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const token = requiredArg(rawArgs, index);
+    if (token === "--help" || token === "-h") return { help: true };
+    const equals = token.indexOf("=");
+    const option = equals >= 0 ? token.slice(0, equals) : token;
+    if (option === "--script" || option === "--name" || option === "--input") {
+      const value = equals >= 0 ? token.slice(equals + 1) : rawArgs[++index];
+      if (!value?.trim()) throw new Error(`Missing value for ${option}`);
+      if (option === "--script") {
+        if (scriptPath !== undefined) throw new Error("--script may only be provided once");
+        scriptPath = value;
+      } else if (option === "--name") {
+        if (name !== undefined) throw new Error("--name may only be provided once");
+        name = value;
+      } else {
+        if (input !== undefined) throw new Error("--input may only be provided once");
+        input = parseJsonInput(value);
+      }
+      continue;
+    }
+    throw new Error(`Unknown option: ${token}`);
+  }
+  if (scriptPath === undefined) throw new Error("Missing required option: --script");
+  const workflowName = name === undefined ? scriptWorkflowName(scriptPath) : name.trim();
+  if (!workflowName) throw new Error("Workflow name must be non-empty");
+  return { help: false, scriptPath, name: workflowName, args: input ?? null };
+}
 function exportUsage(): string { return [`Usage: piewf export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
 function bundleUsage(): string { return [`Usage: piewf bundle <workflow-name> [--name <command>] [--output <directory>] [--force]`, "", "The bundle contains a launcher, manifest, workflow payload, and external-runtime setup instructions.", "Repeat --role, --alias, --tool, --command, or --environment to declare recipient requirements.", "Use --extension, --skill, --resource, and --dependency to copy selected payload resources."].join("\n") + "\n"; }
 function parseInspectArgs(rawArgs: readonly string[]): { sessionId?: string; mode: InspectMode; failedOnly: boolean } {
@@ -433,13 +472,18 @@ class CliProgress {
 }
 
 type CliWorkflowResult = { value: JsonValue; runId?: string };
-async function invokeWorkflow(fn: WorkflowCatalogFunction, args: Record<string, JsonValue>, runtime: WorkflowRuntime, options: WorkflowIo, context: unknown): Promise<CliWorkflowResult> {
-  if (!Value.Check(fn.input, args)) throw new Error(`Invalid input for ${fn.name}`);
+type CliWorkflowLaunch = { name: string; args: JsonValue; fn?: WorkflowCatalogFunction; scriptPath?: string };
+async function invokeWorkflow(launch: CliWorkflowLaunch, runtime: WorkflowRuntime, options: WorkflowIo, context: unknown): Promise<CliWorkflowResult> {
+  if (launch.fn && (!object(launch.args) || !Value.Check(launch.fn.input, launch.args))) throw new Error(`Invalid input for ${launch.fn.name}`);
+  if (!launch.fn && launch.scriptPath === undefined) throw new Error("Workflow launch has no source");
   let announcedRunId: string | undefined;
   const announceRunId = (runId: string) => { if (announcedRunId === runId) return; announcedRunId = runId; options.stderr(`Run ID: ${runId}\n`); };
   const progress = new CliProgress(options.stderr, options.isTTY ?? process.stderr.isTTY, announceRunId);
   try {
-    const result: unknown = await runtime.workflowTool.execute(randomUUID(), { name: fn.name, script: `return await ${fn.name}(args);`, args, foreground: true }, options.signal, (update: unknown) => { if (object(update) && object(update.details) && isPersistedRun(update.details.run)) progress.update(update.details.run); }, context);
+    const params = launch.scriptPath === undefined
+      ? { name: launch.name, script: `return await ${launch.fn?.name ?? launch.name}(args);`, args: launch.args, foreground: true }
+      : { name: launch.name, scriptPath: launch.scriptPath, args: launch.args, foreground: true };
+    const result: unknown = await runtime.workflowTool.execute(randomUUID(), params, options.signal, (update: unknown) => { if (object(update) && object(update.details) && isPersistedRun(update.details.run)) progress.update(update.details.run); }, context);
     if (!isHeadlessWorkflowResult(result)) throw new Error("Workflow returned an invalid result");
     const details = object(result.details) ? result.details : {};
     const runId = typeof details.runId === "string" ? details.runId : undefined;
@@ -482,14 +526,25 @@ async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): 
   const parsed = stripTrustOptions(rawArgs);
   const args = parsed.args;
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(workflowUsage()); return args.length ? 0 : 1; }
+  const runtimeOptions = { ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) };
+  const scriptMode = args[0] === "--script" || args[0]?.startsWith("--script=") || args[0]?.startsWith("--") && args.some((arg) => arg === "--script" || arg.startsWith("--script="));
+  if (scriptMode) {
+    const script = parseScriptWorkflowCliArgs(args);
+    if (script.help) { options.write(scriptWorkflowUsage()); return 0; }
+    return withWorkflowRuntime(runtimeOptions, async (runtime, context) => {
+      const result = await invokeWorkflow({ name: script.name, scriptPath: script.scriptPath, args: script.args }, runtime, options, context);
+      options.write(`${JSON.stringify(result.value)}\n`);
+      return 0;
+    });
+  }
   const name = requiredArg(args, 0);
-  return withWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) }, async (runtime, context) => {
+  return withWorkflowRuntime(runtimeOptions, async (runtime, context) => {
     const help = args.slice(1).some((arg) => arg === "--help" || arg === "-h");
     const fn = runtime.catalog.functions.find((candidate) => candidate.name === name);
     if (!fn) throw new Error(`Unknown workflow function: ${name}`);
     if (help) { options.write(formatWorkflowCliHelp(fn)); return 0; }
     const input = parseWorkflowCliArgs(fn.input, args.slice(1));
-    const result = await invokeWorkflow(fn, input, runtime, options, context);
+    const result = await invokeWorkflow({ name: fn.name, fn, args: input }, runtime, options, context);
     options.write(`${JSON.stringify(result.value)}\n`);
     return 0;
   });
@@ -653,7 +708,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${errorText(error)}\n`); return 1; }
   }
-  write("Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  write("Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   return 1;
 }
 
