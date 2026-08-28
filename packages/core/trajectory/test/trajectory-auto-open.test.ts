@@ -106,7 +106,7 @@ async function launch(workflow: TestTool, ctx: Record<string, unknown>, name: st
   await workflow.execute("call", { name, script: "return true;", foreground: true }, new AbortController().signal, undefined, ctx);
 }
 
-void test("headless sessions never auto-open Trajectory", async () => {
+void test("headless sessions never auto-attach Trajectory", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-headless-"));
   const cwd = join(home, "project");
   await persistRun(cwd, home, "completed", "completed");
@@ -120,7 +120,7 @@ void test("headless sessions never auto-open Trajectory", async () => {
   await host.shutdown();
 });
 
-void test("empty interactive sessions auto-open once after the first successful launch", async () => {
+void test("empty interactive sessions auto-attach once after the first successful launch", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-first-launch-"));
   const cwd = join(home, "project");
   const probe = trajectoryProbe();
@@ -134,14 +134,14 @@ void test("empty interactive sessions auto-open once after the first successful 
   assert.ok(attached);
   assert.equal(attached.cwd, cwd);
   assert.equal(attached.sessionId, SESSION_ID);
-  assert.deepEqual(probe.urls, ["http://127.0.0.1:9876/"]);
+  assert.deepEqual(probe.urls, []);
   await launch(host.workflow, ctx, "second-launch");
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(probe.inputs.length, 1);
   await host.shutdown();
 });
 
-void test("completed sessions auto-open on session_start without a resume picker", async () => {
+void test("completed sessions auto-attach on session_start without a resume picker", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-completed-"));
   const cwd = join(home, "project");
   await persistRun(cwd, home, "completed", "completed");
@@ -149,10 +149,11 @@ void test("completed sessions auto-open on session_start without a resume picker
   const host = install(home, probe);
   await host.start({}, context(cwd, true));
   await waitForOpen(probe, 1);
+  assert.deepEqual(probe.urls, []);
   await host.shutdown();
 });
 
-void test("interrupted sessions auto-open before the resume picker and keep one attachment", async () => {
+void test("interrupted sessions auto-attach before the resume picker and keep one attachment", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-interrupted-"));
   const cwd = join(home, "project");
   await persistRun(cwd, home, "interrupted", "interrupted");
@@ -163,6 +164,7 @@ void test("interrupted sessions auto-open before the resume picker and keep one 
   const ctx = context(cwd, true, async () => picker);
   const starting = host.start({}, ctx);
   await waitForOpen(probe, 1);
+  assert.deepEqual(probe.urls, []);
   resolvePicker(undefined);
   await starting;
   await launch(host.workflow, ctx, "after-resume-picker");
@@ -182,7 +184,7 @@ void test("manual Trajectory re-open uses the same path after auto-attach", asyn
   await waitForOpen(probe, 1);
   await host.command("trajectory", ctx);
   assert.equal(probe.inputs.length, 2);
-  assert.deepEqual(probe.urls, ["http://127.0.0.1:9876/", "http://127.0.0.1:9876/"]);
+  assert.deepEqual(probe.urls, ["http://127.0.0.1:9876/"]);
   await host.shutdown();
 });
 void test("Trajectory overlays live subagent status observed by the workflow registry", async () => {

@@ -1036,7 +1036,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, recovery.budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
     }
-    if (runIds.length > 0) getTrajectoryHost()?.autoOpen(trajectoryProvider, ctx);
+    if (runIds.length > 0) getTrajectoryHost()?.autoAttach(trajectoryProvider, ctx);
     const resumeSelect = uiHostCapabilities(ctx.ui)?.select;
     if (ctx.hasUI && resumeSelect) {
       const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
@@ -1135,7 +1135,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
-      getTrajectoryHost()?.autoOpen(trajectoryProvider, ctx);
+      getTrajectoryHost()?.autoAttach(trajectoryProvider, ctx);
       if (params.foreground) {
         const delivery: ForegroundDelivery = {
           store, inline: false, detached: false,

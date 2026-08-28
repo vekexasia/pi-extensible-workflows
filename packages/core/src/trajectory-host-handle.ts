@@ -4,7 +4,7 @@ export type TrajectoryPublisherProvider = (context: unknown) => TrajectoryPublis
 
 export type TrajectoryHost = {
   open(provider: TrajectoryPublisherProvider, context: unknown): Promise<void>;
-  autoOpen(provider: TrajectoryPublisherProvider, context: { hasUI: boolean }): void;
+  autoAttach(provider: TrajectoryPublisherProvider, context: { hasUI: boolean }): void;
   close(): Promise<void>;
 };
 

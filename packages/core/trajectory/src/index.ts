@@ -282,27 +282,29 @@ type TrajectoryExtensionAPI = Pick<ExtensionAPI, "on">;
 export function registerTrajectoryExtension(pi: TrajectoryExtensionAPI, options: TrajectoryExtensionOptions = {}): TrajectoryHost {
   const controller = options.controller ?? createTrajectoryController(options.agentDir ?? getAgentDir());
   const openUrl = options.openUrl ?? openTrajectoryUrl;
-  let autoOpened = false;
+  let autoAttached = false;
+  const notify = (context: unknown, message: string, level: "info" | "error"): void => {
+    const current = object(context) ? context : undefined;
+    const ui = current && object(current.ui) ? current.ui : undefined;
+    if (typeof ui?.notify === "function") Reflect.apply(ui.notify, ui, [message, level]);
+  };
+  const attach = async (provider: TrajectoryPublisherProvider, context: unknown): Promise<{ port: number } | undefined> => {
+    try { return await controller.open(provider(context)); }
+    catch (error) { notify(context, `Unable to attach Trajectory: ${errorText(error)}`, "error"); return undefined; }
+  };
   const open = async (provider: TrajectoryPublisherProvider, context: unknown): Promise<void> => {
-    try {
-      const server = await controller.open(provider(context));
-      const url = trajectoryUrl(server.port);
-      openUrl(url);
-      const current = object(context) ? context : undefined;
-      const ui = current && object(current.ui) ? current.ui : undefined;
-      if (typeof ui?.notify === "function") Reflect.apply(ui.notify, ui, [`Trajectory opened at ${url}`, "info"]);
-    } catch (error) {
-      const current = object(context) ? context : undefined;
-      const ui = current && object(current.ui) ? current.ui : undefined;
-      if (typeof ui?.notify === "function") Reflect.apply(ui.notify, ui, [`Unable to open Trajectory: ${errorText(error)}`, "error"]);
-    }
+    const server = await attach(provider, context);
+    if (server === undefined) return;
+    const url = trajectoryUrl(server.port);
+    openUrl(url);
+    notify(context, `Trajectory opened at ${url}`, "info");
   };
   const host: TrajectoryHost = {
     open,
-    autoOpen(provider, context) {
-      if (autoOpened || !context.hasUI) return;
-      autoOpened = true;
-      void open(provider, context);
+    autoAttach(provider, context) {
+      if (autoAttached || !context.hasUI) return;
+      autoAttached = true;
+      void attach(provider, context);
     },
     close: () => controller.close(),
   };
