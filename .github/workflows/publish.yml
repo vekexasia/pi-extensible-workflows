@@ -39,22 +39,21 @@ jobs:
         run: npm ci
       - name: Run checks
         run: npm run check
-      - name: Inspect package contents
-        run: |
-          npm pack --dry-run --json --workspace=packages/core
-          npm pack --dry-run --json --workspace=packages/cli
-          npm pack --dry-run --json --workspace=packages/extensions/herdr
+      - name: Verify package artifacts
+        run: npm run test:packages -- "$RUNNER_TEMP/piewf-packages"
       - name: Publish missing packages
         run: |
           publish() {
             workspace=$1
             name=$(node -p "require('./$workspace/package.json').name")
             version=$(node -p "require('./$workspace/package.json').version")
+            filename="${name#@}"
+            filename="${filename/\//-}-$version.tgz"
             if npm view "$name@$version" version >/dev/null 2>&1; then
               echo "$name@$version is already published"
             else
               case "$version" in *-*) tag=next;; *) tag=latest;; esac
-              (cd "$workspace" && npm publish --access public --tag "$tag")
+              npm publish "$RUNNER_TEMP/piewf-packages/$filename" --access public --tag "$tag"
             fi
           }
           publish packages/core

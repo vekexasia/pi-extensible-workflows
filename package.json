@@ -20,10 +20,11 @@
   "scripts": {
     "build": "npm run build --workspace=packages/core && npm run build --workspace=packages/cli && npm run build --workspace=packages/extensions/herdr",
     "inspect": "npm run inspect --workspace=packages/cli",
-    "lint": "npm run lint --workspace=packages/core && npm run lint --workspace=packages/cli && npm run lint --workspace=packages/extensions/herdr",
+    "lint": "eslint scripts/verify-packed-packages.mjs && npm run lint --workspace=packages/core && npm run lint --workspace=packages/cli && npm run lint --workspace=packages/extensions/herdr",
     "test": "npm run test --workspace=packages/core && npm run test --workspace=packages/cli && npm run test --workspace=packages/extensions/herdr && npm run test:template",
     "test:run": "npm run test:run --workspace=packages/core && npm run test:herdr --workspace=packages/core && npm run test:run --workspace=packages/cli",
     "test:template": "node --test --test-timeout=10000 --test-force-exit packages/core/examples/workflow-extension-template/extension.test.mjs",
+    "test:packages": "node scripts/verify-packed-packages.mjs",
     "acceptance": "npm run acceptance --workspace=packages/core",
     "docs:check": "node scripts/check-docs.mjs",
     "check": "npm run build && npm run lint && npm test && npm run docs:check",

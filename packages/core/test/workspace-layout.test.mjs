@@ -10,6 +10,11 @@ const repositoryRoot = resolve(coreRoot, "../..");
 const cliRoot = resolve(repositoryRoot, "packages/cli");
 const readPackage = (path) => JSON.parse(readFileSync(path, "utf8"));
 
+test("the published core package includes compiled subagents", () => {
+  const core = readPackage(resolve(coreRoot, "package.json"));
+  assert.ok(core.files.includes("dist/subagents"));
+});
+
 test("the repository keeps the public package in the core workspace", () => {
   const root = readPackage(resolve(repositoryRoot, "package.json"));
   const core = readPackage(resolve(coreRoot, "package.json"));
@@ -30,11 +35,14 @@ test("the repository keeps the public package in the core workspace", () => {
     "./budget": "./dist/src/budget.js",
     "./validation": "./dist/src/validation.js",
     "./registry": "./dist/src/registry.js",
-    "./runtime": "./dist/src/runtime/index.js"
+    "./runtime": "./dist/src/runtime/index.js",
+    "./trajectory": "./dist/trajectory/index.js"
   });
   assert.equal(core.bin, undefined);
   assert.ok(core.files.includes("starter"));
   assert.ok(core.files.includes("dist/trajectory"));
+  assert.ok(core.files.includes("!dist/**/test/**"));
+  assert.ok(core.files.includes("!dist/**/*.test.*"));
   assert.ok(core.files.includes("trajectory/index.ts"));
   assert.ok(core.files.includes("trajectory/src"));
   assert.ok(core.files.includes("subagents/index.ts"));

@@ -14,7 +14,7 @@ export default tseslint.config(
     rules: { "@typescript-eslint/require-await": "off" },
   },
   {
-    files: ["packages/core/test/**/*.mjs", "packages/core/subagents/**/*.mjs", "packages/extensions/herdr/**/*.js", "packages/extensions/herdr/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "packages/core/test/**/*.mjs", "packages/core/subagents/**/*.mjs", "packages/extensions/herdr/**/*.js", "packages/extensions/herdr/**/*.mjs"],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: { project: false, projectService: false },
