@@ -26,7 +26,7 @@ test("the repository keeps the public package in the core workspace", () => {
   assert.equal(core.name, "pi-extensible-workflows");
   assert.equal(core.version, root.version);
   assert.notEqual(core.private, true);
-  assert.deepEqual(core.pi.extensions, ["./src/index.ts", "./starter/index.ts", "./subagents/index.ts", "./trajectory/index.ts"]);
+  assert.deepEqual(core.pi.extensions, ["./dist/src/index.js", "./dist/starter/index.js", "./dist/subagents/index.js", "./dist/trajectory/index.js"]);
   assert.deepEqual(core.exports, {
     ".": "./dist/src/index.js",
     "./persistence": "./dist/src/persistence.js",

@@ -30,6 +30,7 @@
   },
   "files": [
     "dist/src",
+    "dist/starter",
     "dist/subagents",
     "dist/trajectory",
     "!dist/**/test/**",
@@ -46,7 +47,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets",
+    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist",
     "lint": "eslint .",
     "test": "npm run test:layout && npm run build && npm run test:widget && npm run test:run && npm run test:herdr && npm run test:subagents",
     "test:layout": "node --test --test-timeout=10000 --test-force-exit test/workspace-layout.test.mjs",
@@ -62,10 +63,10 @@
   },
   "pi": {
     "extensions": [
-      "./src/index.ts",
-      "./starter/index.ts",
-      "./subagents/index.ts",
-      "./trajectory/index.ts"
+      "./dist/src/index.js",
+      "./dist/starter/index.js",
+      "./dist/subagents/index.js",
+      "./dist/trajectory/index.js"
     ],
     "image": "https://raw.githubusercontent.com/vekexasia/pi-extensible-workflows/main/assets/banner.svg"
   },
@@ -81,6 +82,7 @@
     "@earendil-works/pi-tui": "0.84.1",
     "@eslint/js": "10.0.1",
     "@types/node": "24.12.4",
+    "esbuild": "^0.28.2",
     "eslint": "10.0.3",
     "typescript": "5.9.3",
     "typescript-eslint": "8.63.0"

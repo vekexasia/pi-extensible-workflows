@@ -317,7 +317,17 @@ export interface AgentAttemptActionContext { readonly run: Readonly<RunRecord>; 
 export interface AgentAttemptAction { readonly label: string; visible(context: Readonly<AgentAttemptActionContext>): boolean; run(context: Readonly<AgentAttemptActionContext>): void | Promise<void>; visibleStandalone?(context: Readonly<StandaloneAgentAttemptActionContext>): boolean; runStandalone?(context: Readonly<StandaloneAgentAttemptActionContext>): void | Promise<void> }
 export interface WorkflowExtension extends WorkflowExtensionMetadata { description?: string; functions?: Readonly<Record<string, WorkflowFunction>>; modelAliases?: Readonly<Record<string, WorkflowModelAlias>>; agentSetupHooks?: Readonly<Record<string, AgentSetupHook>>; agentAttemptActions?: Readonly<Record<string, AgentAttemptAction>>; roleDirectories?: readonly (string | URL)[] }
 export interface WorkflowJournal { get(path: string): JsonValue | undefined; put(path: string, value: JsonValue): void }
-export class WorkflowError extends Error { constructor(public readonly code: WorkflowErrorCode, message: string) { super(message); this.name = "WorkflowError"; } }
+// The brand keeps instanceof working across the bundled extension entries, which each inline their own copy of this class.
+const WORKFLOW_ERROR_BRAND = Symbol.for("pi-extensible-workflows.workflow-error");
+export class WorkflowError extends Error {
+  constructor(public readonly code: WorkflowErrorCode, message: string) { super(message); this.name = "WorkflowError"; (this as unknown as Record<symbol, boolean>)[WORKFLOW_ERROR_BRAND] = true; }
+  static [Symbol.hasInstance](value: unknown): boolean {
+    if (Function.prototype[Symbol.hasInstance].call(this, value)) return true;
+    // Subclasses do not own the brand marker, so they keep plain prototype-chain semantics.
+    return Object.hasOwn(this, WORKFLOW_ERROR_BRAND) && typeof value === "object" && value !== null && WORKFLOW_ERROR_BRAND in value;
+  }
+}
+Object.defineProperty(WorkflowError, WORKFLOW_ERROR_BRAND, { value: true });
 export interface WorkflowFailureAgent { id: string; label?: string; role?: string; structuralPath: readonly string[]; attempt: number; transport?: string; session?: WorkflowAgentSessionReference }
 export interface WorkflowSiblingAgent { id: string; label?: string; role?: string; structuralPath: readonly string[] }
 export interface WorkflowFailureDiagnostics { runId: string; workflowName: string; state: RunState; failedAt: string | null; error: WorkflowErrorShape; failedAgent?: WorkflowFailureAgent; completedSiblingAgents?: readonly WorkflowSiblingAgent[]; completedSiblingPaths: readonly (readonly string[])[]; retry?: { sourceRunId: string; action: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[]; warning: string }; artifacts: { runDirectory: string; statePath: string; journalPath: string } }

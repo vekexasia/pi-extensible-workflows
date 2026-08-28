@@ -54,13 +54,13 @@
       </section>
       <section id="bundled-filters">
         <h2>Disable bundled features</h2>
-        <p>The core package loads the workflow host plus three optional extension entries. Exclude only the entries you do not want; keep <code>src/index.ts</code> loaded for workflow tools and <code>/workflow</code>. Independent Trajectory filtering requires version 5.8.0 or newer; earlier versions loaded it from the workflow host entry.</p>
+        <p>The core package loads the workflow host plus three optional extension entries. Exclude only the entries you do not want; keep <code>dist/src/index.js</code> loaded for workflow tools and <code>/workflow</code>. Independent Trajectory filtering requires version 5.8.0 or newer; earlier versions loaded it from the workflow host entry. Since 5.10.0 the published entries are bundled <code>dist/*.js</code> files; update pre-5.10 <code>.ts</code> filters to the paths below.</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Feature</th><th>Package path</th><th>What exclusion removes</th></tr></thead>
           <tbody>
-            <tr><td><code>reviewLoop</code> starter</td><td><code>starter/index.ts</code></td><td>The <code>reviewLoop</code> function, packaged developer/reviewer roles, and dynamic model aliases.</td></tr>
-            <tr><td>Standalone Subagents</td><td><code>subagents/index.ts</code></td><td>The five <code>subagents_*</code> tools and <code>/subagents</code>.</td></tr>
-            <tr><td>Trajectory</td><td><code>trajectory/index.ts</code></td><td>The browser server and automatic attachment. <code>/workflow trajectory</code> remains available and reports that Trajectory is disabled.</td></tr>
+            <tr><td><code>reviewLoop</code> starter</td><td><code>dist/starter/index.js</code></td><td>The <code>reviewLoop</code> function, packaged developer/reviewer roles, and dynamic model aliases.</td></tr>
+            <tr><td>Standalone Subagents</td><td><code>dist/subagents/index.js</code></td><td>The five <code>subagents_*</code> tools and <code>/subagents</code>.</td></tr>
+            <tr><td>Trajectory</td><td><code>dist/trajectory/index.js</code></td><td>The browser server and automatic attachment. <code>/workflow trajectory</code> remains available and reports that Trajectory is disabled.</td></tr>
           </tbody>
         </table></div>
         <p>Use exact package-root exclusions in Pi's global <code>settings.json</code>. This example disables all three optional entries; delete an exclusion to keep that feature:</p>
@@ -69,18 +69,18 @@
     <span class="tok-punctuation">{</span>
       <span class="tok-property">"source"</span><span class="tok-punctuation">:</span> <span class="tok-string">"npm:pi-extensible-workflows"</span><span class="tok-punctuation">,</span>
       <span class="tok-property">"extensions"</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>
-        <span class="tok-string">"-starter/index.ts"</span><span class="tok-punctuation">,</span>
-        <span class="tok-string">"-subagents/index.ts"</span><span class="tok-punctuation">,</span>
-        <span class="tok-string">"-trajectory/index.ts"</span>
+        <span class="tok-string">"-dist/starter/index.js"</span><span class="tok-punctuation">,</span>
+        <span class="tok-string">"-dist/subagents/index.js"</span><span class="tok-punctuation">,</span>
+        <span class="tok-string">"-dist/trajectory/index.js"</span>
       <span class="tok-punctuation">]</span>
     <span class="tok-punctuation">}</span>
   <span class="tok-punctuation">]</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p>The same exclusions apply to the documented source install, <code>pi install "$PWD/packages/core"</code>, because that directory is the package root. Only a repository-root package source needs the <code>packages/core/</code> prefix. Restart Pi after changing the filter.</p>
+        <p>The same exclusions apply to the documented source install, <code>pi install "$PWD/packages/core"</code>, because that directory is the package root. A repository-root package source loads the TypeScript source entries instead, so filters there use the <code>packages/core/</code> prefix with <code>.ts</code> paths. Restart Pi after changing the filter.</p>
       </section>
       <section id="starter">
         <h2>Bundled starter</h2>
-        <p>The core package loads <code>starter/index.ts</code> next to the workflow host. It registers one function, two packaged roles, and two dynamic model aliases:</p>
+        <p>The core package loads <code>dist/starter/index.js</code> next to the workflow host. It registers one function, two packaged roles, and two dynamic model aliases:</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Piece</th><th>Name</th><th>Default</th></tr></thead>
           <tbody>
@@ -99,7 +99,7 @@
             <tr><td><code>reviewLoop</code></td><td>None. A second function with the same name is <code>GLOBAL_COLLISION</code>.</td><td>Disable the starter extension, then register your own function.</td></tr>
           </tbody>
         </table></div>
-        <p>To replace <code>reviewLoop</code>, exclude <code>starter/index.ts</code> as described above, then register the replacement.</p>
+        <p>To replace <code>reviewLoop</code>, exclude <code>dist/starter/index.js</code> as described above, then register the replacement.</p>
       </section>
       <section id="start-here">
         <h2>Start here</h2>

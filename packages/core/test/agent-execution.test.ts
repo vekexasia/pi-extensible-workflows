@@ -1158,7 +1158,7 @@ void test("bare no-policy local sessions exclude the workflow host and retain co
   try {
     const session = await createLocalPiSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "no-policy-extensions" });
     try {
-      assert.deepEqual(session.getResourceInspection().extensions, [realpathSync(benignExtension), realpathSync(join(process.cwd(), "trajectory/index.ts"))]);
+      assert.deepEqual(session.getResourceInspection().extensions, [realpathSync(benignExtension), realpathSync(join(process.cwd(), "dist/trajectory/index.js"))]);
       assert.deepEqual(readFileSync(lifecycleFile, "utf8").trim().split("\n"), ["start:startup"]);
     } finally {
       await session.dispose();
