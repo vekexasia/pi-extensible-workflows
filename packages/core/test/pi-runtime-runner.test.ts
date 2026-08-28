@@ -441,68 +441,40 @@ void test("Pi runtime runner keeps a provider pause outside the attempt deadline
   assert.equal(result.value, "done");
   assert.equal(prompts, 2);
 });
-void test("Pi runtime runner skips provider-error recovery while a Herdr handoff is in flight (regression #204)", async () => {
+void test("Pi runtime runner suppresses abort-shaped provider recovery only for a live handoff", async () => {
   const resultSchema: RuntimeJsonSchema = { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false };
-  let preparedWithResult: PreparedAgentSession | undefined;
-  let prompts = 0;
-  let providerErrors = 0;
-  const abortedAssistant: WorkflowAgentMessage = { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" };
-  let last: WorkflowAgentMessage | undefined;
-  const handoff: RuntimeAgentHandoff = {
-    state: "remote-running",
-    transferred: false,
-    observe() {},
-    request: async (launch) => { await launch(); },
-    waitForTakeover: async () => {},
-    takeover() {},
-    waitForResume: async () => {},
-    release() {},
+  const run = async (handoff?: RuntimeAgentHandoff, aborts = 1) => {
+    let prepared: PreparedAgentSession | undefined;
+    let last: WorkflowAgentMessage | undefined;
+    let prompts = 0;
+    let providerErrors = 0;
+    const aborted: WorkflowAgentMessage = { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" };
+    const session = sessionFor(async () => {
+      prompts += 1;
+      if (prompts <= aborts) { last = aborted; return { assistant: aborted }; }
+      const resultTool = prepared?.resultTool;
+      if (!resultTool) throw new Error("result tool is missing");
+      await resultTool.execute("result", { answer: 9 }, undefined, undefined, testExtensionContext);
+      last = { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { answer: 9 } }] };
+      return { assistant: last };
+    }, { lastAssistant: () => last });
+    const transport: AgentTransport = { id: "local", async createSession(value) { prepared = value; return session; } };
+    const { runner, controller } = runnerFor(session, preparedWithResultTool(resultSchema), transport, undefined, false);
+    const result = await runner.run(requestFor(controller.signal, { resultSchema, ...(handoff ? { handoff } : {}), onProviderError: async () => { providerErrors += 1; return "retry"; } }));
+    return { result: result.value, prompts, providerErrors };
   };
-  const session = sessionFor(async () => {
-    prompts += 1;
-    if (prompts === 1) { last = abortedAssistant; return { assistant: abortedAssistant }; }
-    const tool = preparedWithResult?.resultTool;
-    if (!tool) throw new Error("result tool is missing");
-    await tool.execute("result", { answer: 9 }, undefined, undefined, testExtensionContext);
-    const message: WorkflowAgentMessage = { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { answer: 9 } }] };
-    last = message;
-    return { assistant: message };
-  }, { lastAssistant: () => last });
-  const transport: AgentTransport = { id: "local", async createSession(prepared) { preparedWithResult = prepared; return session; } };
-  const { runner, controller } = runnerFor(session, preparedWithResultTool(resultSchema), transport);
-  const result = await runner.run(requestFor(controller.signal, {
-    resultSchema,
-    handoff,
-    onProviderError: async () => { providerErrors += 1; return "retry"; },
-  }));
-  assert.deepEqual(result.value, { answer: 9 });
-  assert.equal(providerErrors, 0);
-  assert.equal(prompts, 2);
+  const handoff: RuntimeAgentHandoff = { state: "remote-running", transferred: true, observe() {}, async request(launch) { await launch(); }, async waitForTakeover() {}, takeover() {}, async waitForResume() {}, release() {} };
+  assert.deepEqual(await run(), { result: { answer: 9 }, prompts: 2, providerErrors: 1 });
+  assert.deepEqual(await run(handoff), { result: { answer: 9 }, prompts: 2, providerErrors: 0 });
+  assert.deepEqual(await run(handoff, 3), { result: { answer: 9 }, prompts: 4, providerErrors: 1 });
 });
-void test("Pi runtime runner does not classify an aborted terminal message as a provider failure (regression #204)", async () => {
-  const resultSchema: RuntimeJsonSchema = { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false };
-  let preparedWithResult: PreparedAgentSession | undefined;
-  let prompts = 0;
+void test("Pi runtime runner skips provider recovery after intentional cancellation", async () => {
+  let cancel = () => {};
   let providerErrors = 0;
-  const abortedAssistant: WorkflowAgentMessage = { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" };
-  let last: WorkflowAgentMessage | undefined;
-  const session = sessionFor(async () => {
-    prompts += 1;
-    if (prompts === 1) { last = abortedAssistant; return { assistant: abortedAssistant }; }
-    const tool = preparedWithResult?.resultTool;
-    if (!tool) throw new Error("result tool is missing");
-    await tool.execute("result", { answer: 3 }, undefined, undefined, testExtensionContext);
-    const message: WorkflowAgentMessage = { role: "assistant", content: [{ type: "toolCall", id: "result", name: "workflow_result", arguments: { answer: 3 } }] };
-    last = message;
-    return { assistant: message };
-  }, { lastAssistant: () => last });
-  const transport: AgentTransport = { id: "local", async createSession(prepared) { preparedWithResult = prepared; return session; } };
-  const { runner, controller } = runnerFor(session, preparedWithResultTool(resultSchema), transport);
-  const result = await runner.run(requestFor(controller.signal, {
-    resultSchema,
-    onProviderError: async () => { providerErrors += 1; return "retry"; },
-  }));
-  assert.deepEqual(result.value, { answer: 3 });
+  const aborted: WorkflowAgentMessage = { role: "assistant", content: [], stopReason: "error", errorMessage: "This operation was aborted" };
+  const session = sessionFor(async () => { cancel(); return { assistant: aborted }; }, { lastAssistant: () => aborted });
+  const { runner, controller } = runnerFor(session, undefined, undefined, undefined, false);
+  cancel = () => { controller.abort(); };
+  await assert.rejects(runner.run(requestFor(controller.signal, { onProviderError: async () => { providerErrors += 1; return "retry"; } })), (error: unknown) => error instanceof WorkflowError && error.code === "CANCELLED");
   assert.equal(providerErrors, 0);
-  assert.equal(prompts, 2);
 });

@@ -137,7 +137,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
         const setStatus = uiHostCapabilities(ctx.ui)?.setStatus;
         setStatus?.call(ctx.ui, "workflow-stop", text);
       };
-      const runAction = async (actionCommand: string, status: (text: string | undefined) => void = setWorkflowStatus): Promise<"dashboard" | "picker"> => {
+      const runAction = async (actionCommand: string, status: (text: string | undefined) => void = setWorkflowStatus): Promise<"dashboard" | "picker" | "stopped"> => {
         const [action, runId, ...rest] = actionCommand.split(/\s+/);
         try {
           const run = runId ? runs.get(runId) : undefined;
@@ -192,7 +192,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             status(`Stopping workflow ${workflowName}...`);
             await stopWorkflowRun(run.store.runId);
             status(`Workflow ${run.store.runId} stopped.`);
-            ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return "dashboard";
+            ctx.ui.notify(`Stopped workflow ${run.store.runId}.`, "info"); return "stopped";
           }
           if (action && runId) ctx.ui.notify(`Cannot ${action} workflow ${runId}: the run is no longer available.`, "warning");
           else ctx.ui.notify("Workflow action is no longer available.", "warning");
@@ -536,7 +536,10 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       stopStatus = status;
                       setWorkflowStatus(status);
                       if (!disposed) tui.requestRender();
-                    }).then(() => updateDashboard()).catch((error: unknown) => {
+                    }).then(async (outcome) => {
+                      if (outcome === "stopped") { done("__stopped__"); return; }
+                      await updateDashboard();
+                    }).catch((error: unknown) => {
                       if (disposed) return;
                       stopStatus = `Could not stop workflow ${store.runId}: ${errorText(error)}`;
                       setWorkflowStatus(stopStatus);
@@ -684,6 +687,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                   };
                 })
               : await ctx.ui.select(view.dashboard, [...view.actions.keys(), "Back"]);
+            if (actionChoice === "__stopped__") return;
             if (!actionChoice || actionChoice === "Back") { stores = await loadStores(); break; }
             if (actionChoice === "Agents...") { await selectAgent(view); continue; }
             if (actionChoice.startsWith("__workflow_agent__:")) { await selectAgent(view, actionChoice.slice("__workflow_agent__:".length)); continue; }

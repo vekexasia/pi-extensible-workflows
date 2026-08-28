@@ -408,7 +408,7 @@ void test("navigator stop asks for confirmation before cancelling", async () => 
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["running"]);
 });
 
-void test("navigator stop stays visible through cleanup and ignores repeated input", async () => {
+void test("navigator stop stays visible through cleanup, then closes", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-progress-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
@@ -428,7 +428,6 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
   let componentDisposed = false;
   let pickerCalls = 0;
   let rendered = "";
-  let closeNavigator = () => {};
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
   assert.ok(start && commands[0]);
   const ctx = {
@@ -442,7 +441,6 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
         let resolveCustom!: (value: string | undefined) => void;
         const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
         const component = factory({ requestRender() { rendered = component.render(200).join("\n"); } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; resolveCustom(value); });
-        closeNavigator = () => component.handleInput?.("tui.select.cancel");
         if (componentDisposed) component.handleInput?.("tui.select.cancel"); else { component.handleInput?.("a"); component.handleInput?.("tui.select.down"); component.handleInput?.("tui.select.confirm"); component.handleInput?.("tui.select.confirm"); }
         await completed;
         component.dispose?.();
@@ -464,15 +462,9 @@ void test("navigator stop stays visible through cleanup and ignores repeated inp
   assert.equal(confirmations.length, 1);
   assert.equal((await store.load()).run.state, "stopped");
   releaseCleanup();
-  for (let attempt = 0; attempt < 100 && !rendered.includes("Workflow run stopped."); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.match(rendered, /Workflow run stopped\.|state=stopped/);
-  assert.ok(statuses.some((status) => status?.includes("Workflow run stopped")));
-  assert.equal(componentDisposed, false);
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  for (let attempt = 0; attempt < 20; attempt += 1) { closeNavigator(); await new Promise((resolve) => setTimeout(resolve, 10)); }
-  await pending;
-  delayedOwnership.delete(store.directory);
+  await Promise.race([pending, new Promise<never>((_resolve, reject) => setTimeout(() => { reject(new Error("navigator did not close after stop")); }, 1_000))]);
   assert.equal(componentDisposed, true);
+  delayedOwnership.delete(store.directory);
   assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled"]);
   assert.ok(statuses.some((status) => status?.includes("Stopping workflow")));
   assert.ok(statuses.some((status) => status?.includes("Workflow run stopped")));

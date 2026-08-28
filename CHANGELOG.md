@@ -10,6 +10,11 @@
 
 - Moved the eval harness from `src/` to the unpublished `evals/src/` directory and stopped publishing `evals/` cases and `test/fixtures` in the npm package. `npm run evals` and `npm run evals:ambient` are unchanged for repository checkouts.
 
+### Fixes
+
+- Closing the workflow dashboard after a confirmed stop now leaves the parent Pi session ready for its next prompt, and intentional cancellation skips provider recovery ([#241](https://github.com/vekexasia/pi-extensible-workflows/issues/241)).
+- Live Herdr handoffs show queued/opening status and bypass provider recovery only when a handoff was actually attempted, preserving genuine provider errors containing `abort` ([#204](https://github.com/vekexasia/pi-extensible-workflows/issues/204), [#240](https://github.com/vekexasia/pi-extensible-workflows/pull/240)).
+
 ## [5.8.0] - 2026-08-23
 
 ### Breaking changes

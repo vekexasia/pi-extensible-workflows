@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createServer } from "node:net";
 import type { Socket } from "node:net";
@@ -146,29 +146,6 @@ function materializeSessionForHandoff(session: HerdrSession, prepared: Readonly<
   const content = [header, ...manager.getEntries()].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
   try { writeFileSync(path, content, { encoding: "utf8", flag: "wx", mode: 0o600 }); }
   catch (error) { if (!error || typeof error !== "object" || !("code" in error) || error.code !== "EEXIST") throw error; }
-}
-
-// Keep the word "abort" in this text: the core runner classifies abort-shaped errorMessages (/abort/i) as deliberate handoff aborts rather than provider failures (#204). Dropping it would resurrect the "Subagent failed" dialog when a pane closes without appending entries.
-const HANDOFF_ABORT_NOTE = "Turn aborted for handoff to a Herdr live pane (expected)";
-
-// ponytail: also relabels a trailing user-initiated abort if the pane opens right after one — cosmetic mislabel; gate on the suspend cycle if it ever matters.
-export function annotateHandoffAbort(session: Pick<HerdrSession, "reference">): void {
-  const path = sessionPath(session.reference);
-  if (!path || !existsSync(path)) return;
-  try {
-    const lines = readFileSync(path, "utf8").split("\n");
-    let last = lines.length - 1;
-    while (last >= 0 && !lines[last]?.trim()) last -= 1;
-    const line = lines[last];
-    if (last < 0 || line === undefined) return;
-    const entry = JSON.parse(line) as { type?: unknown; message?: { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown } };
-    const message = entry.type === "message" ? entry.message : undefined;
-    if (!message || message.role !== "assistant" || !Array.isArray(message.content) || message.content.length > 0) return;
-    if (message.stopReason !== "error" || typeof message.errorMessage !== "string" || !/abort/i.test(message.errorMessage)) return;
-    message.errorMessage = HANDOFF_ABORT_NOTE;
-    lines[last] = JSON.stringify(entry);
-    writeFileSync(path, lines.join("\n"), "utf8");
-  } catch { /* Annotation is cosmetic; never block the handoff. */ }
 }
 
 async function createBridgeContext(session: HerdrSession, prepared: Readonly<PreparedAgentSession>): Promise<(signal: AbortSignal, abort: () => void) => ExtensionContext> {
@@ -348,7 +325,6 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
   let commandFiles: CommandFiles | undefined;
   let pane: string | undefined;
   try {
-    annotateHandoffAbort(session);
     inlineBridge = createInlineExtensionBridge(prepared);
     const selectedContextFiles = prepared.contextFiles === undefined ? undefined : session.getHerdrContextFiles?.() ?? [];
     commandFiles = createCommandFiles(prepared, prompt, directPrompt, selectedContextFiles);
@@ -627,7 +603,6 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
     };
     const handoffReleased = (): boolean => handoff.state === "completed";
     const handoffCancelled = (): boolean => context.signal.aborted || handoffReleased();
-    // request() parks the launch behind waitForBoundary(); without feedback the silent queue looks broken and invites double-triggers.
     setWorkingMessage("queued (waiting for a turn boundary)");
     await handoff.request(async () => {
       setWorkingMessage("opening pane");
