@@ -11,6 +11,12 @@ permissions:
   issues: write
   pull-requests: write
 
+# Serialize runs: concurrent OAuth refreshes would fork the refresh-token
+# chain and invalidate the stored credential.
+concurrency:
+  group: triage
+  cancel-in-progress: false
+
 jobs:
   triage:
     runs-on: ubuntu-latest
@@ -56,6 +62,19 @@ jobs:
           pi --no-tools --no-session --print --mode text --model "openai-codex/gpt-5.6-luna:xhigh" "$(cat prompt.txt)" > out.txt
           perl -0777 -ne 'print $1 if /<triage>(.*?)<\/triage>/s' out.txt > triage.json
           jq -e '(.summary | type == "string") and ((.labels // []) | type == "array")' triage.json
+
+      # pi may have refreshed the OAuth credential; persist it or the next
+      # run starts from a rotated-out refresh token. Runs even if triage
+      # parsing failed. Requires a fine-grained PAT (this repo, Secrets: rw).
+      - name: Persist refreshed credentials
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.REPO_SECRETS_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "REPO_SECRETS_PAT not set; skipping write-back"; exit 0; fi
+          if [ ! -f ~/.pi/agent/auth.json ]; then echo "no auth.json; skipping"; exit 0; fi
+          jq -c '{"openai-codex": .["openai-codex"]}' ~/.pi/agent/auth.json | gh secret set PI_AUTH_JSON --repo "$REPO"
 
       - name: Apply triage
         env:
