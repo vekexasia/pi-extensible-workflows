@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+## [5.10.0] - 2026-08-28
+
 ### Packaging
 
 - The published package now loads bundled extension entries (`dist/src/index.js`, `dist/starter/index.js`, `dist/subagents/index.js`, `dist/trajectory/index.js`) instead of TypeScript sources, cutting Pi startup overhead from ~1.25s to ~0.06s. Package filters that excluded the old `.ts` entries must switch to the new `dist/*.js` paths (see the extensions guide). Repository-root source installs still load the TypeScript entries.
