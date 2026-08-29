@@ -178,9 +178,10 @@ function deliver(pi: WorkflowExtensionAPI, content: string): void {
   if (typeof pi.sendMessage !== "function") return;
   pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
 }
+const WORKFLOW_WARNING_ENTRY = "workflow-warning";
+interface WorkflowWarningEntry { message: string }
 function deliverWarning(pi: WorkflowExtensionAPI, content: string): void {
-  if (typeof pi.sendMessage !== "function") return;
-  pi.sendMessage({ customType: "workflow", content: `Warning: ${content}`, display: true }, { deliverAs: "steer" });
+  pi.appendEntry<WorkflowWarningEntry>(WORKFLOW_WARNING_ENTRY, { message: content });
 }
 
 type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -264,6 +265,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
     return textBlock(data ? `Workflow ${data.workflowName}: ${data.message}` : "");
+  });
+  registerEntryRenderer?.<WorkflowWarningEntry>(WORKFLOW_WARNING_ENTRY, (entry) => {
+    const data = entry.data;
+    return textBlock(data ? `Warning: ${data.message}` : "");
   });
   let backgroundWidgetEnabled = true;
   try { backgroundWidgetEnabled = loadSettings(workflowSettingsPath(extensionAgentDir)).backgroundWidget ?? true; } catch { /* Keep the optional UI enabled; the launch path reports settings errors. */ }

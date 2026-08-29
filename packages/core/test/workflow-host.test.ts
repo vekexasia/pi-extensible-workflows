@@ -202,6 +202,34 @@ void test("attributes dynamic alias cycles to the registering extension", async 
   await assert.rejects(execute("id", { name: "cycle", script: "return true;", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR" && error.message.includes("Cycle policy"));
   loadingRegistry().freeze();
 });
+void test("keeps unavailable role tool warnings out of model context", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-warning-entry-"));
+  const agentDir = join(home, "agent");
+  const roleDirectory = join(agentDir, "pi-extensible-workflows", "roles");
+  mkdirSync(roleDirectory, { recursive: true });
+  writeFileSync(join(roleDirectory, "developer.md"), `---\ntools: ["!*", missing_tool]\n---\n`);
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const messages: string[] = [];
+  const entries: Array<{ type: string; data: unknown }> = [];
+  const pi = testExtensionApi({
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read"],
+    registerEntryRenderer() {},
+    sendMessage(message) { messages.push(message.content); },
+  });
+  workflowExtension({ ...pi, appendEntry(type, data) { entries.push({ type, data }); } }, home, async () => {}, testTransport(async (): Promise<TestPiSession> => ({
+    sessionId: "warning-entry-agent", sessionFile: "/sessions/warning-entry-agent.jsonl",
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => {}, steer: async () => {}, dispose() {},
+  })), agentDir);
+  const execute = tools.find(({ name }) => name === "workflow")?.execute;
+  assert.ok(execute);
+  await execute("warning-entry", { name: "warning-entry", script: `return await agent("work", { role: "developer" });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }], getAvailable: () => [{ provider: "openai", id: "gpt" }] }, sessionManager: { getSessionId: () => "session" } });
+  assert.deepEqual(messages, []);
+  assert.deepEqual(entries, [{ type: "workflow-warning", data: { message: "Tool not available in this session for role developer: missing_tool. The agent runs without it." } }]);
+  loadingRegistry().freeze();
+});
 const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt:medium", tools: ["read"] });`;
 void test("workflow call preview summarizes inline scripts safely", () => {
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });

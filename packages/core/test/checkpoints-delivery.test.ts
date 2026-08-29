@@ -516,7 +516,7 @@ void test("background workflow logs persist and append capped TUI transcript ent
   let renderer: ((entry: { data?: LogData }, options: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
-    registerEntryRenderer(type: string, candidate: NonNullable<typeof renderer>) { assert.equal(type, "workflow-log"); renderer = candidate; },
+    registerEntryRenderer(type: string, candidate: NonNullable<typeof renderer>) { if (type === "workflow-log") renderer = candidate; },
     appendEntry(type: string, data: LogData) { entries.push({ type, data }); },
     getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"],
   }), home);
