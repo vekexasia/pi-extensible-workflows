@@ -1,4 +1,5 @@
-import { isAbsolute } from "node:path";
+import { realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowFunction, WorkflowFunctionContext, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
@@ -26,6 +27,15 @@ function normalizeRoleDirectory(value: unknown): string {
   }
   fail("INVALID_METADATA", "Workflow role directories require file URLs or absolute filesystem paths");
 }
+function canonicalRoleDirectory(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
+const registryDirectory = dirname(fileURLToPath(import.meta.url));
+const workflowPackageRoot = basename(dirname(registryDirectory)) === "dist" ? resolve(registryDirectory, "../..") : resolve(registryDirectory, "..");
+const BUILTIN_ROLE_DIRECTORIES = new Set([
+  resolve(workflowPackageRoot, "starter/roles"),
+  resolve(workflowPackageRoot, "dist/starter/roles"),
+].map(canonicalRoleDirectory));
+function isBuiltinRoleDirectory(path: string): boolean { return BUILTIN_ROLE_DIRECTORIES.has(canonicalRoleDirectory(path)); }
+
 function catalogSchema(schema: unknown, at: string): JsonSchema {
   validateSchema(schema, at);
   return structuredClone(schema);
@@ -86,7 +96,7 @@ export class WorkflowRegistry {
     }
     const stored = deepFreeze({ ...extension, functions, modelAliases, agentSetupHooks, agentAttemptActions, ...(roleDirectories.length ? { roleDirectories } : {}) });
     this.#extensions.add(stored);
-    for (const directory of roleDirectories) if (!this.#roleDirectories.has(directory)) this.#roleDirectories.set(directory, deepFreeze({ path: directory, extension: { version: extension.version, headline: extension.headline } }));
+    for (const directory of roleDirectories) if (!this.#roleDirectories.has(directory)) this.#roleDirectories.set(directory, deepFreeze({ path: directory, extension: { version: extension.version, headline: extension.headline }, ...(isBuiltinRoleDirectory(directory) ? { builtin: true as const } : {}) }));
     for (const name of names) this.#globals.set(name, name);
     for (const [name, alias] of Object.entries(modelAliases)) this.#modelAliases.set(name, { name, version: extension.version, headline: extension.headline, resolve: alias.resolve });
     for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });

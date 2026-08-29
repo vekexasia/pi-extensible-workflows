@@ -277,13 +277,13 @@ function projectRoleDirectories(root: string): readonly string[] {
   return [join(root, ROLE_DIRECTORY, "roles")];
 }
 
-type RoleDirectorySource = { path: string; extension?: WorkflowExtensionMetadata };
+type RoleDirectorySource = { path: string; extension?: WorkflowExtensionMetadata; builtin?: true };
 export type WorkflowRoleDirectoryInput = string | WorkflowRoleDirectoryRegistration;
 type RoleFile = { name: string; path: string; source: RoleDirectorySource };
 function roleDirectorySources(dirs: readonly WorkflowRoleDirectoryInput[]): RoleDirectorySource[] {
   const seen = new Set<string>();
   return dirs.flatMap((value) => {
-    const source = typeof value === "string" ? { path: value } : { path: value.path, extension: value.extension };
+    const source = typeof value === "string" ? { path: value } : { path: value.path, extension: value.extension, ...(value.builtin === true ? { builtin: true as const } : {}) };
     if (seen.has(source.path)) return [];
     seen.add(source.path);
     return [source];
@@ -314,18 +314,21 @@ function scanRoleFiles(dirs: readonly WorkflowRoleDirectoryInput[], extension: b
 }
 function readRoleDefinitions(dirs: readonly WorkflowRoleDirectoryInput[], extension = false): Record<string, AgentDefinition> {
   const files = scanRoleFiles(dirs, extension);
+  const starterFiles = files.filter(({ source }) => source.builtin === true);
+  const regularFiles = files.filter(({ source }) => source.builtin !== true);
   if (extension) {
     const byName = new Map<string, RoleFile[]>();
-    for (const file of files) byName.set(file.name, [...(byName.get(file.name) ?? []), file]);
+    for (const file of regularFiles) byName.set(file.name, [...(byName.get(file.name) ?? []), file]);
     for (const [name, matches] of byName) if (matches.length > 1) fail("INVALID_METADATA", `Duplicate extension role "${name}": ${matches.map(({ path, source }) => `${roleDirectoryLabel(source)} role directory "${source.path}" (${path})`).join("; ")}`);
   }
-  return Object.fromEntries(files.map(({ name, path, source }) => {
+  const read = (roleFiles: readonly RoleFile[]): Record<string, AgentDefinition> => Object.fromEntries(roleFiles.map(({ name, path, source }) => {
     try { return [name, parseRoleMarkdown(readFileSync(path, "utf8"), true, path)]; }
     catch (error) {
       if (extension) fail("INVALID_METADATA", `${roleDirectoryLabel(source)} role directory "${source.path}" contains invalid role "${name}" at "${path}": ${errorText(error)}`);
       throw error;
     }
   }));
+  return extension ? { ...read(starterFiles), ...read(regularFiles) } : read(files);
 }
 export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), projectTrusted = true, extensionRoleDirectories: readonly WorkflowRoleDirectoryInput[] = registeredWorkflowRoleDirectoryRegistrations()): Readonly<Record<string, AgentDefinition>> {
   return deepFreeze({ ...readRoleDefinitions(extensionRoleDirectories, true), ...readRoleDefinitions(workflowRoleDirectories(agentDir)), ...(projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))) : {}) });

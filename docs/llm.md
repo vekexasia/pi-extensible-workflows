@@ -266,7 +266,7 @@ Use `roleDirectories` for extension-provided role defaults. Paths must be absolu
 roleDirectories: [new URL("./roles/", import.meta.url)]
 ```
 
-Extension roles are defaults. Matching global and trusted project roles override them. Duplicate role names across extension directories are rejected.
+Extension roles are defaults. The full precedence order is starter roles < user extension roles < global roles < trusted project roles. Regular extension roles silently override matching starter roles; duplicate role names across regular extension directories are rejected.
 
 ## Create and modify roles
 

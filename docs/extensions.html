@@ -80,7 +80,7 @@
       </section>
       <section id="starter">
         <h2>Bundled starter</h2>
-        <p>The core package loads <code>dist/starter/index.js</code> next to the workflow host. It registers one function, five packaged roles, and five dynamic model aliases. The package manifest also ships slash-command prompts (<code>/scout</code>, <code>/parallel-scout</code>, <code>/oracle</code>, <code>/council</code>, <code>/review</code>, <code>/parallel-review</code>, <code>/review-loop</code>, <code>/deep-research</code>) that launch subagents or workflows with these roles; prompts are package-level and are not removed by the starter filter.</p>
+        <p>The core package loads <code>dist/starter/index.js</code> next to the workflow host. It registers one function, five packaged roles, and five dynamic model aliases. The package manifest also ships slash-command prompts (<code>/scout</code>, <code>/parallel-scout</code>, <code>/oracle</code>, <code>/council</code>, <code>/review</code>, <code>/parallel-review</code>, <code>/review-loop</code>, <code>/deep-research</code>) that launch subagents or workflows with these roles; prompts are package-level and are not removed by the starter filter. Bundled starter roles are low-precedence fallbacks: role precedence is <code>starter roles &lt; user extension roles &lt; global roles &lt; trusted project roles</code>.</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Piece</th><th>Name</th><th>Default</th></tr></thead>
           <tbody>
@@ -97,7 +97,7 @@
         <div class="table-wrap"><table>
           <thead><tr><th>Piece</th><th>Override</th><th>Replace</th></tr></thead>
           <tbody>
-            <tr><td>Roles</td><td>A global or trusted project role file with the same name wins. <code>piewf doctor</code> shows <code>overrides</code> / <code>overriddenBy</code>.</td><td>Unnecessary if you only need different policy.</td></tr>
+            <tr><td>Roles</td><td>A regular user extension role overrides a bundled starter role with the same name; global or trusted project roles override extension roles. <code>piewf doctor</code> shows <code>overrides</code> / <code>overriddenBy</code>.</td><td>Unnecessary if you only need different policy.</td></tr>
             <tr><td>Aliases</td><td>Static <code>modelAliases</code> in workflow settings shadow the dynamic resolvers. The resolver is not called.</td><td>Unnecessary if you only need a concrete target.</td></tr>
             <tr><td><code>reviewLoop</code></td><td>None. A second function with the same name is <code>GLOBAL_COLLISION</code>.</td><td>Disable the starter extension, then register your own function.</td></tr>
           </tbody>
@@ -139,7 +139,7 @@
             <tr><td><code>modelAliases</code></td><td>record of <code>WorkflowModelAlias</code></td><td>Optional named dynamic model resolvers. Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>; names are unique across extensions.</td></tr>
             <tr><td><code>agentSetupHooks</code></td><td>record of <code>AgentSetupHook</code></td><td>Optional trusted hooks. Hook names must be identifiers and unique across extensions.</td></tr>
             <tr><td><code>agentAttemptActions</code></td><td>record of <code>AgentAttemptAction</code></td><td>Optional collision-checked actions for selected agents in <code>/workflow</code> and standalone runs in <code>/subagents</code>. Every action requires <code>label</code>, <code>visible</code>, and <code>run</code>; standalone participation additionally requires both <code>visibleStandalone</code> and <code>runStandalone</code>.</td></tr>
-            <tr><td><code>roleDirectories</code></td><td>array of absolute paths or <code>file:</code> URLs</td><td>Optional packaged role directories. They are scanned as extension defaults; standard global and trusted project roles override matching names, while duplicate extension role names are rejected.</td></tr>
+            <tr><td><code>roleDirectories</code></td><td>array of absolute paths or <code>file:</code> URLs</td><td>Optional packaged role directories. They are scanned as extension defaults; bundled starter roles are lower precedence than regular extension roles, and global and trusted project roles override extension roles. Duplicate names among regular extension directories are rejected.</td></tr>
           </tbody>
         </table></div>
         <p>Unknown top-level keys are rejected. The removed <code>workflows</code> and <code>variables</code> formats are not accepted. Function names cannot be reserved globals such as <code>agent</code>, <code>args</code>, <code>JSON</code>, <code>extensions</code>, or <code>workflow_catalog</code>, and names beginning with <code>__pi_extensible_workflows_</code> are rejected. Duplicate function names across extensions are <code>GLOBAL_COLLISION</code>; duplicate hook or model-alias names are <code>DUPLICATE_NAME</code> errors.</p>
