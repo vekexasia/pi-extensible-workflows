@@ -51,7 +51,7 @@ void test("registers the starter function, aliases, and packaged roles", async (
       availableModels: new Set(["example/root"]),
       signal: new AbortController().signal,
     }),
-    { "developer-model": "example/root", "reviewer-model": "example/root" },
+    { "developer-model": "example/root", "reviewer-model": "example/root", "scout-model": "example/root", "oracle-model": "example/root", "researcher-model": "example/root" },
   );
 
   const registration = registeredWorkflowRoleDirectoryRegistrations();
@@ -126,7 +126,7 @@ void test("static settings aliases shadow starter dynamic aliases", async () => 
       },
       new Set(Object.keys(catalog.modelAliases ?? {})),
     );
-    assert.deepEqual(resolved, { "developer-model": "dynamic/root" });
+    assert.deepEqual(resolved, { "developer-model": "dynamic/root", "scout-model": "dynamic/root", "oracle-model": "dynamic/root", "researcher-model": "dynamic/root" });
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

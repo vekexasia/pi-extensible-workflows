@@ -115,6 +115,7 @@ export interface AgentExecutionRoot {
   agentSetupHooks?: readonly RegisteredAgentSetupHook[];
   agentResourcePolicy?: () => AgentResourcePolicy | Promise<AgentResourcePolicy>;
   runContext?: Readonly<WorkflowRunContext>;
+  onResourceWarning?: (message: string) => void;
 }
 export interface AgentToolCallProgress { id: string; name: string; state: "running" | "completed" | "failed" }
 export interface AgentProgress { accounting: AgentAccounting; toolCalls: readonly AgentToolCallProgress[]; state?: WorkflowAgentSessionState; activity?: AgentActivity; lastEventAt?: number; persist: boolean }
@@ -858,6 +859,7 @@ export function getAgentAttempts(error: unknown): readonly AgentAttempt[] | unde
 }
 export class WorkflowAgentExecutor {
   private readonly transport: AgentTransport;
+  private readonly warnedRoleTools = new Set<string>();
   constructor(private readonly root: AgentExecutionRoot, transport: AgentTransport = localAgentTransport) { this.transport = transport; }
   setRunContext(runContext: Readonly<WorkflowRunContext>): void { this.root.runContext = runContext; }
 
@@ -868,7 +870,10 @@ export class WorkflowAgentExecutor {
     const candidateTools = inheritedTools !== undefined ? [...inheritedTools] : [...this.root.tools];
     if (inheritedTools === undefined) for (const pattern of roleDefinition?.tools ?? []) {
       const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
-      if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !this.root.tools.has(body)) throw new WorkflowError("UNKNOWN_TOOL", `Unknown tool for role ${roleName ?? "agent"}: ${body}`);
+      if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !this.root.tools.has(body)) {
+        const key = `${roleName ?? "agent"}:${body}`;
+        if (!this.warnedRoleTools.has(key)) { this.warnedRoleTools.add(key); this.root.onResourceWarning?.(`Tool not available in this session for role ${roleName ?? "agent"}: ${body}. The agent runs without it.`); }
+      }
     }
     const selectorLayers = [
       this.root.resourceSelectors?.tools,

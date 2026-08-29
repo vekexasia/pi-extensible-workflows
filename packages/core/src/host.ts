@@ -178,6 +178,10 @@ function deliver(pi: WorkflowExtensionAPI, content: string): void {
   if (typeof pi.sendMessage !== "function") return;
   pi.sendMessage({ customType: "workflow", content, display: true }, { deliverAs: "followUp", triggerTurn: true });
 }
+function deliverWarning(pi: WorkflowExtensionAPI, content: string): void {
+  if (typeof pi.sendMessage !== "function") return;
+  pi.sendMessage({ customType: "workflow", content: `Warning: ${content}`, display: true }, { deliverAs: "steer" });
+}
 
 type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
 
@@ -841,7 +845,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     });
     catalogRegistered = true;
   };
-  const createAgentExecutor = (root: Omit<import("./agent-execution.js").AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks() }, transport);
+  const createAgentExecutor = (root: Omit<import("./agent-execution.js").AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks(), onResourceWarning: (message) => { deliverWarning(pi, message); } }, transport);
   const activeSnapshotTools = (tools: readonly string[], active: ReadonlySet<string> | "session") => active === "session"
     ? new Set(tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog"))
     : new Set(tools.filter((tool) => active.has(tool) || tool === "workflow_catalog"));

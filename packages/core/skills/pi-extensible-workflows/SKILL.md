@@ -138,7 +138,7 @@ Registered extension functions receive `withWorktree` in context and can compose
 ## Rules
 
 - Workflow run does not inherit any of the main agent context. Keep that in mind when creating agent's prompts. 
-- When specifying a model. use `pi --list-models "search term"` to find the proper provider and model name.
+- `model` must be a configured alias or the canonical `provider/model[:thinking]` form. Aliases are listed by `workflow_catalog`; prefer a suitable alias over a hardcoded model. Never guess a model identifier: verify unknown names with `pi --list-models "search term"` first, then use the fully qualified identifier it returns.
 - Use `log(messageString)` for brief operator status and `phase(phaseName)` to signal the start of another phase.
 - Role-file defaults apply first. Restrict selectors with `["!*", "read", "grep"]`. `tools: ["*"]` turns everything back on.
 - Use `parallel()` for independent tasks with different flows and `pipeline()` when every keyed item follows the same ordered stages; do not duplicate identical chains in `parallel()`. Signatures are `parallel(operationName, tasksRecord)` and `pipeline(operationName, itemsRecord, stagesRecord)`; keys are stable task, item, and stage names.

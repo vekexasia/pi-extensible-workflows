@@ -152,6 +152,7 @@ export interface SubagentManagerDependencies {
   readonly liveness?: SubagentLiveness;
   readonly notify?: (notification: Readonly<SubagentNotification>) => void | Promise<void>;
   readonly onStatus?: (status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void;
+  readonly onResourceWarning?: (message: string) => void;
 }
 export interface SubagentManager {
   run(request: Readonly<SubagentRunRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;

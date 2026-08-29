@@ -195,6 +195,7 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     agentSetupHooks: registry.agentSetupHooks(),
     agentResourcePolicy: () => structuredClone(resourcePolicy),
     runContext: run,
+    ...(dependencies.onResourceWarning ? { onResourceWarning: dependencies.onResourceWarning } : {}),
   };
 }
 

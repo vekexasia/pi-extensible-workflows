@@ -138,13 +138,14 @@ function notificationContent(notification: SubagentNotification): string {
   if (notification.state === "completed") return `Subagent ${identity} completed. Inspect it with subagents_inspect({ id: "${notification.id}" }).`;
   return `Subagent ${identity} failed: ${notification.error?.message ?? "unknown error"}. Inspect it with subagents_inspect({ id: "${notification.id}" }).`;
 }
-function managerDependencies(options: SubagentsExtensionOptions, activeTools: (() => readonly string[]) | undefined, notify: ((notification: SubagentNotification) => void | Promise<void>) | undefined, onStatus: ((status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void) | undefined): SubagentsExtensionOptions["managerDependencies"] {
+function managerDependencies(options: SubagentsExtensionOptions, activeTools: (() => readonly string[]) | undefined, notify: ((notification: SubagentNotification) => void | Promise<void>) | undefined, onStatus: ((status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void) | undefined, onResourceWarning?: (message: string) => void): SubagentsExtensionOptions["managerDependencies"] {
   const dependencies = options.managerDependencies;
   const next = {
     ...(dependencies ?? {}),
     ...(activeTools !== undefined && dependencies?.getActiveTools === undefined ? { getActiveTools: activeTools } : {}),
     ...(notify !== undefined && dependencies?.notify === undefined ? { notify } : {}),
     ...(onStatus !== undefined && dependencies?.onStatus === undefined ? { onStatus } : {}),
+    ...(onResourceWarning !== undefined && dependencies?.onResourceWarning === undefined ? { onResourceWarning } : {}),
   };
   return Object.keys(next).length === 0 ? dependencies : next;
 }
@@ -153,8 +154,8 @@ function storageDirectory(options: SubagentsExtensionOptions): string {
   return dependencies?.storageDir ?? join(dependencies?.agentDir ?? getAgentDir(), "subagents");
 }
 
-export function createSubagentsExtension(options: SubagentsExtensionOptions = {}, activeTools?: () => readonly string[], notify?: (notification: SubagentNotification) => void | Promise<void>, onStatus?: (status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void): SubagentsExtension {
-  const manager = options.manager ?? createSubagentManager(managerDependencies(options, activeTools, notify, onStatus));
+export function createSubagentsExtension(options: SubagentsExtensionOptions = {}, activeTools?: () => readonly string[], notify?: (notification: SubagentNotification) => void | Promise<void>, onStatus?: (status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void, onResourceWarning?: (message: string) => void): SubagentsExtension {
+  const manager = options.manager ?? createSubagentManager(managerDependencies(options, activeTools, notify, onStatus, onResourceWarning));
   const extension = { manager, tools: createSubagentTools(manager) };
   return extension;
 }
@@ -166,8 +167,11 @@ export function registerSubagentsExtension(pi: SubagentsExtensionAPI, options: S
   const notify = sendMessage === undefined ? undefined : (notification: SubagentNotification): void => {
     sendMessage.call(pi, { customType: "subagents", content: notificationContent(notification), display: true, details: notification }, { deliverAs: "steer", triggerTurn: true });
   };
+  const onResourceWarning = sendMessage === undefined ? undefined : (message: string): void => {
+    sendMessage.call(pi, { customType: "subagents", content: `Warning: ${message}`, display: true }, { deliverAs: "steer" });
+  };
   const widget = createSubagentBackgroundWidget();
-  const extension = createSubagentsExtension(options, activeTools, notify, (status, request) => { widget.update(status, request); const registry = loadingRegistry(); if (typeof registry.observeSubagentStatus === "function") registry.observeSubagentStatus(status, request); });
+  const extension = createSubagentsExtension(options, activeTools, notify, (status, request) => { widget.update(status, request); const registry = loadingRegistry(); if (typeof registry.observeSubagentStatus === "function") registry.observeSubagentStatus(status, request); }, onResourceWarning);
   for (const tool of extension.tools) pi.registerTool(tool);
   if (pi.registerCommand !== undefined) registerSubagentNavigator(pi.registerCommand.bind(pi), extension.manager, storageDirectory(options), options.clipboard);
   if (pi.on !== undefined) {

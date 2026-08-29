@@ -330,7 +330,7 @@ function readRoleDefinitions(dirs: readonly WorkflowRoleDirectoryInput[], extens
 export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), projectTrusted = true, extensionRoleDirectories: readonly WorkflowRoleDirectoryInput[] = registeredWorkflowRoleDirectoryRegistrations()): Readonly<Record<string, AgentDefinition>> {
   return deepFreeze({ ...readRoleDefinitions(extensionRoleDirectories, true), ...readRoleDefinitions(workflowRoleDirectories(agentDir)), ...(projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))) : {}) });
 }
-function validateRolePolicies(definitions: Readonly<Record<string, AgentDefinition>>, roles: readonly string[], availableModels: ReadonlySet<string>, rootTools: ReadonlySet<string>, aliases: Readonly<Record<string, string>> = {}, knownModels = availableModels, settingsPath?: string): void {
+function validateRolePolicies(definitions: Readonly<Record<string, AgentDefinition>>, roles: readonly string[], availableModels: ReadonlySet<string>, aliases: Readonly<Record<string, string>> = {}, knownModels = availableModels, settingsPath?: string): void {
   for (const role of roles) {
     const definition = definitions[role];
     if (!definition) continue;
@@ -341,10 +341,8 @@ function validateRolePolicies(definitions: Readonly<Record<string, AgentDefiniti
         fail("UNKNOWN_MODEL", `Unknown model for role ${role}: ${resolved}`);
       }
     }
-    for (const pattern of definition.tools ?? []) {
-      const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
-      if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !rootTools.has(body)) fail("UNKNOWN_TOOL", `Unknown tool for role ${role}: ${body}`);
-    }
+    // Role tools absent from the session are tolerated at launch: the runtime resolve emits a
+    // warning and the agent runs without them. Doctor still reports unmatched patterns.
   }
 }
 
@@ -840,7 +838,7 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   const knownModels = context.knownModels ?? context.availableModels;
   const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)), modelAliases: aliases, knownModels, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) }, [], metadata);
   const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
-  validateRolePolicies(agentDefinitions, roleNames, context.availableModels, context.rootTools, aliases, knownModels, context.settingsPath);
+  validateRolePolicies(agentDefinitions, roleNames, context.availableModels, aliases, knownModels, context.settingsPath);
   return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames };
 }
 

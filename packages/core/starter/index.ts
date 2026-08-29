@@ -15,6 +15,15 @@ const extension: WorkflowExtension = {
     "developer-model": {
       resolve: ({ rootModel }) => `${rootModel.provider}/${rootModel.model}`,
     },
+    "scout-model": {
+      resolve: ({ rootModel }) => `${rootModel.provider}/${rootModel.model}`,
+    },
+    "oracle-model": {
+      resolve: ({ rootModel }) => `${rootModel.provider}/${rootModel.model}`,
+    },
+    "researcher-model": {
+      resolve: ({ rootModel }) => `${rootModel.provider}/${rootModel.model}`,
+    },
   },
   roleDirectories: [new URL("./roles/", import.meta.url)],
 };

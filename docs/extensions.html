@@ -58,7 +58,7 @@
         <div class="table-wrap"><table>
           <thead><tr><th>Feature</th><th>Package path</th><th>What exclusion removes</th></tr></thead>
           <tbody>
-            <tr><td><code>reviewLoop</code> starter</td><td><code>dist/starter/index.js</code></td><td>The <code>reviewLoop</code> function, packaged developer/reviewer roles, and dynamic model aliases.</td></tr>
+            <tr><td><code>reviewLoop</code> starter</td><td><code>dist/starter/index.js</code></td><td>The <code>reviewLoop</code> function, packaged developer/reviewer/scout/oracle/researcher roles, dynamic model aliases, and role-driven slash-command prompts.</td></tr>
             <tr><td>Standalone Subagents</td><td><code>dist/subagents/index.js</code></td><td>The five <code>subagents_*</code> tools and <code>/subagents</code>.</td></tr>
             <tr><td>Trajectory</td><td><code>dist/trajectory/index.js</code></td><td>The browser server and automatic attachment. <code>/workflow trajectory</code> remains available and reports that Trajectory is disabled.</td></tr>
           </tbody>
@@ -80,14 +80,17 @@
       </section>
       <section id="starter">
         <h2>Bundled starter</h2>
-        <p>The core package loads <code>dist/starter/index.js</code> next to the workflow host. It registers one function, two packaged roles, and two dynamic model aliases:</p>
+        <p>The core package loads <code>dist/starter/index.js</code> next to the workflow host. It registers one function, five packaged roles, and five dynamic model aliases. The package manifest also ships slash-command prompts (<code>/scout</code>, <code>/parallel-scout</code>, <code>/oracle</code>, <code>/council</code>, <code>/review</code>, <code>/parallel-review</code>, <code>/review-loop</code>, <code>/deep-research</code>) that launch subagents or workflows with these roles; prompts are package-level and are not removed by the starter filter.</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Piece</th><th>Name</th><th>Default</th></tr></thead>
           <tbody>
             <tr><td>Function</td><td><code>reviewLoop</code></td><td>Developer then reviewer until <code>pass</code> or <code>maxIterations</code> (default 5).</td></tr>
             <tr><td>Role</td><td><code>developer</code></td><td><code>model: developer-model</code>. No tool restriction.</td></tr>
-            <tr><td>Role</td><td><code>reviewer</code></td><td><code>model: reviewer-model</code>. Tools <code>read</code>, <code>grep</code>, <code>find</code>, <code>ls</code>.</td></tr>
-            <tr><td>Alias</td><td><code>developer-model</code>, <code>reviewer-model</code></td><td>Resolve to the launching session model when settings do not define them.</td></tr>
+            <tr><td>Role</td><td><code>reviewer</code></td><td><code>model: reviewer-model</code>. Tools <code>read</code>, <code>grep</code>, <code>find</code>, <code>ls</code>. Evidence-filtered P0/P1/P2 findings and a merge verdict.</td></tr>
+            <tr><td>Role</td><td><code>scout</code></td><td><code>model: scout-model</code>. Tools <code>read</code>, <code>grep</code>, <code>find</code>, <code>ls</code>. Read-only recon brief.</td></tr>
+            <tr><td>Role</td><td><code>oracle</code></td><td><code>model: oracle-model</code>. Tools <code>read</code>, <code>grep</code>, <code>find</code>, <code>ls</code>, <code>bash</code>. Second opinion; no edits.</td></tr>
+            <tr><td>Role</td><td><code>researcher</code></td><td><code>model: researcher-model</code>. All session tools except <code>edit</code>, <code>write</code>, <code>bash</code>; uses web tools when present.</td></tr>
+            <tr><td>Alias</td><td><code>developer-model</code>, <code>reviewer-model</code>, <code>scout-model</code>, <code>oracle-model</code>, <code>researcher-model</code></td><td>Resolve to the launching session model when settings do not define them.</td></tr>
           </tbody>
         </table></div>
         <p>Not everything is overridable the same way.</p>

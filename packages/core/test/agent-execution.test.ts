@@ -405,8 +405,12 @@ void test("resolves explicit capabilities without widening least privilege", () 
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", model: "missing/model" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
   assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "reviewer", tools: ["*"] }).tools, ["read", "grep", "find", "bash"]);
-  const broken = new WorkflowAgentExecutor({ ...root, agentDefinitions: { broken: { tools: ["write"] } } }, testTransport(async () => { throw new Error("must not launch"); }));
-  assert.throws(() => broken.resolve({ label: "a", workflowName: "w", role: "broken" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
+  const warnings: string[] = [];
+  const broken = new WorkflowAgentExecutor({ ...root, agentDefinitions: { broken: { tools: ["write"] } }, onResourceWarning: (message) => { warnings.push(message); } }, testTransport(async () => { throw new Error("must not launch"); }));
+  assert.deepEqual(broken.resolve({ label: "a", workflowName: "w", role: "broken" }).tools, ["read", "grep", "find", "bash"]);
+  assert.deepEqual(warnings, ["Tool not available in this session for role broken: write. The agent runs without it."]);
+  broken.resolve({ label: "a", workflowName: "w", role: "broken" });
+  assert.equal(warnings.length, 1);
 });
 void test("applies call-level context files over the role file", async () => {
   const basePolicy: AgentResourcePolicy = { globalSettingsPath: "/g", projectSettingsPath: "/p", projectTrusted: true, global: { skills: [], extensions: [] }, project: { skills: [], extensions: [] }, effective: { skills: ["global"], extensions: ["/global.ts"] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { skills: ["global"], extensions: ["/global.ts"] }, project: {} } };
