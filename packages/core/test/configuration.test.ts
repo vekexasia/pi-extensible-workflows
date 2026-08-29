@@ -251,9 +251,9 @@ void test("workflow extension wires the background widget from global settings",
     return { renderers, shortcuts };
   };
 
-  assert.deepEqual(install(undefined), { renderers: ["workflow-log", "piewf-run-receipt"], shortcuts: ["alt+o"] });
-  assert.deepEqual(install(JSON.stringify({ backgroundWidget: false })), { renderers: ["workflow-log"], shortcuts: [] });
-  assert.deepEqual(install("{"), { renderers: ["workflow-log", "piewf-run-receipt"], shortcuts: ["alt+o"] });
+  assert.deepEqual(install(undefined), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: ["alt+o"] });
+  assert.deepEqual(install(JSON.stringify({ backgroundWidget: false })), { renderers: ["workflow-log", "workflow-warning"], shortcuts: [] });
+  assert.deepEqual(install("{"), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: ["alt+o"] });
 });
 
 void test("composes trusted resource selectors and ignores untrusted project selectors", () => {

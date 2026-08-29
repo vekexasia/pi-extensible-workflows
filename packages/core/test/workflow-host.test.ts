@@ -214,6 +214,7 @@ void test("keeps unavailable role tool warnings out of model context", async () 
   const pi = testExtensionApi({
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
     getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read"],
+    registerEntryRenderer() {},
     sendMessage(message) { messages.push(message.content); },
   });
   workflowExtension({ ...pi, appendEntry(type, data) { entries.push({ type, data }); } }, home, async () => {}, testTransport(async (): Promise<TestPiSession> => ({
