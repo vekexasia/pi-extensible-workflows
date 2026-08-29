@@ -169,9 +169,34 @@ function filterContextFiles(base: readonly { path: string; content: string }[], 
   });
 }
 type NativePromptTemplateModule = { expandPromptTemplate(text: string, templates: readonly { name: string; content: string }[]): string };
+type PiCodingAgentModule = { readonly getPackageDir?: unknown };
+type PiPackageDirectoryResolution = { readonly directory?: string; readonly error?: string };
+function isPackageDirectoryProvider(value: unknown): value is () => unknown { return typeof value === "function"; }
+let piCodingAgentModule: Promise<PiPackageDirectoryResolution> | undefined;
+function loadPiPackageDirectory(): Promise<PiPackageDirectoryResolution> {
+  return piCodingAgentModule ??= import("@earendil-works/pi-coding-agent").then((module: PiCodingAgentModule) => {
+    const provider = module.getPackageDir;
+    if (provider === undefined) return {};
+    if (!isPackageDirectoryProvider(provider)) return { error: "@earendil-works/pi-coding-agent exports a non-callable getPackageDir" };
+    try {
+      const directory = Reflect.apply(provider, module, []);
+      return typeof directory === "string" && directory.trim() ? { directory } : { error: "@earendil-works/pi-coding-agent returned an invalid package directory" };
+    } catch (error) {
+      return { error: `getPackageDir failed: ${errorText(error)}` };
+    }
+  }).catch((error: unknown) => ({ error: `could not load @earendil-works/pi-coding-agent package metadata: ${errorText(error)}` }));
+}
 let nativePromptTemplateModule: Promise<NativePromptTemplateModule> | undefined;
-function loadNativePromptTemplateModule(): Promise<NativePromptTemplateModule> {
-  return nativePromptTemplateModule ??= import(resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core/prompt-templates.js")).then((module) => module as NativePromptTemplateModule);
+async function loadNativePromptTemplateModule(): Promise<NativePromptTemplateModule> {
+  const packageDirectory = await loadPiPackageDirectory();
+  let promptTemplatePath: string | undefined;
+  if (packageDirectory.directory) {
+    const candidate = resolve(packageDirectory.directory, "dist/core/prompt-templates.js");
+    if (existsSync(candidate)) promptTemplatePath = candidate;
+  }
+  promptTemplatePath ??= resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core/prompt-templates.js");
+  const packageDirectoryError = packageDirectory.error ? ` Package directory lookup failed: ${packageDirectory.error}` : "";
+  return nativePromptTemplateModule ??= import(promptTemplatePath).then((module) => module as NativePromptTemplateModule).catch((error: unknown) => { throw new Error(`Could not load Pi prompt templates.${packageDirectoryError}`, { cause: error }); });
 }
 async function expandPromptTemplateForInspection(text: string, templates: readonly { name: string; content: string }[]): Promise<string> {
   return (await loadNativePromptTemplateModule()).expandPromptTemplate(text, templates);
@@ -717,46 +742,56 @@ function packageRoot(start: string): string | undefined {
   for (;;) {
     const candidates = [current, join(current, "..", "@earendil-works", "pi-coding-agent"), join(current, "..", "pi-coding-agent")];
     for (const candidate of candidates) {
-      try {
-        const packageJson: unknown = JSON.parse(readFileSync(join(candidate, "package.json"), "utf8"));
-        if (object(packageJson) && typeof packageJson.name === "string" && packageJson.name === "@earendil-works/pi-coding-agent") return candidate;
-      } catch { /* Continue to the next package candidate. */ }
+      const packageJsonPath = join(candidate, "package.json");
+      if (!existsSync(packageJsonPath)) continue;
+      const packageJson: unknown = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+      if (object(packageJson) && typeof packageJson.name === "string" && packageJson.name === "@earendil-works/pi-coding-agent") return candidate;
     }
     const parent = dirname(current);
     if (parent === current) return undefined;
     current = parent;
   }
 }
+function piPackageEntrypoint(root: string): string {
+  const packageJson: unknown = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+  if (!object(packageJson)) throw new Error("the @earendil-works/pi-coding-agent package does not declare a pi CLI");
+  const bin = packageJson.bin;
+  const cli = typeof bin === "string" ? bin : object(bin) && typeof bin.pi === "string" ? bin.pi : undefined;
+  if (!cli) throw new Error("the @earendil-works/pi-coding-agent package does not declare a pi CLI");
+  const entrypoint = resolve(root, cli);
+  if (!existsSync(entrypoint)) throw new Error(`the originating Pi CLI entrypoint is unavailable: ${entrypoint}`);
+  return entrypoint;
+}
 type PiRuntimeResolution = { runtime?: PiRuntimeLaunchInfo; error?: string };
-function resolvePiRuntime(): PiRuntimeResolution {
+async function resolvePiRuntime(): Promise<PiRuntimeResolution> {
   const executableName = basename(process.execPath).toLowerCase();
   const bunBinary = ["$bunfs", "~BUN", "%7EBUN"].some((marker) => import.meta.url.includes(marker)) || Boolean(process.versions.bun && !["bun", "bun.exe"].includes(executableName));
   if (bunBinary) return { runtime: Object.freeze({ executable: process.execPath }) };
+  const errors: string[] = [];
+  const packageDirectory = await loadPiPackageDirectory();
+  if (packageDirectory.error) errors.push(packageDirectory.error);
+  if (packageDirectory.directory) {
+    try { return { runtime: Object.freeze({ executable: process.execPath, entrypoint: piPackageEntrypoint(packageDirectory.directory) }) }; }
+    catch (error) { errors.push(`package directory resolution failed: ${errorText(error)}`); }
+  }
   try {
     const packageEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
     const root = packageRoot(packageEntry);
     if (!root) throw new Error("could not locate the @earendil-works/pi-coding-agent package root");
-    const packageJson: unknown = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-    if (!object(packageJson)) throw new Error("the @earendil-works/pi-coding-agent package does not declare a pi CLI");
-    const bin = packageJson.bin;
-    const cli = typeof bin === "string" ? bin : object(bin) && typeof bin.pi === "string" ? bin.pi : undefined;
-    if (!cli) throw new Error("the @earendil-works/pi-coding-agent package does not declare a pi CLI");
-    const entrypoint = resolve(root, cli);
-    if (!existsSync(entrypoint)) throw new Error(`the originating Pi CLI entrypoint is unavailable: ${entrypoint}`);
-    return { runtime: Object.freeze({ executable: process.execPath, entrypoint }) };
+    return { runtime: Object.freeze({ executable: process.execPath, entrypoint: piPackageEntrypoint(root) }) };
   } catch (error) {
-    return { error: errorText(error) };
+    errors.push(`import.meta.resolve fallback failed: ${errorText(error)}`);
+    return { error: errors.join("; ") };
   }
 }
 const piRuntimeResolution = resolvePiRuntime();
-const piRuntime = piRuntimeResolution.runtime;
-const piRuntimeError = piRuntimeResolution.error;
 function workflowAgentPrompt(task: string, options: AgentExecutionOptions, attempt: number, previousError?: string): string {
   const basePrompt = [`Workflow: ${options.workflowName}`, `Agent: ${options.label}`, options.phase ? `Phase: ${options.phase}` : "", options.parent ? `Parent: ${options.parent}` : "", "You own this task and any direct child agents you create. Return child results to your parent; do not leave descendants running.", options.schema ? "Call workflow_result exactly once with the final result matching its schema. Do not return prose as the final result." : "Call workflow_result exactly once with { result: \"final response\" } to submit the final response. Do not return prose as the final result.", attempt > 1 ? `Retry attempt ${String(attempt)}. Previous state: ${options.retryState ?? previousError ?? "failed attempt"}` : ""].filter(Boolean).join("\n");
   const instruction = options.budget?.instruction();
   return `${basePrompt}\n\nTask:\n${task}${instruction ? `\n\n${instruction}` : ""}`;
 }
-function preparedAgentSession(input: SessionInput, initialPrompt?: string): Readonly<PreparedAgentSession> {
+async function preparedAgentSession(input: SessionInput, initialPrompt?: string): Promise<Readonly<PreparedAgentSession>> {
+  const { runtime: piRuntime, error: piRuntimeError } = await piRuntimeResolution;
   const systemPromptPath = input.systemPrompt === undefined ? workflowSystemPromptPath(input.cwd, input.agentDir ?? getAgentDir(), input.resourcePolicy?.projectTrusted ?? true) : undefined;
   const prepared = {
     cwd: input.cwd, model: Object.freeze({ ...input.model }), tools: Object.freeze([...input.tools]), sessionLabel: input.sessionLabel, ...(initialPrompt === undefined ? {} : { initialPrompt }),
@@ -807,17 +842,17 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
   }
   const resourcePolicyCeiling = resourcePolicy ? structuredClone(resourcePolicy) : undefined;
   const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
-  const setup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, prepared: preparedAgentSession(sessionInput, task), transport };
+  const setup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, prepared: await preparedAgentSession(sessionInput, task), transport };
   const base = fallbackSetupContext(root, options, setupSignal);
   const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal, ...(base.tuiIndex === undefined ? {} : { tuiIndex: base.tuiIndex }), ...(base.tuiLabel === undefined ? {} : { tuiLabel: base.tuiLabel }), ...(inspection ? { mode: "inspection" as const } : {}) });
   const hookNames: string[] = [];
   for (const hook of [...(root.agentSetupHooks ?? [])].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))) {
     if (setupSignal.aborted) return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error: new WorkflowError("CANCELLED", "Agent cancelled") } };
     try { await hook.setup(setup, context); } catch (error) {
-      setup.prepared = preparedAgentSession(setup.sessionInput, task);
+      setup.prepared = await preparedAgentSession(setup.sessionInput, task);
       return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error: setupSignal.reason !== undefined ? new WorkflowError("CANCELLED", "Agent cancelled") : error, hook: hook.name } };
     }
-    setup.prepared = preparedAgentSession(setup.sessionInput, task);
+    setup.prepared = await preparedAgentSession(setup.sessionInput, task);
     hookNames.push(hook.name);
     if (setupSignal.reason !== undefined) return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error: new WorkflowError("CANCELLED", "Agent cancelled") } };
   }
@@ -833,10 +868,10 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
     const outsideTool = widened ?? setup.sessionInput.tools.find((tool) => !root.tools.has(tool) && !customToolNames.has(tool));
     if (outsideTool) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the prepared agent policy: ${outsideTool}`);
   } catch (error) {
-    setup.prepared = preparedAgentSession(setup.sessionInput, task);
+    setup.prepared = await preparedAgentSession(setup.sessionInput, task);
     return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error } };
   }
-  setup.prepared = preparedAgentSession(setup.sessionInput, inspection ? task : workflowAgentPrompt(setup.prompt, options, attempt, previousError));
+  setup.prepared = await preparedAgentSession(setup.sessionInput, inspection ? task : workflowAgentPrompt(setup.prompt, options, attempt, previousError));
   return { setup, summary: agentSetupSummary(setup, hookNames) };
 }
 export async function prepareAgentSetupForInspection(root: AgentExecutionRoot, task: string, options: AgentExecutionOptions, transport: AgentTransport): Promise<PreparedAgentSetup> {
