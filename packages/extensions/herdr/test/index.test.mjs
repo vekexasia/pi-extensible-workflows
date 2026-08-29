@@ -8,7 +8,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import extension, { breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
-import { WORKFLOW_BLOCKED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
+import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_STARTED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
 
 const piRuntime = { executable: process.execPath, entrypoint: "/originating/pi-coding-agent/dist/cli.js" };
 function writeFixtureStream(res, id = "fixture") {
@@ -315,9 +315,10 @@ void test("reports terminal turns as idle", async () => {
   let releaseAgent;
   let releaseStarted = false;
   const releaseFinished = new Promise((resolve) => { releaseAgent = resolve; });
+  const register = (name, handler) => { const previous = handlers.get(name); handlers.set(name, previous ? async (...args) => { await previous(...args); await handler(...args); } : handler); };
   extension({
-    on(name, handler) { const previous = handlers.get(name); handlers.set(name, previous ? async (...args) => { await previous(...args); await handler(...args); } : handler); },
-    events: { on(name, handler) { handlers.set(name, handler); }, emit(name, data) { emitted.push({ name, data }); } },
+    on: register,
+    events: { on: register, emit(name, data) { emitted.push({ name, data }); } },
   }, {
     env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane", PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER: "1" },
     runner: async (args) => { calls.push([...args]); if (args[1] === "release-agent") { releaseStarted = true; await releaseFinished; } return ""; },
@@ -335,6 +336,13 @@ void test("reports terminal turns as idle", async () => {
   await handlers.get("agent_start")({}, context);
   await handlers.get("agent_settled")({}, context);
   assert.deepEqual(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "report-agent").map((args) => args[args.indexOf("--state") + 1]), ["working", "idle", "working", "idle", "working", "idle"]);
+  await handlers.get(WORKFLOW_RUN_STARTED_EVENT)({ runId: "background" });
+  await handlers.get("herdr:working")({ runId: "background", active: true });
+  await new Promise((resolve) => globalThis.setImmediate(resolve));
+  await handlers.get(WORKFLOW_RUN_COMPLETED_EVENT)({ runId: "background" });
+  await handlers.get("herdr:working")({ runId: "background", active: false });
+  await new Promise((resolve) => globalThis.setImmediate(resolve));
+  assert.deepEqual(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "report-agent").map((args) => args[args.indexOf("--state") + 1]), ["working", "idle", "working", "idle", "working", "idle", "working", "idle"]);
   const shutdown = handlers.get("session_shutdown")({ reason: "quit" }, context);
   assert.ok(shutdown instanceof Promise);
   await new Promise((resolve) => globalThis.setImmediate(resolve));
@@ -347,6 +355,27 @@ void test("reports terminal turns as idle", async () => {
   await shutdown;
 });
 
+void test("reports background workflow activity after the root agent settles", async () => {
+  const handlers = new Map(); const emitted = [];
+  const register = (name, handler) => { const previous = handlers.get(name); handlers.set(name, previous ? async (...args) => { await previous(...args); await handler(...args); } : handler); };
+  const pi = {
+    on: register,
+    events: {
+      on: register,
+      emit(name, data) { emitted.push({ name, data }); return handlers.get(name)?.(data); },
+    },
+  };
+  resetWorkflowRegistry();
+  extension(pi, { env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane" } });
+  await pi.events.emit("session_start", { reason: "startup" });
+  await pi.events.emit("agent_start", {});
+  await pi.events.emit("turn_end", { message: { content: [{ type: "toolCall", name: "workflow" }] } });
+  await pi.events.emit("agent_settled", {});
+  await pi.events.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run" });
+  assert.deepEqual(emitted.filter(({ name }) => name === "herdr:working"), [{ name: "herdr:working", data: { runId: "run", active: true } }]);
+  await pi.events.emit(WORKFLOW_RUN_COMPLETED_EVENT, { runId: "run" });
+  assert.deepEqual(emitted.filter(({ name }) => name === "herdr:working"), [{ name: "herdr:working", data: { runId: "run", active: true } }, { name: "herdr:working", data: { runId: "run", active: false } }]);
+});
 void test("resumes and terminally disposes the local session when initial Herdr pane launch fails", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-initial-launch-failure-"));
   try {

@@ -9,6 +9,9 @@ import type { AgentEndEvent, AgentStartEvent, ExtensionAPI, ExtensionContext, In
 import {
   WORKFLOW_BLOCKED_EVENT,
   WORKFLOW_RUN_COMPLETED_EVENT,
+  WORKFLOW_RUN_FAILED_EVENT,
+  WORKFLOW_RUN_RESUMED_EVENT,
+  WORKFLOW_RUN_STARTED_EVENT,
   WORKFLOW_RUN_STATE_CHANGED_EVENT,
   createHerdrAgentReporter,
   createToolTimingExtension,
@@ -501,6 +504,13 @@ function registerLifecycleHooks(pi: ExtensionAPI | null | undefined, runner: Her
   const pane = env.HERDR_PANE_ID;
   if (!pane || !hasExtensionHooks(pi)) return;
   pi.events.on(WORKFLOW_BLOCKED_EVENT, (data) => { if (isHerdrBlockedEvent(data)) pi.events.emit("herdr:blocked", data); });
+  const liveRunIds = new Set<string>();
+  const setLiveRun = (runId: string, active: boolean): void => { const before = liveRunIds.size; if (active) liveRunIds.add(runId); else liveRunIds.delete(runId); if (liveRunIds.size !== before) pi.events.emit("herdr:working", { runId, active }); };
+  pi.events.on(WORKFLOW_RUN_STARTED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, true); });
+  pi.events.on(WORKFLOW_RUN_RESUMED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, true); });
+  pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, false); });
+  pi.events.on(WORKFLOW_RUN_FAILED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, false); });
+  pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event) => { if (isRunEvent(event) && isLiveRunTerminalState((event as { state?: unknown }).state)) setLiveRun(event.runId, false); });
   if (env.PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER !== "1") return;
   const reporter = createHerdrAgentReporter(pane, "pi", runner);
   let sessionRef: SessionReference = {};
@@ -518,7 +528,7 @@ function registerLifecycleHooks(pi: ExtensionAPI | null | undefined, runner: Her
     sessionRef = { ...(typeof id === "string" ? { sessionId: id } : {}), ...(typeof path === "string" ? { sessionPath: path } : {}) };
     return sessionRef;
   };
-  const desiredState = (): LifecycleReport => blockedCount > 0 ? { state: "blocked", message: blockedMessage } : agentActive ? { state: "working", message: undefined } : { state: "idle", message: undefined };
+  const desiredState = (): LifecycleReport => blockedCount > 0 ? { state: "blocked", message: blockedMessage } : agentActive || liveRunIds.size > 0 ? { state: "working", message: undefined } : { state: "idle", message: undefined };
   const drainState = async (): Promise<void> => {
     while (queuedState) {
       const next = queuedState;
@@ -534,6 +544,7 @@ function registerLifecycleHooks(pi: ExtensionAPI | null | undefined, runner: Her
     queuedState = next;
     stateReport = stateReport.then(drainState, drainState);
   };
+  pi.events.on("herdr:working", () => { if (rootSession) publishState(); });
   pi.events.on("herdr:blocked", (data) => {
     if (!rootSession) return;
     const blocked = isHerdrBlockedEvent(data) ? data : { active: false };
@@ -684,6 +695,7 @@ function isRunEvent(value: unknown): value is { runId: string } {
 function isTerminalRunState(value: unknown): value is "failed" | "stopped" | "interrupted" | "budget_exhausted" {
   return value === "failed" || value === "stopped" || value === "interrupted" || value === "budget_exhausted";
 }
+function isLiveRunTerminalState(value: unknown): boolean { return value === "completed" || isTerminalRunState(value); }
 
 function registerWorkspaceLifecycle(pi: ExtensionAPI | null | undefined, workspaces: WorkspaceManager): void {
   if (!hasExtensionHooks(pi)) return;
