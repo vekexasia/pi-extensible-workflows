@@ -1,6 +1,18 @@
 # Changelog
 ## Unreleased
 
+## [5.11.0] - 2026-08-29
+
+### Starter
+
+- New packaged roles: `scout` (read-only recon), `oracle` (second opinion, read-only plus `bash`), and `researcher` (all session tools except `edit`/`write`/`bash`, uses web tools when present), with dynamic `scout-model`, `oracle-model`, and `researcher-model` aliases.
+- The packaged `reviewer` role now filters findings on evidence, labels them P0/P1/P2, and ends with a machine-readable merge verdict.
+- New package-level slash-command prompts that drive the packaged roles: `/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, and `/deep-research`. Prompts are declared in the package manifest and are not removed by the starter filter.
+
+### Runtime
+
+- Role frontmatter tools that are not active in the launching session no longer fail the launch with `UNKNOWN_TOOL`. The agent now runs without the missing tool and a warning is surfaced in the TUI (once per role/tool per executor). Call-level `tools`, `effectiveTools`, and boundary checks still fail hard, and doctor diagnostics are unchanged. This makes packaged roles such as `reviewer` work on sessions without the optional `grep`/`find`/`ls` built-ins.
+
 ## [5.10.0] - 2026-08-28
 
 ### Packaging

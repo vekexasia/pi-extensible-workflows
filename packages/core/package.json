@@ -1,6 +1,6 @@
 {
   "name": "pi-extensible-workflows",
-  "version": "5.10.0",
+  "version": "5.11.0",
   "description": "Deterministic multi-agent workflow orchestration for Pi",
   "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
   "repository": {
@@ -67,6 +67,9 @@
       "./dist/starter/index.js",
       "./dist/subagents/index.js",
       "./dist/trajectory/index.js"
+    ],
+    "prompts": [
+      "./starter/prompts"
     ],
     "image": "https://raw.githubusercontent.com/vekexasia/pi-extensible-workflows/main/assets/banner.svg"
   },

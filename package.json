@@ -1,6 +1,6 @@
 {
   "name": "pi-extensible-workflows-workspace",
-  "version": "5.10.0",
+  "version": "5.11.0",
   "private": true,
   "description": "Workspace orchestrator for pi-extensible-workflows",
   "type": "module",
@@ -15,6 +15,9 @@
       "./packages/core/starter/index.ts",
       "./packages/core/subagents/index.ts",
       "./packages/core/trajectory/index.ts"
+    ],
+    "prompts": [
+      "./packages/core/starter/prompts"
     ]
   },
   "scripts": {
