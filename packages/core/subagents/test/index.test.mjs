@@ -104,7 +104,8 @@ test("renders subagent calls and background or foreground progress consistently"
     context,
   ).render(80).join("\n");
   assert.match(partial, /Subagent: scout.*\[running\].*mode=foreground role=reviewer.*runtime=1s/);
-  assert.match(partial, /reasoning/);
+  assert.match(partial, /reasoning · thinking/);
+  assert.equal(run.renderCall(args, theme, { state: foregroundState }).render(80).length, 0);
   assert.doesNotMatch(partial, /stalled\?/);
   const staleForeground = run.renderResult(
     { content: [], details: { id: "foreground", state: "running", startedAt: Date.now() - 1000, progress: { accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.001 }, toolCalls: [], activity: { kind: "reasoning", text: "thinking" }, lastEventAt: Date.now() - WORKFLOW_AGENT_STALL_THRESHOLD_MS - 1 } } },
@@ -112,7 +113,7 @@ test("renders subagent calls and background or foreground progress consistently"
     theme,
     context,
   ).render(80).join("\n");
-  assert.match(staleForeground, /reasoning - stalled\? 10m/);
+  assert.match(staleForeground, /reasoning · thinking - stalled\? 10m/);
   assert.ok(foregroundState.subagentSpinner);
 
   const completed = run.renderResult(

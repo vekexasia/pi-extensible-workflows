@@ -81,7 +81,7 @@ export function createSubagentTools(manager: SubagentManager): readonly ToolDefi
       async execute(toolCallId, params, signal, onUpdate, context) {
         return toolResult(await manager.run(validateSubagentRunRequest(params), managerContext(toolCallId, signal, onUpdate, context)));
       },
-      renderCall(args) { return renderSubagentCall(args); },
+      renderCall(args, _theme, context) { return renderSubagentCall(args, context); },
       renderResult(result, options, theme, context) { return renderSubagentResult(result, options, theme, context); },
     }),
     defineTool({

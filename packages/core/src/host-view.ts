@@ -535,8 +535,17 @@ function stalledDuration(agent: AgentRecord, now: number): number | undefined {
   const duration = now - agent.lastEventAt;
   return duration >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? duration : undefined;
 }
+function agentActivityLabel(agent: { readonly activity?: AgentRecord["activity"]; readonly toolCalls?: AgentRecord["toolCalls"] }): string {
+  const activity = agent.activity;
+  if (activity?.kind === "reasoning" || activity?.kind === "text") {
+    const name = activity.kind === "reasoning" ? "reasoning" : "responding";
+    return activity.text && activity.text !== name ? `${name} · ${activity.text}` : name;
+  }
+  if (activity?.kind === "tool") return activity.text;
+  return [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "";
+}
 function formatAgentActivity(agent: AgentRecord, spinner: string, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now()): string {
-  const label = agent.activity?.kind === "reasoning" ? "reasoning" : agent.activity?.kind === "text" ? "responding" : agent.activity?.kind === "tool" ? agent.activity.text : [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "";
+  const label = agentActivityLabel(agent);
   const activity = label ? `${styles.accent(spinner)} ${styles.dim(label)}` : "";
   const stalled = stalledDuration(agent, now);
   if (stalled === undefined) return activity;
@@ -599,7 +608,7 @@ export function formatAgentDetail(agent: Readonly<AgentDetailPresentation>, styl
   const model = agent.model === undefined ? undefined : `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
   const tools = agent.tools?.join(", ") || "(none)";
   const lines = [
-    ...(agent.activity ? [`Activity: ${agent.activity.text}`] : []),
+    ...(agent.activity ? [`Activity: ${agentActivityLabel(agent) || agent.activity.kind}`] : []),
     ...(stalled === undefined ? [] : [styles.warning(`stalled? ${formatStalledDuration(stalled)}`)]),
     `State: ${state(agent.state)}`,
     ...(agent.structuralPath?.length ? [`Structural path: ${agent.structuralPath.join(" > ")}`] : []),

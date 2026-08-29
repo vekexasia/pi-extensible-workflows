@@ -610,8 +610,8 @@ void test("streams non-content and tool-call progress", async () => {
   assert.equal(result.value, "done");
   assert.equal(updates.length, 8);
   assert.doesNotMatch(JSON.stringify(updates), /REASONING_ONE|REASONING_TWO|RESPONSE_ONE|RESPONSE_TWO/);
-  assert.ok(updates.some(({ activity }) => activity?.kind === "reasoning" && activity.text === "reasoning"));
-  assert.ok(updates.some(({ activity }) => activity?.kind === "text" && activity.text === "responding"));
+  assert.ok(updates.some(({ activity }) => activity?.kind === "reasoning"));
+  assert.ok(updates.some(({ activity }) => activity?.kind === "text" && activity.text.endsWith("response") && activity.text.length <= 200));
   assert.ok(updates.some(({ toolCalls, activity }) => activity?.kind === "tool" && toolCalls.some(({ name, state }) => name === "read" && state === "running")));
   assert.ok(updates.some(({ toolCalls, persist }) => !persist && toolCalls.some(({ name, state }) => name === "read" && state === "completed")));
   assert.deepEqual(updates.at(-1)?.accounting, { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 });

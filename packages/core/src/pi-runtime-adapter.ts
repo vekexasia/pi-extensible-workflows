@@ -3,6 +3,7 @@ import type { AgentProgress } from "./agent-execution.js";
 import type { LiveSessionHandoff, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionState } from "./types.js";
 import { THINKING_LEVELS } from "./types.js";
 const TURN_START_EVENTS = new Set(["turn_start", "turn_started", "turnStarted"]);
+const MAX_ACTIVITY_TEXT_CHARS = 200;
 const AGENT_START_EVENTS = new Set(["agent_start"]);
 const TURN_END_EVENTS = new Set(["turn_end", "turnEnded", "agent_end", "agent_settled"]);
 type RecordValue = Record<string, unknown>;
@@ -65,6 +66,7 @@ function normalizedEvent(value: unknown): WorkflowAgentSessionEvent | undefined 
   const message = normalizeMessage(candidate.message);
   const assistantMessageEvent = record(candidate.assistantMessageEvent);
   const assistantType = stringValue(assistantMessageEvent?.type);
+  const assistantDelta = stringValue(assistantMessageEvent?.delta);
   const toolCallId = stringValue(candidate.toolCallId);
   const toolName = stringValue(candidate.toolName);
   const isError = candidate.isError;
@@ -72,7 +74,7 @@ function normalizedEvent(value: unknown): WorkflowAgentSessionEvent | undefined 
     type,
     ...(state === undefined ? {} : { state }),
     ...(message === undefined ? {} : { message }),
-    ...(assistantType === undefined ? {} : { assistantMessageEvent: { type: assistantType } }),
+    ...(assistantType === undefined ? {} : { assistantMessageEvent: { type: assistantType, ...(assistantDelta === undefined ? {} : { delta: assistantDelta }) } }),
     ...(toolCallId === undefined ? {} : { toolCallId }),
     ...(toolName === undefined ? {} : { toolName }),
     ...(typeof isError === "boolean" ? { isError } : {}),
@@ -152,6 +154,7 @@ export function createPiRuntimeSessionAdapter(session: WorkflowAgentSession, han
   const neutralHandoff = createRuntimeHandoffAdapter(handoff);
   const toolCalls = new Map<string, RuntimeToolCallProgress>();
   let activity: RuntimeAgentProgress["activity"];
+  let streamText = "";
   let lastEventAt: number | undefined;
   let lastReportedEventAt: number | undefined;
   let disposed = false;
@@ -172,14 +175,18 @@ export function createPiRuntimeSessionAdapter(session: WorkflowAgentSession, han
       const previousActivity = activity;
       let eventToolCalls = toolCallsView;
       if (event.type === "state_changed") { report = true; persist = true; }
-      if (event.type === "message_start" && event.message?.role === "assistant") { activity = { kind: "text", text: "responding" }; report = true; }
+      if (event.type === "message_start" && event.message?.role === "assistant") { streamText = ""; activity = { kind: "text", text: "" }; report = true; }
       if (event.type === "message_update") {
         const updateType = event.assistantMessageEvent?.type;
-        if (updateType && ["thinking_start", "thinking_delta", "thinking_end"].includes(updateType)) activity = { kind: "reasoning", text: "reasoning" };
-        else if (updateType && ["text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_end"].includes(updateType)) activity = { kind: "text", text: "responding" };
-        report = !sameActivity(previousActivity, activity);
+        if (updateType === "thinking_start" || updateType === "text_start") streamText = "";
+        const delta = event.assistantMessageEvent?.delta;
+        if ((updateType === "thinking_delta" || updateType === "text_delta") && delta) streamText = `${streamText}${delta}`.replace(/\s+/g, " ").slice(-MAX_ACTIVITY_TEXT_CHARS);
+        if (updateType && ["thinking_start", "thinking_delta", "thinking_end"].includes(updateType)) activity = { kind: "reasoning", text: streamText };
+        else if (updateType && ["text_start", "text_delta", "text_end", "toolcall_start", "toolcall_delta", "toolcall_end"].includes(updateType)) activity = { kind: "text", text: streamText };
+        report = previousActivity?.kind !== activity?.kind;
       }
       if (event.type === "message_end") {
+        streamText = "";
         activity = undefined;
         report = !sameActivity(previousActivity, activity);
         if (event.message?.role === "assistant") { persist = true; report = true; }

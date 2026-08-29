@@ -495,11 +495,9 @@ void test("workflow progress keeps each agent to one line with latest tool", () 
   const agent = run.agents[0];
   assert.ok(agent);
   const reasoning = makeRun({ ...run, agents: [{ ...agent, activity: { kind: "reasoning", text: "checking cache" } }] });
-  assert.match(formatWorkflowProgress(reasoning), /reasoning/);
-  assert.doesNotMatch(formatWorkflowProgress(reasoning), /checking cache/);
+  assert.match(formatWorkflowProgress(reasoning), /reasoning · checking cache/);
   const text = makeRun({ ...run, agents: [{ ...agent, activity: { kind: "text", text: "streaming answer" } }] });
-  assert.match(formatWorkflowProgress(text), /responding/);
-  assert.doesNotMatch(formatWorkflowProgress(text), /streaming answer/);
+  assert.match(formatWorkflowProgress(text), /responding · streaming answer/);
   const settled = makeRun({ ...run, agents: [{ ...agent, state: "completed", activity: { kind: "text", text: "stale output" } }] });
   assert.doesNotMatch(formatWorkflowProgress(settled), /stale output|◇ read/);
 });
@@ -524,7 +522,7 @@ void test("workflow progress applies semantic styles without coloring agent name
   assert.match(progress, /<bold><accent>Workflow: styled/);
   assert.match(progress, /<warning>!<\/warning>/);
   assert.match(progress, /<success>✓<\/success> done <success>\[completed\]<\/success>/);
-  assert.match(progress, /<accent>@<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding<\/dim>/);
+  assert.match(progress, /<accent>@<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding · answer<\/dim>/);
   assert.match(progress, /<muted>○<\/muted> waiting <muted>\[queued\]<\/muted>/);
   assert.match(progress, /<error>✗<\/error> failed <error>\[failed\]<\/error>/);
   assert.match(progress, /<error>✗<\/error> cancelled <error>\[cancelled\]<\/error>/);

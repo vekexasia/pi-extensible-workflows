@@ -954,8 +954,7 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.match(dashB, /phase: review/);
   assert.match(dashB, /1\/2 agents/);
   assert.match(dashB, /37 tok/);
-  assert.match(dashB, /reasoning/);
-  assert.doesNotMatch(dashB, /checking source/);
+  assert.match(dashB, /reasoning · checking source/);
   assert.match(dashB, /⠦ root > child · running · 37 tok/);
   assert.doesNotMatch(dashB, /model=|requested=|tools=|role=/);
   assert.doesNotMatch(dashB, /cache read|transcript attempt/);

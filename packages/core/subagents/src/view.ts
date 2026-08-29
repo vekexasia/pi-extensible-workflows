@@ -54,7 +54,16 @@ export function formatSubagentPreview(args: Partial<SubagentRunRequest>): string
   return `subagent ${label(args)} ${requestMetadata(args, true)}`;
 }
 
-export function renderSubagentCall(args: Partial<SubagentRunRequest>) { return textBlock(formatSubagentPreview(args)); }
+export function renderSubagentCall(args: Partial<SubagentRunRequest>, context?: { state?: SubagentRenderState; isError?: boolean }) {
+  const preview = formatSubagentPreview(args);
+  return {
+    render(width: number): string[] {
+      if (context?.state?.subagentStatus && !context.isError) return [];
+      return [truncateToWidth(preview, Math.max(1, width), "…")];
+    },
+    invalidate() {},
+  };
+}
 
 function statusValue(value: unknown): SubagentStatus | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -87,9 +96,12 @@ function stateColor(state: SubagentStatus["state"]): "accent" | "success" | "err
 
 function activity(status: SubagentStatus): string | undefined {
   if (status.state !== "running") return undefined;
-  if (status.progress?.activity?.kind === "reasoning") return "reasoning";
-  if (status.progress?.activity?.kind === "text") return "responding";
-  if (status.progress?.activity?.kind === "tool") return status.progress.activity.text;
+  const current = status.progress?.activity;
+  if (current?.kind === "reasoning" || current?.kind === "text") {
+    const name = current.kind === "reasoning" ? "reasoning" : "responding";
+    return current.text && current.text !== name ? `${name} · ${current.text}` : name;
+  }
+  if (current?.kind === "tool") return current.text;
   return [...(status.progress?.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name;
 }
 

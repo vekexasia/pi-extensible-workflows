@@ -228,7 +228,7 @@ export interface WorkflowAgentSessionReference { readonly transport: string; rea
 export interface WorkflowAgentSessionStats { readonly tokens: { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly total: number }; readonly cost: number }
 export interface WorkflowAgentMessage { readonly role: string; readonly content?: unknown; readonly stopReason?: string; readonly errorMessage?: string; readonly usage?: { readonly input: number; readonly output: number; readonly cacheRead: number; readonly cacheWrite: number; readonly cost: { readonly total: number } } }
 export interface WorkflowAgentSessionState { readonly model: ModelSpec; readonly thinking?: ModelSpec["thinking"]; readonly tools: readonly string[]; readonly systemPrompt?: string }
-export interface WorkflowAgentSessionEvent { readonly type: string; readonly state?: Readonly<WorkflowAgentSessionState>; readonly message?: WorkflowAgentMessage; readonly assistantMessageEvent?: { readonly type: string }; readonly toolCallId?: string; readonly toolName?: string; readonly isError?: boolean }
+export interface WorkflowAgentSessionEvent { readonly type: string; readonly state?: Readonly<WorkflowAgentSessionState>; readonly message?: WorkflowAgentMessage; readonly assistantMessageEvent?: { readonly type: string; readonly delta?: string }; readonly toolCallId?: string; readonly toolName?: string; readonly isError?: boolean }
 export type LiveSessionHandoffState = "local-running" | "handoff-pending" | "herdr-running" | "returning-local" | "completed";
 export interface LiveSessionHandoff {
   readonly state: LiveSessionHandoffState;
