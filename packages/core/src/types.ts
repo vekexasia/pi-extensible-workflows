@@ -309,7 +309,7 @@ export interface AgentSetupContext { readonly run: Readonly<WorkflowRunContext>;
 export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
 export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }
 export interface WorkflowExtensionMetadata { version: string; headline: string }
-export interface WorkflowRoleDirectoryRegistration { path: string; extension: WorkflowExtensionMetadata }
+export interface WorkflowRoleDirectoryRegistration { path: string; extension: WorkflowExtensionMetadata; readonly builtin?: true }
 export interface AgentAttemptActionUi { notify(message: string, level?: "info" | "warning" | "error"): void; confirm(title: string, message: string): Promise<boolean>; select(title: string, options: readonly string[]): Promise<string | undefined>; input(title: string, placeholder?: string): Promise<string | undefined>; setWorkingMessage?(message?: string): void }
 export interface StandaloneAgentRecord { readonly id: string; readonly name: string; readonly label?: string; readonly state: "running" | "completed" | "failed" | "stopped"; readonly structuralPath?: readonly string[] }
 export interface StandaloneAgentAttemptActionContext { readonly agent: Readonly<StandaloneAgentRecord>; readonly attempt: Readonly<AgentAttemptSummary>; readonly session?: WorkflowAgentSessionReference; readonly liveSession?: WorkflowAgentSession; readonly prepared?: Readonly<PreparedAgentSession>; readonly handoff?: LiveSessionHandoff; readonly signal: AbortSignal; readonly ui: Readonly<AgentAttemptActionUi> }

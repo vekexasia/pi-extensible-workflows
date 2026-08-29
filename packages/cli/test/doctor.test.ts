@@ -8,7 +8,7 @@ import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
 import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { registerWorkflowExtension, WorkflowRegistry, type WorkflowExtension } from "pi-extensible-workflows";
+import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry, type WorkflowExtension } from "pi-extensible-workflows";
 import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, type CliTestBundleExtension } from "./support.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
@@ -736,6 +736,34 @@ void test("doctor diagnoses extension role directories with extension provenance
   assert.equal(doctorExitCode(report), 1);
   const formatted = formatDoctorReport({ ...report, diagnostics: [] });
   assert.ok(formatted.includes(`Extension "Role package" (1.0.0) role directory "${first}"`));
+});
+void test("doctor reports regular extension roles overriding bundled starter roles", async () => {
+  const paths = fixture();
+  const regular = join(paths.root, "regular-roles");
+  const starter = join(process.cwd(), "../core/dist/starter/roles");
+  mkdirSync(regular);
+  writeFileSync(join(regular, "developer.md"), "User developer role");
+  resetWorkflowRegistry();
+  registerWorkflowExtension({
+    version: "1.0.0",
+    headline: "User roles",
+    modelAliases: Object.fromEntries(["developer", "reviewer", "scout", "oracle", "researcher"].map((name) => [`${name}-model`, { resolve: () => "openai/gpt" }])),
+    roleDirectories: [starter, regular],
+  });
+  try {
+    const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ activeTools: ["read", "grep", "find", "ls", "bash"] }) }));
+    const starterRole = report.roles.find(({ name, scope, path }) => name === "developer" && scope === "extension" && path.startsWith(starter));
+    const userRole = report.roles.find(({ name, scope, path }) => name === "developer" && scope === "extension" && path === join(regular, "developer.md"));
+    assert.ok(starterRole);
+    assert.ok(userRole);
+    assert.equal(starterRole.active, false);
+    assert.equal(starterRole.overriddenBy, userRole.path);
+    assert.equal(userRole.active, true);
+    assert.equal(userRole.overrides, starterRole.path);
+    assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_DUPLICATE"), false);
+  } finally {
+    resetWorkflowRegistry();
+  }
 });
 void test("portable bundles load method shorthand functions and selected payload resources", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-payload-"));

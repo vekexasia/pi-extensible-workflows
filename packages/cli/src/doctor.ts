@@ -217,7 +217,7 @@ function roleFilesFrom(dirs: readonly string[]): string[] {
   const paths = dirs.flatMap((dir) => roleFiles(dir));
   return [...new Map(paths.map((path) => [basename(path, ".md"), path])).values()].sort();
 }
-type ExtensionRoleFile = { name: string; path: string; directory: string; extension: WorkflowExtensionMetadata };
+type ExtensionRoleFile = { name: string; path: string; directory: string; extension: WorkflowExtensionMetadata; builtin?: true };
 type ExtensionRoleScan = { files: ExtensionRoleFile[]; empty: WorkflowRoleDirectoryRegistration[]; errors: Array<{ registration: WorkflowRoleDirectoryRegistration; error: unknown }> };
 function extensionLabel(extension: WorkflowExtensionMetadata): string { return `Extension "${extension.headline}" (${extension.version})`; }
 function scanExtensionRoleFiles(registrations: readonly WorkflowRoleDirectoryRegistration[]): ExtensionRoleScan {
@@ -229,7 +229,7 @@ function scanExtensionRoleFiles(registrations: readonly WorkflowRoleDirectoryReg
       const entries = readdirSync(registration.path, { withFileTypes: true });
       const roleFiles = entries.filter((entry) => isRoleFile(registration.path, entry));
       if (!roleFiles.length) empty.push(registration);
-      for (const entry of roleFiles) files.push({ name: basename(entry.name, ".md"), path: join(registration.path, entry.name), directory: registration.path, extension: registration.extension });
+      for (const entry of roleFiles) files.push({ name: basename(entry.name, ".md"), path: join(registration.path, entry.name), directory: registration.path, extension: registration.extension, ...(registration.builtin === true ? { builtin: true as const } : {}) });
     } catch (error) { errors.push({ registration, error }); }
   }
   files.sort((left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path));
@@ -404,16 +404,33 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const extensionFilesByName = new Map<string, ExtensionRoleFile[]>();
   for (const file of extensionScan.files) extensionFilesByName.set(file.name, [...(extensionFilesByName.get(file.name) ?? []), file]);
   const duplicateExtensionNames = new Set<string>();
-  for (const [name, matches] of extensionFilesByName) if (matches.length > 1) {
-    duplicateExtensionNames.add(name);
-    diagnostics.push(diagnostic("error", "ROLE_DUPLICATE", `Duplicate extension role "${name}": ${matches.map(({ path, directory, extension }) => `${extensionLabel(extension)} role directory "${directory}" (${path})`).join("; ")}`, matches[0]?.path, "Keep one extension role with this name; global and project roles may override packaged defaults."));
-  }
   const extensionPaths = new Map<string, string>();
+  const starterOverrides = new Map<string, string>();
+  const starterOverriddenBy = new Map<string, string>();
+  for (const [name, matches] of extensionFilesByName) {
+    const regularMatches = matches.filter(({ builtin }) => builtin !== true);
+    const starterMatches = matches.filter(({ builtin }) => builtin === true);
+    if (regularMatches.length > 1) {
+      duplicateExtensionNames.add(name);
+      diagnostics.push(diagnostic("error", "ROLE_DUPLICATE", `Duplicate extension role "${name}": ${regularMatches.map(({ path, directory, extension }) => `${extensionLabel(extension)} role directory "${directory}" (${path})`).join("; ")}`, regularMatches[0]?.path, "Keep one extension role with this name; global and project roles may override packaged defaults."));
+      continue;
+    }
+    const extension = regularMatches[0] ?? starterMatches[0];
+    if (extension) extensionPaths.set(name, extension.path);
+    const regular = regularMatches[0];
+    const starter = starterMatches[0];
+    if (regular && starter) {
+      starterOverrides.set(regular.path, starter.path);
+      starterOverriddenBy.set(starter.path, regular.path);
+    }
+  }
   for (const file of extensionScan.files) {
-    roles.push({ name: file.name, path: file.path, scope: "extension", active: true, extension: file.extension });
+    const starterPath = starterOverrides.get(file.path);
+    const overriddenBy = starterOverriddenBy.get(file.path);
+    roles.push({ name: file.name, path: file.path, scope: "extension", active: overriddenBy === undefined, extension: file.extension, ...(starterPath ? { overrides: starterPath } : {}), ...(overriddenBy ? { overriddenBy } : {}) });
     const definition = inspectRole(file.path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath, { directory: file.directory, extension: file.extension });
     if (duplicateExtensionNames.has(file.name)) continue;
-    extensionPaths.set(file.name, file.path);
+    if (extensionPaths.get(file.name) !== file.path) continue;
     if (definition) definitions.set(file.name, definition);
   }
   const globalPaths = new Map<string, string>();

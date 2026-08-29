@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import starter from "../starter/index.js";
@@ -13,6 +14,7 @@ import {
   registeredWorkflowRoleDirectoryRegistrations,
   resetWorkflowRegistry,
   type WorkflowFunctionContext,
+  WorkflowRegistry,
 } from "../src/index.js";
 
 function registerStarter() {
@@ -58,9 +60,18 @@ void test("registers the starter function, aliases, and packaged roles", async (
   assert.equal(registration.length, 1);
   assert.deepEqual(
     registration[0] && Object.keys(registration[0]).sort(),
-    ["extension", "path"],
+    ["builtin", "extension", "path"],
   );
   assert.match(registration[0]?.path ?? "", /starter[\\/]roles[\\/]?$/);
+  assert.equal(registration[0]?.builtin, true);
+});
+void test("marks a symlinked starter roles directory as builtin", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-role-link-"));
+  const link = join(root, "roles");
+  symlinkSync(fileURLToPath(new URL("../starter/roles/", import.meta.url)), link, "dir");
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Starter roles", roleDirectories: [link] });
+  assert.equal(registry.roleDirectoryRegistrations()[0]?.builtin, true);
 });
 
 void test("reviewLoop passes after a reviewer approves", async () => {

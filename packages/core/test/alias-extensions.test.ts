@@ -419,6 +419,26 @@ void test("loads extension role directories as defaults beneath standard roles",
   assert.throws(() => { registry.register({ version: "1.0.0", headline: "Invalid", roleDirectories: [new URL("https://example.com/roles")] }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => { registry.register({ version: "1.0.0", headline: "Invalid", roleDirectories: Array(1) }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
 });
+void test("starter roles are fallback defaults beneath extension, global, and project roles", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-role-precedence-"));
+  const cwd = join(home, "project");
+  const agentDir = join(home, "agent");
+  const extensionDirectory = join(home, "extension-roles");
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+  mkdirSync(extensionDirectory);
+  writeFileSync(join(extensionDirectory, "developer.md"), "Extension developer role");
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Global reviewer role");
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "scout.md"), "Project scout role");
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Starter roles", roleDirectories: [new URL("../starter/roles/", import.meta.url), extensionDirectory] });
+  const registrations = registry.roleDirectoryRegistrations();
+  assert.equal(registrations.filter(({ builtin }) => builtin === true).length, 1);
+  const roles = loadAgentDefinitions(cwd, agentDir, true, registrations);
+  assert.equal(roles.developer?.prompt, "Extension developer role");
+  assert.equal(roles.reviewer?.prompt, "Global reviewer role");
+  assert.equal(roles.scout?.prompt, "Project scout role");
+});
 void test("extension roles flow through host guidance, preflight, launch snapshots, and agent setup", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-role-host-"));
   const cwd = join(home, "project");
