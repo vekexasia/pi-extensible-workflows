@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+## [5.11.1] - 2026-08-30
+
 ### Fixes
 
 - Keep streamed reasoning and response progress out of workflow and subagent status, persistence, and exports, and sanitize live activity before terminal rendering.
