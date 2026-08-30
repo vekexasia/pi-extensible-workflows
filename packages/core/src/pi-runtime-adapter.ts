@@ -2,6 +2,7 @@ import type { RuntimeAgentHandoff, RuntimeAgentProgress, RuntimeAgentState, Runt
 import type { AgentProgress } from "./agent-execution.js";
 import type { LiveSessionHandoff, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionState } from "./types.js";
 import { THINKING_LEVELS } from "./types.js";
+import { sanitizeDisplayText } from "./utils.js";
 const TURN_START_EVENTS = new Set(["turn_start", "turn_started", "turnStarted"]);
 const MAX_ACTIVITY_TEXT_CHARS = 200;
 const AGENT_START_EVENTS = new Set(["agent_start"]);
@@ -237,7 +238,7 @@ export function runtimeProgressToAgentProgress(value: RuntimeAgentProgress): Age
     accounting: { input: requiredUsage(value.usage.input, "input"), output: requiredUsage(value.usage.output, "output"), cacheRead: requiredUsage(value.usage.cacheRead, "cacheRead"), cacheWrite: requiredUsage(value.usage.cacheWrite, "cacheWrite"), cost: requiredUsage(value.usage.costUsd, "costUsd") },
     toolCalls: value.toolCalls.map(({ id, name, state }) => ({ id, name, state })),
     ...(value.state === undefined ? {} : { state: { model: { ...value.state.model }, ...(value.state.thinking === undefined ? {} : { thinking: value.state.thinking }), tools: [...value.state.tools], ...(value.state.systemPrompt === undefined ? {} : { systemPrompt: value.state.systemPrompt }) } }),
-    ...(value.activity === undefined ? {} : { activity: { ...value.activity } }),
+    ...(value.activity === undefined ? {} : { activity: { ...value.activity, text: sanitizeDisplayText(value.activity.text) } }),
     ...(value.lastEventAt === undefined ? {} : { lastEventAt: value.lastEventAt }),
     persist: value.persist,
   };

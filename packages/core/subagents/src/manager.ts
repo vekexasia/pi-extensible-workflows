@@ -15,6 +15,7 @@ import {
   resolveAgentResourcePolicy,
   resolveWorkflowSettings,
   roleNameOf,
+  sanitizeDisplayText,
   sumAccounting,
   structuralPath,
   validateModelAliasAvailability,
@@ -398,12 +399,12 @@ function boundedAttemptSetup(setup: AgentAttempt["setup"]): AgentAttemptSummary[
   };
 }
 type ProgressSnapshotInput = Pick<AgentProgress, "accounting" | "toolCalls" | "state" | "activity" | "lastEventAt">;
-function portableProgress(progress: ProgressSnapshotInput): PersistedProgress {
+function portableProgress(progress: ProgressSnapshotInput, includeActivity = false): PersistedProgress {
   return {
     accounting: structuredClone(progress.accounting),
     toolCalls: structuredClone(progress.toolCalls),
     ...(progress.state === undefined ? {} : { state: { model: { ...progress.state.model }, ...(progress.state.thinking === undefined ? {} : { thinking: progress.state.thinking }), tools: [...progress.state.tools] } }),
-    ...(progress.activity === undefined ? {} : { activity: structuredClone(progress.activity) }),
+    ...(includeActivity && progress.activity !== undefined ? { activity: { ...progress.activity, text: sanitizeDisplayText(progress.activity.text) } } : {}),
     ...(progress.lastEventAt === undefined ? {} : { lastEventAt: progress.lastEventAt }),
   };
 }
@@ -672,7 +673,7 @@ function decodeStatus(value: unknown, id: string, includeAttemptMetadata = true)
   if (includeAttemptMetadata && attempts !== undefined && attemptDetails?.some((attempt) => attempt !== undefined && attempt.attempt > attempts)) return undefined;
   return { id, ...(sessionId === undefined ? {} : { sessionId }), state: record.state, startedAt: record.startedAt, ...(attempts === undefined ? {} : { attempts }), ...(attemptDetails === undefined ? {} : { attemptDetails: attemptDetails.filter((attempt): attempt is AgentAttemptSummary => attempt !== undefined) }), ...(record.finishedAt === undefined ? {} : { finishedAt: record.finishedAt }), ...(owner === undefined ? {} : { owner }), ...(worktree === undefined ? {} : { worktree }), ...(worktreeContext === undefined ? {} : { worktreeContext }), ...(error === undefined ? {} : { error }), ...(progress === undefined ? {} : { progress }) };
 }
-function publicStatus(status: SubagentStatus, includeAttemptMetadata = false): SubagentStatus {
+function publicStatus(status: SubagentStatus, includeAttemptMetadata = false, includeActivity = false): SubagentStatus {
   return {
     id: status.id,
     ...(status.sessionId === undefined ? {} : { sessionId: status.sessionId }),
@@ -683,14 +684,17 @@ function publicStatus(status: SubagentStatus, includeAttemptMetadata = false): S
     ...(status.finishedAt === undefined ? {} : { finishedAt: status.finishedAt }),
     ...(status.worktree === undefined ? {} : { worktree: { ...status.worktree } }),
     ...(status.error === undefined ? {} : { error: { ...status.error } }),
-    ...(status.progress === undefined ? {} : { progress: portableProgress(status.progress) }),
+    ...(status.progress === undefined ? {} : { progress: portableProgress(status.progress, includeActivity) }),
   };
 }
-function emitUpdate(run: LiveRun): void {
+function liveStatus(run: LiveRun): PersistedSubagentStatus {
   const persisted = persistedStatus(run);
-  const status = publicStatus(persisted);
-  try { run.update?.(status); } catch { /* Rendering must not affect execution. */ }
-  try { run.observe?.(publicStatus(persisted, true)); } catch { /* A widget failure is display-only. */ }
+  return run.progress === undefined ? persisted : { ...persisted, progress: portableProgress(run.progress, true) };
+}
+function emitUpdate(run: LiveRun): void {
+  const live = liveStatus(run);
+  try { run.update?.(publicStatus(live, false, true)); } catch { /* Rendering must not affect execution. */ }
+  try { run.observe?.(publicStatus(live, true, true)); } catch { /* A widget failure is display-only. */ }
 }
 
 async function createRunStorage(root: string, id: string, request: Readonly<SubagentRunRequest>, status: PersistedSubagentStatus): Promise<string> {
@@ -1214,7 +1218,7 @@ class PersistentSubagentManager implements SubagentManager {
   private async recordProgress(run: LiveRun | undefined, progress: AgentProgress): Promise<void> {
     if (!run || !this.canSteer(run)) return;
     if (run.activeAttempt !== undefined && run.finalizedAttemptAccounting.has(run.activeAttempt)) return;
-    const snapshot = portableProgress(progress);
+    const snapshot = portableProgress(progress, true);
     const accounting = addAccounting(sumAccounting(run.finalizedAttemptAccounting.values()), progress.accounting);
     // Agent progress is a current-attempt snapshot. Do not retain a field-wise maximum: it can combine values from different snapshots.
     run.progress = { ...snapshot, accounting };

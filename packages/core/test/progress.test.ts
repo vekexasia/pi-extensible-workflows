@@ -39,6 +39,13 @@ void test("workflow progress warns after ten minutes of agent silence and resets
   const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "stalling" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   assert.match(formatWorkflowPhaseDashboard(stalled, snapshot, 120, { agentId: "run:1" }, undefined, now).join("\n"), /stalled\? 12m/);
 });
+void test("workflow progress sanitizes streamed activity before terminal rendering", () => {
+  const marker = "P1_TUI_STREAM_SECRET";
+  const rendered = formatWorkflowProgress(makeRun({ agents: [makeAgent({ activity: { kind: "text", text: `${marker}\u001b[31mred\u0007` } })] }));
+  assert.match(rendered, /P1_TUI_STREAM_SECRETred/);
+  assert.equal(rendered.includes(String.fromCharCode(27)), false);
+  assert.equal(rendered.includes(String.fromCharCode(7)), false);
+});
 void test("workflow progress shows runtime after the workflow state", () => {
   const run = makeRun({ workflowName: "runtime", usage: { tokens: 0, costUsd: 0, durationMs: 12_345, agentLaunches: 0 } });
   assert.match(formatWorkflowProgress(run), /\[running\] runtime=12s/);

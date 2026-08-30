@@ -170,7 +170,7 @@ test("renders subagent calls and background or foreground progress consistently"
         startedAt: 0,
         finishedAt: 1000,
         lastEventAt: 900,
-        progress: { state: { model: { provider: "fixture", model: "reviewer", thinking: "high" } }, activity: { kind: "tool", text: "read" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, toolCalls: [{ id: "tool-1", name: "read", state: "completed" }], lastEventAt: 900 },
+        progress: { state: { model: { provider: "fixture", model: "reviewer", thinking: "high" } }, activity: { kind: "tool", text: "P1_SUBAGENT_TUI_SECRET\u001b[31mred\u0007" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, toolCalls: [{ id: "tool-1", name: "read", state: "completed" }], lastEventAt: 900 },
         worktree: { path: "/tmp/worktree", branch: "subagent/inspect" },
         value: { answer: 42 },
       },
@@ -181,7 +181,9 @@ test("renders subagent calls and background or foreground progress consistently"
   ).render(120).join("\n");
   assert.match(inspection, /startedAt=1970-01-01T00:00:00\.000Z/);
   assert.match(inspection, /model=fixture\/reviewer:high/);
-  assert.match(inspection, /activity=tool read/);
+  assert.match(inspection, /activity=tool P1_SUBAGENT_TUI_SECRETred/);
+  assert.equal(inspection.includes(String.fromCharCode(27)), false);
+  assert.equal(inspection.includes(String.fromCharCode(7)), false);
   assert.match(inspection, /accounting=input=1 output=2 cacheRead=3 cacheWrite=4 cost=\$0\.50/);
   assert.match(inspection, /toolCalls=1.*read \[completed\]/s);
   assert.match(inspection, /value:.*"answer": 42/s);
@@ -1747,15 +1749,17 @@ test("stop and steer race without affecting a sibling run", async () => {
 test("persists progress under one snapshot without duplicate accounting fields", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-progress-"));
   const storageDir = join(cwd, "subagents-storage");
+  const updates = [];
   const pending = deferred();
   const accounting = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 };
   const toolCalls = [{ id: "tool-1", name: "read", state: "running" }];
   const manager = createSubagentManager({
     storageDir,
+    onStatus(status) { updates.push(status); },
     createExecutor() {
       return {
         async execute(_prompt, options) {
-          await options.onProgress?.({ accounting, toolCalls, activity: { kind: "tool", text: "read" }, lastEventAt: 123, persist: true });
+          await options.onProgress?.({ accounting, toolCalls, activity: { kind: "text", text: "P1_SUBAGENT_STREAM_SECRET\u001b[31m\u0007" }, lastEventAt: 123, persist: true });
           return pending.promise;
         },
       };
@@ -1765,7 +1769,11 @@ test("persists progress under one snapshot without duplicate accounting fields",
   try {
     const run = await manager.run({ prompt: "progress" }, context);
     const status = await (async () => { await waitFor(async () => Boolean((await manager.inspect({ id: run.id }, context)).progress)); return manager.inspect({ id: run.id }, context); })();
-    assert.deepEqual(status.progress, { accounting, toolCalls, activity: { kind: "tool", text: "read" }, lastEventAt: 123 });
+    assert.deepEqual(status.progress, { accounting, toolCalls, lastEventAt: 123 });
+    assert.ok(updates.some(({ progress }) => progress?.activity?.text === "P1_SUBAGENT_STREAM_SECRET "));
+    assert.equal(JSON.stringify(status).includes("P1_SUBAGENT_STREAM_SECRET"), false);
+    assert.equal(JSON.stringify(updates).includes(String.fromCharCode(27)), false);
+    assert.equal(JSON.stringify(updates).includes(String.fromCharCode(7)), false);
     for (const field of ["usage", "accounting", "toolCalls", "activity", "lastEventAt"]) assert.equal(status[field], undefined);
     assert.equal(JSON.stringify(status).includes("systemPrompt"), false);
     await waitFor(async () => { try { return JSON.parse(await readFile(join(storageDir, run.id, "status.json"), "utf8")).progress !== undefined; } catch { return false; } });

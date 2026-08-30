@@ -1,6 +1,11 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- Keep streamed reasoning and response progress out of workflow and subagent status, persistence, and exports, and sanitize live activity before terminal rendering.
+- Keep Herdr's working state aligned with workflow lifecycle transitions, including pauses, checkpoints, terminal runs, and concurrent runs.
+
 ## [5.11.0] - 2026-08-29
 
 ### Starter

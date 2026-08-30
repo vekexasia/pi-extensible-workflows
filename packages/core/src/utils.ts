@@ -10,6 +10,11 @@ export class SerialLane {
 }
 
 export function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
+const ESCAPE_CHARACTER = String.fromCharCode(27);
+const BELL_CHARACTER = String.fromCharCode(7);
+const ANSI_ESCAPE_SEQUENCE = new RegExp(`${ESCAPE_CHARACTER}(?:\\[[0-?]*[ -/]*[@-~]|\\][^${BELL_CHARACTER}]*(?:${BELL_CHARACTER}|${ESCAPE_CHARACTER}\\\\))`, "g");
+const TERMINAL_CONTROL_CHARACTER = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}-${String.fromCharCode(159)}]`, "g");
+export function sanitizeDisplayText(value: string): string { return value.replace(ANSI_ESCAPE_SEQUENCE, "").replace(TERMINAL_CONTROL_CHARACTER, " "); }
 export { object as isObject };
 function isStringKey(key: PropertyKey): key is string { return typeof key === "string"; }
 function stringKeyValue(value: object, key: string): unknown { return object(value) ? value[key] : undefined; }

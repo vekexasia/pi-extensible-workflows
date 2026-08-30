@@ -1,6 +1,6 @@
 import type { AgentToolResult, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatCost, formatStalledDuration, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
+import { formatCost, formatStalledDuration, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
 import type { SubagentRunRequest, SubagentStatus } from "./contracts.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -99,10 +99,11 @@ function activity(status: SubagentStatus): string | undefined {
   const current = status.progress?.activity;
   if (current?.kind === "reasoning" || current?.kind === "text") {
     const name = current.kind === "reasoning" ? "reasoning" : "responding";
-    return current.text && current.text !== name ? `${name} · ${current.text}` : name;
+    const text = sanitizeDisplayText(current.text);
+    return text && text !== name ? `${name} · ${text}` : name;
   }
-  if (current?.kind === "tool") return current.text;
-  return [...(status.progress?.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name;
+  if (current?.kind === "tool") return sanitizeDisplayText(current.text);
+  return sanitizeDisplayText([...(status.progress?.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "");
 }
 
 function stalledDuration(status: SubagentStatus, now: number): number | undefined {
@@ -180,8 +181,8 @@ function formatSubagentInspection(status: SubagentStatus, args: { id?: string },
   if (lastEventAt) lines.push(`  ${theme.fg("dim", `lastEventAt=${lastEventAt}`)}`);
   const model = status.progress?.state?.model;
   if (model) lines.push(`  ${theme.fg("dim", `model=${model.provider}/${model.model}${model.thinking ? `:${model.thinking}` : ""}`)}`);
-  const activity = status.progress?.activity;
-  if (activity) lines.push(`  ${theme.fg("dim", `activity=${activity.kind}${activity.text ? ` ${activity.text}` : ""}`)}`);
+  const currentActivity = status.progress?.activity;
+  if (currentActivity) lines.push(`  ${theme.fg("dim", `activity=${currentActivity.kind}${currentActivity.text ? ` ${sanitizeDisplayText(currentActivity.text)}` : ""}`)}`);
   const accounting = status.progress?.accounting;
   if (accounting) lines.push(`  ${theme.fg("dim", `accounting=input=${String(accounting.input)} output=${String(accounting.output)} cacheRead=${String(accounting.cacheRead)} cacheWrite=${String(accounting.cacheWrite)} cost=${formatCost(accounting.cost) || "$0.00"}`)}`);
   if (status.worktree) lines.push(`  ${theme.fg("dim", `worktree=${status.worktree.path} branch=${status.worktree.branch}`)}`);

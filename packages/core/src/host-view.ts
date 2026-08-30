@@ -3,7 +3,7 @@ import { type AwaitingCheckpoint, type PersistedRun, type RunStore, type Worktre
 import { budgetUsage } from "./budget.js";
 import { formatCost } from "./background-widget.js";
 import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, type AgentAttemptAction, type AgentAttemptActionContext, type AgentRecord, type LaunchSnapshot, type StandaloneAgentAttemptActionContext, type WorkflowCatalogFunction, type WorkflowCatalogIndex, type WorkflowPhaseShellActivity } from "./types.js";
-import { object } from "./utils.js";
+import { object, sanitizeDisplayText } from "./utils.js";
 import {
   buildWorkflowPhaseModel,
   buildWorkflowPhaseTree,
@@ -539,10 +539,11 @@ function agentActivityLabel(agent: { readonly activity?: AgentRecord["activity"]
   const activity = agent.activity;
   if (activity?.kind === "reasoning" || activity?.kind === "text") {
     const name = activity.kind === "reasoning" ? "reasoning" : "responding";
-    return activity.text && activity.text !== name ? `${name} · ${activity.text}` : name;
+    const text = sanitizeDisplayText(activity.text);
+    return text && text !== name ? `${name} · ${text}` : name;
   }
-  if (activity?.kind === "tool") return activity.text;
-  return [...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "";
+  if (activity?.kind === "tool") return sanitizeDisplayText(activity.text);
+  return sanitizeDisplayText([...(agent.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "");
 }
 function formatAgentActivity(agent: AgentRecord, spinner: string, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now()): string {
   const label = agentActivityLabel(agent);

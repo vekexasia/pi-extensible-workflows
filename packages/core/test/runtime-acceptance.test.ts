@@ -1261,7 +1261,7 @@ void test("workflow_status returns a safe current-project summary across session
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-status-"));
   const cwd = join(home, "project");
   const snapshot = (name: string) => createLaunchSnapshot({ script: "return true;", args: null, metadata: { name }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
-  const agent = { id: "run-current:1", name: "private-name", label: "Review", path: "agent/review", state: "failed" as const, model: { provider: "openai", model: "gpt" }, tools: ["private-tool"], attempts: 2, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, activity: { kind: "tool" as const, text: "read" }, lastEventAt: 1234, prompt: "PRIVATE PROMPT", systemPrompt: "PRIVATE SYSTEM PROMPT", attemptDetails: [{ attempt: 1, transport: "local", setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: ["private-tool"], cwd }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, session: { transport: "local", sessionId: "private-session" } }] };
+  const agent = { id: "run-current:1", name: "private-name", label: "Review", path: "agent/review", state: "failed" as const, model: { provider: "openai", model: "gpt" }, tools: ["private-tool"], attempts: 2, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, activity: { kind: "text" as const, text: "P1_WORKFLOW_STREAM_SECRET\u001b[31m\u0007" }, lastEventAt: 1234, prompt: "PRIVATE PROMPT", systemPrompt: "PRIVATE SYSTEM PROMPT", attemptDetails: [{ attempt: 1, transport: "local", setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: ["private-tool"], cwd }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 }, session: { transport: "local", sessionId: "private-session" } }] };
   const current = new RunStore(cwd, "current-session", "run-current", home);
   await current.create({ id: "run-current", workflowName: "status-check", cwd, sessionId: "current-session", state: "failed", error: { code: "AGENT_FAILED", message: "failed" }, failedAt: "agent/review", phase: "review", budget: { tokens: { hard: 100 } }, usage: { tokens: 10, costUsd: 0.5, durationMs: 20, agentLaunches: 1 }, delivery: { mode: "background", state: "pending", toolCallId: "private-call" }, agents: [agent], agentSessions: [{ transport: "local", sessionId: "private-session" }] }, snapshot("status-check"));
   const other = new RunStore(cwd, "other-session", "run-other", home);
@@ -1272,8 +1272,13 @@ void test("workflow_status returns a safe current-project summary across session
   assert.ok(status);
   const context = { cwd, sessionManager: { getSessionId: () => "current-session" } };
   const result = await status.execute("status", { runId: "run-current" }, undefined, undefined, context);
-  assert.deepEqual(result.details, { runId: "run-current", workflowName: "status-check", state: "failed", error: { code: "AGENT_FAILED", message: "failed" }, failedAt: "agent/review", budget: { tokens: { hard: 100 } }, usage: { tokens: 10, costUsd: 0.5, durationMs: 20, agentLaunches: 1 }, phase: "review", delivery: { mode: "background", state: "pending" }, agents: [{ id: "run-current:1", label: "Review", path: "agent/review", state: "failed", activity: { kind: "tool", text: "read" }, lastEventAt: 1234, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }] });
-  assert.equal(result.content[0]?.text, JSON.stringify(result.details));
+  assert.deepEqual(result.details, { runId: "run-current", workflowName: "status-check", state: "failed", error: { code: "AGENT_FAILED", message: "failed" }, failedAt: "agent/review", budget: { tokens: { hard: 100 } }, usage: { tokens: 10, costUsd: 0.5, durationMs: 20, agentLaunches: 1 }, phase: "review", delivery: { mode: "background", state: "pending" }, agents: [{ id: "run-current:1", label: "Review", path: "agent/review", state: "failed", lastEventAt: 1234, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }] });
+  const firstContent = result.content[0];
+  assert.ok(firstContent);
+  const resultText = firstContent.text;
+  assert.equal(resultText.includes("P1_WORKFLOW_STREAM_SECRET"), false);
+  assert.equal(resultText.includes(String.fromCharCode(27)), false);
+  assert.equal(resultText.includes(String.fromCharCode(7)), false);
   const crossSession = await status.execute("status", { runId: "run-other" }, undefined, undefined, context);
   assert.deepEqual(crossSession.details, { runId: "run-other", workflowName: "other-status", state: "interrupted", agents: [] });
   const legacy = new RunStore(cwd, "legacy-session", "run-legacy", home);

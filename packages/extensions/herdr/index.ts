@@ -510,7 +510,11 @@ function registerLifecycleHooks(pi: ExtensionAPI | null | undefined, runner: Her
   pi.events.on(WORKFLOW_RUN_RESUMED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, true); });
   pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, false); });
   pi.events.on(WORKFLOW_RUN_FAILED_EVENT, (event) => { if (isRunEvent(event)) setLiveRun(event.runId, false); });
-  pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event) => { if (isRunEvent(event) && isLiveRunTerminalState((event as { state?: unknown }).state)) setLiveRun(event.runId, false); });
+  pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event) => {
+    if (!isRunEvent(event)) return;
+    const state = (event as { state?: unknown }).state;
+    if (state !== undefined) setLiveRun(event.runId, isLiveRunActiveState(state));
+  });
   if (env.PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER !== "1") return;
   const reporter = createHerdrAgentReporter(pane, "pi", runner);
   let sessionRef: SessionReference = {};
@@ -695,8 +699,7 @@ function isRunEvent(value: unknown): value is { runId: string } {
 function isTerminalRunState(value: unknown): value is "failed" | "stopped" | "interrupted" | "budget_exhausted" {
   return value === "failed" || value === "stopped" || value === "interrupted" || value === "budget_exhausted";
 }
-function isLiveRunTerminalState(value: unknown): boolean { return value === "completed" || isTerminalRunState(value); }
-
+function isLiveRunActiveState(value: unknown): boolean { return value === "running" || value === "pausing"; }
 function registerWorkspaceLifecycle(pi: ExtensionAPI | null | undefined, workspaces: WorkspaceManager): void {
   if (!hasExtensionHooks(pi)) return;
   pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event) => { if (isRunEvent(event)) void workspaces.close(event.runId); });

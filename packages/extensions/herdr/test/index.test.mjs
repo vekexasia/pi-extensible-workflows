@@ -8,7 +8,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import extension, { breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
-import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_STARTED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
+import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
 
 const piRuntime = { executable: process.execPath, entrypoint: "/originating/pi-coding-agent/dist/cli.js" };
 function writeFixtureStream(res, id = "fixture") {
@@ -375,6 +375,42 @@ void test("reports background workflow activity after the root agent settles", a
   assert.deepEqual(emitted.filter(({ name }) => name === "herdr:working"), [{ name: "herdr:working", data: { runId: "run", active: true } }]);
   await pi.events.emit(WORKFLOW_RUN_COMPLETED_EVENT, { runId: "run" });
   assert.deepEqual(emitted.filter(({ name }) => name === "herdr:working"), [{ name: "herdr:working", data: { runId: "run", active: true } }, { name: "herdr:working", data: { runId: "run", active: false } }]);
+});
+void test("tracks active workflow lifecycle states across concurrent runs", async () => {
+  const handlers = new Map();
+  const register = (name, handler) => { const previous = handlers.get(name); handlers.set(name, previous ? async (...args) => { await previous(...args); await handler(...args); } : handler); };
+  const emitted = [];
+  const pi = {
+    on: register,
+    events: {
+      on: register,
+      emit(name, data) { emitted.push({ name, data }); return handlers.get(name)?.(data); },
+    },
+  };
+  resetWorkflowRegistry();
+  extension(pi, { env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane" } });
+  const state = (runId, value) => pi.events.emit(WORKFLOW_RUN_STATE_CHANGED_EVENT, { runId, state: value });
+  await pi.events.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "one" });
+  await pi.events.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "two" });
+  await state("one", "paused");
+  await state("one", "awaiting_input");
+  await state("one", "running");
+  await pi.events.emit(WORKFLOW_RUN_RESUMED_EVENT, { runId: "one" });
+  await pi.events.emit(WORKFLOW_RUN_COMPLETED_EVENT, { runId: "one" });
+  await state("two", "awaiting_input");
+  await state("two", "running");
+  await pi.events.emit(WORKFLOW_RUN_RESUMED_EVENT, { runId: "two" });
+  await state("two", "failed");
+  assert.deepEqual(emitted.filter(({ name }) => name === "herdr:working"), [
+    { name: "herdr:working", data: { runId: "one", active: true } },
+    { name: "herdr:working", data: { runId: "two", active: true } },
+    { name: "herdr:working", data: { runId: "one", active: false } },
+    { name: "herdr:working", data: { runId: "one", active: true } },
+    { name: "herdr:working", data: { runId: "one", active: false } },
+    { name: "herdr:working", data: { runId: "two", active: false } },
+    { name: "herdr:working", data: { runId: "two", active: true } },
+    { name: "herdr:working", data: { runId: "two", active: false } },
+  ]);
 });
 void test("resumes and terminally disposes the local session when initial Herdr pane launch fails", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-initial-launch-failure-"));

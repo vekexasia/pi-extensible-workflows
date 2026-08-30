@@ -61,6 +61,7 @@ void test("trajectory loads first-class subagents with filtering, ordering, tran
     assert.deepEqual(subagents.map((subagent) => subagent.id), ["running", "oversized-failure", "failed", "stopped", "oversized-result", "with-transcript", "completed"]);
     const current = subagents.find((subagent) => subagent.id === "with-transcript");
     assert.ok(current);
+    assert.equal(current.progress?.activity, undefined);
     assert.equal(current.sessionId, "session");
     assert.equal(current.request.prompt, "prompt-with-transcript");
     assert.deepEqual(current.tools, ["read"]);

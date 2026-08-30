@@ -12,7 +12,7 @@ import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunId
 import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
 import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
-import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, validateModelAliases } from "./utils.js";
+import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
 import { loadAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
@@ -163,8 +163,7 @@ function agentWithProgress(agent: AgentRecord, progress: AgentProgress): AgentRe
     next.tools = progress.state.tools;
     if (progress.state.systemPrompt !== undefined) next.systemPrompt = progress.state.systemPrompt;
   }
-  if (progress.activity === undefined) delete next.activity;
-  else next.activity = progress.activity;
+  delete next.activity;
   if (progress.lastEventAt !== undefined) next.lastEventAt = progress.lastEventAt;
   return next;
 }
@@ -672,7 +671,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     await cleanupTerminalRun(runId);
     return { runId, state: "stopped", stopped: true };
   };
-  type WorkflowStatusAgent = { id: string; label?: string; path: string; state: AgentRecord["state"]; activity?: AgentActivity; lastEventAt?: number; accounting?: NonNullable<AgentRecord["accounting"]> };
+  type WorkflowStatusAgent = { id: string; label?: string; path: string; state: AgentRecord["state"]; lastEventAt?: number; accounting?: NonNullable<AgentRecord["accounting"]> };
   type WorkflowStatusResult = { runId: string; workflowName: string; state: RunState; error?: { code: WorkflowErrorCode; message: string }; failedAt?: string; budget?: NonNullable<PersistedRun["budget"]>; usage?: NonNullable<PersistedRun["usage"]>; phase?: string; delivery?: Pick<NonNullable<PersistedRun["delivery"]>, "mode" | "state">; agents: readonly WorkflowStatusAgent[] };
   const workflowStatusRun = async (runId: string, context: unknown): Promise<WorkflowStatusResult> => {
     const host = object(context) ? context : {};
@@ -682,7 +681,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       if (!(await listRunIds(cwd, sessionId, home, false)).includes(runId)) continue;
       const store = new RunStore(cwd, sessionId, runId, home);
       try {
-        const run = withLiveActivities(await store.loadStatus());
+        const run = await store.loadStatus();
         const failedAt = run.failedAt ?? run.error?.failedAt;
         return {
           runId: run.id, workflowName: run.workflowName, state: run.state,
@@ -691,7 +690,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           ...(run.budget === undefined ? {} : { budget: run.budget, ...(run.usage === undefined ? {} : { usage: run.usage }) }),
           ...(run.phase ? { phase: run.phase } : {}),
           ...(run.delivery ? { delivery: { mode: run.delivery.mode, state: run.delivery.state } } : {}),
-          agents: run.agents.map((agent) => ({ id: agent.id, ...(agent.label === undefined ? {} : { label: agent.label }), path: agent.path, state: agent.state, ...(agent.activity === undefined ? {} : { activity: agent.activity }), ...(agent.lastEventAt === undefined ? {} : { lastEventAt: agent.lastEventAt }), ...(agent.accounting === undefined ? {} : { accounting: agent.accounting }) })),
+          agents: run.agents.map((agent) => ({ id: agent.id, ...(agent.label === undefined ? {} : { label: agent.label }), path: agent.path, state: agent.state, ...(agent.lastEventAt === undefined ? {} : { lastEventAt: agent.lastEventAt }), ...(agent.accounting === undefined ? {} : { accounting: agent.accounting }) })),
         };
       } catch {
         continue;
@@ -1359,7 +1358,7 @@ class LiveAgentRegistry {
     else this.#clear(runId, agentId, (state) => { delete state.prepared; delete state.handoff; });
   }
   setActivity(runId: string, agentId: string, activity?: AgentActivity): void {
-    if (activity) this.#state(runId, agentId).activity = activity;
+    if (activity) this.#state(runId, agentId).activity = { ...activity, text: sanitizeDisplayText(activity.text) };
     else this.#clear(runId, agentId, (state) => { delete state.activity; });
   }
   setEventTime(runId: string, agentId: string, timestamp?: number): void {

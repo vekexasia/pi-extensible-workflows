@@ -245,12 +245,21 @@ export async function withResolvedResources(run: PersistedRun, cwd: string): Pro
   if (agents.every((agent, index) => agent === run.agents[index])) return run;
   return { ...run, agents };
 }
+function withoutAgentActivities(run: PersistedRun): PersistedRun {
+  const agents = run.agents.map((agent) => {
+    if (agent.activity === undefined) return agent;
+    const next = { ...agent };
+    delete next.activity;
+    return next;
+  });
+  return agents.every((agent, index) => agent === run.agents[index]) ? run : { ...run, agents };
+}
 
 async function loadTrajectoryRun(store: RunStore): Promise<TrajectoryRun> {
   const value = await store.load();
   const summary = await store.loadSummary().catch(() => undefined);
   const prompts = await store.systemPrompts().catch(() => []);
-  const run = await withResolvedResources(withPiToolDescriptions(applySystemPrompts(value.run, prompts)), store.cwd);
+  const run = withoutAgentActivities(await withResolvedResources(withPiToolDescriptions(applySystemPrompts(value.run, prompts)), store.cwd));
   return { run, snapshot: value.snapshot, awaiting: await store.awaitingCheckpoints(), ...(summary?.createdAt === undefined ? {} : { createdAt: summary.createdAt }), transcripts: await runTranscripts(run) };
 }
 
@@ -314,12 +323,18 @@ async function subagentFileBytes(path: string): Promise<number | undefined> {
 }
 function subagentArtifact(path: string, bytes: number | undefined): TrajectorySubagentArtifact | undefined { return bytes === undefined ? undefined : { truncated: true, path, bytes }; }
 function boundedSubagentJson(value: unknown): JsonValue | undefined { return jsonValue(value) ? value : undefined; }
+function withoutProgressActivity(progress: SubagentProgress): SubagentProgress {
+  const rest = { ...progress };
+  delete rest.activity;
+  return rest;
+}
 async function loadTrajectorySubagent(directory: string, cwd: string, sessionId: string): Promise<TrajectorySubagent | "foreign" | undefined> {
   try {
     const id = basename(directory);
     const status = statusValue(await readSubagentJson(join(directory, "status.json")));
     if (!status || status.id !== id) return undefined;
     if (status.sessionId !== sessionId) return "foreign";
+    const progress = status.progress === undefined ? undefined : withoutProgressActivity(status.progress);
     const request = normalizeSubagentRunRequest(await readSubagentJson(join(directory, "request.json")));
     const resultPath = join(directory, "result.json");
     const failurePath = join(directory, "failure.json");
@@ -336,9 +351,9 @@ async function loadTrajectorySubagent(directory: string, cwd: string, sessionId:
     const failure = failureArtifact ?? (failureValue === undefined ? undefined : subagentErrorValue(failureValue));
     const rawAttempt = status.attemptDetails?.at(-1);
     const attempt = rawAttempt === undefined ? undefined : await withResolvedAttemptResources(rawAttempt, cwd);
-    const tools = status.progress?.state?.tools ?? attempt?.setup.tools ?? [];
+    const tools = progress?.state?.tools ?? attempt?.setup.tools ?? [];
     const toolDefinitions = toolDefinitionsFor(tools, piToolCatalog(cwd));
-    const model = status.progress?.state?.model ?? attempt?.setup.model;
+    const model = progress?.state?.model ?? attempt?.setup.model;
     const transcriptPath = sessionFile(attempt?.session);
     const transcript = transcriptPath === undefined ? [] : await readTranscript(transcriptPath);
     return {
@@ -352,7 +367,7 @@ async function loadTrajectorySubagent(directory: string, cwd: string, sessionId:
       ...(status.worktree === undefined ? {} : { worktree: status.worktree }),
       ...(model === undefined ? {} : { model }),
       ...(toolDefinitions.length ? { toolDefinitions } : {}),
-      ...(status.progress === undefined ? {} : { progress: status.progress }),
+      ...(progress === undefined ? {} : { progress }),
       ...(attempt === undefined ? {} : { attempt }),
       ...(result === undefined ? {} : { result }),
       ...(failure === undefined ? {} : { failure }),
