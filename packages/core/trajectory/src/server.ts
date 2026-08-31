@@ -8,29 +8,36 @@ const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
 type Socket = import("node:stream").Duplex;
 type ClientKind = "publisher" | "browser";
-type Client = { socket: Socket; kind: ClientKind; publisherId?: string; buffer: Buffer; pendingState: Buffer | undefined; backpressured: boolean };
+type Client = { socket: Socket; kind: ClientKind; publisherId?: string; buffer: Buffer; pendingState: Buffer | undefined; backpressured: boolean; superseded: boolean };
 type State = { type: "state"; publishers: readonly unknown[]; updatedAt: number; initial?: boolean; truncated?: boolean };
+type PendingRequest = { requestId: string; kind: "transcript" | "action"; browser: Client; publisherId: string; publisher: Client; target: { runId?: string; agentId?: string; subagentId?: string; revision?: number }; timer: ReturnType<typeof setTimeout> };
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+const MAX_PENDING_REQUESTS = 128;
+const TRANSCRIPT_REQUEST_TIMEOUT_MS = 10_000;
+const ACTION_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
 const TIMING_ENTRY_TYPE = "pi-workflows:tool-timing";
-
 function isTimingEntry(value: unknown): boolean {
   return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "custom" && (value as { customType?: unknown }).customType === TIMING_ENTRY_TYPE);
 }
-
+function compactTranscript(value: unknown): unknown {
+  if (Array.isArray(value)) return value.filter(isTimingEntry);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { revision: 0, status: "missing", timing: [] };
+  const record = value as Record<string, unknown>;
+  return { ...record, ...(Array.isArray(record.timing) ? { timing: record.timing.filter(isTimingEntry) } : {}) };
+}
 function compactRun(run: unknown): unknown {
   if (!run || typeof run !== "object" || Array.isArray(run)) return run;
   const record = run as { transcripts?: unknown };
   if (!record.transcripts || typeof record.transcripts !== "object" || Array.isArray(record.transcripts)) return { ...record, transcripts: {} };
-  const transcripts: Record<string, unknown[]> = {};
-  for (const [id, entries] of Object.entries(record.transcripts as Record<string, unknown>)) transcripts[id] = Array.isArray(entries) ? entries.filter(isTimingEntry) : [];
+  const transcripts: Record<string, unknown> = {};
+  for (const [id, entries] of Object.entries(record.transcripts as Record<string, unknown>)) transcripts[id] = compactTranscript(entries);
   return { ...record, transcripts };
 }
 function compactSubagent(subagent: unknown): unknown {
   if (!subagent || typeof subagent !== "object" || Array.isArray(subagent)) return subagent;
   const record = subagent as { transcript?: unknown };
-  return { ...record, transcript: Array.isArray(record.transcript) ? record.transcript.filter(isTimingEntry) : [] };
+  return { ...record, transcript: compactTranscript(record.transcript) };
 }
-
 function compactPublishers(publishers: readonly unknown[]): unknown[] {
   return publishers.map((publisher) => {
     if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return publisher;
@@ -38,18 +45,84 @@ function compactPublishers(publishers: readonly unknown[]): unknown[] {
     return { ...value, ...(Array.isArray(value.runs) ? { runs: value.runs.map(compactRun) } : {}), ...(Array.isArray(value.subagents) ? { subagents: value.subagents.map(compactSubagent) } : {}) };
   });
 }
-
+const MAX_METADATA_STRING_BYTES = 64 * 1024;
+const MAX_METADATA_ARRAY_ENTRIES = 256;
+const MAX_METADATA_OBJECT_KEYS = 64;
+const METADATA_ARRAY_KEYS = new Set(["agents", "runs", "subagents"]);
+const METADATA_OBJECT_KEYS = new Set(["transcripts"]);
+function boundedMetadata(value: unknown, key = "", depth = 0): unknown {
+  if (typeof value === "string") {
+    const bytes = Buffer.from(value);
+    return bytes.length > MAX_METADATA_STRING_BYTES ? bytes.subarray(0, MAX_METADATA_STRING_BYTES).toString("utf8") : value;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (depth >= 12) return undefined;
+  if (Array.isArray(value)) {
+    const array = value as readonly unknown[];
+    const entries = key === "attemptDetails" ? array.slice(-8) : METADATA_ARRAY_KEYS.has(key) ? array : array.length <= MAX_METADATA_ARRAY_ENTRIES ? array : [...array.slice(0, 32), ...array.slice(-MAX_METADATA_ARRAY_ENTRIES + 32)];
+    return entries.map((entry) => boundedMetadata(entry, "", depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    const properties = METADATA_OBJECT_KEYS.has(key) ? Object.keys(value).sort() : Object.keys(value).sort().slice(0, MAX_METADATA_OBJECT_KEYS);
+    for (const property of properties) result[property] = boundedMetadata((value as Record<string, unknown>)[property], property, depth + 1);
+    return result;
+  }
+  return undefined;
+}
+function minimalPublisher(publisher: unknown): unknown {
+  return boundedMetadata(publisher);
+}
+function tinyPublisher(publisher: unknown): unknown {
+  if (!publisher || typeof publisher !== "object" || Array.isArray(publisher)) return { id: "publisher" };
+  const value = publisher as Record<string, unknown>;
+  return { id: typeof value.id === "string" ? value.id.slice(0, 200) : "publisher", title: typeof value.title === "string" ? value.title.slice(0, 200) : undefined, cwd: typeof value.cwd === "string" ? value.cwd.slice(0, 1024) : undefined, sessionId: typeof value.sessionId === "string" ? value.sessionId.slice(0, 200) : undefined, themes: value.themes, connected: value.connected === true };
+}
+function encodePublisherList(publishers: readonly unknown[], updatedAt: number, maxBytes: number, initial: boolean, truncated: boolean, projector: (publisher: unknown) => unknown, fallback?: (publisher: unknown) => unknown): { serialized: string; truncated: boolean } {
+  const prefix = `{"type":"state","publishers":[`;
+  const suffix = (isTruncated: boolean): string => `],"updatedAt":${String(updatedAt)}${initial ? ",\"initial\":true" : ""}${isTruncated ? ",\"truncated\":true" : ""}}`;
+  const markerBytes = Buffer.byteLength(suffix(true)) - Buffer.byteLength(suffix(false));
+  const parts: string[] = [];
+  let bytes = Buffer.byteLength(prefix) + Buffer.byteLength(suffix(false));
+  let wasTruncated = truncated;
+  for (const publisher of publishers) {
+    let serialized: string;
+    try { serialized = JSON.stringify(projector(publisher)); } catch { wasTruncated = true; continue; }
+    let nextBytes = bytes + Buffer.byteLength(serialized) + (parts.length ? 1 : 0);
+    if (nextBytes + markerBytes >= maxBytes && fallback !== undefined) {
+      try { serialized = JSON.stringify(fallback(publisher)); } catch { wasTruncated = true; continue; }
+      nextBytes = bytes + Buffer.byteLength(serialized) + (parts.length ? 1 : 0);
+    }
+    if (nextBytes + markerBytes >= maxBytes) { wasTruncated = true; continue; }
+    parts.push(serialized);
+    bytes = nextBytes;
+  }
+  const serialized = `${prefix}${parts.join(",")}${suffix(wasTruncated)}`;
+  if (Buffer.byteLength(serialized) < maxBytes) return { serialized, truncated: wasTruncated };
+  return { serialized: `${prefix}${suffix(true)}`, truncated: true };
+}
 function encodeState(state: State, maxBytes: number): string {
-  const full = JSON.stringify(state);
-  if (Buffer.byteLength(full) <= maxBytes) return full;
-  // ponytail: strip message transcripts when combined state exceeds the frame cap; ui:transcript loads one agent
-  const compact = JSON.stringify({ type: "state", publishers: compactPublishers(state.publishers), updatedAt: state.updatedAt });
-  if (Buffer.byteLength(compact) <= maxBytes) return compact;
-  return JSON.stringify({ type: "state", publishers: [], updatedAt: state.updatedAt, truncated: true });
+  const initial = state.initial === true;
+  const compactedPublishers = compactPublishers(state.publishers);
+  const full = encodePublisherList(compactedPublishers, state.updatedAt, maxBytes, initial, state.truncated === true, (publisher) => publisher);
+  if (!full.truncated) return full.serialized;
+  return encodePublisherList(compactedPublishers, state.updatedAt, maxBytes, initial, true, minimalPublisher, tinyPublisher).serialized;
+}
+function encodeApplication(value: unknown, maxBytes: number): string {
+  let serialized: string;
+  try { serialized = JSON.stringify(value); } catch { return "{}"; }
+  if (Buffer.byteLength(serialized) < maxBytes) return serialized;
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    if (record.type === "transcript") serialized = JSON.stringify({ type: "transcript", ...(typeof record.requestId === "string" ? { requestId: record.requestId } : {}), ...(typeof record.publisherId === "string" ? { publisherId: record.publisherId } : {}), ...(typeof record.runId === "string" ? { runId: record.runId } : {}), ...(typeof record.agentId === "string" ? { agentId: record.agentId } : {}), ...(typeof record.subagentId === "string" ? { subagentId: record.subagentId } : {}), ok: false, status: "oversized", revision: typeof record.revision === "number" ? record.revision : 0, error: "Transcript is too large" });
+    else if (record.type === "action-result") serialized = JSON.stringify({ type: "action-result", ...(typeof record.requestId === "string" ? { requestId: record.requestId } : {}), ok: false, error: "Trajectory action result is too large" });
+    else serialized = JSON.stringify({ type: "error", error: "Trajectory message is too large" });
+  }
+  return Buffer.byteLength(serialized) < maxBytes ? serialized : "{}";
 }
 function frame(payload: string, maxBytes: number): Buffer {
   const body = Buffer.from(payload);
-  if (body.length > maxBytes) throw new Error("Trajectory WebSocket frame is too large");
+  if (body.length >= maxBytes) throw new Error("Trajectory WebSocket frame is too large");
   if (body.length < 126) return Buffer.concat([Buffer.from([0x81, body.length]), body]);
   if (body.length <= 0xffff) { const header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(body.length, 2); return Buffer.concat([header, body]); }
   const header = Buffer.alloc(10); header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(body.length), 2); return Buffer.concat([header, body]);
@@ -70,7 +143,7 @@ function writeFrame(client: Client, packet: Buffer, state: boolean): void {
 function send(client: Client, value: unknown, maxBytes: number): void {
   try {
     const state = isState(value);
-    const packet = frame(state ? encodeState(value, maxBytes) : JSON.stringify(value), maxBytes);
+    const packet = frame(state ? encodeState(value, maxBytes) : encodeApplication(value, maxBytes), maxBytes);
     writeFrame(client, packet, state);
   } catch { client.socket.destroy(); }
 }
@@ -88,7 +161,8 @@ function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly 
     let offset = 2;
     let length = second & 0x7f;
     if (length === 126) { if (client.buffer.length < 4) break; length = client.buffer.readUInt16BE(2); offset = 4; }
-    else if (length === 127) { if (client.buffer.length < 10) break; const longLength = client.buffer.readBigUInt64BE(2); if (longLength > BigInt(maxBytes)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
+    else if (length === 127) { if (client.buffer.length < 10) break; const longLength = client.buffer.readBigUInt64BE(2); if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
+    if (length >= maxBytes) throw new Error("Trajectory WebSocket frame is too large");
     if (opcode >= 0x8 && (length > 125 || (first & 0x80) === 0)) throw new Error("Invalid Trajectory WebSocket control frame");
     if (client.buffer.length < offset + 4 + length) break;
     const mask = client.buffer.subarray(offset, offset + 4); offset += 4;
@@ -122,9 +196,26 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
   const clients = new Set<Client>();
   const publishers = new Map<string, { client: Client; value: Record<string, unknown>; sequence: number }>();
   let latest: State = { type: "state", publishers: [], updatedAt: Date.now(), initial: true };
+  const pending = new Map<Client, Map<string, PendingRequest>>();
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   const emit = (client: Client, value: unknown) => { send(client, value, maxFrameBytes); };
+  const pendingFor = (browser: Client): Map<string, PendingRequest> => { let requests = pending.get(browser); if (!requests) { requests = new Map(); pending.set(browser, requests); } return requests; };
+  const hasPendingRequest = (requests: ReadonlyMap<string, PendingRequest>, requestId: string): boolean => [...requests.values()].some((request) => request.requestId === requestId);
+  const publisherRequestIdFor = (requestId: string): string => [...pending.values()].some((requests) => requests.has(requestId)) ? randomUUID() : requestId;
+  const errorResponse = (_publisherRequestId: string, request: PendingRequest, status: string, error: string): unknown => request.kind === "action" ? { type: "action-result", requestId: request.requestId, ok: false, error } : { type: "transcript", requestId: request.requestId, publisherId: request.publisherId, ...(request.target.runId === undefined ? {} : { runId: request.target.runId }), ...(request.target.agentId === undefined ? {} : { agentId: request.target.agentId }), ...(request.target.subagentId === undefined ? {} : { subagentId: request.target.subagentId }), ok: false, status, revision: request.target.revision ?? 0, error };
+  const clearPending = (client: Client, error: string): void => {
+    const own = pending.get(client);
+    if (own) { for (const [requestId, request] of own) { clearTimeout(request.timer); emit(client, errorResponse(requestId, request, "disconnected", error)); } own.clear(); pending.delete(client); }
+    for (const [browser, requests] of pending) { for (const [requestId, request] of requests) { if (request.publisher !== client) continue; clearTimeout(request.timer); requests.delete(requestId); emit(browser, errorResponse(requestId, request, "disconnected", error)); } if (!requests.size) pending.delete(browser); }
+  };
+  const rejectRequest = (browser: Client, requestId: string, request: PendingRequest, error: string): void => {
+    const requests = pending.get(browser);
+    if (!requests || requests.get(requestId) !== request) return;
+    requests.delete(requestId);
+    if (!requests.size) pending.delete(browser);
+    emit(browser, errorResponse(requestId, request, "failed", error));
+  };
   const scheduleIdleExit = () => {
     if (closed || [...publishers.values()].some(({ value }) => value.connected === true) || idleTimer !== undefined) return;
     idleTimer = setTimeout(() => {
@@ -157,6 +248,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     broadcast(latest);
   };
   const disconnect = (client: Client) => {
+    clearPending(client, client.kind === "publisher" ? "Publisher is disconnected" : "Trajectory browser disconnected");
     clients.delete(client);
     if (client.kind === "publisher" && client.publisherId && publishers.get(client.publisherId)?.client === client) {
       publishers.delete(client.publisherId);
@@ -169,11 +261,19 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     try { value = JSON.parse(raw); } catch { return; }
     if (!value || typeof value !== "object" || Array.isArray(value)) return;
     const message = value as Record<string, unknown>;
+    if (client.superseded) return;
+    if (message.type === "publisher:detach" && client.kind === "publisher" && client.publisherId && publishers.get(client.publisherId)?.client === client) { clearPending(client, "Publisher is disconnected"); publishers.delete(client.publisherId); publishState(); scheduleIdleExit(); return; }
     if (message.type === "ui:attach") { client.kind = "browser"; emit(client, latest); return; }
     if (client.kind === "publisher" && message.type === "publisher:attach" && typeof message.publisherId === "string") {
       cancelIdleExit();
       client.publisherId = message.publisherId;
       const previous = publishers.get(message.publisherId);
+      if (previous && previous.client !== client) {
+        previous.client.superseded = true;
+        clearPending(previous.client, "Publisher replaced");
+        emit(previous.client, { type: "publisher:replaced" });
+        previous.client.socket.end();
+      }
       const sequence = (previous?.sequence ?? 0) + 1;
       publishers.set(message.publisherId, { client, value: { ...(previous?.value ?? { id: message.publisherId }), id: message.publisherId, connected: true }, sequence });
       publishState();
@@ -182,71 +282,90 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     if (client.kind === "publisher" && message.type === "publisher:state" && typeof message.publisher === "object" && message.publisher !== null) {
       const publisher = message.publisher as Record<string, unknown>;
       const id = typeof publisher.id === "string" ? publisher.id : client.publisherId;
-      if (!id) return;
-      client.publisherId = id;
+      if (!id || client.publisherId !== id || publishers.get(id)?.client !== client) return;
       cancelIdleExit();
       const previous = publishers.get(id);
       const sequence = (previous?.sequence ?? 0) + 1;
-      publishers.set(id, { client, value: { ...(previous?.value ?? { id }), ...publisher, connected: true }, sequence });
       const runs = Array.isArray(message.runs) ? message.runs : [];
       const subagents = Array.isArray(message.subagents) ? message.subagents : [];
-      publishers.set(id, { client, value: { ...publisher, connected: true, runs, subagents }, sequence });
+      publishers.set(id, { client, value: { ...publisher, connected: true, runs, subagents, ...(message.truncated === true || publisher.truncated === true ? { truncated: true } : {}) }, sequence });
       publishState();
       return;
     }
-    if (client.kind === "publisher" && message.type === "publisher:action-result" && typeof message.requestId === "string") { broadcast(message); return; }
+    if (client.kind === "publisher" && (message.type === "publisher:action-result" || message.type === "publisher:transcript-result") && typeof message.requestId === "string") {
+      for (const [browser, requests] of pending) {
+        const request = requests.get(message.requestId);
+        if (!request || request.publisher !== client || request.publisherId !== message.publisherId || message.type !== (request.kind === "action" ? "publisher:action-result" : "publisher:transcript-result")) continue;
+        const responseRevision = message.requestedRevision ?? message.revision;
+        const targetMatches = request.kind === "action" || (request.target.runId === message.runId && request.target.agentId === message.agentId && request.target.subagentId === message.subagentId && (request.target.revision === undefined || request.target.revision === responseRevision));
+        if (!targetMatches) return;
+        clearTimeout(request.timer);
+        requests.delete(message.requestId);
+        if (!requests.size) pending.delete(browser);
+        if (request.kind === "action") emit(browser, { type: "action-result", requestId: request.requestId, ...(message.ok === true ? { ok: true, ...(message.result === undefined ? {} : { result: message.result }) } : { ok: false, error: typeof message.error === "string" ? message.error : "Trajectory action failed" }) });
+        else emit(browser, { type: "transcript", requestId: request.requestId, publisherId: request.publisherId, ...(request.target.runId === undefined ? {} : { runId: request.target.runId }), ...(request.target.agentId === undefined ? {} : { agentId: request.target.agentId }), ...(request.target.subagentId === undefined ? {} : { subagentId: request.target.subagentId }), ok: message.ok === true, status: typeof message.status === "string" ? message.status : message.ok === true ? "available" : "failed", revision: typeof message.revision === "number" ? message.revision : request.target.revision ?? 0, ...(message.ok === true ? { entries: Array.isArray(message.entries) ? message.entries : [] } : { error: typeof message.error === "string" ? message.error : "Transcript failed" }) });
+        return;
+      }
+      return;
+    }
     if (client.kind === "browser" && message.type === "ui:transcript") {
       const validId = (value: unknown): value is string => typeof value === "string" && value.length >= 1 && value.length <= 200;
       if (!validId(message.publisherId)) return;
       const runRequest = validId(message.runId) && validId(message.agentId) && message.subagentId === undefined;
       const subagentRequest = validId(message.subagentId) && message.runId === undefined && message.agentId === undefined;
       if (!runRequest && !subagentRequest) return;
+      const requestId = validId(message.requestId) ? message.requestId : randomUUID();
+      const revision = message.revision === undefined ? undefined : typeof message.revision === "number" && Number.isSafeInteger(message.revision) && message.revision >= 0 ? message.revision : undefined;
       const target = publishers.get(message.publisherId);
-      let entries: unknown[] = [];
-      if (runRequest) {
-        const runs = target?.value.runs;
-        if (Array.isArray(runs)) {
-          for (const item of runs) {
-            if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-            const record = item as { run?: { id?: unknown }; transcripts?: unknown };
-            if (record.run?.id !== message.runId) continue;
-            const transcripts = record.transcripts;
-            if (transcripts && typeof transcripts === "object" && !Array.isArray(transcripts)) {
-              const found = (transcripts as Record<string, unknown>)[message.agentId as string];
-              entries = Array.isArray(found) ? found : [];
-            }
-            break;
-          }
+      if (!target || !target.value.connected) { emit(client, { type: "transcript", requestId, publisherId: message.publisherId, ...(runRequest ? { runId: message.runId, agentId: message.agentId } : { subagentId: message.subagentId }), ok: false, status: "disconnected", revision: revision ?? 0, error: "Publisher is disconnected" }); return; }
+      // Legacy publishers sent transcript bodies in state. New publishers send metadata and use the RPC below.
+      let legacyEntries: unknown[] | undefined;
+      if (runRequest && Array.isArray(target.value.runs)) {
+        for (const item of target.value.runs) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+          const record = item as { run?: { id?: unknown }; transcripts?: unknown };
+          if (record.run?.id !== message.runId || !record.transcripts || typeof record.transcripts !== "object" || Array.isArray(record.transcripts)) continue;
+          const found = (record.transcripts as Record<string, unknown>)[message.agentId as string];
+          if (Array.isArray(found)) legacyEntries = found;
+          break;
         }
-      } else {
-        const subagents = target?.value.subagents;
-        if (Array.isArray(subagents)) {
-          for (const item of subagents) {
-            if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-            const record = item as { id?: unknown; transcript?: unknown };
-            if (record.id !== message.subagentId) continue;
-            entries = Array.isArray(record.transcript) ? record.transcript : [];
-            break;
-          }
+      } else if (subagentRequest && Array.isArray(target.value.subagents)) {
+        for (const item of target.value.subagents) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+          const record = item as { id?: unknown; transcript?: unknown };
+          if (record.id === message.subagentId && Array.isArray(record.transcript)) { legacyEntries = record.transcript; break; }
         }
       }
-      const reply = runRequest ? { type: "transcript", publisherId: message.publisherId, runId: message.runId, agentId: message.agentId, entries } : { type: "transcript", publisherId: message.publisherId, subagentId: message.subagentId, entries };
-      if (Buffer.byteLength(JSON.stringify(reply)) > maxFrameBytes) {
-        emit(client, runRequest ? { type: "transcript", publisherId: message.publisherId, runId: message.runId, agentId: message.agentId, ok: false, error: "Transcript is too large" } : { type: "transcript", publisherId: message.publisherId, subagentId: message.subagentId, ok: false, error: "Transcript is too large" });
+      if (legacyEntries !== undefined) {
+        const reply = { type: "transcript", requestId, publisherId: message.publisherId, ...(runRequest ? { runId: message.runId, agentId: message.agentId } : { subagentId: message.subagentId }), ok: true, status: legacyEntries.length ? "available" : "empty", revision: revision ?? 1, entries: legacyEntries };
+        if (Buffer.byteLength(JSON.stringify(reply)) > maxFrameBytes) emit(client, { ...reply, ok: false, status: "oversized", entries: undefined, error: "Transcript is too large" }); else emit(client, reply);
         return;
       }
-      emit(client, reply);
+      const requests = pendingFor(client);
+      const requestTarget = runRequest ? { runId: message.runId as string, agentId: message.agentId as string, ...(revision === undefined ? {} : { revision }) } : { subagentId: message.subagentId as string, ...(revision === undefined ? {} : { revision }) };
+      if (requests.size >= MAX_PENDING_REQUESTS || hasPendingRequest(requests, requestId)) { emit(client, { type: "transcript", requestId, publisherId: message.publisherId, ...(runRequest ? { runId: message.runId, agentId: message.agentId } : { subagentId: message.subagentId }), ok: false, status: "failed", revision: revision ?? 0, error: "Too many pending Trajectory requests" }); return; }
+      const publisherRequestId = publisherRequestIdFor(requestId);
+      const request: PendingRequest = { requestId, kind: "transcript", browser: client, publisherId: message.publisherId, publisher: target.client, target: requestTarget, timer: setTimeout(() => { rejectRequest(client, publisherRequestId, request, "Trajectory request timed out"); }, TRANSCRIPT_REQUEST_TIMEOUT_MS) };
+      requests.set(publisherRequestId, request);
+      emit(target.client, { type: "publisher:transcript", requestId: publisherRequestId, publisherId: message.publisherId, ...(runRequest ? { runId: message.runId, agentId: message.agentId } : { subagentId: message.subagentId }), ...(revision === undefined ? {} : { revision }) });
       return;
     }
     if (client.kind !== "browser" || message.type !== "ui:action" || typeof message.publisherId !== "string") return;
-    const requestId = typeof message.requestId === "string" ? message.requestId : randomUUID();
+    const requestId = typeof message.requestId === "string" && message.requestId.length >= 1 && message.requestId.length <= 200 ? message.requestId : randomUUID();
     if (!isTrajectoryAction(message.action)) { emit(client, { type: "action-result", requestId, ok: false, error: "Unsupported Trajectory action" }); return; }
     if (!isTrajectoryTarget(message.target)) { emit(client, { type: "action-result", requestId, ok: false, error: "Invalid Trajectory action target" }); return; }
     const actionError = trajectoryActionError(message.action, message.target);
     if (actionError !== undefined) { emit(client, { type: "action-result", requestId, ok: false, error: actionError }); return; }
     const target = publishers.get(message.publisherId);
     if (!target || !target.value.connected) { emit(client, { type: "action-result", requestId, ok: false, error: "Publisher is disconnected" }); return; }
-    emit(target.client, { type: "publisher:action", requestId, action: message.action, target: message.target, ...(typeof message.name === "string" ? { name: message.name } : {}), ...(message.payload === undefined ? {} : { payload: message.payload }) });
+    const publisherRequestId = publisherRequestIdFor(requestId);
+    const outbound = { type: "publisher:action", requestId: publisherRequestId, action: message.action, target: message.target, ...(typeof message.name === "string" ? { name: message.name } : {}), ...(message.payload === undefined ? {} : { payload: message.payload }) };
+    if (Buffer.byteLength(JSON.stringify(outbound)) >= maxFrameBytes) { emit(client, { type: "action-result", requestId, ok: false, error: "Trajectory action is too large" }); return; }
+    const requests = pendingFor(client);
+    if (requests.size >= MAX_PENDING_REQUESTS || hasPendingRequest(requests, requestId)) { emit(client, { type: "action-result", requestId, ok: false, error: "Too many pending Trajectory requests" }); return; }
+    const request: PendingRequest = { requestId, kind: "action", browser: client, publisherId: message.publisherId, publisher: target.client, target: {}, timer: setTimeout(() => { rejectRequest(client, publisherRequestId, request, "Trajectory request timed out"); }, ACTION_REQUEST_TIMEOUT_MS) };
+    requests.set(publisherRequestId, request);
+    emit(target.client, outbound);
   };
   const server = createServer((request, response) => {
     let url: URL;
@@ -293,7 +412,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     if (!authorized(request, port) || url.pathname !== "/ws" || typeof key !== "string") { socket.destroy(); return; }
     const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    const client: Client = { socket, kind: "publisher", buffer: Buffer.alloc(0), pendingState: undefined, backpressured: false };
+    const client: Client = { socket, kind: "publisher", buffer: Buffer.alloc(0), pendingState: undefined, backpressured: false, superseded: false };
     socket.on("drain", () => {
       const pendingState = client.pendingState;
       client.pendingState = undefined;

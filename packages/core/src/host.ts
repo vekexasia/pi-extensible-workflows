@@ -18,7 +18,7 @@ import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIf
 import { agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
 import backgroundWidget, { type BackgroundWidgetAPI } from "./background-widget.js";
 import { showChangelogNotice } from "./changelog.js";
-import { createTrajectoryRunLoader, createTrajectorySubagentLoader, type TrajectoryActionRequest, type TrajectoryActionResult } from "./trajectory.js";
+import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
 import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, WORKFLOW_BLOCKED_EVENT, WorkflowError, roleNameOf, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
@@ -417,7 +417,25 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const model = live.status.progress?.state?.model ?? attempt?.setup.model ?? subagent.model;
       return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
     });
-    return { cwd, sessionId, ...(port === undefined ? {} : { port }), themes, loadRuns, loadSubagents, handleAction: (request: Readonly<TrajectoryActionRequest>) => trajectoryAction(request, context) };
+    const loadRunsMetadata = createTrajectoryRunMetadataLoader(cwd, sessionId, home, (run) => {
+      const active = runs.get(run.id);
+      const live = withLiveActivities(run);
+      return active ? { ...live, state: active.lifecycle.state, usage: active.budget.usage } : live;
+    });
+    const loadSubagentsMetadata = createTrajectorySubagentMetadataLoader(cwd, sessionId, extensionAgentDir, (subagent) => {
+      const live = liveSubagents.get(subagent.id);
+      if (!live || live.status.sessionId !== subagent.sessionId) return subagent;
+      if (live.status.state !== "running" && live.status.finishedAt === subagent.finishedAt) { liveSubagents.delete(subagent.id); return subagent; }
+      const attempt = live.status.attemptDetails?.at(-1) ?? subagent.attempt;
+      const tools = live.status.progress?.state?.tools ?? attempt?.setup.tools ?? subagent.tools;
+      const model = live.status.progress?.state?.model ?? attempt?.setup.model ?? subagent.model;
+      return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
+    });
+    const loadTranscript = createTrajectoryTranscriptLoader(cwd, sessionId, home, extensionAgentDir, (subagentId) => {
+      const live = liveSubagents.get(subagentId);
+      return live?.status.sessionId === sessionId ? live.status.attemptDetails?.at(-1)?.session : undefined;
+    });
+    return { cwd, sessionId, ...(port === undefined ? {} : { port }), themes, loadRuns, loadSubagents, loadMetadata: async () => ({ runs: await loadRunsMetadata(), subagents: await loadSubagentsMetadata() }), loadTranscript, handleAction: (request: Readonly<TrajectoryActionRequest>) => trajectoryAction(request, context) };
   };
   const withLiveActivities = (run: PersistedRun): PersistedRun => liveAgents.overlay(run);
   const terminalRunStates = new Map<string, "completed" | "failed" | "stopped">();

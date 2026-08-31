@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createTrajectoryRunLoader, createTrajectorySubagentLoader, applySystemPrompts, applyToolDescriptions } from "../../src/trajectory.js";
+import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectoryTranscriptLoader, applySystemPrompts, applyToolDescriptions, TRAJECTORY_MAX_TRANSCRIPT_BYTES } from "../../src/trajectory.js";
 import { trajectoryUrl } from "../src/index.js";
 import { RunStore } from "../../src/persistence.js";
 import { createLaunchSnapshot } from "../../src/utils.js";
@@ -78,6 +78,9 @@ void test("trajectory loads first-class subagents with filtering, ordering, tran
     assert.deepEqual(oversizedFailure?.failure, { truncated: true, path: join(agentDir, "subagents", "oversized-failure", "failure.json"), bytes: 2 * 1024 * 1024 + 36 });
     assert.equal(subagents.some((subagent) => subagent.id === "other-session"), false);
     assert.equal(subagents.some((subagent) => subagent.id === "corrupt"), false);
+    const foreignTranscript = await createTrajectoryTranscriptLoader("/project", "session", "/home", agentDir)({ subagentId: "other-session" });
+    assert.equal(foreignTranscript.status, "missing");
+    assert.deepEqual(foreignTranscript.entries, []);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 void test("Trajectory overlays live subagent status over stale persisted status", async () => {
@@ -97,6 +100,23 @@ void test("Trajectory overlays live subagent status over stale persisted status"
     assert.ok(current);
     assert.equal(current.request.prompt, "live");
     assert.equal(current.progress?.activity?.text, "fresh");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+void test("Trajectory transcript loader follows the live subagent attempt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-subagent-transcript-overlay-"));
+  const agentDir = join(root, "agent");
+  const cwd = join(root, "project");
+  const persistedPath = join(root, "persisted.jsonl");
+  const livePath = join(root, "live.jsonl");
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(persistedPath, `${JSON.stringify({ type: "message", text: "persisted" })}\n`);
+  writeFileSync(livePath, `${JSON.stringify({ type: "message", text: "live" })}\n`);
+  writeSubagentFixture(agentDir, "live", "session", "running", persistedPath);
+  try {
+    const loader = createTrajectoryTranscriptLoader(cwd, "session", join(root, "home"), agentDir, () => ({ transport: "local", sessionId: "live-session", locator: { sessionFile: livePath } }));
+    const result = await loader({ subagentId: "live" });
+    assert.equal(result.status, "available");
+    assert.equal((result.entries[0] as { text?: unknown }).text, "live");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -164,6 +184,7 @@ void test("Trajectory agent view requests a compacted transcript on demand", () 
   assert.match(source, /type: "ui:transcript"/);
   assert.match(source, /message\.type === "transcript"/);
   assert.match(source, /requestTranscript\(found, agent\.id\)/);
+  assert.match(source, /publisherId: found\.publisher\.id, runId: found\.record\.run\.id, agentId, \.\.\.\(revision === undefined \? \{\} : \{ revision \}\)/);
 });
 
 void test("Trajectory timelines keep cursors and agent-only range selection", () => {
@@ -262,7 +283,7 @@ void test("Trajectory returns to an empty home when a publisher disappears", () 
   assert.match(source, /function selectHome\(mode = "replace"\)/);
   assert.match(source, /let hasAcceptedState = false/);
   assert.match(source, /call\(history, \{ view: document\.body\.dataset\.view, run: target\?\.kind === "run" \? state\.currentRun : null, subagent:/);
-  assert.match(source, /value\.truncated === true/);
+  assert.match(source, /if \(value\.truncated === true && value\.publishers\.length === 0 && state\.publishers\.length > 0\) return/);
   assert.match(source, /value\.initial === true && hasAcceptedState/);
   assert.match(source, /setView\("run", mode\)/);
   assert.doesNotMatch(source, /if \(!selected\(\) && allRuns\(\)\[0\]/);
@@ -559,6 +580,36 @@ void test("trajectory transcript retention stays bounded with timing entries", a
     assert.equal(entries.length, 800);
     assert.equal(entries.filter((entry) => (entry as { type?: string }).type === "custom").length, 400);
     assert.equal(entries.some((entry) => JSON.stringify(entry).includes("call-0")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("trajectory metadata keeps large transcripts available through bounded tail reads", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-metadata-cap-"));
+  const cwd = join(root, "project");
+  const home = join(root, "home");
+  const sessionFile = join(root, "session.jsonl");
+  mkdirSync(cwd, { recursive: true });
+  const entries = Array.from({ length: 420 }, (_, index) => ({ type: "message", message: { role: "assistant", toolCallId: `call-${String(index)}`, content: [{ type: "text", text: index === 419 ? "large-transcript-tail-marker" : "x".repeat(6000) }] } }));
+  entries.push({ type: "custom", customType: "pi-workflows:tool-timing", data: { toolCallId: "call-419", toolName: "bash", startedAt: 1, completedAt: 2, durationMs: 1, isError: false } } as unknown as (typeof entries)[number]);
+  writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+  const store = new RunStore(cwd, "session", "run", home);
+  const model = { provider: "fixture", model: "fixture-model" };
+  const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: [] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
+  try {
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    assert.ok(readFileSync(sessionFile).byteLength > TRAJECTORY_MAX_TRANSCRIPT_BYTES);
+    const metadataRun = (await createTrajectoryRunMetadataLoader(cwd, "session", home)())[0];
+    assert.ok(metadataRun);
+    const metadata = metadataRun.transcripts.agent;
+    assert.ok(metadata);
+    assert.equal(metadata.status, "available");
+    assert.ok((metadata.bytes ?? 0) > TRAJECTORY_MAX_TRANSCRIPT_BYTES);
+    assert.equal(metadata.timing?.length, 1);
+    const result = await createTrajectoryTranscriptLoader(cwd, "session", home, join(root, "agent"))({ runId: "run", agentId: "agent", revision: metadata.revision });
+    assert.equal(result.status, "available");
+    assert.ok(result.entries.some((entry) => JSON.stringify(entry).includes("large-transcript-tail-marker")));
+    assert.equal(result.entries.some((entry) => JSON.stringify(entry).includes("call-419")), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

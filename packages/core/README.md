@@ -12,6 +12,7 @@ The repository [README](https://github.com/vekexasia/pi-extensible-workflows#rea
 
 Requires Node.js 22.19 or newer. This is trusted Pi host code with the same filesystem and process access as Pi.
 The core installation includes workflow orchestration, the `reviewLoop` starter for implementation-and-review cycles, packaged `developer`/`reviewer`/`scout`/`oracle`/`researcher` roles with ready-made slash commands (`/scout`, `/oracle`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`, and more), and durable standalone subagent tools. See the [Subagents guide](https://vekexasia.github.io/pi-extensible-workflows/subagents.html) for the bundled tools.
+Trajectory live monitoring is included in the package. Restart existing Pi processes after upgrading the package so their publisher protocol matches the detached Trajectory server.
 
 ```sh
 pi install npm:pi-extensible-workflows

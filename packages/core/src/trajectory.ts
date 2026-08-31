@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
@@ -11,7 +12,7 @@ import { statusValue, subagentErrorValue } from "../subagents/src/decode.js";
 import { isNodeError, jsonValue, object, resourcePatternHasMagic, selectResourcesByLayers } from "./utils.js";
 import type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
 
-const TRAJECTORY_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
+export const TRAJECTORY_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const TRAJECTORY_MAX_NON_TIMING_ENTRIES = 400;
 
 export type TrajectoryRun = {
@@ -21,6 +22,9 @@ export type TrajectoryRun = {
   createdAt?: string;
   transcripts: Readonly<Record<string, readonly unknown[]>>;
 };
+export type TrajectoryTranscriptStatus = "available" | "empty" | "missing" | "failed" | "oversized" | "disconnected";
+export type TrajectoryTranscriptMetadata = { readonly revision: number; readonly status: TrajectoryTranscriptStatus; readonly bytes?: number; readonly timing?: readonly unknown[]; };
+export type TrajectoryRunMetadata = Omit<TrajectoryRun, "transcripts"> & { transcripts: Readonly<Record<string, TrajectoryTranscriptMetadata>> };
 export type TrajectorySubagentArtifact = { readonly truncated: true; readonly path: string; readonly bytes: number };
 export type TrajectorySubagent = {
   id: string;
@@ -45,15 +49,22 @@ export type TrajectorySubagent = {
   failure?: { readonly code: string; readonly message: string } | TrajectorySubagentArtifact;
   transcript: readonly unknown[];
 };
+export type TrajectorySubagentMetadata = Omit<TrajectorySubagent, "transcript"> & { transcript: TrajectoryTranscriptMetadata };
+export type TrajectoryTranscriptRequest = { readonly runId?: string; readonly agentId?: string; readonly subagentId?: string; readonly revision?: number };
+export type TrajectorySubagentSessionResolver = (subagentId: string) => WorkflowAgentSessionReference | undefined;
+export type TrajectoryTranscriptResult = { readonly status: TrajectoryTranscriptStatus; readonly revision: number; readonly entries: readonly unknown[]; readonly bytes?: number; readonly error?: string };
+export type TrajectoryTranscriptLoader = (request: Readonly<TrajectoryTranscriptRequest>) => Promise<TrajectoryTranscriptResult>;
+export type TrajectoryRunMetadataLoader = () => Promise<readonly TrajectoryRunMetadata[]>;
+export type TrajectorySubagentMetadataLoader = () => Promise<readonly TrajectorySubagentMetadata[]>;
+export type TrajectoryPublisherMetadata = { readonly runs: readonly TrajectoryRunMetadata[]; readonly subagents: readonly TrajectorySubagentMetadata[] };
+export type TrajectoryPublisherMetadataLoader = () => Promise<TrajectoryPublisherMetadata>;
 export type TrajectorySubagentLoader = () => Promise<readonly TrajectorySubagent[]>;
-
 export type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
 export { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "./trajectory-contracts.js";
 export type TrajectoryActionRequest = { action: TrajectoryAction; target: TrajectoryTarget; name?: string; payload?: unknown };
 export type TrajectoryActionResult = { readonly id: string; readonly state: "running" };
 export type TrajectoryActionHandler = (request: Readonly<TrajectoryActionRequest>) => Promise<void> | Promise<TrajectoryActionResult | undefined>;
 export type TrajectoryRunLoader = () => Promise<readonly TrajectoryRun[]>;
-
 export type TrajectoryPublisherInput = {
   cwd: string;
   sessionId: string;
@@ -61,6 +72,8 @@ export type TrajectoryPublisherInput = {
   themes: boolean;
   loadRuns: TrajectoryRunLoader;
   loadSubagents: TrajectorySubagentLoader;
+  loadMetadata: TrajectoryPublisherMetadataLoader;
+  loadTranscript?: TrajectoryTranscriptLoader;
   handleAction: TrajectoryActionHandler;
 };
 
@@ -83,7 +96,7 @@ function timingToolCallId(value: unknown): string | undefined {
   if (!object(value) || !isTimingTranscriptEntry(value) || !object(value.data)) return undefined;
   return typeof value.data.toolCallId === "string" ? value.data.toolCallId : undefined;
 }
-async function readTranscript(path: string): Promise<readonly unknown[]> {
+async function readTranscript(path: string, throwOnError = false): Promise<readonly unknown[]> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const info = await stat(path);
@@ -116,7 +129,7 @@ async function readTranscript(path: string): Promise<readonly unknown[]> {
     const retainedTiming = entries.filter((entry) => { const id = timingToolCallId(entry); return id !== undefined && retainedIds.has(id); });
     const retained = new Set([...retainedEntries, ...retainedTiming]);
     return entries.filter((entry) => retained.has(entry));
-  } catch { return []; }
+  } catch (error) { if (throwOnError) throw error; return []; }
   finally { await handle?.close(); }
 }
 
@@ -255,12 +268,12 @@ function withoutAgentActivities(run: PersistedRun): PersistedRun {
   return agents.every((agent, index) => agent === run.agents[index]) ? run : { ...run, agents };
 }
 
-async function loadTrajectoryRun(store: RunStore): Promise<TrajectoryRun> {
+async function loadTrajectoryRun(store: RunStore, includeTranscripts = true): Promise<TrajectoryRun> {
   const value = await store.load();
   const summary = await store.loadSummary().catch(() => undefined);
   const prompts = await store.systemPrompts().catch(() => []);
   const run = withoutAgentActivities(await withResolvedResources(withPiToolDescriptions(applySystemPrompts(value.run, prompts)), store.cwd));
-  return { run, snapshot: value.snapshot, awaiting: await store.awaitingCheckpoints(), ...(summary?.createdAt === undefined ? {} : { createdAt: summary.createdAt }), transcripts: await runTranscripts(run) };
+  return { run, snapshot: value.snapshot, awaiting: await store.awaitingCheckpoints(), ...(summary?.createdAt === undefined ? {} : { createdAt: summary.createdAt }), transcripts: includeTranscripts ? await runTranscripts(run) : {} };
 }
 
 export async function loadTrajectoryRuns(cwd: string, sessionId: string, home = homedir(), overlay?: (run: PersistedRun) => PersistedRun): Promise<readonly TrajectoryRun[]> {
@@ -308,6 +321,128 @@ export function createTrajectoryRunLoader(cwd: string, sessionId: string, home =
     return loaded;
   };
 }
+function transcriptRevision(info: { mtimeNs: bigint; size: bigint }): number {
+  const digest = createHash("sha256").update(`${String(info.mtimeNs)}:${String(info.size)}`).digest();
+  return Math.max(1, digest.readUIntBE(0, 6));
+}
+async function transcriptMetadata(path: string | undefined): Promise<TrajectoryTranscriptMetadata> {
+  if (path === undefined) return { revision: 0, status: "missing" };
+  try {
+    const info = await stat(path, { bigint: true });
+    const bytes = info.size > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(info.size);
+    if (!info.isFile()) return { revision: transcriptRevision(info), status: "failed" };
+    const revision = transcriptRevision(info);
+    if (info.size === 0n) return { revision, status: "empty", bytes: 0, timing: [] };
+    const entries = await readTranscript(path, true);
+    return { revision, status: "available", bytes, timing: entries.filter(isTimingTranscriptEntry) };
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { revision: 0, status: "missing" };
+    return { revision: 0, status: "failed" };
+  }
+}
+async function metadataForRun(value: TrajectoryRun): Promise<TrajectoryRunMetadata> {
+  const transcripts: Record<string, TrajectoryTranscriptMetadata> = {};
+  for (const [agentId, path] of transcriptPaths(value.run)) transcripts[agentId] = await transcriptMetadata(path);
+  return { ...value, transcripts };
+}
+type CachedTrajectoryRunMetadata = {
+  value: TrajectoryRunMetadata;
+  stateMtimeMs: number;
+  journalMtimeMs: number;
+  transcriptSignatures: ReadonlyMap<string, string | undefined>;
+};
+async function fileSignature(path: string): Promise<string | undefined> {
+  try {
+    const info = await stat(path, { bigint: true });
+    return info.isFile() ? `${String(info.mtimeNs)}:${String(info.size)}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+async function metadataCacheEntryChanged(store: RunStore, entry: CachedTrajectoryRunMetadata): Promise<boolean> {
+  if (await fileMtime(join(store.directory, "state.json")) !== entry.stateMtimeMs) return true;
+  if (await fileMtime(join(store.directory, "journal.json")) !== entry.journalMtimeMs) return true;
+  for (const [agentId, path] of transcriptPaths(entry.value.run)) if (await fileSignature(path) !== entry.transcriptSignatures.get(agentId)) return true;
+  return false;
+}
+export function createTrajectoryRunMetadataLoader(cwd: string, sessionId: string, home = homedir(), overlay?: (run: PersistedRun) => PersistedRun): TrajectoryRunMetadataLoader {
+  const cache = new Map<string, CachedTrajectoryRunMetadata>();
+  return async () => {
+    const ids = await listRunIds(cwd, sessionId, home, false);
+    const current = new Set(ids);
+    for (const runId of cache.keys()) if (!current.has(runId)) cache.delete(runId);
+    const loaded: TrajectoryRunMetadata[] = [];
+    for (const runId of ids) {
+      const store = new RunStore(cwd, sessionId, runId, home);
+      try {
+        let entry = cache.get(runId);
+        if (!entry || await metadataCacheEntryChanged(store, entry)) {
+          const value = await metadataForRun(await loadTrajectoryRun(store, false));
+          const transcriptSignatures = new Map<string, string | undefined>();
+          for (const [agentId, path] of transcriptPaths(value.run)) transcriptSignatures.set(agentId, await fileSignature(path));
+          entry = { value, stateMtimeMs: (await fileMtime(join(store.directory, "state.json"))) ?? 0, journalMtimeMs: (await fileMtime(join(store.directory, "journal.json"))) ?? 0, transcriptSignatures };
+          cache.set(runId, entry);
+        }
+        loaded.push(overlay ? { ...entry.value, run: overlay(entry.value.run) } : entry.value);
+      } catch { cache.delete(runId); /* Ignore corrupt or concurrently removed runs. */ }
+    }
+    return loaded;
+  };
+}
+type CachedTrajectoryTranscriptMetadata = { path: string | undefined; signature: string | undefined; value: TrajectoryTranscriptMetadata };
+export function createTrajectorySubagentMetadataLoader(cwd: string, sessionId: string, agentDir: string, overlay?: (subagent: TrajectorySubagent) => TrajectorySubagent): TrajectorySubagentMetadataLoader {
+  const loader = createTrajectorySubagentLoader(cwd, sessionId, agentDir, undefined, false);
+  const cache = new Map<string, CachedTrajectoryTranscriptMetadata>();
+  return async () => {
+    const values = await loader();
+    const current = new Set(values.map((value) => value.id));
+    for (const id of cache.keys()) if (!current.has(id)) cache.delete(id);
+    return Promise.all(values.map(async (value) => {
+      const currentValue = overlay ? overlay(value) : value;
+      const path = sessionFile(currentValue.attempt?.session);
+      const signature = path === undefined ? undefined : await fileSignature(path);
+      let entry = cache.get(value.id);
+      if (!entry || entry.path !== path || entry.signature !== signature) {
+        entry = { path, signature, value: await transcriptMetadata(path) };
+        cache.set(value.id, entry);
+      }
+      return { ...currentValue, transcript: entry.value };
+    }));
+  };
+}
+function safeTrajectorySubagentId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
+export function createTrajectoryTranscriptLoader(cwd: string, sessionId: string, home = homedir(), agentDir: string, resolveSubagentSession?: TrajectorySubagentSessionResolver): TrajectoryTranscriptLoader {
+  return async (request) => {
+    let path: string | undefined;
+    try {
+      if (request.runId !== undefined && request.agentId !== undefined && request.subagentId === undefined) {
+        const value = await new RunStore(cwd, sessionId, request.runId, home).load();
+        path = sessionFile(value.run.agents.find((agent) => agent.id === request.agentId)?.attemptDetails?.at(-1)?.session);
+      } else if (request.subagentId !== undefined && request.runId === undefined && request.agentId === undefined) {
+        if (!safeTrajectorySubagentId(request.subagentId)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+        const rawStatus = await readSubagentJson(join(agentDir, "subagents", request.subagentId, "status.json"));
+        const status = statusValue(rawStatus);
+        const statusRecord = object(rawStatus) ? rawStatus : undefined;
+        const statusCwd = statusRecord === undefined ? undefined : statusRecord.cwd;
+        if (!status || status.sessionId !== sessionId || typeof statusCwd === "string" && resolve(statusCwd) !== resolve(cwd)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+        path = sessionFile(resolveSubagentSession?.(request.subagentId) ?? status.attemptDetails?.at(-1)?.session);
+      }
+    } catch (error) {
+      return isNodeError(error, "ENOENT") ? { status: "missing", revision: 0, entries: [], error: "Transcript not found" } : { status: "failed", revision: 0, entries: [], error: "Transcript failed" };
+    }
+    const metadata = await transcriptMetadata(path);
+    if (request.revision !== undefined && request.revision !== metadata.revision) return { ...metadata, entries: [], error: "Transcript revision is stale" };
+    if (metadata.status === "missing") return { ...metadata, entries: [], error: "Transcript not found" };
+    if (metadata.status === "empty") return { ...metadata, entries: [] };
+    if (path === undefined) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+    if (metadata.status === "failed" || metadata.status === "oversized") return { ...metadata, entries: [], error: metadata.status === "oversized" ? "Transcript is too large" : "Transcript failed" };
+    try {
+      const entries = await readTranscript(path, true);
+      if (Buffer.byteLength(JSON.stringify(entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) return { ...metadata, status: "oversized", entries: [], error: "Transcript is too large" };
+      return { ...metadata, entries };
+    } catch { return { ...metadata, status: "failed", entries: [], error: "Transcript failed" }; }
+  };
+}
 type CachedTrajectorySubagent = { value: TrajectorySubagent; fileMtimes: ReadonlyMap<string, number | undefined>; transcriptMtime: number | undefined };
 const TRAJECTORY_SUBAGENT_FILES = ["status.json", "request.json", "result.json", "failure.json"] as const;
 const TRAJECTORY_SUBAGENT_ATTENTION_ORDER: Readonly<Record<SubagentStatus["state"], number>> = { running: 0, failed: 1, stopped: 2, completed: 3 };
@@ -328,7 +463,7 @@ function withoutProgressActivity(progress: SubagentProgress): SubagentProgress {
   delete rest.activity;
   return rest;
 }
-async function loadTrajectorySubagent(directory: string, cwd: string, sessionId: string): Promise<TrajectorySubagent | "foreign" | undefined> {
+async function loadTrajectorySubagent(directory: string, cwd: string, sessionId: string, includeTranscript = true): Promise<TrajectorySubagent | "foreign" | undefined> {
   try {
     const id = basename(directory);
     const status = statusValue(await readSubagentJson(join(directory, "status.json")));
@@ -355,7 +490,7 @@ async function loadTrajectorySubagent(directory: string, cwd: string, sessionId:
     const toolDefinitions = toolDefinitionsFor(tools, piToolCatalog(cwd));
     const model = progress?.state?.model ?? attempt?.setup.model;
     const transcriptPath = sessionFile(attempt?.session);
-    const transcript = transcriptPath === undefined ? [] : await readTranscript(transcriptPath);
+    const transcript = !includeTranscript ? [] : transcriptPath === undefined ? [] : await readTranscript(transcriptPath);
     return {
       id, sessionId, cwd, mode: request.mode ?? "background", state: status.state, request, tools, transcript,
       ...(request.label === undefined ? {} : { label: request.label }),
@@ -379,7 +514,7 @@ async function subagentCacheEntryChanged(directory: string, entry: CachedTraject
   const transcriptPath = sessionFile(entry.value.attempt?.session);
   return transcriptPath !== undefined && await fileMtime(transcriptPath) !== entry.transcriptMtime;
 }
-export function createTrajectorySubagentLoader(cwd: string, sessionId: string, agentDir: string, overlay?: (subagent: TrajectorySubagent) => TrajectorySubagent): TrajectorySubagentLoader {
+export function createTrajectorySubagentLoader(cwd: string, sessionId: string, agentDir: string, overlay?: (subagent: TrajectorySubagent) => TrajectorySubagent, includeTranscript = true): TrajectorySubagentLoader {
   const root = join(agentDir, "subagents");
   const cache = new Map<string, CachedTrajectorySubagent>();
   const negativeCache = new Map<string, number | undefined>();
@@ -401,7 +536,7 @@ export function createTrajectorySubagentLoader(cwd: string, sessionId: string, a
         negativeCache.delete(id);
         let entry = cache.get(id);
         if (!entry || await subagentCacheEntryChanged(directory, entry)) {
-          const value = await loadTrajectorySubagent(directory, cwd, sessionId);
+          const value = await loadTrajectorySubagent(directory, cwd, sessionId, includeTranscript);
           if (value === "foreign") { cache.delete(id); negativeCache.set(id, statusMtime); continue; }
           if (!value) { cache.delete(id); continue; }
           const fileMtimes = new Map<string, number | undefined>();

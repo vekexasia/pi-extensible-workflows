@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTrajectoryHost, setTrajectoryHost, type TrajectoryHost, type TrajectoryPublisherProvider } from "../../src/trajectory-host-handle.js";
 import { errorText, isNodeError, object, positiveInteger } from "../../src/utils.js";
-import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, type TrajectoryPublisherInput } from "../../src/trajectory.js";
+import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
 import { shareTrajectoryRun } from "./export.js";
 
 const DEFAULT_TRAJECTORY_PORT = 7432;
@@ -180,89 +180,376 @@ function openBrowser(url: string): void {
 export function trajectoryUrl(port: number): string { return `http://127.0.0.1:${String(port)}/`; }
 export function openTrajectoryUrl(url: string): void { openBrowser(url); }
 
+const MAX_FRAME_BYTES = 32 * 1024 * 1024;
+const MAX_LIVE_STATE_BYTES = MAX_FRAME_BYTES - 1024;
+const MAX_TRANSCRIPT_REQUESTS = 64;
+const TRANSCRIPT_REQUEST_TIMEOUT_MS = 10_000;
+const RECONNECT_INITIAL_DELAY_MS = 100;
+const RECONNECT_MAX_DELAY_MS = 5_000;
+type LiveStateRecord = Record<string, unknown>;
+type TranscriptRevision = { signature: string; revision: number };
+type PendingTranscript = { generation: number; timer: ReturnType<typeof setTimeout>; publisherId: string; runId?: string; agentId?: string; subagentId?: string; revision?: number };
+function isTimingEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === "pi-workflows:tool-timing"; }
+function boundedString(value: unknown, maxLength = 1024): unknown {
+  if (typeof value !== "string") return value;
+  const bytes = Buffer.from(value);
+  return bytes.length > maxLength ? bytes.subarray(0, maxLength).toString("utf8") : value;
+}
+const MAX_LIVE_STRING_BYTES = 64 * 1024;
+const MAX_LIVE_ARRAY_ENTRIES = 256;
+const MAX_LIVE_OBJECT_KEYS = 64;
+const LIVE_METADATA_ARRAY_KEYS = new Set(["agents", "runs", "subagents"]);
+const LIVE_TRUNCATABLE_ARRAY_KEYS = new Set(["events", "phaseHistory"]);
+const LIVE_METADATA_OBJECT_KEYS = new Set(["transcripts"]);
+function boundedTiming(value: unknown): unknown[] {
+  const entries = Array.isArray(value) ? value.filter(isTimingEntry) : [];
+  const retained: unknown[] = [];
+  let bytes = 2;
+  for (const entry of entries) {
+    let serialized: string;
+    try { serialized = JSON.stringify(entry); } catch { continue; }
+    const nextBytes = bytes + (retained.length ? 1 : 0) + Buffer.byteLength(serialized);
+    if (nextBytes >= 64 * 1024) break;
+    retained.push(entry);
+    bytes = nextBytes;
+  }
+  return retained;
+}
+function boundedLiveValue(value: unknown, key = "", depth = 0): unknown {
+  if (typeof value === "string") return boundedString(value, MAX_LIVE_STRING_BYTES);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (depth >= 12) return undefined;
+  if (key === "timing") return boundedTiming(value);
+  if (Array.isArray(value)) {
+    const array = value as readonly unknown[];
+    const maxEntries = LIVE_TRUNCATABLE_ARRAY_KEYS.has(key) ? MAX_LIVE_ARRAY_ENTRIES - 1 : MAX_LIVE_ARRAY_ENTRIES;
+    const entries = key === "attemptDetails" ? array.slice(-8) : LIVE_METADATA_ARRAY_KEYS.has(key) ? array : array.length <= maxEntries ? array : [...array.slice(0, 32), ...array.slice(-maxEntries + 32)];
+    const bounded = entries.map((entry) => boundedLiveValue(entry, "", depth + 1));
+    if (entries.length !== array.length && LIVE_TRUNCATABLE_ARRAY_KEYS.has(key)) bounded.push({ type: "trajectory:truncated", field: key, omitted: array.length - entries.length });
+    return bounded;
+  }
+  if (object(value)) {
+    const result: LiveStateRecord = {};
+    const properties = LIVE_METADATA_OBJECT_KEYS.has(key) ? Object.keys(value).sort() : Object.keys(value).sort().slice(0, MAX_LIVE_OBJECT_KEYS);
+    for (const property of properties) result[property] = boundedLiveValue(value[property], property, depth + 1);
+    return result;
+  }
+  return undefined;
+}
+function transcriptRevisionProjection(value: unknown, depth = 0): unknown {
+  if (depth >= 8) return typeof value === "string" ? boundedString(value, 1024) : typeof value === "number" || typeof value === "boolean" || value === null ? value : undefined;
+  if (Array.isArray(value)) {
+    const entries = value as readonly unknown[];
+    const sample = entries.length <= 16 ? entries : [...entries.slice(0, 8), ...entries.slice(-8)];
+    return { length: entries.length, values: sample.map((entry) => transcriptRevisionProjection(entry, depth + 1)) };
+  }
+  if (object(value)) {
+    const result: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort().slice(0, 32)) result[key] = transcriptRevisionProjection(value[key], depth + 1);
+    return result;
+  }
+  return value;
+}
+function sourceMetadata(value: unknown, key: string, revisions: Map<string, TranscriptRevision>): LiveStateRecord {
+  if (object(value) && !Array.isArray(value) && typeof value.revision === "number" && typeof value.status === "string") return { ...value, timing: boundedTiming(value.timing) };
+  const entries = Array.isArray(value) ? value : [];
+  const signature = createHash("sha256").update(JSON.stringify(transcriptRevisionProjection(entries))).digest("hex");
+  const previous = revisions.get(key);
+  const revision = previous?.signature === signature ? previous.revision : (previous?.revision ?? 0) + 1;
+  revisions.set(key, { signature, revision });
+  return { revision, status: entries.length ? "available" : "empty", timing: boundedTiming(entries) };
+}
+function projectRun(value: LiveStateRecord, key: string, revisions: Map<string, TranscriptRevision>): LiveStateRecord {
+  const run = object(value.run) && !Array.isArray(value.run) ? value.run : {};
+  const rawAgents: unknown[] = Array.isArray(run.agents) ? run.agents : [];
+  const agents = rawAgents.map((agent: unknown): unknown => {
+    if (!object(agent)) return agent;
+    if (agent.activity === undefined) return agent;
+    const activity = object(agent.activity) ? agent.activity : {};
+    return { ...agent, activity: { ...activity, text: boundedString(activity.text) } };
+  });
+  const transcripts: LiveStateRecord = {};
+  const source = object(value.transcripts) && !Array.isArray(value.transcripts) ? value.transcripts : {};
+  for (const [agentId, transcript] of Object.entries(source)) transcripts[agentId] = sourceMetadata(transcript, `${key}\t${agentId}`, revisions);
+  return { ...value, run: { ...run, agents }, transcripts };
+}
+function projectSubagent(value: LiveStateRecord, key: string, revisions: Map<string, TranscriptRevision>): LiveStateRecord {
+  return { ...value, transcript: sourceMetadata(value.transcript, key, revisions) };
+}
+function projectPublisher(metadata: TrajectoryPublisherMetadata, publisher: LiveStateRecord, revisions: Map<string, TranscriptRevision>): LiveStateRecord {
+  const publisherId = typeof publisher.id === "string" ? publisher.id : "";
+  return { ...publisher, runs: metadata.runs.map((run) => projectRun(run as unknown as LiveStateRecord, `${publisherId}\t${run.run.id}`, revisions)), subagents: metadata.subagents.map((subagent) => projectSubagent(subagent as unknown as LiveStateRecord, `${publisherId}\tsubagent\t${subagent.id}`, revisions)) };
+}
+function minimalStatePublisher(publisher: LiveStateRecord): LiveStateRecord {
+  return (boundedLiveValue(publisher) as LiveStateRecord | undefined) ?? {};
+}
+function publisherStateFrame(publisher: LiveStateRecord, runs: readonly unknown[], subagents: readonly unknown[], truncated = false): LiveStateRecord {
+  const publisherSummary = { ...publisher };
+  delete publisherSummary.runs;
+  delete publisherSummary.subagents;
+  return { type: "publisher:state", publisher: { ...publisherSummary, ...(truncated ? { truncated: true } : {}) }, runs, subagents, ...(truncated ? { truncated: true } : {}) };
+}
+function encodeLiveState(publisher: LiveStateRecord): string {
+  const projected = minimalStatePublisher(publisher);
+  const publisherJson = JSON.stringify(publisherStateFrame(projected, [], []).publisher);
+  const runs: readonly unknown[] = Array.isArray(projected.runs) ? projected.runs : [];
+  const subagents: readonly unknown[] = Array.isArray(projected.subagents) ? projected.subagents : [];
+  const prefix = `{"type":"publisher:state","publisher":${publisherJson},"runs":[`;
+  const baseBytes = Buffer.byteLength(`${prefix}],"subagents":[]}`);
+  const truncatedBytes = Buffer.byteLength(',"truncated":true');
+  const selectedRuns: string[] = [];
+  const selectedSubagents: string[] = [];
+  let bytes = baseBytes;
+  const state = { truncated: false };
+  const add = (serialized: string, target: string[]): boolean => {
+    const nextBytes = bytes + Buffer.byteLength(serialized) + (target.length ? 1 : 0);
+    if (nextBytes + truncatedBytes >= MAX_LIVE_STATE_BYTES) return false;
+    target.push(serialized);
+    bytes = nextBytes;
+    return true;
+  };
+  const addValue = (value: unknown, target: string[]): void => {
+    if (bytes + truncatedBytes >= MAX_LIVE_STATE_BYTES) { state.truncated = true; return; }
+    let serializedValue: unknown;
+    try { serializedValue = JSON.stringify(value); } catch { state.truncated = true; return; }
+    if (typeof serializedValue !== "string" || !add(serializedValue, target)) state.truncated = true;
+  };
+  for (let index = 0; index < Math.max(runs.length, subagents.length); index += 1) {
+    const run = runs[index];
+    if (run !== undefined) addValue(run, selectedRuns);
+    const subagent = subagents[index];
+    if (subagent !== undefined) addValue(subagent, selectedSubagents);
+  }
+  return `${prefix}${selectedRuns.join(",")}],"subagents":[${selectedSubagents.join(",")}]${state.truncated ? ',"truncated":true' : ""}}`;
+}
 export function createTrajectoryController(agentDir: string): TrajectoryController {
   let socket: TrajectoryPublisherClient | undefined;
+  let connectionGeneration = 0;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  let reconnectLoop: Promise<void> | undefined;
   let currentInput: TrajectoryPublisherInput | undefined;
+  let configuredPort: number | undefined;
   let closing = false;
+  const transcriptRevisions = new Map<string, TranscriptRevision>();
+  const pendingTranscripts = new Map<string, PendingTranscript>();
   const stopPolling = () => { if (pollTimer !== undefined) { clearInterval(pollTimer); pollTimer = undefined; } };
-  let stateLoad: Promise<void> | undefined;
+  const clearTranscriptRequests = () => { for (const request of pendingTranscripts.values()) clearTimeout(request.timer); pendingTranscripts.clear(); };
+  const startPolling = () => { stopPolling(); pollTimer = setInterval(() => { void sendState().catch((error: unknown) => { if (!closing) console.error(`Trajectory state publish failed: ${errorText(error)}`); }); }, 1000); pollTimer.unref(); };
+  let stateLoad: { socket: TrajectoryPublisherClient; task: Promise<void> } | undefined;
   let lastState: string | undefined;
+  const publisherValue = (input: TrajectoryPublisherInput): LiveStateRecord => ({ id: publisherId(input.cwd, input.sessionId), title: `session ${input.sessionId.slice(0, 8)}`, cwd: input.cwd, sessionId: input.sessionId, themes: input.themes, connected: true });
   const sendState = async (): Promise<void> => {
-    if (stateLoad) return stateLoad;
+    const activeSocket = socket;
+    if (activeSocket !== undefined && stateLoad?.socket === activeSocket) return stateLoad.task;
     const task = (async () => {
-      const activeSocket = socket;
       const input = currentInput;
       if (!activeSocket || !input || activeSocket.readyState !== 1) return;
-      const runs = await input.loadRuns();
-      const subagents = await input.loadSubagents();
+      const metadata = await input.loadMetadata();
       if (closing || socket !== activeSocket) return;
-      const state = { type: "publisher:state", publisher: { id: publisherId(input.cwd, input.sessionId), title: `session ${input.sessionId.slice(0, 8)}`, cwd: input.cwd, sessionId: input.sessionId, themes: input.themes }, runs, subagents };
-      const serialized = JSON.stringify(state);
+      const publisher = projectPublisher(metadata, publisherValue(input), transcriptRevisions);
+      const serialized = encodeLiveState(publisher);
       if (serialized === lastState) return;
       lastState = serialized;
       activeSocket.send(serialized);
     })();
-    stateLoad = task;
+    if (activeSocket !== undefined) stateLoad = { socket: activeSocket, task };
     try { await task; }
-    finally { if (stateLoad === task) stateLoad = undefined; }
+    finally { if (stateLoad?.task === task) stateLoad = undefined; }
+  };
+  const abandonSocket = (candidate: TrajectoryPublisherClient): void => {
+    if (socket !== candidate) return;
+    socket = undefined;
+    lastState = undefined;
+    stopPolling();
+    clearTranscriptRequests();
+    candidate.close();
+  };
+  const publishConnectedState = async (next: TrajectoryPublisherClient, input: TrajectoryPublisherInput): Promise<void> => {
+    startPolling();
+    try {
+      await sendState();
+      if (closing || currentInput !== input) return;
+      if (socket !== next || next.readyState !== 1) throw new Error("Trajectory connection closed before state publish");
+    }
+    catch (error) {
+      if (!closing && socket === next && currentInput === input) abandonSocket(next);
+      throw error;
+    }
+  };
+  const transcriptFromFallback = async (input: TrajectoryPublisherInput, request: TrajectoryTranscriptRequest): Promise<TrajectoryTranscriptResult> => {
+    const boundedTranscriptResult = (result: TrajectoryTranscriptResult): TrajectoryTranscriptResult => {
+      try { if (result.status === "available" && Buffer.byteLength(JSON.stringify(result.entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) return { status: "oversized", revision: result.revision, entries: [], error: "Transcript is too large" }; } catch { return { status: "failed", revision: result.revision, entries: [], error: "Transcript failed" }; }
+      return result;
+    };
+    const boundedResult = (entries: readonly unknown[], revision: number): TrajectoryTranscriptResult => { try { if (Buffer.byteLength(JSON.stringify(entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) return { status: "oversized", revision, entries: [], error: "Transcript is too large" }; } catch { return { status: "failed", revision, entries: [], error: "Transcript failed" }; } return { status: entries.length ? "available" : "empty", revision, entries }; };
+    if (input.loadTranscript) {
+      const result = await input.loadTranscript(request);
+      const revisionChanged = request.revision !== undefined && result.revision !== request.revision && result.status !== "missing" && result.status !== "failed" && result.status !== "oversized" && result.status !== "disconnected";
+      return boundedTranscriptResult(revisionChanged ? { ...result, status: "available", entries: [], error: "Transcript revision is stale" } : result);
+    }
+    if (request.runId !== undefined && request.agentId !== undefined && request.subagentId === undefined) {
+      const runs = await input.loadRuns();
+      const run = runs.find((candidate) => candidate.run.id === request.runId);
+      const entries = run?.transcripts[request.agentId];
+      const metadata = sourceMetadata(entries, `${publisherId(input.cwd, input.sessionId)}\t${request.runId}\t${request.agentId}`, transcriptRevisions);
+      if (request.revision !== undefined && request.revision !== metadata.revision) return { status: "available", revision: Number(metadata.revision), entries: [], error: "Transcript revision is stale" };
+      if (run === undefined || entries === undefined) return { status: "missing", revision: Number(metadata.revision), entries: [], error: "Transcript not found" };
+      return boundedResult(entries, Number(metadata.revision));
+    }
+    if (request.subagentId !== undefined && request.runId === undefined && request.agentId === undefined) {
+      const subagents = await input.loadSubagents();
+      const subagent = subagents.find((candidate) => candidate.id === request.subagentId);
+      const entries = subagent?.transcript;
+      const metadata = sourceMetadata(entries, `${publisherId(input.cwd, input.sessionId)}\tsubagent\t${request.subagentId}`, transcriptRevisions);
+      if (request.revision !== undefined && request.revision !== metadata.revision) return { status: "available", revision: Number(metadata.revision), entries: [], error: "Transcript revision is stale" };
+      if (subagent === undefined || entries === undefined) return { status: "missing", revision: Number(metadata.revision), entries: [], error: "Transcript not found" };
+      return boundedResult(entries, Number(metadata.revision));
+    }
+    return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+  };
+  const sendTranscriptResult = (next: TrajectoryPublisherClient, generation: number, message: LiveStateRecord, result: TrajectoryTranscriptResult): void => {
+    const requestId = String(message.requestId);
+    const pending = pendingTranscripts.get(requestId);
+    if (!pending || pending.generation !== generation || socket !== next || closing || pending.publisherId !== message.publisherId || pending.runId !== message.runId || pending.agentId !== message.agentId || pending.subagentId !== message.subagentId || pending.revision !== message.revision) return;
+    clearTimeout(pending.timer);
+    pendingTranscripts.delete(requestId);
+    const failed = result.error !== undefined || result.status === "missing" || result.status === "failed" || result.status === "oversized" || result.status === "disconnected";
+    let safeResult = result;
+    try { if (!failed && Buffer.byteLength(JSON.stringify(result.entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) safeResult = { status: "oversized", revision: result.revision, entries: [], error: "Transcript is too large" }; } catch { safeResult = { status: "failed", revision: result.revision, entries: [], error: "Transcript failed" }; }
+    const safeFailed = safeResult.error !== undefined || safeResult.status === "missing" || safeResult.status === "failed" || safeResult.status === "oversized" || safeResult.status === "disconnected";
+    const error = typeof safeResult.error === "string" ? safeResult.error.slice(0, 1024) : safeResult.status;
+    next.send(JSON.stringify({ type: "publisher:transcript-result", requestId: message.requestId, publisherId: message.publisherId, ...(message.runId === undefined ? {} : { runId: message.runId }), ...(message.agentId === undefined ? {} : { agentId: message.agentId }), ...(message.subagentId === undefined ? {} : { subagentId: message.subagentId }), ...(message.revision === undefined ? {} : { requestedRevision: message.revision }), ok: !safeFailed, status: safeResult.status, revision: safeResult.revision, ...(safeFailed ? { error } : { entries: safeResult.entries }) }));
+  };
+  const handleTranscriptRequest = (next: TrajectoryPublisherClient, generation: number, message: LiveStateRecord, input: TrajectoryPublisherInput): void => {
+    const requestId = typeof message.requestId === "string" ? message.requestId : "";
+    const revision = typeof message.revision === "number" && Number.isSafeInteger(message.revision) && message.revision >= 0 ? message.revision : undefined;
+    const target = { ...(typeof message.runId === "string" ? { runId: message.runId } : {}), ...(typeof message.agentId === "string" ? { agentId: message.agentId } : {}), ...(typeof message.subagentId === "string" ? { subagentId: message.subagentId } : {}), ...(revision === undefined ? {} : { requestedRevision: revision }) };
+    const existing = pendingTranscripts.get(requestId);
+    if (!requestId || (existing === undefined && pendingTranscripts.size >= MAX_TRANSCRIPT_REQUESTS)) { next.send(JSON.stringify({ type: "publisher:transcript-result", requestId, publisherId: message.publisherId, ...target, ok: false, status: "failed", revision: revision ?? 0, error: "Too many transcript requests" })); return; }
+    if (existing !== undefined) {
+      const original: LiveStateRecord = { requestId, publisherId: existing.publisherId, ...(existing.runId === undefined ? {} : { runId: existing.runId }), ...(existing.agentId === undefined ? {} : { agentId: existing.agentId }), ...(existing.subagentId === undefined ? {} : { subagentId: existing.subagentId }), ...(existing.revision === undefined ? {} : { revision: existing.revision }) };
+      sendTranscriptResult(next, generation, original, { status: "failed", revision: existing.revision ?? 0, entries: [], error: "Duplicate transcript request" });
+      return;
+    }
+    const timer = setTimeout(() => {
+      const pending = pendingTranscripts.get(requestId);
+      if (!pending || pending.timer !== timer) return;
+      pendingTranscripts.delete(requestId);
+      if (socket === next && !closing && next.readyState === 1) next.send(JSON.stringify({ type: "publisher:transcript-result", requestId, publisherId: pending.publisherId, ...(pending.runId === undefined ? {} : { runId: pending.runId }), ...(pending.agentId === undefined ? {} : { agentId: pending.agentId }), ...(pending.subagentId === undefined ? {} : { subagentId: pending.subagentId }), ...(pending.revision === undefined ? {} : { requestedRevision: pending.revision }), ok: false, status: "failed", revision: pending.revision ?? 0, error: "Transcript request timed out" }));
+    }, TRANSCRIPT_REQUEST_TIMEOUT_MS);
+    const pending: PendingTranscript = { generation, timer, publisherId: message.publisherId as string, ...(typeof message.runId === "string" ? { runId: message.runId } : {}), ...(typeof message.agentId === "string" ? { agentId: message.agentId } : {}), ...(typeof message.subagentId === "string" ? { subagentId: message.subagentId } : {}), ...(revision === undefined ? {} : { revision }) };
+    pendingTranscripts.set(requestId, pending);
+    const request = { ...(typeof message.runId === "string" ? { runId: message.runId } : {}), ...(typeof message.agentId === "string" ? { agentId: message.agentId } : {}), ...(typeof message.subagentId === "string" ? { subagentId: message.subagentId } : {}), ...(revision === undefined ? {} : { revision }) };
+    const requestMessage: LiveStateRecord = { ...message, revision };
+    void transcriptFromFallback(input, request).then((result) => { sendTranscriptResult(next, generation, requestMessage, result); }, (error: unknown) => { sendTranscriptResult(next, generation, requestMessage, { status: "failed", revision: 0, entries: [], error: errorText(error) }); }).catch(() => undefined);
   };
   const connect = async (port: number, input: TrajectoryPublisherInput): Promise<void> => {
     const Constructor = trajectoryWebSocket();
     if (!Constructor) throw new Error("Trajectory requires a WebSocket-capable Node runtime");
     const next = new Constructor(`ws://127.0.0.1:${String(port)}/ws`);
+    const generation = connectionGeneration + 1;
+    let established = false;
+    connectionGeneration = generation;
     socket = next;
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        if (error) reject(error); else resolve();
-      };
-      next.addEventListener("open", () => { finish(); });
-      next.addEventListener("error", () => { finish(new Error("Could not connect to Trajectory server")); });
-    });
-    next.addEventListener("close", () => { if (socket === next) { socket = undefined; lastState = undefined; stopPolling(); } });
+    const onClose = () => {
+      if (socket !== next) return;
+      socket = undefined;
+      lastState = undefined;
+      stopPolling();
+      clearTranscriptRequests();
+      if (established && !closing) scheduleReconnect();
+    };
+    next.addEventListener("close", onClose);
+    next.addEventListener("error", onClose);
     next.addEventListener("message", (event) => {
       try {
         const message: unknown = JSON.parse(typeof event === "object" && event !== null && "data" in event ? String(event.data) : "");
-        if (!object(message) || message.type !== "publisher:action" || typeof message.requestId !== "string") return;
-        if (!isTrajectoryAction(message.action)) { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: false, error: "Unsupported Trajectory action" })); return; }
-        if (!isTrajectoryTarget(message.target)) { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: false, error: "Invalid Trajectory action target" })); return; }
+        if (!object(message)) return;
+        if (message.type === "publisher:replaced") { established = false; return; }
+        if (message.type === "publisher:transcript" && typeof message.requestId === "string" && typeof message.publisherId === "string" && (typeof message.runId === "string" && typeof message.agentId === "string" || typeof message.subagentId === "string")) { handleTranscriptRequest(next, generation, message, input); return; }
+        if (message.type !== "publisher:action" || typeof message.requestId !== "string") return;
+        const sendActionResponse = (response: LiveStateRecord): void => { if (socket !== next || closing || next.readyState !== 1) return; let serialized: string; try { serialized = JSON.stringify(response); } catch { serialized = JSON.stringify({ type: "publisher:action-result", requestId: response.requestId, publisherId: response.publisherId, ok: false, error: "Trajectory action result is invalid" }); } if (Buffer.byteLength(serialized) >= MAX_FRAME_BYTES) serialized = JSON.stringify({ type: "publisher:action-result", requestId: response.requestId, publisherId: response.publisherId, ok: false, error: "Trajectory action result is too large" }); next.send(serialized); };
+        const sendActionResult = (value: unknown): void => { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ...object(value) ? { ok: true, result: value } : { ok: true } }); };
+        if (!isTrajectoryAction(message.action)) { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ok: false, error: "Unsupported Trajectory action" }); return; }
+        if (!isTrajectoryTarget(message.target)) { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ok: false, error: "Invalid Trajectory action target" }); return; }
         const target = message.target;
         const actionError = trajectoryActionError(message.action, target);
-        if (actionError !== undefined) { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: false, error: actionError })); return; }
+        if (actionError !== undefined) { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ok: false, error: actionError }); return; }
         if (message.action === "share") {
-          // Share is served by the extension itself: it reads persisted state and needs no live host context.
-          void shareTrajectoryRun({ cwd: input.cwd, sessionId: input.sessionId, runId: target.id }).then((result) => { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: true, result })); }, (error: unknown) => { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: false, error: errorText(error) })); }).catch(() => undefined);
+          void shareTrajectoryRun({ cwd: input.cwd, sessionId: input.sessionId, runId: target.id }).then((result) => { sendActionResult(result); }, (error: unknown) => { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ok: false, error: errorText(error).slice(0, 1024) }); }).catch(() => undefined);
           return;
         }
-        void input.handleAction({ action: message.action, target, ...(typeof message.name === "string" ? { name: message.name } : {}), ...(message.payload === undefined ? {} : { payload: message.payload }) }).then((result) => { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: true, ...(result === undefined ? {} : { result }) })); }, (error: unknown) => { next.send(JSON.stringify({ type: "publisher:action-result", requestId: message.requestId, ok: false, error: errorText(error) })); }).catch(() => undefined);
+        void input.handleAction({ action: message.action, target, ...(typeof message.name === "string" ? { name: message.name } : {}), ...(message.payload === undefined ? {} : { payload: message.payload }) }).then((result) => { sendActionResult(result); }, (error: unknown) => { sendActionResponse({ type: "publisher:action-result", requestId: message.requestId, publisherId: publisherId(input.cwd, input.sessionId), ok: false, error: errorText(error).slice(0, 1024) }); }).catch(() => undefined);
       } catch { /* Ignore malformed local browser messages. */ }
     });
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => { if (settled) return; settled = true; if (error) reject(error); else resolve(); };
+      next.addEventListener("open", () => { finish(); });
+      next.addEventListener("error", () => { finish(new Error("Could not connect to Trajectory server")); });
+      next.addEventListener("close", () => { finish(new Error("Could not connect to Trajectory server")); });
+    });
+    if (closing || currentInput !== input || socket !== next || next.readyState !== 1) { next.close(); throw new Error("Trajectory connection was replaced"); }
+    established = true;
     next.send(JSON.stringify({ type: "publisher:attach", publisherId: publisherId(input.cwd, input.sessionId) }));
+  };
+  let reconnectCancel: (() => void) | undefined;
+  const waitReconnect = (ms: number): Promise<void> => new Promise((resolve) => { const timer = setTimeout(() => { if (reconnectTimer === timer) reconnectTimer = undefined; reconnectCancel = undefined; resolve(); }, ms); timer.unref(); reconnectTimer = timer; reconnectCancel = () => { clearTimeout(timer); if (reconnectTimer === timer) reconnectTimer = undefined; reconnectCancel = undefined; resolve(); }; });
+  const scheduleReconnect = (): void => {
+    if (closing || reconnectLoop !== undefined || configuredPort === undefined) return;
+    const reconnectInput = (): { port: number; input: TrajectoryPublisherInput } | undefined => closing || socket !== undefined || currentInput === undefined || configuredPort === undefined ? undefined : { port: configuredPort, input: currentInput };
+    reconnectLoop = (async () => {
+      let backoff = RECONNECT_INITIAL_DELAY_MS;
+      while (reconnectInput() !== undefined) {
+        await waitReconnect(backoff);
+        const active = reconnectInput();
+        if (active === undefined) return;
+        const { port, input } = active;
+        const isCurrent = (): boolean => !closing && currentInput === input && configuredPort === port;
+        try {
+          const server = await ensureTrajectoryServer(agentDir, port);
+          if (!isCurrent()) return;
+          await connect(server.port, input);
+          if (!isCurrent()) return;
+          const activeSocket = socket;
+          if (!activeSocket) throw new Error("Trajectory connection closed before state publish");
+          await publishConnectedState(activeSocket, input);
+          return;
+        } catch (error) { console.error(`Trajectory reconnect failed: ${errorText(error)}`); backoff = Math.min(RECONNECT_MAX_DELAY_MS, backoff * 2); }
+      }
+    })().finally(() => { reconnectLoop = undefined; if (!closing && socket === undefined && currentInput !== undefined && configuredPort !== undefined) scheduleReconnect(); });
   };
   return {
     async open(input) {
       closing = false;
       currentInput = input;
       const envPort = process.env.PI_WORKFLOW_TRAJECTORY_PORT;
-      const configured = envPort !== undefined && /^\d+$/.test(envPort) ? trajectoryPort(Number(envPort)) : trajectoryPort(input.port);
-      const server = await ensureTrajectoryServer(agentDir, configured);
+      configuredPort = envPort !== undefined && /^\d+$/.test(envPort) ? trajectoryPort(Number(envPort)) : trajectoryPort(input.port);
+      const server = await ensureTrajectoryServer(agentDir, configuredPort);
       if (!socket || socket.readyState !== 1) await connect(server.port, input);
       stopPolling();
-      await sendState();
-      pollTimer = setInterval(() => { void sendState().catch(() => undefined); }, 1000);
-      pollTimer.unref();
+      const activeSocket = socket;
+      if (!activeSocket) throw new Error("Trajectory connection closed before state publish");
+      await publishConnectedState(activeSocket, input);
       return server;
     },
     async close() {
       closing = true;
+      const input = currentInput;
+      const reconnect = reconnectLoop;
       currentInput = undefined;
+      configuredPort = undefined;
+      reconnectCancel?.();
       stopPolling();
+      clearTranscriptRequests();
+      lastState = undefined;
+      connectionGeneration += 1;
       const activeSocket = socket;
+      if (activeSocket?.readyState === 1 && input) activeSocket.send(JSON.stringify({ type: "publisher:detach", publisherId: publisherId(input.cwd, input.sessionId) }));
       socket = undefined;
       activeSocket?.close();
+      if (reconnect) await reconnect;
     },
   };
 }

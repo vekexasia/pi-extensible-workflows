@@ -1,6 +1,9 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- Keep Trajectory live state below the WebSocket frame cap, fetch transcript bodies on demand, and reconnect detached servers after publisher disconnects. Restart existing Pi processes after upgrading so their Trajectory publisher uses the new protocol.
 ## [5.11.1] - 2026-08-30
 
 ### Fixes

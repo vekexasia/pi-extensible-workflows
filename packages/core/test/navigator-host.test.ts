@@ -33,7 +33,7 @@ void test("workflow slash subcommands are rejected with picker guidance", async 
 void test("trajectory is the only accepted workflow argument", async () => {
   let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   const opened: unknown[] = [];
-  registerWorkflowNavigator({ pi: { registerCommand(_name: string, options: { handler: typeof handler }) { handler = options.handler; } }, trajectoryProvider: (context: unknown) => { opened.push(context); return { cwd: "/repo", sessionId: "session", themes: false, loadRuns: async () => [], loadSubagents: async () => [], handleAction: async () => {} }; } } as unknown as WorkflowNavigatorDependencies);
+  registerWorkflowNavigator({ pi: { registerCommand(_name: string, options: { handler: typeof handler }) { handler = options.handler; } }, trajectoryProvider: (context: unknown) => { opened.push(context); return { cwd: "/repo", sessionId: "session", themes: false, loadRuns: async () => [], loadSubagents: async () => [], loadMetadata: async () => ({ runs: [], subagents: [] }), handleAction: async () => {} }; } } as unknown as WorkflowNavigatorDependencies);
   assert.ok(handler);
   const notices: string[] = [];
   const context = { ui: { notify(message: string) { notices.push(message); } } };

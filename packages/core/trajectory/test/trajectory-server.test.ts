@@ -85,10 +85,10 @@ async function readJsonFrame(socket: Socket): Promise<unknown> {
   });
 }
 
-function publisherState(id: string, blob: string, subagents: readonly unknown[] = []): string {
+function publisherState(id: string, blob: string, subagents: readonly unknown[] = [], title = ""): string {
   return JSON.stringify({
     type: "publisher:state",
-    publisher: { id },
+    publisher: { id, ...(title ? { title } : {}) },
     runs: [{ run: { id, workflowName: id, agents: [], state: "completed" }, transcripts: { agent: [{ type: "message", text: blob }] }, snapshot: {}, awaiting: [] }],
     subagents,
   });
@@ -186,10 +186,11 @@ void test("Trajectory HTTP and WebSocket boundaries require localhost and origin
 void test("Trajectory keeps the browser socket when combined publisher state exceeds the frame cap", async () => {
   const root = await mkdtemp(join(tmpdir(), "trajectory-server-cap-"));
   const port = await availablePort();
-  const maxFrameBytes = 800;
+  const maxFrameBytes = 1000;
   const blob = "x".repeat(400);
-  const first = publisherState("one", blob);
-  const second = publisherState("two", blob);
+  const title = "x".repeat(300);
+  const first = publisherState("one", blob, [], title);
+  const second = publisherState("two", blob, [], title);
   assert.ok(Buffer.byteLength(first) < maxFrameBytes);
   assert.ok(Buffer.byteLength(second) < maxFrameBytes);
   const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { maxFrameBytes });
@@ -212,13 +213,41 @@ void test("Trajectory keeps the browser socket when combined publisher state exc
     browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
     const message = await Promise.race([state, closed.then((value) => { throw new Error(value); })]);
     assert.equal((message as { type?: unknown }).type, "state");
+    assert.equal((message as { truncated?: unknown }).truncated, true);
     const publishers = (message as { publishers?: unknown[] }).publishers;
     assert.ok(Array.isArray(publishers));
     assert.equal(publishers.length, 2);
     for (const publisher of publishers) {
+      assert.equal((publisher as { connected?: unknown }).connected, true);
       const runs = (publisher as { runs?: { transcripts?: { agent?: unknown[] } }[] }).runs;
       assert.deepEqual(runs?.[0]?.transcripts?.agent ?? [], []);
     }
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections();
+    server.closeIdleConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory tells a replaced publisher to stop reconnecting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-replaced-publisher-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  await listen(server, port);
+  const sockets: Socket[] = [];
+  try {
+    const origin = `http://127.0.0.1:${String(port)}`;
+    const first = await handshake(port, origin);
+    const second = await handshake(port, origin);
+    sockets.push(first.socket, second.socket);
+    first.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "same" })));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const replaced = readJsonFrame(first.socket);
+    second.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "same" })));
+    assert.deepEqual(await replaced, { type: "publisher:replaced" });
   } finally {
     for (const socket of sockets) socket.destroy();
     server.closeAllConnections();
@@ -398,6 +427,82 @@ void test("Trajectory rejects an oversized subagent transcript reply", async () 
   }
 });
 
+void test("Trajectory correlates duplicate browser request IDs to their requesting browser", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-request-correlation-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  await listen(server, port);
+  const sockets: Socket[] = [];
+  try {
+    const origin = `http://127.0.0.1:${String(port)}`;
+    const publisher = await handshake(port, origin);
+    sockets.push(publisher.socket);
+    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "one" })));
+    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:state", publisher: { id: "one" }, runs: [{ run: { id: "one", agents: [] }, transcripts: { agent: { revision: 1, status: "available", timing: [] } } }], subagents: [] })));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const browserOne = await handshake(port, origin);
+    const browserTwo = await handshake(port, origin);
+    sockets.push(browserOne.socket, browserTwo.socket);
+    const stateOne = readJsonFrame(browserOne.socket);
+    browserOne.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await stateOne;
+    const stateTwo = readJsonFrame(browserTwo.socket);
+    browserTwo.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await stateTwo;
+    const request = { type: "ui:transcript", requestId: "shared-request", publisherId: "one", runId: "one", agentId: "agent" };
+    browserOne.socket.write(maskedFrame(JSON.stringify(request)));
+    const forwardedOne = await readJsonFrame(publisher.socket) as { requestId?: unknown };
+    browserTwo.socket.write(maskedFrame(JSON.stringify(request)));
+    const forwardedTwo = await readJsonFrame(publisher.socket) as { requestId?: unknown };
+    assert.notEqual(forwardedOne.requestId, forwardedTwo.requestId);
+    for (const forwarded of [forwardedOne, forwardedTwo]) publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:transcript-result", requestId: forwarded.requestId, publisherId: "one", runId: "one", agentId: "agent", ok: true, status: "available", revision: 1, entries: [{ requestId: forwarded.requestId }] })));
+    const responseOne = await readJsonFrame(browserOne.socket) as { entries?: { requestId?: unknown }[] };
+    const responseTwo = await readJsonFrame(browserTwo.socket) as { entries?: { requestId?: unknown }[] };
+    assert.equal(responseOne.entries?.[0]?.requestId, forwardedOne.requestId);
+    assert.equal(responseTwo.entries?.[0]?.requestId, forwardedTwo.requestId);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections();
+    server.closeIdleConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+void test("Trajectory does not let transcript results settle action requests", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-request-kind-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  await listen(server, port);
+  const sockets: Socket[] = [];
+  try {
+    const origin = `http://127.0.0.1:${String(port)}`;
+    const publisher = await handshake(port, origin);
+    sockets.push(publisher.socket);
+    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "one" })));
+    publisher.socket.write(maskedFrame(publisherState("one", "run")));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const browser = await handshake(port, origin);
+    sockets.push(browser.socket);
+    const state = readJsonFrame(browser.socket);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await state;
+    const forwarded = readJsonFrame(publisher.socket);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:action", requestId: "same-request", publisherId: "one", action: "retry", target: { kind: "run", id: "run-id" } })));
+    const action = await forwarded as { requestId?: unknown };
+    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:transcript-result", requestId: action.requestId, publisherId: "one", runId: "run-id", agentId: "agent", ok: true, status: "available", revision: 1, entries: [{ type: "message" }] })));
+    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:action-result", requestId: action.requestId, publisherId: "one", ok: true, result: { accepted: true } })));
+    const result = await readJsonFrame(browser.socket) as { type?: unknown; result?: unknown };
+    assert.deepEqual(result, { type: "action-result", requestId: "same-request", ok: true, result: { accepted: true } });
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections();
+    server.closeIdleConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 void test("Trajectory relays target-addressed actions and rejects run-only subagent actions", async () => {
   const root = await mkdtemp(join(tmpdir(), "trajectory-server-actions-"));
   const port = await availablePort();

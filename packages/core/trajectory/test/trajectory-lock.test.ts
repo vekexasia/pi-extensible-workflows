@@ -28,7 +28,7 @@ async function availablePort(): Promise<number> {
 function lockPath(home: string): string { return join(home, "pi-extensible-workflows", "trajectory.lock"); }
 async function readLock(home: string): Promise<TrajectoryLock> { return JSON.parse(await readFile(lockPath(home), "utf8")) as TrajectoryLock; }
 function input(home: string, port: number) {
-  return { cwd: home, sessionId: "trajectory-lock-test", port, themes: false, loadRuns: async () => [], loadSubagents: async () => [], handleAction: async () => {} };
+  return { cwd: home, sessionId: "trajectory-lock-test", port, themes: false, loadRuns: async () => [], loadSubagents: async () => [], loadMetadata: async () => ({ runs: [], subagents: [] }), handleAction: async () => {} };
 }
 async function currentFingerprint(): Promise<string> {
   const serverPath = fileURLToPath(new URL("../src/server.js", import.meta.url));
@@ -173,7 +173,7 @@ void test("unhealthy Trajectory lock owned by the attacher is replaced without k
   try {
     const fingerprint = await currentFingerprint();
     const trajectoryModule = new URL("../src/index.js", import.meta.url).href;
-    const childScript = `import { mkdir, writeFile } from "node:fs/promises"; import { dirname } from "node:path"; const { createTrajectoryController } = await import(${JSON.stringify(trajectoryModule)}); const home = ${JSON.stringify(home)}; const lockPath = ${JSON.stringify(lockPath(home))}; const port = ${String(port)}; await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 }); await writeFile(lockPath, JSON.stringify({ pid: process.pid, port, fingerprint: ${JSON.stringify(fingerprint)} }) + String.fromCharCode(10)); const controller = createTrajectoryController(home); await controller.open({ cwd: home, sessionId: "trajectory-lock-self-test", port, themes: false, loadRuns: async () => [], loadSubagents: async () => [], handleAction: async () => {} }); await controller.close();`;
+    const childScript = `import { mkdir, writeFile } from "node:fs/promises"; import { dirname } from "node:path"; const { createTrajectoryController } = await import(${JSON.stringify(trajectoryModule)}); const home = ${JSON.stringify(home)}; const lockPath = ${JSON.stringify(lockPath(home))}; const port = ${String(port)}; await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 }); await writeFile(lockPath, JSON.stringify({ pid: process.pid, port, fingerprint: ${JSON.stringify(fingerprint)} }) + String.fromCharCode(10)); const controller = createTrajectoryController(home); await controller.open({ cwd: home, sessionId: "trajectory-lock-self-test", port, themes: false, loadRuns: async () => [], loadSubagents: async () => [], loadMetadata: async () => ({ runs: [], subagents: [] }), handleAction: async () => {} }); await controller.close();`;
     const child = spawn(process.execPath, ["--input-type=module", "-e", childScript], { stdio: "ignore" });
     assert.ok(child.pid);
     pids.push(child.pid);
