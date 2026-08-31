@@ -194,7 +194,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
   const maxFrameBytes = options.maxFrameBytes ?? MAX_FRAME_BYTES;
   const serverFingerprint = options.fingerprint ?? "";
   const clients = new Set<Client>();
-  const publishers = new Map<string, { client: Client; value: Record<string, unknown>; sequence: number }>();
+  const publishers = new Map<string, { client: Client; value: Record<string, unknown>; generation: number }>();
   let latest: State = { type: "state", publishers: [], updatedAt: Date.now(), initial: true };
   const pending = new Map<Client, Map<string, PendingRequest>>();
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -243,7 +243,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     for (const client of clients) if (client.kind === "browser") emit(client, value);
   };
   const publishState = () => {
-    const values = [...publishers.values()].map(({ value }) => value);
+    const values = [...publishers.values()].map(({ value, generation }) => ({ ...value, generation }));
     latest = { type: "state", publishers: values, updatedAt: Date.now() };
     broadcast(latest);
   };
@@ -274,8 +274,8 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
         emit(previous.client, { type: "publisher:replaced" });
         previous.client.socket.end();
       }
-      const sequence = (previous?.sequence ?? 0) + 1;
-      publishers.set(message.publisherId, { client, value: { ...(previous?.value ?? { id: message.publisherId }), id: message.publisherId, connected: true }, sequence });
+      const generation = (previous?.generation ?? 0) + 1;
+      publishers.set(message.publisherId, { client, value: { ...(previous?.value ?? { id: message.publisherId }), id: message.publisherId, connected: true }, generation });
       publishState();
       return;
     }
@@ -285,10 +285,10 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
       if (!id || client.publisherId !== id || publishers.get(id)?.client !== client) return;
       cancelIdleExit();
       const previous = publishers.get(id);
-      const sequence = (previous?.sequence ?? 0) + 1;
+      const generation = previous?.generation ?? 1;
       const runs = Array.isArray(message.runs) ? message.runs : [];
       const subagents = Array.isArray(message.subagents) ? message.subagents : [];
-      publishers.set(id, { client, value: { ...publisher, connected: true, runs, subagents, ...(message.truncated === true || publisher.truncated === true ? { truncated: true } : {}) }, sequence });
+      publishers.set(id, { client, value: { ...publisher, connected: true, runs, subagents, generation, ...(message.truncated === true || publisher.truncated === true ? { truncated: true } : {}) }, generation });
       publishState();
       return;
     }

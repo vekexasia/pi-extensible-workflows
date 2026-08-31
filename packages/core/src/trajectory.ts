@@ -96,6 +96,7 @@ function timingToolCallId(value: unknown): string | undefined {
   if (!object(value) || !isTimingTranscriptEntry(value) || !object(value.data)) return undefined;
   return typeof value.data.toolCallId === "string" ? value.data.toolCallId : undefined;
 }
+class OversizedTranscriptError extends Error {}
 async function readTranscript(path: string, throwOnError = false): Promise<readonly unknown[]> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
@@ -113,8 +114,17 @@ async function readTranscript(path: string, throwOnError = false): Promise<reado
     }
     let content = buffer.subarray(0, bytesRead).toString("utf8");
     if (startOffset > 0) {
+      const boundary = Buffer.alloc(1);
+      const boundaryRead = await handle.read(boundary, 0, 1, startOffset - 1);
+      const startsAtRecordBoundary = boundaryRead.bytesRead === 1 && boundary[0] === 0x0a;
       const firstLine = content.indexOf("\n");
-      content = firstLine < 0 ? "" : content.slice(firstLine + 1);
+      if (firstLine < 0) {
+        if (!startsAtRecordBoundary && throwOnError) throw new OversizedTranscriptError("Transcript is too large");
+        if (!startsAtRecordBoundary) return [];
+      } else if (firstLine === content.length - 1 && content.slice(0, firstLine).trim() && !startsAtRecordBoundary) {
+        if (throwOnError) throw new OversizedTranscriptError("Transcript is too large");
+        return [];
+      } else content = content.slice(firstLine + 1);
     }
     const entries: unknown[] = [];
     for (const line of content.split("\n")) {
@@ -333,8 +343,13 @@ async function transcriptMetadata(path: string | undefined): Promise<TrajectoryT
     if (!info.isFile()) return { revision: transcriptRevision(info), status: "failed" };
     const revision = transcriptRevision(info);
     if (info.size === 0n) return { revision, status: "empty", bytes: 0, timing: [] };
-    const entries = await readTranscript(path, true);
-    return { revision, status: "available", bytes, timing: entries.filter(isTimingTranscriptEntry) };
+    try {
+      const entries = await readTranscript(path, true);
+      return { revision, status: "available", bytes, timing: entries.filter(isTimingTranscriptEntry) };
+    } catch (error) {
+      if (error instanceof OversizedTranscriptError) return { revision, status: "oversized", bytes, timing: [] };
+      throw error;
+    }
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return { revision: 0, status: "missing" };
     return { revision: 0, status: "failed" };

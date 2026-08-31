@@ -257,6 +257,45 @@ void test("Trajectory tells a replaced publisher to stop reconnecting", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+void test("Trajectory invalidates an active transcript across same-id publisher replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-publisher-generation-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"));
+  await listen(server, port);
+  const sockets: Socket[] = [];
+  try {
+    const origin = `http://127.0.0.1:${String(port)}`;
+    const publisherOne = await handshake(port, origin);
+    const publisherTwo = await handshake(port, origin);
+    const browser = await handshake(port, origin);
+    sockets.push(publisherOne.socket, publisherTwo.socket, browser.socket);
+    const initialState = readJsonFrame(browser.socket);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    assert.deepEqual((await initialState as { publishers?: unknown[] }).publishers, []);
+    publisherOne.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "same" })));
+    const attachedState = await readJsonFrame(browser.socket) as { publishers?: { generation?: unknown }[] };
+    assert.equal(attachedState.publishers?.[0]?.generation, 1);
+    publisherOne.socket.write(maskedFrame(JSON.stringify({ type: "publisher:state", publisher: { id: "same" }, runs: [{ run: { id: "run", agents: [] }, transcripts: { agent: { revision: 1, status: "available", timing: [] } } }], subagents: [] })));
+    const firstState = await readJsonFrame(browser.socket) as { publishers?: { generation?: unknown }[] };
+    assert.equal(firstState.publishers?.[0]?.generation, 1);
+    const forwarded = readJsonFrame(publisherOne.socket);
+    browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:transcript", requestId: "active", publisherId: "same", runId: "run", agentId: "agent", revision: 1 })));
+    assert.equal((await forwarded as { type?: unknown }).type, "publisher:transcript");
+    publisherTwo.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "same" })));
+    const replacementBrowser = await handshake(port, origin);
+    sockets.push(replacementBrowser.socket);
+    const replacementState = readJsonFrame(replacementBrowser.socket);
+    replacementBrowser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    assert.equal((await replacementState as { publishers?: { generation?: unknown }[] }).publishers?.[0]?.generation, 2);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.closeAllConnections();
+    server.closeIdleConnections();
+    server.close();
+    server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 void test("Trajectory removes disconnected publishers from browser state", async () => {
   const root = await mkdtemp(join(tmpdir(), "trajectory-server-disconnect-"));

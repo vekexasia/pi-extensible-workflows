@@ -290,6 +290,16 @@ void test("Trajectory returns to an empty home when a publisher disappears", () 
   assert.doesNotMatch(source, /state\.transcripts = \{\}; state\.transcriptPending = \{\};/);
   assert.doesNotMatch(source, /localStorage\.removeItem\("traj-theme"\)/);
 });
+void test("Trajectory drops transcript cache when a publisher generation changes", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const shareStart = source.indexOf("    function sharePublishers");
+  const shareEnd = source.indexOf("    const livePublishers", shareStart);
+  const invalidateStart = source.indexOf("    function invalidatePublisherTranscripts");
+  const invalidateEnd = source.indexOf("    const transcriptEmptyMessage", invalidateStart);
+  assert.ok(shareStart >= 0 && shareEnd > shareStart && invalidateStart > shareEnd && invalidateEnd > invalidateStart);
+  const state = JSON.parse(JSON.stringify(runInNewContext(`(() => { const state = { transcripts: { "same\\trun\\tagent": [1] }, transcriptPending: { "same\\trun\\tagent": { requestId: "old" } }, transcriptSources: { "same\\trun\\tagent": "old" }, transcriptRefresh: { "same\\trun\\tagent": true }, transcriptRevision: { "same\\trun\\tagent": 1 }, transcriptStatus: { "same\\trun\\tagent": "disconnected" }, transcriptCacheOrder: ["same\\trun\\tagent"] }; const sharePublisher = (_previous, incoming) => incoming; ${source.slice(shareStart, shareEnd)} ${source.slice(invalidateStart, invalidateEnd)}; sharePublishers([{ id: "same", generation: 1 }], [{ id: "same", generation: 2 }]); return state; })()`) as unknown)) as unknown;
+  assert.deepEqual(state, { transcripts: {}, transcriptPending: {}, transcriptSources: {}, transcriptRefresh: {}, transcriptRevision: {}, transcriptStatus: {}, transcriptCacheOrder: [] });
+});
 
 type TrajectorySidebarPublisher = { id: string; cwd?: string };
 type TrajectorySidebarGroup = { key: string; label: string; publishers: readonly TrajectorySidebarPublisher[] };
@@ -610,6 +620,32 @@ void test("trajectory metadata keeps large transcripts available through bounded
     assert.equal(result.status, "available");
     assert.ok(result.entries.some((entry) => JSON.stringify(entry).includes("large-transcript-tail-marker")));
     assert.equal(result.entries.some((entry) => JSON.stringify(entry).includes("call-419")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("trajectory reports a single oversized JSONL record instead of an empty transcript", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-single-record-cap-"));
+  const cwd = join(root, "project");
+  const home = join(root, "home");
+  const sessionFile = join(root, "session.jsonl");
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(sessionFile, `${JSON.stringify({ type: "message", text: "x".repeat(TRAJECTORY_MAX_TRANSCRIPT_BYTES) })}\n`);
+  const store = new RunStore(cwd, "session", "run", home);
+  const model = { provider: "fixture", model: "fixture-model" };
+  const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: [] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
+  try {
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    const metadataRun = (await createTrajectoryRunMetadataLoader(cwd, "session", home)())[0];
+    assert.ok(metadataRun);
+    const agentMetadata = metadataRun.transcripts.agent;
+    assert.ok(agentMetadata);
+    assert.equal(agentMetadata.status, "oversized");
+    assert.ok((agentMetadata.bytes ?? 0) > TRAJECTORY_MAX_TRANSCRIPT_BYTES);
+    const result = await createTrajectoryTranscriptLoader(cwd, "session", home, join(root, "agent"))({ runId: "run", agentId: "agent", revision: agentMetadata.revision });
+    assert.equal(result.status, "oversized");
+    assert.equal(result.error, "Transcript is too large");
+    assert.deepEqual(result.entries, []);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
