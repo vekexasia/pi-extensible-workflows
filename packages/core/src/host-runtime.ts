@@ -277,7 +277,15 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
     const worktreeOwner = identity.worktreeOwner;
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
-    const sideEffects: Promise<void>[] = [];
+    type SideEffectOutcome = { ok: true } | { ok: false; error: unknown };
+    const sideEffects: Array<Promise<SideEffectOutcome>> = [];
+    const ownSideEffect = (effect: () => void | Promise<void>): void => {
+      try {
+        sideEffects.push(Promise.resolve(effect()).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error })));
+      } catch (error) {
+        sideEffects.push(Promise.resolve({ ok: false as const, error }));
+      }
+    };
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
       run: runContext,
@@ -325,11 +333,13 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);
       },
-      phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
-      log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
+      phase: (name: string) => { ownSideEffect(() => bridge.phase?.(name)); },
+      log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },
     };
     const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
-    await Promise.all(sideEffects);
+    const outcomes = await Promise.all(sideEffects);
+    const sideEffectError = outcomes.find((outcome) => !outcome.ok);
+    if (sideEffectError) throw sideEffectError.error;
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
   };

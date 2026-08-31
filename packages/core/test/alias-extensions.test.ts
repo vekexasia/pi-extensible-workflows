@@ -279,6 +279,105 @@ void test("registered function context.invoke validates nested calls and replays
   await assert.rejects(context.invoke("leaf", { value: 1 }), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   await assert.rejects(context.invoke("missing", {}), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
 });
+void test("host owns phase and log rejections while registered functions continue", async () => {
+  const registry = new WorkflowRegistry();
+  let markStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const continueFunction = new Promise<void>((resolve) => { release = resolve; });
+  const phaseError = new Error("phase failed");
+  const logError = new Error("log failed");
+  let resolvePhase!: () => void;
+  let rejectPhase!: (error: unknown) => void;
+  const phaseRejection = new Promise<void>((resolve, reject) => { resolvePhase = resolve; rejectPhase = reject; });
+  let resolveLog!: () => void;
+  let rejectLog!: (error: unknown) => void;
+  const logRejection = new Promise<void>((resolve, reject) => { resolveLog = resolve; rejectLog = reject; });
+  registry.register({ version: "1.0.0", headline: "Side effects", functions: {
+    sideEffects: { description: "Side effects", input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, run: async (_input, context) => { context.phase("phase"); context.log("message"); markStarted(); await continueFunction; return {}; } },
+  } });
+  const store = { replay: async () => undefined, complete: async () => {} } as unknown as RunStore;
+  const controller = new AbortController();
+  const wrapped = withWorkflowFunctions({ phase: () => phaseRejection, log: () => logRejection }, store, workflowRunContext("/repo", "session", "run", { name: "side-effects" }, null, controller.signal), registry);
+  if (!wrapped.function) throw new Error("Missing function bridge");
+  const events: string[] = [];
+  const onUnhandled = () => { events.push("unhandledRejection"); };
+  const onHandled = () => { events.push("rejectionHandled"); };
+  const drainEventLoop = async (): Promise<void> => {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  };
+  process.on("unhandledRejection", onUnhandled);
+  process.on("rejectionHandled", onHandled);
+  try {
+    const invocation = wrapped.function("sideEffects", {}, controller.signal, { path: "function/sideEffects/1", structuralPath: [], occurrence: 1 });
+    const rejection = assert.rejects(invocation, (error: unknown) => error === phaseError);
+    await started;
+    rejectPhase(phaseError);
+    rejectLog(logError);
+    await drainEventLoop();
+    assert.deepEqual(events, []);
+    release();
+    await rejection;
+    await drainEventLoop();
+    assert.deepEqual(events, []);
+  } finally {
+    markStarted();
+    release();
+    resolvePhase();
+    resolveLog();
+    process.off("unhandledRejection", onUnhandled);
+    process.off("rejectionHandled", onHandled);
+  }
+});
+void test("host owns phase and log rejections when registered functions throw", async () => {
+  const registry = new WorkflowRegistry();
+  let markThrown!: () => void;
+  const thrown = new Promise<void>((resolve) => { markThrown = resolve; });
+  const phaseError = new Error("phase failed");
+  const logError = new Error("log failed");
+  const functionError = new Error("function failed");
+  let resolvePhase!: () => void;
+  let rejectPhase!: (error: unknown) => void;
+  const phaseRejection = new Promise<void>((resolve, reject) => { resolvePhase = resolve; rejectPhase = reject; });
+  let resolveLog!: () => void;
+  let rejectLog!: (error: unknown) => void;
+  const logRejection = new Promise<void>((resolve, reject) => { resolveLog = resolve; rejectLog = reject; });
+  registry.register({ version: "1.0.0", headline: "Throwing side effects", functions: {
+    failed: { description: "Failed function", input: { type: "object", additionalProperties: false }, output: { type: "object", additionalProperties: false }, run: (_input, context) => { context.phase("phase"); context.log("message"); try { throw functionError; } finally { markThrown(); } } },
+  } });
+  const store = { replay: async () => undefined, complete: async () => {} } as unknown as RunStore;
+  const controller = new AbortController();
+  const wrapped = withWorkflowFunctions({ phase: () => phaseRejection, log: () => logRejection }, store, workflowRunContext("/repo", "session", "run", { name: "throwing-side-effects" }, null, controller.signal), registry);
+  if (!wrapped.function) throw new Error("Missing function bridge");
+  const events: string[] = [];
+  const onUnhandled = () => { events.push("unhandledRejection"); };
+  const onHandled = () => { events.push("rejectionHandled"); };
+  const drainEventLoop = async (): Promise<void> => {
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+  };
+  process.on("unhandledRejection", onUnhandled);
+  process.on("rejectionHandled", onHandled);
+  try {
+    const invocation = wrapped.function("failed", {}, controller.signal, { path: "function/failed/1", structuralPath: [], occurrence: 1 });
+    const rejection = assert.rejects(invocation, (error: unknown) => error === functionError);
+    await thrown;
+    rejectPhase(phaseError);
+    rejectLog(logError);
+    await rejection;
+    await drainEventLoop();
+    assert.deepEqual(events, []);
+    await drainEventLoop();
+    assert.deepEqual(events, []);
+  } finally {
+    markThrown();
+    resolvePhase();
+    resolveLog();
+    process.off("unhandledRejection", onUnhandled);
+    process.off("rejectionHandled", onHandled);
+  }
+});
 void test("host composes occurrence-aware nested function breadcrumbs", async () => {
   const registry = new WorkflowRegistry();
   registry.register({
