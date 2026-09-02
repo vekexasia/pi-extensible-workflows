@@ -277,14 +277,17 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
     const worktreeOwner = identity.worktreeOwner;
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
-    type SideEffectOutcome = { ok: true } | { ok: false; error: unknown };
-    const sideEffects: Array<Promise<SideEffectOutcome>> = [];
+    const sideEffects: Promise<void>[] = [];
     const ownSideEffect = (effect: () => void | Promise<void>): void => {
+      let sideEffect: Promise<void>;
       try {
-        sideEffects.push(Promise.resolve(effect()).then(() => ({ ok: true as const }), (error: unknown) => ({ ok: false as const, error })));
+        sideEffect = Promise.resolve(effect());
       } catch (error) {
-        sideEffects.push(Promise.resolve({ ok: false as const, error }));
+        sideEffect = Promise.resolve().then(() => { throw error; });
       }
+      sideEffects.push(sideEffect);
+      // Own rejection immediately; Promise.all below still propagates it after the function completes.
+      void sideEffect.catch(() => undefined);
     };
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
@@ -337,9 +340,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },
     };
     const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
-    const outcomes = await Promise.all(sideEffects);
-    const sideEffectError = outcomes.find((outcome) => !outcome.ok);
-    if (sideEffectError) throw sideEffectError.error;
+    await Promise.all(sideEffects);
     if (!replayed) await store.complete(path, stored ?? result);
     return result;
   };
