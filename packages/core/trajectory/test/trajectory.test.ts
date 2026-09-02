@@ -190,7 +190,7 @@ void test("Trajectory agent view requests a compacted transcript on demand", () 
 void test("Trajectory timelines keep cursors and agent-only range selection", () => {
   const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
   assert.match(source, /bindTimeCursor\(\$\("swim"\), "\.axis \.ticks"\)/);
-  assert.match(source, /bindTimeCursor\(\$\("agent-timeline"\), "\.axis \.ticks"\)/);
+  assert.match(source, /bindTimeCursor\(\$\("agent-timeline"\), "\.axis \.ticks", \$\("events"\)\)/);
   assert.match(source, /bindBrush\(\$\("agent-timeline"\), "\.axis \.ticks", setAgentRange\)/);
   assert.doesNotMatch(source, /bindBrush\(\$\("swim"\)/);
   assert.doesNotMatch(source, /runRange/);
@@ -205,6 +205,29 @@ void test("Trajectory timelines keep cursors and agent-only range selection", ()
   assert.match(source, /function renderGantt\(record, timingsByAgent\)/);
   assert.doesNotMatch(source, /summary !== "—"/);
   assert.doesNotMatch(source, /agent-path/);
+});
+void test("Trajectory transcript hover positions the agent timeline cursor", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helperStart = source.indexOf("    function bindTimeCursor");
+  const helperEnd = source.indexOf("    function openScript", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const result = runInNewContext(`(() => {
+    const classes = new Set(["hidden"]);
+    const label = { textContent: "" };
+    const cursor = { style: {}, classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) }, querySelector: () => label };
+    const track = { getBoundingClientRect: () => ({ left: 100, width: 200 }) };
+    const root = { dataset: { timelineHasTime: "true", timelineStart: "1000", timelineSpan: "1000" }, scrollTop: 0, handlers: {}, querySelector: (selector) => selector === ":scope > .now" ? cursor : track, getBoundingClientRect: () => ({ left: 90 }), addEventListener: (name, handler) => { root.handlers[name] = handler; } };
+    const events = { handlers: {}, addEventListener: (name, handler) => { events.handlers[name] = handler; } };
+    const fmtClock = (stamp) => String(stamp);
+    ${source.slice(helperStart, helperEnd)}
+    bindTimeCursor(root, ".axis .ticks", events);
+    events.handlers.mouseover({ target: { closest: () => ({ dataset: { t: "25" } }) } });
+    const hiddenAfterHover = classes.has("hidden");
+    events.handlers.mouseleave();
+    return { left: cursor.style.left, label: label.textContent, hiddenAfterHover, hiddenAfterLeave: classes.has("hidden") };
+  })()`) as { left: string; label: string; hiddenAfterHover: boolean; hiddenAfterLeave: boolean };
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { left: "60px", label: "1250", hiddenAfterHover: false, hiddenAfterLeave: true });
+  assert.match(source, /bindTimeCursor\(\$\("agent-timeline"\), "\.axis \.ticks", \$\("events"\)\)/);
 });
 
 void test("Trajectory run layout supports bounded Gantt resizing and persisted section toggles", () => {
