@@ -278,6 +278,17 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
     const replayed = await store.replay(path);
     let stored: JsonValue | undefined;
     const sideEffects: Promise<void>[] = [];
+    const ownSideEffect = (effect: () => void | Promise<void>): void => {
+      let sideEffect: Promise<void>;
+      try {
+        sideEffect = Promise.resolve(effect());
+      } catch (error) {
+        sideEffect = Promise.resolve().then(() => { throw error; });
+      }
+      sideEffects.push(sideEffect);
+      // Own rejection immediately; Promise.all below still propagates it after the function completes.
+      void sideEffect.catch(() => undefined);
+    };
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
       run: runContext,
@@ -325,8 +336,8 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);
       },
-      phase: (name: string) => { sideEffects.push(Promise.resolve(bridge.phase?.(name))); },
-      log: (message: string) => { sideEffects.push(Promise.resolve(bridge.log?.(message))); },
+      phase: (name: string) => { ownSideEffect(() => bridge.phase?.(name)); },
+      log: (message: string) => { ownSideEffect(() => bridge.log?.(message)); },
     };
     const result = await inheritedHostAgentPath.run([...structuralPath], async () => registry.invokeFunction(name, input, context, path, { get: () => replayed?.value, put: (_path, value) => { stored = value; } }));
     await Promise.all(sideEffects);
