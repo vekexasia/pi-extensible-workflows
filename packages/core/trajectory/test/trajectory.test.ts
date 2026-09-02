@@ -349,13 +349,14 @@ type TrajectoryPreviewHelpers = {
   eventLabel: (kind: string) => string;
   entryDetails: (entry: unknown, agent: unknown, entries?: readonly unknown[]) => { kind: string; entry: unknown; agent: unknown };
   isDisplayableTranscriptEntry: (entry: { type?: unknown }) => boolean;
+  renderAgentTimeline: (entries: readonly unknown[]) => string;
 };
 
 function loadTrajectoryPreviewHelpers(source: string): TrajectoryPreviewHelpers {
   const helperStart = source.indexOf("    const esc");
   const helperEnd = source.indexOf("    function renderToolPane", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
-  return runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; return { compactSkillReadPreview, eventPreview, eventPreviewParts, toolPreviewHtml, eventSearchText, eventLabel, entryDetails, isDisplayableTranscriptEntry }; })()`) as TrajectoryPreviewHelpers;
+  return runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; return { compactSkillReadPreview, eventPreview, eventPreviewParts, toolPreviewHtml, eventSearchText, eventLabel, entryDetails, isDisplayableTranscriptEntry, renderAgentTimeline }; })()`) as TrajectoryPreviewHelpers;
 }
 
 type TrajectoryMarkdownHelpers = { sanitizeMarkdown: (html: string) => string };
@@ -726,7 +727,7 @@ void test("Trajectory subagent crumb returns home with a cleared target and URL"
   const handlerEnd = source.indexOf('    $("events").addEventListener', handlerStart);
   assert.ok(navigationStart >= 0 && navigationEnd > navigationStart && handlerStart >= 0 && handlerEnd > handlerStart);
   const result = runInNewContext(`(() => {
-    const state = { currentRun: "publisher:agent", currentTarget: { kind: "subagent", publisherId: "publisher", id: "agent" }, pendingTarget: { kind: "subagent" }, currentPub: "publisher", currentAgent: "agent", agentRange: {}, agentRangeAgent: "agent", selectedEvent: 1, eventsSig: "events", subagentEventSig: "events" };
+    const state = { currentRun: "publisher:agent", currentTarget: { kind: "subagent", publisherId: "publisher", id: "agent" }, pendingTarget: { kind: "subagent" }, currentPub: "publisher", currentAgent: "agent", agentRange: {}, agentRangeAgent: "agent", selectedEvent: 1, timelineHighlight: null, eventsSig: "events", subagentEventSig: "events" };
     const elements = {
       q: { addEventListener: () => {} },
       events: { addEventListener: () => {} },
@@ -744,6 +745,7 @@ void test("Trajectory subagent crumb returns home with a cleared target and URL"
     const closeScript = () => {};
     const renderSidebar = () => {};
     const applyEventSearch = () => {};
+    const clearEventHighlight = () => { state.timelineHighlight = null; };
     ${source.slice(navigationStart, navigationEnd)}
     ${source.slice(handlerStart, handlerEnd)}
     elements["run-crumb"].handler();
@@ -917,4 +919,42 @@ void test("Trajectory run rendering preserves the dossier scroll across re-rende
   // The dossier is rewritten on every state frame, so the scroll must be restored around the patch.
   assert.match(body, /const dossierBody = \$\("insp"\)\.querySelector\("\.ins-body"\); const dossierScroll = dossierBody \? dossierBody\.scrollTop : 0;/);
   assert.match(body, /patch\(\$\("insp"\), renderDossier\(publisher, record\)\); const nextDossierBody = \$\("insp"\)\.querySelector\("\.ins-body"\); if \(nextDossierBody && dossierScroll\) nextDossierBody\.scrollTop = dossierScroll;/);
+});
+
+void test("Trajectory timeline clicks highlight the matching transcript event", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryPreviewHelpers(source);
+  const html = helpers.renderAgentTimeline([{ type: "message", timestamp: 1000, message: { role: "user", content: "hello" } }]);
+  assert.match(html, /<i class="tick in" data-event="0" style="left:0%;" title="user"><\/i>/);
+  assert.doesNotMatch(html, /title="[^"]*><\/i>/);
+  assert.match(source, /\.evt\.timeline-highlight/);
+  assert.match(source, /function highlightEvent\(index\)/);
+  assert.match(source, /scrollIntoView\(\{ block: "nearest" \}\)/);
+  assert.match(source, /\$\("agent-timeline"\)\.addEventListener\("click"/);
+});
+
+void test("Trajectory clears timeline highlights when leaving the view", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const start = source.indexOf("    function clearEventHighlight()");
+  const end = source.indexOf("    function nearestTimelineEvent", start);
+  assert.ok(start >= 0 && end > start);
+  const result = runInNewContext(`(() => {
+    const classes = new Set();
+    const item = { dataset: { event: "0" }, offsetWidth: 0, classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) }, scrollIntoView: () => {} };
+    const events = { querySelectorAll: (selector) => selector === "[data-event]" ? [item] : classes.has("timeline-highlight") ? [item] : [] };
+    const state = { timelineHighlight: null };
+    let eventHighlightTimer;
+    let timeoutCleared = false;
+    const $ = (id) => id === "events" ? events : undefined;
+    const setTimeout = () => "timer";
+    const clearTimeout = () => { timeoutCleared = true; };
+    const applyEventSearch = () => {};
+    ${source.slice(start, end)}
+    highlightEvent(0);
+    const highlighted = classes.has("timeline-highlight");
+    const stateAfterHighlight = state.timelineHighlight;
+    clearEventHighlight();
+    return { highlighted, stateAfterHighlight, timeoutCleared, removed: !classes.has("timeline-highlight"), stateAfterClear: state.timelineHighlight };
+  })()`) as { highlighted: boolean; stateAfterHighlight: number; timeoutCleared: boolean; removed: boolean; stateAfterClear: null };
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { highlighted: true, stateAfterHighlight: 0, timeoutCleared: true, removed: true, stateAfterClear: null });
 });
