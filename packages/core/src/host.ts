@@ -12,7 +12,7 @@ import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunId
 import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
 import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
-import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
+import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
 import { loadAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
@@ -41,6 +41,7 @@ import {
   ForegroundDeliveryController,
   markWorkflowFailureDiagnostics,
   WORKFLOW_LOG_ENTRY,
+  completionDescriptor,
   completionDeliveryFromStore,
   createWorkflowFailureDiagnostics,
   failureDiagnosticsFrom,
@@ -460,15 +461,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   };
   pi.on("tool_result", async (event) => {
     const delivery = event.toolName === "workflow" ? deliveryController.foregroundDeliveries.get(event.toolCallId) : undefined;
-    if (delivery && !delivery.detached) {
-      if (delivery.timer) clearImmediate(delivery.timer);
-      delivery.inline = true;
-      await delivery.store.updateState((current) => {
-        if (current.delivery?.toolCallId !== event.toolCallId || current.delivery.state === "delivered") return current;
-        return { ...current, delivery: { ...current.delivery, state: "delivered" } };
-      });
-      deliveryController.foregroundDeliveries.delete(event.toolCallId);
-    }
+    if (delivery && !delivery.detached) deliveryController.foregroundDeliveries.delete(event.toolCallId);
     if (event.toolName !== "workflow" || !event.isError) return;
     const pending = deliveryController.pendingFailureDiagnostics.get(event.toolCallId);
     if (!pending) return;
@@ -1004,6 +997,19 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       return { text: completionControlContent(result), details: result };
     },
   );
+  const deliverStaleTerminal = async (store: RunStore, run: PersistedRun): Promise<void> => {
+    if (!((run.delivery?.mode === "foreground" && run.delivery.state === "attached") || (run.delivery?.mode === "background" && run.delivery.state === "pending"))) return;
+    if (run.state === "completed") {
+      const resultPath = join(store.directory, "result.json");
+      let resultBytes = 0;
+      let hasResult = true;
+      try { resultBytes = await store.resultBytes(); } catch (error) { if (!isNodeError(error, "ENOENT")) throw error; hasResult = false; }
+      await deliveryController.deliverTerminal(store, completionDescriptor({ runId: run.id, ...(hasResult ? { resultPath } : {}), resultBytes }));
+      return;
+    }
+    const error = run.error ? new WorkflowError(run.error.code, run.error.message) : new WorkflowError(run.state === "stopped" ? "CANCELLED" : "INTERNAL_ERROR", `Workflow ${run.workflowName} ended in ${run.state} without an error`);
+    await deliveryController.deliverTerminal(store, formatWorkflowFailureDeliveryFallback(run.workflowName, run.id, store.directory, error, run.state === "failed"), true);
+  };
   pi.on("session_start", async (_event, ctx) => {
     if (sessionStarted) return;
     sessionStarted = true;
@@ -1015,15 +1021,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
     let retention: WorkflowSettings["retention"];
     try { retention = resolveWorkflowSettings(ctx.cwd, projectTrusted(ctx), workflowSettingsPath(extensionAgentDir)).effective.retention; } catch { retention = undefined; }
-    // Retention is optional housekeeping; a corrupt or racing run must not block resume.
-    if (retention !== undefined) void retainTerminalRuns({ cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), ...(home === undefined ? {} : { home }), allSessions: true, retention }).catch(() => undefined);
     const runIds = await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home);
     for (const runId of runIds) {
       if (runs.has(runId)) continue;
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       let loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> };
       try { loaded = await store.load(); } catch { if (!await store.isComplete()) await store.delete(true).catch(() => undefined); continue; }
-      if (loaded.run.state === "completed" || loaded.run.state === "failed" || loaded.run.state === "stopped") { terminalRunStates.set(runId, loaded.run.state); continue; }
+      // Stale terminal delivery is best effort; a corrupt run must not block session recovery.
+      if (loaded.run.state === "completed" || loaded.run.state === "failed" || loaded.run.state === "stopped") { terminalRunStates.set(runId, loaded.run.state); await deliverStaleTerminal(store, loaded.run).catch(() => undefined); continue; }
       if (loaded.run.state !== "interrupted" && loaded.run.state !== "budget_exhausted") {
         const previousState = loaded.run.state;
         await store.updateState((current) => {
@@ -1063,6 +1068,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch());
     }
     if (runIds.length > 0) getTrajectoryHost()?.autoAttach(trajectoryProvider, ctx);
+    // Retention is optional housekeeping; start it only after recovery stops reading terminal runs.
+    if (retention !== undefined) void retainTerminalRuns({ cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), ...(home === undefined ? {} : { home }), allSessions: true, retention }).catch(() => undefined);
     const resumeSelect = uiHostCapabilities(ctx.ui)?.select;
     if (ctx.hasUI && resumeSelect) {
       const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
@@ -1104,8 +1111,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     promptSnippet: WORKFLOW_TOOL_PROMPT_SNIPPET,
     parameters: WORKFLOW_TOOL_PARAMETERS,
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      let resolveForegroundResult: (() => void) | undefined;
-      const foregroundResultReady = new Promise<void>((resolve) => { resolveForegroundResult = resolve; });
+      let resolveDetached: ((result: ForegroundDetachResult) => void) | undefined;
+      let foregroundStore: RunStore | undefined;
+      let completionInstalled = false;
+      const detachedResult = params.foreground ? new Promise<ForegroundDetachResult>((resolve) => { resolveDetached = resolve; }) : undefined;
+      const detachedToolResult = (run: PersistedRun) => {
+        const detached = { runId: run.id, state: "running" as const, detached: true as const };
+        return { content: [{ type: "text" as const, text: JSON.stringify(detached) }], details: { ...detached, run, preview: `Moved workflow ${run.id} to background.` } };
+      };
       try {
       const headless = object(ctx) && ctx.headless === true;
       const settingsPath = workflowSettingsPath(extensionAgentDir);
@@ -1125,8 +1138,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       let foregroundAttached = Boolean(params.foreground);
       const onForegroundAbort = () => { runController.abort(); };
       if (signal?.aborted) runController.abort(); else signal?.addEventListener("abort", onForegroundAbort, { once: true });
-      let resolveDetached: ((result: ForegroundDetachResult) => void) | undefined;
-      const detachedResult = params.foreground ? new Promise<ForegroundDetachResult>((resolve) => { resolveDetached = resolve; }) : undefined;
       const resolvedAliases = await resolveLaunchAliases(registry, launch.settings.modelAliases ?? {}, { cwd: launchCwd, projectTrusted: trustedProject, rootModel, knownModels, availableModels, signal: runController.signal }, availableModels, knownModels, settingsPath);
       const modelAliases = resolvedAliases.aliases;
       const settings = Object.freeze({ ...launch.settings, ...(Object.keys(modelAliases).length ? { modelAliases } : {}) });
@@ -1161,10 +1172,11 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
+      foregroundStore = params.foreground ? store : undefined;
       getTrajectoryHost()?.autoAttach(trajectoryProvider, ctx);
       if (params.foreground) {
         const delivery: ForegroundDelivery = {
-          store, inline: false, detached: false,
+          store, detached: false,
           detach: async () => {
             let moved: boolean | undefined;
             await store.updateState((current) => {
@@ -1180,7 +1192,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             await store.saveSnapshot(createLaunchSnapshot({ ...persistedSnapshot, launchMode: "background" }));
             for (const checkpoint of await store.awaitingCheckpoints()) deliverBackgroundCheckpoint(checked.metadata.name, runId, checkpoint);
             signal?.removeEventListener("abort", onForegroundAbort);
-            if (delivery.timer) clearImmediate(delivery.timer);
             const run = (await store.load()).run;
             const result = { runId, state: "running" as const, detached: true as const, run };
             resolveDetached?.(result);
@@ -1223,6 +1234,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       });
       const completion = finish.finally(() => cleanupTerminalRun(runId));
       runRecord.completion = completion;
+      completionInstalled = true;
       const deliverFailureContent = (error: unknown): string => {
         const diagnostic = failureDiagnosticsFrom(error);
         return diagnostic ? formatWorkflowFailureDelivery(diagnostic) : formatWorkflowFailureDeliveryFallback(checked.metadata.name, runId, store.directory, error);
@@ -1238,9 +1250,9 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` } };
       }
       void completion.then(async (result) => {
-        await deliveryController.queueForegroundDelivery(toolCallId, completionContent("background", result), foregroundResultReady);
+        await deliveryController.deliverDetachedTerminal(toolCallId, completionContent("background", result));
       }, async (error: unknown) => {
-        await deliveryController.queueForegroundDelivery(toolCallId, deliverFailureContent(error), foregroundResultReady, true);
+        await deliveryController.deliverDetachedTerminal(toolCallId, deliverFailureContent(error), true);
       });
       const outcome = detachedResult === undefined
         ? { kind: "completed" as const, result: await completion }
@@ -1248,21 +1260,33 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           completion.then((result) => ({ kind: "completed" as const, result })),
           detachedResult.then((result) => ({ kind: "detached" as const, result })),
         ]);
-      if (outcome.kind === "detached") {
-        const { run, ...detached } = outcome.result;
-        resolveForegroundResult?.();
-        return { content: [{ type: "text" as const, text: JSON.stringify(detached) }], details: { ...detached, run, preview: `Moved workflow ${runId} to background.` } };
-      }
+      if (outcome.kind === "detached") return detachedToolResult(outcome.result.run);
       const { value, resultPath, resultBytes } = outcome.result;
-      const delivery = await completionDeliveryFromStore({ mode: "foreground", name: checked.metadata.name, runId, value, resultPath, resultBytes, store, context: completionContext(ctx) });
+      const foregroundDelivery = await completionDeliveryFromStore({ mode: "foreground", name: checked.metadata.name, runId, value, resultPath, resultBytes, store, context: completionContext(ctx) });
+      const claim = await deliveryController.claimForegroundDelivery(store, toolCallId);
+      if (claim === "detached") {
+        // deliverTerminal sends only if the detached follow-up handler has not already sent.
+        await deliveryController.deliverTerminal(store, completionContent("background", outcome.result));
+        deliveryController.foregroundDeliveries.delete(toolCallId);
+        return detachedToolResult((await store.load()).run);
+      }
+      deliveryController.foregroundDeliveries.delete(toolCallId);
       const run = (await store.load()).run;
-      const result = { content: [{ type: "text" as const, text: delivery.content }, ...(delivery.inlined ? [{ type: "text" as const, text: `Workflow run ID: ${runId}` }] : [])], details: { runId, value, run } };
-      resolveForegroundResult?.();
-      return result;
+      return { content: [{ type: "text" as const, text: foregroundDelivery.content }, ...(foregroundDelivery.inlined ? [{ type: "text" as const, text: `Workflow run ID: ${runId}` }] : [])], details: { runId, value, run } };
       } catch (error) {
-        const presented = mainAgentError(error);
-        resolveForegroundResult?.();
-        throw presented;
+        if (params.foreground && foregroundStore && completionInstalled) {
+          const claim = await deliveryController.claimForegroundDelivery(foregroundStore, toolCallId);
+          if (claim === "detached") {
+            // deliverTerminal sends only if the detached follow-up handler has not already sent.
+            const failed = await foregroundStore.load();
+            const diagnostic = failureDiagnosticsFrom(error);
+            await deliveryController.deliverTerminal(foregroundStore, diagnostic ? formatWorkflowFailureDelivery(diagnostic) : formatWorkflowFailureDeliveryFallback(failed.run.workflowName, failed.run.id, foregroundStore.directory, error), true);
+            deliveryController.foregroundDeliveries.delete(toolCallId);
+            return detachedToolResult((await foregroundStore.load()).run);
+          }
+          deliveryController.foregroundDeliveries.delete(toolCallId);
+        }
+        throw mainAgentError(error);
       }
     },
     renderCall(args) {

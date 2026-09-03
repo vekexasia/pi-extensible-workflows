@@ -17,7 +17,6 @@ type FakeStore = {
 
 type Delivery = {
   store: RunStore;
-  inline: boolean;
   detached: boolean;
   detach: () => Promise<{ runId: string; state: "running"; detached: true; run: PersistedRun }>;
 };
@@ -42,7 +41,6 @@ function controllerFor(store: RunStore, delivered: string[]): ForegroundDelivery
 function attach(controller: ForegroundDeliveryController, toolCallId: string, store: RunStore, overrides: Partial<Omit<Delivery, "store">> = {}): Delivery {
   const delivery: Delivery = {
     store,
-    inline: false,
     detached: false,
     detach: async () => ({ runId: store.runId, state: "running", detached: true, run: (await store.load()).run }),
     ...overrides,
@@ -51,65 +49,24 @@ function attach(controller: ForegroundDeliveryController, toolCallId: string, st
   return delivery;
 }
 
-void test("inline foreground results are not promoted to follow-up delivery", async () => {
-  const { store } = storeFor("inline");
+
+void test("true foreground detach uses background delivery exactly once", async () => {
+  const { store } = storeFor("detached");
   const delivered: string[] = [];
   const controller = controllerFor(store, delivered);
-  attach(controller, "inline", store, { inline: true });
-
-  controller.scheduleForegroundDelivery("inline", async () => { delivered.push("promoted"); });
-  await waitForTurn();
-
-  assert.deepEqual(delivered, []);
-});
-
-void test("non-inline foreground delivery promotes only after an event-loop turn", async () => {
-  const { store } = storeFor("scheduled");
-  const delivered: string[] = [];
-  const controller = controllerFor(store, delivered);
-  attach(controller, "scheduled", store);
-
-  controller.scheduleForegroundDelivery("scheduled", async () => { delivered.push("promoted"); });
-  assert.deepEqual(delivered, []);
-  await waitForTurn();
-  assert.deepEqual(delivered, ["promoted"]);
-});
-
-void test("detached foreground delivery uses background delivery and cleans its entry", async () => {
-  const { store } = storeFor("detached", "running", { mode: "background", state: "pending", toolCallId: "detached" });
-  const delivered: string[] = [];
-  const controller = controllerFor(store, delivered);
-  const delivery = attach(controller, "detached", store, { detached: true });
+  const delivery = attach(controller, "detached", store);
   delivery.detach = async () => {
-    const current = (await store.load()).run;
-    return { runId: current.id, state: "running", detached: true, run: current };
+    await store.updateState((current) => ({ ...current, delivery: { mode: "background", state: "pending", toolCallId: "detached" } }));
+    delivery.detached = true;
+    return { runId: "detached", state: "running", detached: true, run: (await store.load()).run };
   };
 
-  await controller.queueForegroundDelivery("detached", "background result", Promise.resolve());
+  await controller.moveForegroundToBackground("detached");
+  await controller.deliverDetachedTerminal("detached", "background result");
 
   assert.deepEqual(delivered, ["background result"]);
   assert.equal(controller.foregroundDeliveries.has("detached"), false);
   assert.deepEqual((await store.load()).run.delivery, { mode: "background", state: "delivered", toolCallId: "detached" });
-});
-
-void test("attached completion waits for its result turn before background promotion", async () => {
-  const { store } = storeFor("delayed");
-  const delivered: string[] = [];
-  const controller = controllerFor(store, delivered);
-  attach(controller, "delayed", store);
-  let releaseResult!: () => void;
-  const resultReady = new Promise<void>((resolve) => { releaseResult = resolve; });
-
-  const queued = controller.queueForegroundDelivery("delayed", "delayed result", resultReady);
-  await waitForTurn();
-  assert.deepEqual(delivered, []);
-
-  releaseResult();
-  await queued;
-  assert.deepEqual(delivered, []);
-  await waitForTurn();
-  assert.deepEqual(delivered, ["delayed result"]);
-  assert.equal(controller.foregroundDeliveries.has("delayed"), false);
 });
 
 void test("failure delivery clears pending diagnostics and preserves failure content", async () => {
@@ -119,7 +76,7 @@ void test("failure delivery clears pending diagnostics and preserves failure con
   attach(controller, "failure", store, { detached: true });
   (controller.pendingFailureDiagnostics as unknown as Map<string, unknown>).set("failure", { store, diagnostic: { runId: "failure" } });
 
-  await controller.queueForegroundDelivery("failure", "failure diagnostics", Promise.resolve(), true);
+  await controller.deliverDetachedTerminal("failure", "failure diagnostics", true);
 
   assert.deepEqual(delivered, ["failure diagnostics"]);
   assert.equal((controller.pendingFailureDiagnostics as unknown as Map<string, unknown>).has("failure"), false);
@@ -141,19 +98,26 @@ void test("a foreground resume claim suppresses the stale terminal delivery once
   assert.deepEqual(delivered, ["resumed completion"]);
 });
 
+void test("recorded-delivered foreground completion is not redelivered during recovery", async () => {
+  const { store } = storeFor("recovered", "completed", { mode: "foreground", state: "delivered", toolCallId: "recovered" });
+  const delivered: string[] = [];
+  const controller = controllerFor(store, delivered);
+
+  await controller.deliverTerminal(store, "recovered completion");
+
+  assert.deepEqual(delivered, []);
+  assert.deepEqual((await store.load()).run.delivery, { mode: "foreground", state: "delivered", toolCallId: "recovered" });
+});
+
 void test("foreground candidates and detach state track only attached runs", async () => {
   const { store: attachedStore } = storeFor("attached");
-  const { store: inlineStore } = storeFor("inline-candidate");
   const delivered: string[] = [];
-  const runs = new Map<string, { store: RunStore }>([[attachedStore.runId, { store: attachedStore }], [inlineStore.runId, { store: inlineStore }]]);
+  const runs = new Map<string, { store: RunStore }>([[attachedStore.runId, { store: attachedStore }]]);
   const controller = new ForegroundDeliveryController({ runs, deliver: (content: string) => { delivered.push(content); } });
   const attached = attach(controller, "attached", attachedStore);
-  attach(controller, "inline-candidate", inlineStore, { inline: true });
 
   assert.equal(controller.isForegroundAttached("attached"), true);
-  assert.equal(controller.isForegroundAttached("inline-candidate"), false);
   assert.equal(controller.foregroundDeliveryCandidates("attached").length, 1);
-
   attached.detach = async () => {
     await attachedStore.updateState((current) => ({ ...current, delivery: { mode: "background", state: "pending" } }));
     attached.detached = true;
@@ -180,4 +144,39 @@ void test("terminal deliveries for one store are serialized and only the first c
   await Promise.all([first, second]);
 
   assert.deepEqual(delivered, ["first"]);
+});
+
+void test("terminal claim and detach race has exactly one winner", async () => {
+  for (const detachFirst of [false, true]) {
+    const { store } = storeFor(`race-${String(detachFirst)}`);
+    const delivered: string[] = [];
+    const controller = controllerFor(store, delivered);
+    const delivery = attach(controller, store.runId, store);
+    delivery.detach = async () => {
+      let moved: boolean | undefined;
+      await store.updateState((current) => {
+        if (current.delivery?.mode !== "foreground" || current.delivery.state !== "attached") return current;
+        moved = true;
+        return { ...current, delivery: { mode: "background", state: "pending", toolCallId: store.runId } };
+      });
+      if (moved !== true) throw new Error("already claimed");
+      delivery.detached = true;
+      return { runId: store.runId, state: "running", detached: true, run: (await store.load()).run };
+    };
+    const claim = async (): Promise<"inline" | "detached"> => (await controller.claimForegroundDelivery(store, store.runId)) === "claimed" ? "inline" : "detached";
+    const deliverDetached = async (): Promise<"follow-up" | "lost"> => { try { await controller.moveForegroundToBackground(store.runId); await controller.deliverDetachedTerminal(store.runId, "detached result"); return "follow-up"; } catch { return "lost"; } };
+    let inline: Promise<"inline" | "detached">;
+    let detached: Promise<"follow-up" | "lost">;
+    if (detachFirst) {
+      detached = deliverDetached();
+      inline = Promise.resolve().then(claim);
+    } else {
+      inline = claim();
+      detached = Promise.resolve().then(deliverDetached);
+    }
+    const [inlineResult, detachedResult] = await Promise.all([inline, detached]);
+    assert.equal(inlineResult, detachFirst ? "detached" : "inline");
+    assert.equal(detachedResult, detachFirst ? "follow-up" : "lost");
+    assert.equal(delivered.length, detachFirst ? 1 : 0);
+  }
 });

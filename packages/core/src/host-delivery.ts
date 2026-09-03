@@ -6,7 +6,7 @@ import { errorCode, errorText, fail, isWorkflowAuthored, object, SerialLane } fr
 const FAILURE_DELIVERY_STATES: ReadonlySet<PersistedRun["state"]> = new Set(["failed", "stopped", "interrupted", "budget_exhausted"]);
 
 export type ForegroundDetachResult = { runId: string; state: "running"; detached: true; run: PersistedRun };
-export type ForegroundDelivery = { store: RunStore; inline: boolean; detached: boolean; detach: () => Promise<ForegroundDetachResult>; timer?: ReturnType<typeof setImmediate> };
+export type ForegroundDelivery = { store: RunStore; detached: boolean; detach: () => Promise<ForegroundDetachResult> };
 export type PendingFailureDiagnostic = { diagnostic: WorkflowFailureDiagnostics; store: RunStore };
 
 type ForegroundDeliveryControllerOptions = {
@@ -21,6 +21,18 @@ export class ForegroundDeliveryController {
   readonly terminalDeliveryLanes = new WeakMap<RunStore, SerialLane>();
 
   constructor(private readonly options: ForegroundDeliveryControllerOptions) {}
+  claimForegroundDelivery = async (store: RunStore, toolCallId: string): Promise<"claimed" | "delivered" | "detached"> => {
+    let claim: "claimed" | "delivered" | "detached" = "detached";
+    await store.updateState((current) => {
+      const delivery = current.delivery;
+      if (delivery?.toolCallId !== toolCallId || delivery.mode !== "foreground") return current;
+      if (delivery.state === "delivered") { claim = "delivered"; return current; }
+      if (delivery.state !== "attached") return current;
+      claim = "claimed";
+      return { ...current, delivery: { ...delivery, state: "delivered" } };
+    });
+    return claim;
+  };
 
   deliverTerminal = (store: RunStore, content: string | (() => string | Promise<string>), failure = false): Promise<void> => {
     const lane = this.terminalDeliveryLanes.get(store) ?? new SerialLane();
@@ -31,7 +43,7 @@ export class ForegroundDeliveryController {
         if (failure && !FAILURE_DELIVERY_STATES.has(current.state)) return current;
         if (current.delivery?.state === "delivered") { this.foregroundResumeClaims.delete(store); return current; }
         if (this.foregroundResumeClaims.has(store) && current.delivery?.mode === "foreground" && current.delivery.state === "attached") { this.foregroundResumeClaims.delete(store); return current; }
-        if (current.delivery?.mode === "foreground" && current.delivery.state === "attached") { claimed = true; return { ...current, delivery: { ...current.delivery, state: "delivered" } }; }
+        if (current.delivery?.mode === "foreground" && current.delivery.state === "attached") { claimed = true; return { ...current, delivery: { ...current.delivery, mode: "background", state: "delivered" } }; }
         if (!current.delivery) { claimed = true; return current; }
         claimed = true;
         return { ...current, delivery: { ...current.delivery, mode: "background", state: "delivered" } };
@@ -45,17 +57,7 @@ export class ForegroundDeliveryController {
     });
   };
 
-  scheduleForegroundDelivery = (toolCallId: string, send: () => Promise<void>): void => {
-    const delivery = this.foregroundDeliveries.get(toolCallId);
-    if (!delivery || delivery.inline || typeof this.options.deliver !== "function") return;
-    //NOTE: Give Pi one event-loop turn to deliver an uninterrupted tool result before promoting.
-    delivery.timer = setImmediate(() => {
-      delete delivery.timer;
-      void send().finally(() => this.foregroundDeliveries.delete(toolCallId));
-    });
-  };
-
-  foregroundDeliveryCandidates = (runId: string): Array<[string, ForegroundDelivery]> => [...this.foregroundDeliveries.entries()].filter(([, delivery]) => this.options.runs.has(delivery.store.runId) && !delivery.inline && !delivery.detached && delivery.store.runId === runId);
+  foregroundDeliveryCandidates = (runId: string): Array<[string, ForegroundDelivery]> => [...this.foregroundDeliveries.entries()].filter(([, delivery]) => this.options.runs.has(delivery.store.runId) && !delivery.detached && delivery.store.runId === runId);
 
   moveForegroundToBackground = async (runId: string): Promise<ForegroundDetachResult> => {
     const candidates = this.foregroundDeliveryCandidates(runId);
@@ -65,35 +67,13 @@ export class ForegroundDeliveryController {
 
   isForegroundAttached = (runId: string): boolean => this.foregroundDeliveryCandidates(runId).length > 0;
 
-  queueForegroundDelivery = async (toolCallId: string, content: string | (() => string | Promise<string>), foregroundResultReady: Promise<void>, failure = false): Promise<void> => {
+  deliverDetachedTerminal = async (toolCallId: string, content: string | (() => string | Promise<string>), failure = false): Promise<void> => {
     const delivery = this.foregroundDeliveries.get(toolCallId);
     if (!delivery) return;
-    const deliverDetached = async (): Promise<void> => {
-      this.pendingFailureDiagnostics.delete(toolCallId);
-      await this.deliverTerminal(delivery.store, content, failure);
-      this.foregroundDeliveries.delete(toolCallId);
-    };
-    if (delivery.detached) {
-      await deliverDetached();
-      return;
-    }
-    await foregroundResultReady;
-    const currentDelivery = this.foregroundDeliveries.get(toolCallId);
-    if (!currentDelivery) return;
-    if (currentDelivery.detached) {
-      await deliverDetached();
-      return;
-    }
-    await delivery.store.updateState((current) => {
-      if (!current.delivery || current.delivery.state === "delivered") return current;
-      return { ...current, delivery: { ...current.delivery, mode: "background", state: "pending" } };
-    });
-    if (delivery.inline) return;
-    this.scheduleForegroundDelivery(toolCallId, async () => {
-      if (delivery.inline || delivery.detached) return;
-      this.pendingFailureDiagnostics.delete(toolCallId);
-      await this.deliverTerminal(delivery.store, content, failure);
-    });
+    if ((await delivery.store.load()).run.delivery?.mode !== "background") return;
+    this.pendingFailureDiagnostics.delete(toolCallId);
+    await this.deliverTerminal(delivery.store, content, failure);
+    this.foregroundDeliveries.delete(toolCallId);
   };
 }
 
@@ -168,8 +148,8 @@ export interface CompletionDeliveryStoreOptions extends Omit<CompletionDeliveryO
 export interface CompletionDeliveryResult { content: string; inlined: boolean }
 
 function positiveFinite(value: number | undefined): value is number { return value !== undefined && Number.isFinite(value) && value > 0; }
-function completionDescriptor(options: Pick<CompletionDeliveryOptions, "runId" | "resultPath" | "resultBytes">): string {
-  return JSON.stringify({ state: "completed", runId: options.runId, resultPath: options.resultPath, resultBytes: options.resultBytes, inlined: false });
+export function completionDescriptor(options: Pick<CompletionDeliveryOptions, "runId" | "resultBytes"> & { resultPath?: string }): string {
+  return JSON.stringify({ state: "completed", runId: options.runId, ...(options.resultPath === undefined ? {} : { resultPath: options.resultPath }), resultBytes: options.resultBytes, inlined: false });
 }
 function deliveryEnvelope(mode: CompletionDeliveryOptions["mode"], content: string, runId: string): string {
   const timestamp = Date.now();
@@ -352,10 +332,10 @@ export function formatWorkflowFailureDelivery(diagnostic: WorkflowFailureDiagnos
   const line = `Workflow ${name} failed (runId=${runId}): error=${error}${failedPath}${nextAction}${artifacts}`;
   return Buffer.byteLength(line) <= DELIVERY_LIMIT_BYTES ? line : utf8Prefix(line, DELIVERY_LIMIT_BYTES);
 }
-export function formatWorkflowFailureDeliveryFallback(workflowName: string, runId: string, runDirectory: string, error: unknown): string {
+export function formatWorkflowFailureDeliveryFallback(workflowName: string, runId: string, runDirectory: string, error: unknown, retryable = true): string {
   const code = errorCode(error) ?? "INTERNAL_ERROR";
   const failedPath = workflowFailedAt(error);
-  const nextAction = code === "BUDGET_EXHAUSTED" || code === "CANCELLED" ? "" : `; next action: workflow_retry({ runId: ${JSON.stringify(runId)} })`;
+  const nextAction = retryable && code !== "BUDGET_EXHAUSTED" && code !== "CANCELLED" ? `; next action: workflow_retry({ runId: ${JSON.stringify(runId)} })` : "";
   const line = `Workflow ${deliveryPart(workflowName, 128)} failed (runId=${deliveryPart(runId, 128)}): error=${code}: ${deliveryPart(formatWorkflowFailure(error), 768)}${failedPath ? `; failed path=${deliveryPart(failedPath, 512)}` : ""}${nextAction}; artifacts: runDirectory=${deliveryPart(runDirectory, 512)} statePath=${deliveryPart(join(runDirectory, "state.json"), 512)} journalPath=${deliveryPart(join(runDirectory, "journal.json"), 512)}`;
   return Buffer.byteLength(line) <= DELIVERY_LIMIT_BYTES ? line : utf8Prefix(line, DELIVERY_LIMIT_BYTES);
 }

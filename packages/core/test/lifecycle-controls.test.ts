@@ -693,6 +693,43 @@ void test("moves an attached foreground workflow to background without restartin
   await waitForIssue105(() => messages.some((message) => message.startsWith("Workflow background-command completed:")));
   assert.equal(messages.filter((message) => message.startsWith("Workflow background-command completed:")).length, 1);
 });
+
+void test("picker detachment delivers a foreground failure as one follow-up", { timeout: 10_000 }, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-background-failure-command-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const messages: string[] = [];
+  let agentStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { agentStarted = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const createSession = async (): Promise<TestPiSession> => ({
+    sessionId: "background-failure-command-session", sessionFile: "/sessions/background-failure-command.jsonl",
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => { agentStarted(); await gate; }, abort: async () => { release(); }, steer: async () => {}, dispose() {},
+  });
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  const context = { cwd: home, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async (_prompt: string, options: string[]) => options.find((option) => option.includes("background-failure-command")) } };
+  const execution = workflow.execute("foreground-failure-call", { name: "background-failure-command", script: `await log("before failure"); await agent("first"); throw new Error("detached failure");`, foreground: true }, new AbortController().signal, () => {}, context);
+  await started;
+  await waitForIssue105(async () => (await listRunIds(home, "session", home)).length === 1);
+  const runId = (await listRunIds(home, "session", home))[0];
+  assert.ok(runId);
+  const store = new RunStore(home, "session", runId, home);
+  t.after(async () => { release(); await execution.catch(() => {}); });
+  await contextualWorkflowAction(command, context, runId, "Move to background");
+  const detached = await execution as { details: { runId: string; state: string; detached: boolean } };
+  assert.deepEqual({ runId: detached.details.runId, state: detached.details.state, detached: detached.details.detached }, { runId, state: "running", detached: true });
+  release();
+  await waitForIssue105(async () => (await store.load()).run.delivery?.state === "delivered");
+  await waitForIssue105(() => messages.some((message) => message.startsWith("Workflow background-failure-command failed")));
+  assert.equal(messages.filter((message) => message.startsWith("Workflow background-failure-command failed")).length, 1);
+  assert.match(messages[0] ?? "", /detached failure/);
+});
+
 void test("detaching a checkpointed foreground workflow switches future prompts to follow-up delivery", { timeout: 10_000 }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-background-checkpoint-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
