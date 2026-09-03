@@ -1,5 +1,5 @@
-import { realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowFunction, WorkflowFunctionContext, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
@@ -28,13 +28,17 @@ function normalizeRoleDirectory(value: unknown): string {
   fail("INVALID_METADATA", "Workflow role directories require file URLs or absolute filesystem paths");
 }
 function canonicalRoleDirectory(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
-const registryDirectory = dirname(fileURLToPath(import.meta.url));
-const workflowPackageRoot = basename(dirname(registryDirectory)) === "dist" ? resolve(registryDirectory, "../..") : resolve(registryDirectory, "..");
-const BUILTIN_ROLE_DIRECTORIES = new Set([
-  resolve(workflowPackageRoot, "starter/roles"),
-  resolve(workflowPackageRoot, "dist/starter/roles"),
-].map(canonicalRoleDirectory));
-function isBuiltinRoleDirectory(path: string): boolean { return BUILTIN_ROLE_DIRECTORIES.has(canonicalRoleDirectory(path)); }
+function isBuiltinRoleDirectory(path: string): boolean {
+  const canonical = canonicalRoleDirectory(path);
+  const starterDirectory = dirname(canonical);
+  if (basename(canonical) !== "roles" || basename(starterDirectory) !== "starter") return false;
+  const distributionDirectory = dirname(starterDirectory);
+  const packageRoot = basename(distributionDirectory) === "dist" ? dirname(distributionDirectory) : distributionDirectory;
+  try {
+    const metadata: unknown = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf8"));
+    return object(metadata) && metadata.name === "pi-extensible-workflows";
+  } catch { return false; }
+}
 
 function catalogSchema(schema: unknown, at: string): JsonSchema {
   validateSchema(schema, at);

@@ -765,6 +765,35 @@ void test("doctor reports regular extension roles overriding bundled starter rol
     resetWorkflowRegistry();
   }
 });
+void test("doctor recognizes starter roles from Pi's package installation", async () => {
+  const paths = fixture();
+  const packageRoot = join(paths.root, "pi-install", "node_modules", "pi-extensible-workflows");
+  const starter = join(packageRoot, "dist", "starter", "roles");
+  const regular = join(paths.root, "regular-roles");
+  mkdirSync(starter, { recursive: true });
+  mkdirSync(regular);
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-extensible-workflows" }));
+  writeFileSync(join(starter, "developer.md"), "Bundled developer role");
+  writeFileSync(join(regular, "developer.md"), "User developer role");
+  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { openai: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "gpt", name: "GPT", input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
+  resetWorkflowRegistry();
+  registerWorkflowExtension({ version: "1.0.0", headline: "Pi starter and user roles", roleDirectories: [starter, regular] });
+  try {
+    const report = await withHome(paths.root, () => doctor({ ...paths, role: "developer", discoverPi: async () => pi() }));
+    const starterRole = report.roles.find(({ name, path }) => name === "developer" && path === join(starter, "developer.md"));
+    const userRole = report.roles.find(({ name, path }) => name === "developer" && path === join(regular, "developer.md"));
+    assert.ok(starterRole);
+    assert.ok(userRole);
+    assert.equal(starterRole.active, false);
+    assert.equal(starterRole.overriddenBy, userRole.path);
+    assert.equal(userRole.active, true);
+    assert.equal(userRole.overrides, starterRole.path);
+    assert.equal(report.roleInspection?.path, userRole.path);
+    assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_DUPLICATE" || code === "ROLE_NOT_FOUND"), false);
+  } finally {
+    resetWorkflowRegistry();
+  }
+});
 void test("portable bundles load method shorthand functions and selected payload resources", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-payload-"));
   const resource = join(root, "resource.txt");

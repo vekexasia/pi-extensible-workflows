@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -72,6 +72,20 @@ void test("marks a symlinked starter roles directory as builtin", () => {
   const registry = new WorkflowRegistry();
   registry.register({ version: "1.0.0", headline: "Starter roles", roleDirectories: [link] });
   assert.equal(registry.roleDirectoryRegistrations()[0]?.builtin, true);
+});
+void test("marks starter roles from a separate package installation as builtin", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-package-"));
+  const packageRoot = join(root, "node_modules", "pi-extensible-workflows");
+  const roleDirectory = join(packageRoot, "dist", "starter", "roles");
+  mkdirSync(roleDirectory, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-extensible-workflows" }));
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Starter roles", roleDirectories: [roleDirectory] });
+  try {
+    assert.equal(registry.roleDirectoryRegistrations()[0]?.builtin, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 void test("reviewLoop passes after a reviewer approves", async () => {
