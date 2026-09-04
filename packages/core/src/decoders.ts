@@ -1,4 +1,4 @@
-import { AGENT_STATES, RUN_STATES, THINKING_LEVELS, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, RUN_STATES, THINKING_LEVELS, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
 
@@ -30,6 +30,7 @@ function isContextFileScope(value: unknown): value is ContextFileScope { return 
 function isLaunchMode(value: unknown): value is NonNullable<LaunchSnapshot["launchMode"]> { return value === "foreground" || value === "background"; }
 function isRunState(value: unknown): value is RunRecord["state"] { return RUN_STATES.some((candidate) => candidate === value); }
 function isAgentState(value: unknown): value is PersistedAgent["state"] { return AGENT_STATES.some((candidate) => candidate === value); }
+function isAgentContinuity(value: unknown): value is AgentContinuity { return value === "fresh" || value === "continued"; }
 function isBudgetDimension(value: unknown): value is BudgetDimension { return ["tokens", "costUsd", "durationMs", "agentLaunches"].some((candidate) => candidate === value); }
 function isBudgetEventType(value: unknown): value is NonNullable<RunRecord["budgetEvents"]>[number]["type"] { return ["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"].some((candidate) => candidate === value); }
 function optionalString(value: unknown): string | undefined | typeof INVALID_PERSISTED_VALUE { return value === undefined || typeof value === "string" ? value : INVALID_PERSISTED_VALUE; }
@@ -203,8 +204,9 @@ function decodeIdentity(value: unknown): PersistedIdentity | undefined {
   const structuralPath = decodeStringArray(value.structuralPath);
   const parentBreadcrumb = optionalString(value.parentBreadcrumb);
   const worktreeOwner = optionalString(value.worktreeOwner);
-  if (!structuralPath || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE) return undefined;
-  return { structuralPath, callSite: value.callSite, occurrence: value.occurrence, ...(parentBreadcrumb === undefined ? {} : { parentBreadcrumb }), ...(worktreeOwner === undefined ? {} : { worktreeOwner }) };
+  const handle = optionalString(value.handle);
+  if (!structuralPath || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || handle === INVALID_PERSISTED_VALUE || handle !== undefined && !positiveInteger(value.turn)) return undefined;
+  return { structuralPath, callSite: value.callSite, occurrence: value.occurrence, ...(parentBreadcrumb === undefined ? {} : { parentBreadcrumb }), ...(worktreeOwner === undefined ? {} : { worktreeOwner }), ...(handle === undefined ? {} : { handle, turn: value.turn as number }) };
 }
 function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefined {
   if (!object(value) || typeof value.label !== "string" || typeof value.cwd !== "string") return undefined;
@@ -223,7 +225,9 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
   const timeoutMs = value.timeoutMs;
   const agentOptions = value.agentOptions === undefined ? undefined : decodeJsonObject(value.agentOptions);
   const agentIdentity = value.agentIdentity === undefined ? undefined : decodeIdentity(value.agentIdentity);
-  if (requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.role !== undefined && typeof value.role !== "string") || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity)) return undefined;
+  const sessionPath = optionalString(value.sessionPath);
+  const continuity = value.continuity === undefined ? undefined : isAgentContinuity(value.continuity) ? value.continuity : INVALID_PERSISTED_VALUE;
+  if (sessionPath === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.role !== undefined && typeof value.role !== "string") || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity)) return undefined;
   return {
     label: value.label,
     ...(requestedLabel === undefined ? {} : { requestedLabel }),
@@ -238,6 +242,8 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
     ...(schema === undefined ? {} : { schema }),
     ...(retries === undefined ? {} : { retries }),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(sessionPath === undefined ? {} : { sessionPath }),
+    ...(continuity === undefined ? {} : { continuity }),
     ...(agentOptions === undefined ? {} : { agentOptions }),
     ...(agentIdentity === undefined ? {} : { agentIdentity }),
   };
@@ -318,6 +324,8 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
   const resultPath = optionalString(value.resultPath);
   const parentBreadcrumb = optionalString(value.parentBreadcrumb);
   const worktreeOwner = optionalString(value.worktreeOwner);
+  const handle = optionalString(value.handle);
+  const continuity = value.continuity === undefined ? undefined : isAgentContinuity(value.continuity) ? value.continuity : INVALID_PERSISTED_VALUE;
   const role = optionalString(value.role);
   const requestedModel = optionalString(value.requestedModel);
   const startedAt = optionalNumber(value.startedAt);
@@ -327,7 +335,7 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
   const toolCalls = value.toolCalls === undefined ? undefined : decodeArray(value.toolCalls, decodeAgentToolCall);
   const activity = value.activity === undefined ? undefined : decodeAgentActivity(value.activity);
   const lastEventAt = optionalNumber(value.lastEventAt);
-  if (systemPrompt === INVALID_PERSISTED_VALUE || prompt === INVALID_PERSISTED_VALUE || label === INVALID_PERSISTED_VALUE || parentId === INVALID_PERSISTED_VALUE || resultPath === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || role === INVALID_PERSISTED_VALUE || requestedModel === INVALID_PERSISTED_VALUE || startedAt === INVALID_PERSISTED_VALUE || durationMs === INVALID_PERSISTED_VALUE || lastEventAt === INVALID_PERSISTED_VALUE) return undefined;
+  if (systemPrompt === INVALID_PERSISTED_VALUE || prompt === INVALID_PERSISTED_VALUE || label === INVALID_PERSISTED_VALUE || parentId === INVALID_PERSISTED_VALUE || resultPath === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || role === INVALID_PERSISTED_VALUE || requestedModel === INVALID_PERSISTED_VALUE || startedAt === INVALID_PERSISTED_VALUE || durationMs === INVALID_PERSISTED_VALUE || lastEventAt === INVALID_PERSISTED_VALUE || handle === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || handle !== undefined && !positiveInteger(value.turn)) return undefined;
   if (!model || !tools || value.structuralPath !== undefined && !structuralPath || value.attemptDetails !== undefined && !attemptDetails || value.accounting !== undefined && !accounting || value.toolCalls !== undefined && !toolCalls || value.activity !== undefined && !activity) return undefined;
   return {
     ...(systemPrompt === undefined ? {} : { systemPrompt }),
@@ -342,6 +350,8 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
     ...(resultPath === undefined ? {} : { resultPath }),
     ...(parentBreadcrumb === undefined ? {} : { parentBreadcrumb }),
     ...(worktreeOwner === undefined ? {} : { worktreeOwner }),
+    ...(handle === undefined ? {} : { handle, turn: value.turn as number }),
+    ...(continuity === undefined ? {} : { continuity }),
     ...(role === undefined ? {} : { role }),
     ...(requestedModel === undefined ? {} : { requestedModel }),
     model,

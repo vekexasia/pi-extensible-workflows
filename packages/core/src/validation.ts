@@ -480,6 +480,15 @@ function validateRemovedWorkflowPrimitives(program: acorn.AnyNode, code: Workflo
   };
   visit(program);
 }
+function agentCreateCalls(program: acorn.Program): acorn.CallExpression[] {
+  const calls: acorn.CallExpression[] = [];
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && !node.callee.computed && node.callee.object.type === "Identifier" && node.callee.object.name === "agent" && node.callee.property.type === "Identifier" && node.callee.property.name === "create") calls.push(node);
+    for (const child of astChildren(node)) visit(child);
+  };
+  visit(program);
+  return calls;
+}
 function hasIdentifier(node: acorn.AnyNode, name: string): boolean {
   if (node.type === "Identifier" && node.name === name) return true;
   return astChildren(node).some((child) => hasIdentifier(child, name));
@@ -671,7 +680,7 @@ function staticValue(node: acorn.AnyNode | undefined): StaticValue {
 
 
 
-function callArgument(call: WorkflowCall, index: number): acorn.AnyNode | undefined {
+function callArgument(call: acorn.CallExpression, index: number): acorn.AnyNode | undefined {
   const argument = call.arguments[index];
   return argument?.type === "SpreadElement" ? undefined : argument;
 }
@@ -781,24 +790,30 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     if (operation === "parallel" && (call.arguments.length !== 2 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "parallel requires an operation name string and tasks record");
     if (operation === "pipeline" && (call.arguments.length !== 3 || !literalString(call.arguments[0])?.trim() || call.arguments[1]?.type !== "ObjectExpression" || call.arguments[2]?.type !== "ObjectExpression")) fail("INVALID_METADATA", "pipeline requires an operation name string, items record, and stages record");
   }
-  const agentCalls = calls.filter((call) => call.callee.name === "agent");
-  const dynamicAgentRoles = agentCalls.some((call) => hasDynamicAgentRole(call.arguments[1]));
+  const handleOptions = agentCreateCalls(program).map((call) => {
+    const options = call.arguments.length === 1 ? callArgument(call, 0) : undefined;
+    if (options?.type !== "ObjectExpression" || !literalString(propertyNode(options, "name"))?.trim()) fail("INVALID_METADATA", "agent.create requires an options object with a stable explicit name");
+    validateStaticAgentOptions(options, capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
+    return options;
+  });
+  const agentOptions = [...calls.filter((call) => call.callee.name === "agent").map((call) => callArgument(call, 1)), ...handleOptions];
+  const dynamicAgentRoles = agentOptions.some((options) => hasDynamicAgentRole(options));
   const staticSchemas: JsonSchema[] = [];
-  for (const call of agentCalls) {
-    const value = staticValue(propertyNode(call.arguments[1], "outputSchema"));
+  for (const options of agentOptions) {
+    const value = staticValue(propertyNode(options, "outputSchema"));
     if (!value.known) continue;
     const schema = value.value;
     validateSchema(schema, `agent outputSchema[${String(staticSchemas.length)}]`);
     staticSchemas.push(schema);
   }
   checkedSchemas.push(...staticSchemas);
-  const modelRefs = agentCalls.flatMap((call) => { const requested = literalString(propertyNode(call.arguments[1], "model")); return requested === undefined ? [] : [{ requested, resolved: modelCapability(requested, capabilities.modelAliases, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath) }]; });
+  const modelRefs = agentOptions.flatMap((options) => { const requested = literalString(propertyNode(options, "model")); return requested === undefined ? [] : [{ requested, resolved: modelCapability(requested, capabilities.modelAliases, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath) }]; });
   const models = modelRefs.map(({ resolved }) => resolved);
-  const tools = agentCalls.flatMap((call) => {
-    const value = propertyNode(call.arguments[1], "tools");
+  const tools = agentOptions.flatMap((options) => {
+    const value = propertyNode(options, "tools");
     return value?.type === "ArrayExpression" ? value.elements.flatMap((element) => { const tool = element && element.type !== "SpreadElement" ? literalString(element) : undefined; return tool === undefined ? [] : [tool]; }) : [];
   });
-  const agentTypes = agentCalls.flatMap((call) => { const value = staticRoleName(propertyNode(call.arguments[1], "role")); return value === null ? [] : [value]; });
+  const agentTypes = agentOptions.flatMap((options) => { const value = staticRoleName(propertyNode(options, "role")); return value === null ? [] : [value]; });
   for (const pattern of tools) {
     const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
     if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !capabilities.tools.has(body)) fail("UNKNOWN_TOOL", `Unknown tool: ${body}`);

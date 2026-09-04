@@ -167,6 +167,8 @@
           <thead><tr><th>Primitive</th><th>Use</th></tr></thead>
           <tbody>
             <tr><td><code>agent(prompt, options)</code></td><td>Run one Pi agent and return its bare text or JSON value.</td></tr>
+            <tr><td><code>agent.create(options)</code></td><td>Create a persistent agent handle with a stable explicit <code>name</code> and the config frozen for every turn.</td></tr>
+            <tr><td><code>handle.send(prompt, options)</code></td><td>Run the next turn of a handle, continuing its transcript. Options are <code>outputSchema</code> and <code>timeoutMs</code>.</td></tr>
             <tr><td><code>shell(command, options)</code></td><td>Run a platform-shell command and return its exit code, stdout, and stderr.</td></tr>
             <tr><td><code>prompt(template, values)</code></td><td>Safely interpolate JSON-compatible values into a prompt.</td></tr>
             <tr><td><code>parallel(name, tasks)</code></td><td>Run keyed independent tasks concurrently.</td></tr>

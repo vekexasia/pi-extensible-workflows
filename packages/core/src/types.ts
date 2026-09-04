@@ -141,6 +141,9 @@ export interface AgentRecord {
   resultPath?: string;
   parentBreadcrumb?: string;
   worktreeOwner?: string;
+  handle?: string;
+  turn?: number;
+  continuity?: AgentContinuity;
   role?: string;
   requestedModel?: string;
   model: ModelSpec;
@@ -285,6 +288,7 @@ export interface PreparedAgentSession {
   readonly model: ModelSpec;
   readonly tools: readonly string[];
   readonly sessionLabel: string;
+  readonly sessionPath?: string;
   readonly initialPrompt?: string;
   readonly agentDir?: string;
   readonly customTools?: readonly ToolDefinition[];
@@ -333,7 +337,8 @@ export interface WorkflowSiblingAgent { id: string; label?: string; role?: strin
 export interface WorkflowFailureDiagnostics { runId: string; workflowName: string; state: RunState; failedAt: string | null; error: WorkflowErrorShape; failedAgent?: WorkflowFailureAgent; completedSiblingAgents?: readonly WorkflowSiblingAgent[]; completedSiblingPaths: readonly (readonly string[])[]; retry?: { sourceRunId: string; action: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[]; warning: string }; artifacts: { runDirectory: string; statePath: string; journalPath: string } }
 export interface CheckpointInput { name: string; prompt: string; context: JsonValue }
 export interface FunctionIdentity { path: string; structuralPath: readonly string[]; occurrence: number; worktreeOwner?: string }
-export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string }
+export type AgentContinuity = "fresh" | "continued";
+export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; handle?: string; turn?: number }
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
 export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }

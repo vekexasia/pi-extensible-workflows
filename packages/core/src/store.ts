@@ -291,6 +291,29 @@ export class RunStore {
     return this.replayableOperationsFrom(new Set());
   }
 
+  /** Session file of the latest attempt of every journaled agent, across the retry lineage. */
+  async agentSessionFiles(): Promise<ReadonlyMap<string, string>> {
+    return this.agentSessionFilesFrom(new Set());
+  }
+
+  private async agentSessionFilesFrom(seen: Set<string>): Promise<ReadonlyMap<string, string>> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    const nextSeen = new Set(seen);
+    nextSeen.add(this.runId);
+    const loaded = await this.load();
+    const files = new Map<string, string>();
+    if (loaded.run.retry?.sourceRunId) {
+      const source = await this.sourceRun(loaded.run.retry.sourceRunId);
+      for (const [path, file] of await source.agentSessionFilesFrom(nextSeen)) files.set(path, file);
+    }
+    for (const agent of loaded.run.agents) {
+      const locator = agent.attemptDetails?.at(-1)?.session?.locator;
+      const file = object(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
+      if (agent.resultPath && file) files.set(agent.resultPath, file);
+    }
+    return files;
+  }
+
   private async replayableOperationsFrom(seen: Set<string>): Promise<readonly CompletedOperation[]> {
     if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
     const nextSeen = new Set(seen);
