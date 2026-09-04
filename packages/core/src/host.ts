@@ -4,7 +4,7 @@ import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
-import { copyToClipboard, getAgentDir, ModelSelectorComponent, SettingsManager, type ExtensionAPI, type ExtensionContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, ModelSelectorComponent, type ExtensionAPI, type ExtensionContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
 import { RunLifecycle, WorkflowEventPublisher, nextNamedOccurrence, withWorkflowFunctions, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure } from "./host-recovery.js";
@@ -300,9 +300,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   let releaseWorkflowRegistry: (() => void) | undefined;
   const providerRecoveryLane = new SerialLane();
   const enqueueProviderRecovery = <T>(task: () => Promise<T>): Promise<T> => providerRecoveryLane.run(task);
-  // The recovery adapter implements only getAvailableSnapshot, refresh, getModel, and getError from ModelRuntime, plus setDefaultModelAndProvider from SettingsManager; the constructor below is the one third-party boundary because it cannot create another authenticated runtime.
+  // The recovery adapter implements only getAvailableSnapshot, refresh, getModel, and getError from ModelRuntime; the constructor below is the one third-party boundary because it cannot create another authenticated runtime.
   type ModelSelectorRuntimeAdapter = Pick<ModelRuntime, "getAvailableSnapshot" | "refresh" | "getModel" | "getError">;
-  type ModelSelectorSettingsAdapter = Pick<SettingsManager, "setDefaultModelAndProvider">;
   const createProviderErrorRecovery = (host: unknown, fallbackModels: ReadonlySet<string>, abort: () => void) => {
     if (!object(host) || host.mode !== "tui" || host.hasUI !== true) return undefined;
     const ui = object(host.ui) ? host.ui : undefined;
@@ -330,8 +329,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         getModel: (provider: string, model: string) => hostModels.find?.(provider, model) ?? getAvailable().find((candidate) => candidate.provider === provider && candidate.id === model),
         getError: () => hostModels.getError?.(),
       };
-      const settings: ModelSelectorSettingsAdapter = { setDefaultModelAndProvider() {} };
-      return await custom.call(ui, (tui, _theme, _keybindings, done) => new ModelSelectorComponent(tui, current, settings as SettingsManager, runtime as ModelRuntime, [], (model) => { done(`${model.provider}/${model.id}`); }, () => { done(undefined); })) as string | undefined;
+      return await custom.call(ui, (tui, _theme, _keybindings, done) => new ModelSelectorComponent(tui, current, runtime as ModelRuntime, [], (model) => { done(`${model.provider}/${model.id}`); }, () => { done(undefined); })) as string | undefined;
     };
     return (failure: AgentProviderFailure): Promise<AgentProviderRecovery> => enqueueProviderRecovery(async () => {
       reportWorkflowBlocked(true, `Subagent "${failure.label}" failed`);

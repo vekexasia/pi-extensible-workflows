@@ -482,7 +482,7 @@ void test("prepares the resolved workflow system prompt path for external transp
   const runtime = prepared.piRuntime;
   assert.ok(runtime);
   assert.ok(runtime.entrypoint);
-  assert.match(runtime.entrypoint, /@earendil-works[\\/]pi-coding-agent[\\/]dist[\\/]cli\.js$/);
+  assert.match(runtime.entrypoint, /@earendil-works[\\/]pi-coding-agent[\\/].*cli\.js$/);
 });
 
 void test("persists the effective role system prompt emitted for the native turn", async () => {

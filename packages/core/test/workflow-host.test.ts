@@ -613,7 +613,7 @@ void test("registers workflow_catalog only for active non-empty registries", asy
     mdLinkUrl: "", mdCode: "", mdCodeBlock: "", mdCodeBlockBorder: "", mdQuote: "", mdQuoteBorder: "", mdHr: "", mdListBullet: "",
     toolDiffAdded: "", toolDiffRemoved: "", toolDiffContext: "", syntaxComment: "", syntaxKeyword: "", syntaxFunction: "", syntaxVariable: "",
     syntaxString: "", syntaxNumber: "", syntaxType: "", syntaxOperator: "", syntaxPunctuation: "", thinkingOff: "", thinkingMinimal: "",
-    thinkingLow: "", thinkingMedium: "", thinkingHigh: "", thinkingXhigh: "", thinkingMax: "", bashMode: "",
+    thinkingLow: "", thinkingMedium: "", thinkingHigh: "", thinkingXhigh: "", thinkingMax: "", bashMode: "", scrollbarTrack: "", scrollbarThumb: "", searchMatchText: "",
   } satisfies Record<ThemeColor, string>;
   const themeBackgrounds = { selectedBg: "", userMessageBg: "", customMessageBg: "", toolPendingBg: "", toolSuccessBg: "", toolErrorBg: "" };
   const makeTheme = (fg: (color: ThemeColor, text: string) => string, bold: (text: string) => string): Parameters<CatalogCallRenderer>[1] => {

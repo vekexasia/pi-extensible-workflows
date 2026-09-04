@@ -309,7 +309,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
           if (!request.onProviderError) throw new RuntimeAgentProviderError(failure, undefined, false);
           let recovery: RuntimeAgentProviderRecovery;
           try { recovery = await request.onProviderError(failure); }
-          catch { throw new RuntimeAgentProviderError(failure, undefined, true); }
+          catch (error) { throw new RuntimeAgentProviderError({ ...failure, error: `${failure.error} (provider recovery failed: ${errorText(error)})` }, undefined, true); }
           if (recovery !== "retry") throw new RuntimeAgentProviderError(failure, recovery, true);
           continued = true;
           try { await promptOnce(providerContinuationPrompt); }
