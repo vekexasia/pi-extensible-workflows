@@ -26,7 +26,7 @@ Requires Node.js 22.19 or newer. This is trusted Pi host code with the same file
 <tr>
 <td align="center" valign="top" width="50%">
 <video src="https://github.com/user-attachments/assets/e9225bb9-c985-4aec-bc3e-7b6f0e1a6f16" width="100%" controls></video>
-<br><b>Trajectory</b><br>Gantt of model and tool events, plus steer/stop on a running subagent.<br><a href="https://vekexasia.github.io/pi-extensible-workflows/run.html#e70aac2bc4e405baae9276e6f262c0f3">Open sample run report</a>
+<br><b>Trajectory</b><br>Native collapsible Gantt timeline with a separate local Mermaid topology overview of workflow phases, agents, and tools, plus steer/stop on a running subagent.<br><a href="https://vekexasia.github.io/pi-extensible-workflows/run.html#e70aac2bc4e405baae9276e6f262c0f3">Open sample run report</a>
 </td>
 <td align="center" valign="top" width="50%">
 <video src="https://github.com/user-attachments/assets/f9c3a7a3-2116-429a-9aeb-e166dad0d926" width="100%" controls></video>

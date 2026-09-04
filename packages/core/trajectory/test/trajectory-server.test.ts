@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -154,7 +155,15 @@ void test("Trajectory HTTP and WebSocket boundaries require localhost and origin
     assert.equal((await fetch(`${base}/health`)).status, 200);
     assert.equal((await fetch(`${base}/health`, { headers: { host: `localhost:${String(port)}` } })).status, 200);
     assert.equal((await fetch(`${base}/health?token=ignored`)).status, 200);
-    for (const path of ["/", "/index.html", "/marked.min.js"]) assert.equal((await fetch(`${base}${path}`)).status, 200);
+    for (const path of ["/", "/index.html", "/marked.min.js", "/mermaid.min.js"]) assert.equal((await fetch(`${base}${path}`)).status, 200);
+    const mermaid = await fetch(`${base}/mermaid.min.js`);
+    assert.equal(mermaid.headers.get("content-type"), "application/javascript; charset=utf-8");
+    assert.equal(mermaid.headers.get("cache-control"), "no-store");
+    const mermaidBytes = Buffer.from(await mermaid.arrayBuffer());
+    assert.equal(mermaid.headers.get("content-length"), "3572899");
+    assert.equal(mermaidBytes.length, 3_572_899);
+    assert.equal(createHash("sha256").update(mermaidBytes).digest("hex"), "9bd6ad2cd11ed29822ccf5e2f6954b3b1e858b8e93f7148c6ae0bddc4df3aed4");
+    assert.match(mermaidBytes.toString("utf8"), /Mermaid v11\.17\.2/);
     assert.equal((await fetch(`${base}/health`, { headers: { origin: "http://evil.test" } })).status, 403);
     const valid = await handshake(port, `http://127.0.0.1:${String(port)}`);
     assert.match(valid.response, /^HTTP\/1\.1 101 Switching Protocols/);

@@ -32,8 +32,12 @@ function input(home: string, port: number) {
 }
 async function currentFingerprint(): Promise<string> {
   const serverPath = fileURLToPath(new URL("../src/server.js", import.meta.url));
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const [serverBytes, htmlBytes, mermaidBytes] = await Promise.all([
+    readFile(serverPath),
+    readFile(join(dirname(serverPath), "assets/index.html")),
+    readFile(join(dirname(serverPath), "assets/mermaid.min.js")),
+  ]);
+  return [serverBytes, htmlBytes, mermaidBytes].map((bytes) => createHash("sha256").update(bytes).digest("hex")).join(":");
 }
 function kill(pid: number): void {
   try { process.kill(pid, "SIGKILL"); }
@@ -59,6 +63,9 @@ void test("healthy matching Trajectory lock reuses the same process and port", a
     await first.close();
     const firstLock = await readLock(home);
     pids.push(firstLock.pid);
+    const fingerprintParts = firstLock.fingerprint?.split(":") ?? [];
+    assert.equal(fingerprintParts.length, 3);
+    assert.equal(fingerprintParts[2], "9bd6ad2cd11ed29822ccf5e2f6954b3b1e858b8e93f7148c6ae0bddc4df3aed4");
 
     const second = createTrajectoryController(home);
     controllers.push(second);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,12 @@ void test("exportTrajectoryRunHtml renders a self-contained static run report", 
     assert.equal(html.includes('src="./'), false);
     assert.equal(html.includes('href="./'), false);
     assert.ok(html.includes('<script src="data:text/javascript;base64,'));
+    const scripts = [...html.matchAll(/<script src="data:text\/javascript;base64,([^"]+)"><\/script>/g)].map((match) => Buffer.from(match[1] ?? "", "base64"));
+    assert.equal(scripts.length, 3);
+    const mermaid = scripts.find((script) => createHash("sha256").update(script).digest("hex") === "9bd6ad2cd11ed29822ccf5e2f6954b3b1e858b8e93f7148c6ae0bddc4df3aed4");
+    assert.ok(mermaid);
+    assert.equal(mermaid.length, 3_572_899);
+    assert.equal(createHash("sha256").update(mermaid).digest("hex"), "9bd6ad2cd11ed29822ccf5e2f6954b3b1e858b8e93f7148c6ae0bddc4df3aed4");
     assert.ok(html.includes('href="data:image/png;base64,'));
     // The raw injected payload cannot terminate its script block early.
     assert.equal(html.includes("</script> world"), false);

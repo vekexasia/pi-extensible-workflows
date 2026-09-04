@@ -1,11 +1,17 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- Trajectory keeps its native, independently collapsible Gantt timeline and adds a separate local Mermaid flowchart overview for observed workflow phases, structural scopes, agents, and aggregated tool activity; opening an agent or standalone subagent exposes a separate tool-invocation topology.
+- Trajectory topologies are now horizontal and easier to read, with compact invocation labels and linear turn connectors instead of dense cross-call edges; overview/detail graphs have independent 50%-200% zoom controls in 25-point steps, where 100% is the SVG's readable intrinsic size and zoom resizes the pannable canvas, while invocation nodes navigate to their transcript event and matching inspector details.
+
 ## [5.11.2] - 2026-08-31
 
 ### Fixes
 
 - Keep Trajectory live state below the WebSocket frame cap, fetch transcript bodies on demand, and reconnect detached servers after publisher disconnects. Restart existing Pi processes after upgrading so their Trajectory publisher uses the new protocol.
+
 ## [5.11.1] - 2026-08-30
 
 ### Fixes

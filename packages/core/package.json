@@ -39,6 +39,7 @@
     "starter",
     "trajectory/index.ts",
     "trajectory/src",
+    "!trajectory/src/assets/mermaid.min.js",
     "subagents/index.ts",
     "subagents/src",
     "subagents/README.md",

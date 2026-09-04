@@ -37,8 +37,12 @@ export function trajectoryServerPath(moduleDirectory = dirname(fileURLToPath(imp
   return path;
 }
 async function trajectoryFingerprint(serverPath: string): Promise<string> {
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const [serverBytes, htmlBytes, mermaidBytes] = await Promise.all([
+    readFile(serverPath),
+    readFile(join(dirname(serverPath), "assets/index.html")),
+    readFile(join(dirname(serverPath), "assets/mermaid.min.js")),
+  ]);
+  return [serverBytes, htmlBytes, mermaidBytes].map((bytes) => createHash("sha256").update(bytes).digest("hex")).join(":");
 }
 function publisherId(cwd: string, sessionId: string): string { return createHash("sha256").update(`${cwd}\n${sessionId}`).digest("hex").slice(0, 16); }
 function trajectoryPort(value: unknown): number { return positiveInteger(value) && value <= 65535 ? value : DEFAULT_TRAJECTORY_PORT; }

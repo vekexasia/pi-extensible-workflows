@@ -5,7 +5,7 @@ export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   {
-    ignores: ["**/dist/**", "eslint.config.js", "scripts/check-docs.mjs", "**/examples/**/*.js", "**/examples/**/*.mjs", "packages/core/test/workspace-layout.test.mjs", "packages/core/trajectory/src/assets/marked.min.js", "packages/core/trajectory/src/assets/morphdom.min.js"],
+    ignores: ["**/dist/**", "eslint.config.js", "scripts/check-docs.mjs", "**/examples/**/*.js", "**/examples/**/*.mjs", "packages/core/test/workspace-layout.test.mjs", "packages/core/trajectory/src/assets/marked.min.js", "packages/core/trajectory/src/assets/mermaid.min.js", "packages/core/trajectory/src/assets/morphdom.min.js"],
   },
   {
     languageOptions: {
