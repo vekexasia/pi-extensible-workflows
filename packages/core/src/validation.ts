@@ -480,13 +480,13 @@ function validateRemovedWorkflowPrimitives(program: acorn.AnyNode, code: Workflo
   };
   visit(program);
 }
-function validateDirectAgentReferences(program: acorn.AnyNode): void {
+function validateDirectAgentReferences(program: acorn.AnyNode, code: WorkflowErrorCode): void {
   const visit = (node: acorn.AnyNode, parent?: acorn.AnyNode, grandparent?: acorn.AnyNode): void => {
     if (node.type === "Identifier" && node.name === "agent") {
       const directCall = parent?.type === "CallExpression" && parent.callee === node;
       const createCall = parent?.type === "MemberExpression" && parent.object === node && !parent.computed && parent.property.type === "Identifier" && parent.property.name === "create" && grandparent?.type === "CallExpression" && grandparent.callee === parent;
       const propertyName = parent?.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand || parent?.type === "MemberExpression" && parent.property === node && !parent.computed;
-      if (!directCall && !createCall && !propertyName) fail("INVALID_METADATA", "agent calls must use a direct agent(...) or agent.create(...) call; aliases and indirect calls are unsupported");
+      if (!directCall && !createCall && !propertyName) fail(code, "agent calls must use a direct agent(...) or agent.create(...) call; aliases and indirect calls are unsupported");
     }
     for (const child of astChildren(node)) visit(child, node, parent);
   };
@@ -784,7 +784,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   validateDirectPrimitiveReferences(program, "withWorktree");
   validateRemovedWorkflowPrimitives(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
   validateDirectPrimitiveReferences(program, "shell");
-  validateDirectAgentReferences(program);
+  validateDirectAgentReferences(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
   const checkedSchemas: JsonSchema[] = [];
   for (const [index, schema] of schemas.entries()) {
     validateSchema(schema, `schema[${String(index)}]`);

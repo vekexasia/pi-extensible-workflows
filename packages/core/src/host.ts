@@ -1444,13 +1444,22 @@ class LiveAgentRegistry {
  * The agent appends to the copy, so the previous turn's file stays a frozen
  * snapshot: a crash mid-send can never corrupt the input a recovery re-run
  * reads, and recovery needs no special casing.
+ *
+ * Only journaled turns qualify as a source, so a turn that never completed is walked
+ * past; a turn that completed without a usable session file fails the send instead of
+ * silently continuing from an older transcript.
  */
 async function handleTurnInput(store: RunStore, handle: string, turn: number): Promise<string | undefined> {
   if (turn <= 1) return undefined;
   const files = await store.agentSessionFiles();
   let source: string | undefined;
-  for (let previous = turn - 1; previous >= 1 && source === undefined; previous -= 1) source = files.get(agentHandleTurnPath(handle, previous));
-  if (source === undefined) return undefined;
+  for (let previous = turn - 1; previous >= 1; previous -= 1) {
+    const path = agentHandleTurnPath(handle, previous);
+    if (!files.has(path)) continue;
+    source = files.get(path);
+    break;
+  }
+  if (source === undefined) fail("AGENT_FAILED", `Agent handle ${handle} cannot continue from its previous turn: no completed turn recorded a session file`);
   const target = join(store.directory, "handles", encodeURIComponent(handle), `turn-${String(turn)}-input.jsonl`);
   try {
     await mkdir(dirname(target), { recursive: true });

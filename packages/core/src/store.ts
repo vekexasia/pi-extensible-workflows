@@ -291,26 +291,30 @@ export class RunStore {
     return this.replayableOperationsFrom(new Set());
   }
 
-  /** Session file of the latest attempt of every journaled agent, across the retry lineage. */
-  async agentSessionFiles(): Promise<ReadonlyMap<string, string>> {
+  /** Every journaled agent operation of the retry lineage, mapped to its session file when one was recorded. */
+  async agentSessionFiles(): Promise<ReadonlyMap<string, string | undefined>> {
     return this.agentSessionFilesFrom(new Set());
   }
 
-  private async agentSessionFilesFrom(seen: Set<string>): Promise<ReadonlyMap<string, string>> {
+  private async agentSessionFilesFrom(seen: Set<string>): Promise<ReadonlyMap<string, string | undefined>> {
     if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
     const nextSeen = new Set(seen);
     nextSeen.add(this.runId);
     const loaded = await this.load();
-    const files = new Map<string, string>();
+    const files = new Map<string, string | undefined>();
     if (loaded.run.retry?.sourceRunId) {
       const source = await this.sourceRun(loaded.run.retry.sourceRunId);
       for (const [path, file] of await source.agentSessionFilesFrom(nextSeen)) files.set(path, file);
     }
+    await this.journalLane.run(async () => undefined);
+    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
+    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
     for (const agent of loaded.run.agents) {
-      // Failed attempts also record a session; their partial transcript must never become a continuation source.
+      // Only a journaled operation completed: an attempt a dying host left running records no error either.
+      if (!agent.resultPath || !journal.completed[agent.resultPath]) continue;
+      // Failed attempts of that operation also record a session; their partial transcript must never be the source.
       const locator = agent.attemptDetails?.filter((detail) => !detail.error).at(-1)?.session?.locator;
-      const file = object(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
-      if (agent.resultPath && file) files.set(agent.resultPath, file);
+      files.set(agent.resultPath, object(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined);
     }
     return files;
   }

@@ -21,7 +21,7 @@ type Host = { readonly home: string; readonly workflow: TestTool; readonly retry
 const terminalProviderError = { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" };
 
 /** Hosts one workflow extension whose fake sessions persist their turns as JSONL, like Pi does. */
-function host(failTurn?: number, providerErrorSession?: number): Host {
+function host(failTurn?: number, providerErrorSession?: number, onPrompt?: (text: string, count: number) => void): Host {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-handles-"));
   const sessions = join(home, "sessions");
   mkdirSync(sessions, { recursive: true });
@@ -42,6 +42,7 @@ function host(failTurn?: number, providerErrorSession?: number): Host {
       prompt: async (text: string) => {
         prompts.push(text);
         appendFileSync(sessionFile, `${JSON.stringify({ role: "user", text })}\n`);
+        onPrompt?.(text, prompts.length);
         if (failTurn !== undefined && prompts.length === failTurn) throw new Error("send failed");
       },
       dispose() {},
@@ -69,6 +70,19 @@ function handleAgent(run: PersistedRun, turn: number): AgentRecord {
   const agent = run.agents.find((candidate) => candidate.handle === "author" && candidate.turn === turn);
   assert.ok(agent, `run has no handle turn ${String(turn)}`);
   return agent;
+}
+/** Drops an attempt field a dying host never got to persist, leaving the record a crash left behind. */
+async function forgetAttemptField(store: RunStore, turn: number, field: "error" | "session"): Promise<void> {
+  await store.updateState((run) => ({ ...run, agents: run.agents.map((agent) => agent.handle === "author" && agent.turn === turn && agent.attemptDetails ? { ...agent, attemptDetails: agent.attemptDetails.map((detail) => ({ attempt: detail.attempt, transport: detail.transport, setup: detail.setup, accounting: detail.accounting, ...(field === "error" || !detail.error ? {} : { error: detail.error }), ...(field === "session" || !detail.session ? {} : { session: detail.session }) })) } : agent) }));
+}
+async function retried(current: Host, runId: string): Promise<string> {
+  const started = decodeTestRunStart(decodeTestToolResult(await current.retry.execute("retry", { runId, foreground: false }, undefined, undefined, current.context)).content[0]?.text ?? "null");
+  return started.runId;
+}
+function onlyRunId(runIds: readonly string[]): string {
+  const runId = runIds[0];
+  assert.ok(runId);
+  return runId;
 }
 
 void test("sequential handle sends continue one transcript from a per-turn session copy", async () => {
@@ -171,6 +185,7 @@ void test("aliased and computed agent references fail preflight", () => {
   assert.throws(() => preflight(`const create = agent.create; const a = create({ name: args.name }); return a.send("x");`, capabilities), invalid);
   assert.throws(() => preflight(`const a = agent["create"]({ name: args.name }); return a.send("x");`, capabilities), invalid);
   assert.throws(() => preflight(`const alias = agent; return alias("work");`, capabilities), invalid);
+  assert.throws(() => preflight(`const alias = agent; return alias("work");`, capabilities, [], { name: "workflow" }, true), (error: unknown) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
 });
 
 void test("sends from a structural scope other than the creating one are rejected", async () => {
@@ -208,4 +223,40 @@ return { first, second };`;
   assert.equal(current.opened[1]?.sessionPath, turnInput);
   assert.match(readFileSync(turnInput, "utf8"), /first draft/);
   assert.deepEqual(await store.replay(agentHandleTurnPath(name, 2)), { path: agentHandleTurnPath(name, 2), value: "reply-2" });
+});
+
+void test("an interrupted send never becomes a continuation source for a later turn", async () => {
+  const current = host(undefined, undefined, (_text, count) => { if (count >= 2 && count <= 4) throw new Error("send failed"); });
+  const interrupted = `const author = agent.create({ name: "author" });
+const first = await author.send("first draft");
+let failure = "none";
+try { await author.send("boom"); } catch (error) { failure = error.code; }
+const third = await author.send("third pass");
+return { first, failure, third };`;
+  await assert.rejects(current.workflow.execute("handle-interrupted", { name: "handle-interrupted", script: interrupted, foreground: true }, new AbortController().signal, undefined, current.context), WorkflowError);
+  const sourceStore = new RunStore(current.home, "session", onlyRunId(await listRunIds(current.home, "session", current.home)), current.home);
+  // A host dying mid-send leaves the running attempt persisted with its session locator and no error.
+  await forgetAttemptField(sourceStore, 2, "error");
+  const crashed = handleAgent((await sourceStore.load()).run, 2).attemptDetails?.at(-1);
+  assert.ok(crashed?.session?.locator && !crashed.error);
+  assert.equal(await sourceStore.replay(agentHandleTurnPath("author", 2)), undefined);
+  const run = await loadUntil(current.home, await retried(current, sourceStore.runId), "completed");
+  assert.equal(handleAgent(run, 3).continuity, "continued");
+  assert.match(current.openedInput.at(-1) ?? "", /first draft/);
+  assert.doesNotMatch(current.openedInput.at(-1) ?? "", /boom/);
+});
+
+void test("a journaled turn without a recorded session fails the next send loudly", async () => {
+  const current = host(3);
+  const three = `const author = agent.create({ name: "author" });
+const first = await author.send("first draft");
+const second = await author.send("apply findings");
+const third = await author.send("third pass");
+return { first, second, third };`;
+  await assert.rejects(current.workflow.execute("handle-sessionless", { name: "handle-sessionless", script: three, foreground: true }, new AbortController().signal, undefined, current.context), WorkflowError);
+  const sourceStore = new RunStore(current.home, "session", onlyRunId(await listRunIds(current.home, "session", current.home)), current.home);
+  await forgetAttemptField(sourceStore, 2, "session");
+  const run = await loadUntil(current.home, await retried(current, sourceStore.runId), "failed");
+  assert.equal(run.error?.code, "AGENT_FAILED");
+  assert.match(run.error.message, /cannot continue from its previous turn/);
 });
