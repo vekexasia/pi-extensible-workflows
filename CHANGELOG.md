@@ -1,9 +1,18 @@
 # Changelog
 ## Unreleased
 
+## [5.12.0] - 2026-09-04
+
 ### Runtime
 
 - Persistent agent handles: `agent.create({ name, ... })` returns a handle whose `send(prompt, { outputSchema?, timeoutMs? })` keeps one agent's transcript across turns. Each turn is journaled at `agent/handle/<name>/turn:<n>`, continues from a per-turn copy of the previous session file, and replays without contacting the model.
+
+### Fixes
+
+- Foreground workflow completion is delivered on a single path, removing duplicate background completion messages.
+- Bundled roles are recognized across install layouts.
+- Registered function side-effect failures are owned by the registered function and fail-fast side-effect errors are preserved.
+- Trajectory timeline events link to their transcript rows, and the transcript cursor stays in sync on hover.
 
 ## [5.11.2] - 2026-08-31
 
