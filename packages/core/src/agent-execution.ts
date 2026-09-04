@@ -1143,7 +1143,7 @@ export class WorkflowAgentExecutor {
             try {
               const selected = resolveModelReference(providerError.recovery.model, this.root.modelAliases, this.root.knownModels ?? this.root.availableModels, this.root.settingsPath);
               recoveryModel = selected.thinking === undefined && resolved.model.thinking ? { ...selected, thinking: resolved.model.thinking } : selected;
-            } catch { throw errorWithAttempts(typed, attempts); }
+            } catch (error) { throw errorWithAttempts(new WorkflowError(typed.code, `${typed.message} (recovery model rejected: ${errorText(error)})`), attempts); }
             maxAttempts += 1;
             beforeRetry?.();
             continue;

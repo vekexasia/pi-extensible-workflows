@@ -1,6 +1,11 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- "Change model" in the provider-failure recovery dialog opens the model picker again on Pi 0.85 (`ModelSelectorComponent` constructor changed). Recovery callback and recovery-model resolution failures are now appended to the reported agent error instead of being swallowed.
+- Aligned Pi development dependencies at `0.85.0`.
+
 ## [5.12.0] - 2026-09-04
 
 ### Runtime
