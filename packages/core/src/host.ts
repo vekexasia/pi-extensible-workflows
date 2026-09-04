@@ -1446,20 +1446,24 @@ class LiveAgentRegistry {
  * reads, and recovery needs no special casing.
  *
  * Only journaled turns qualify as a source, so a turn that never completed is walked
- * past; a turn that completed without a usable session file fails the send instead of
- * silently continuing from an older transcript.
+ * past; when no previous turn ever completed the send starts fresh, and a turn that
+ * completed without a usable session file fails the send instead of silently
+ * continuing from an older transcript.
  */
 async function handleTurnInput(store: RunStore, handle: string, turn: number): Promise<string | undefined> {
   if (turn <= 1) return undefined;
   const files = await store.agentSessionFiles();
   let source: string | undefined;
+  let completed = false;
   for (let previous = turn - 1; previous >= 1; previous -= 1) {
     const path = agentHandleTurnPath(handle, previous);
     if (!files.has(path)) continue;
+    completed = true;
     source = files.get(path);
     break;
   }
-  if (source === undefined) fail("AGENT_FAILED", `Agent handle ${handle} cannot continue from its previous turn: no completed turn recorded a session file`);
+  if (!completed) return undefined;
+  if (source === undefined) fail("AGENT_FAILED", `Agent handle ${handle} cannot continue from its previous turn: the completed turn recorded no session file`);
   const target = join(store.directory, "handles", encodeURIComponent(handle), `turn-${String(turn)}-input.jsonl`);
   try {
     await mkdir(dirname(target), { recursive: true });

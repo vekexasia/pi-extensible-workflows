@@ -61,7 +61,8 @@ function launch(current: Host, name: string): Promise<unknown> {
 async function loadUntil(home: string, runId: string, state: PersistedRun["state"]): Promise<PersistedRun> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const current = (await new RunStore(home, "session", runId, home).load()).run;
-    if (current.state === state) return current;
+    // The host persists a terminal failed state before its error, so wait for both.
+    if (current.state === state && (state !== "failed" || current.error !== undefined)) return current;
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for ${runId} to become ${state}`);
@@ -178,6 +179,21 @@ return { first, failure, third };`;
   assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { first: "reply-1", failure: "AGENT_FAILED", third: "reply-3" });
   assert.match(current.openedInput.at(-1) ?? "", /first draft/);
   assert.doesNotMatch(current.openedInput.at(-1) ?? "", /boom/);
+});
+
+void test("a send whose prior turns never completed starts fresh", async () => {
+  const current = host(1);
+  const fresh = `const author = agent.create({ name: "author" });
+let failure = "none";
+try { await author.send("boom"); } catch (error) { failure = error.code; }
+const second = await author.send("second try");
+return { failure, second };`;
+  const result = decodeTestToolResult(await current.workflow.execute("handle-fresh-after-failure", { name: "handle-fresh-after-failure", script: fresh, foreground: true }, new AbortController().signal, undefined, current.context));
+  const store = new RunStore(current.home, "session", decodeTestRunDetails(result.details).runId, current.home);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { failure: "AGENT_FAILED", second: "reply-2" });
+  assert.equal(current.opened.at(-1)?.sessionPath, undefined);
+  const run = (await store.load()).run;
+  assert.equal(handleAgent(run, 2).continuity, "fresh");
 });
 
 void test("aliased and computed agent references fail preflight", () => {
