@@ -27,10 +27,11 @@ export async function exportTrajectoryRunHtml(options: TrajectoryExportOptions):
   const run = runs.find((candidate) => candidate.run.id === options.runId);
   if (!run) throw new Error(`Workflow run ${options.runId} was not found for session ${options.sessionId}`);
   const assets = new URL("./assets/", import.meta.url);
-  const [html, marked, morphdom, favicon] = await Promise.all([
+  const [html, marked, morphdom, mermaid, favicon] = await Promise.all([
     readFile(new URL("index.html", assets), "utf8"),
     readFile(new URL("marked.min.js", assets)),
     readFile(new URL("morphdom.min.js", assets)),
+    readFile(new URL("mermaid.min.js", assets)),
     readFile(new URL("favicon.png", assets)),
   ]);
   const state = {
@@ -44,6 +45,7 @@ export async function exportTrajectoryRunHtml(options: TrajectoryExportOptions):
   output = inlineAsset(output, '<link rel="icon" type="image/png" href="./favicon.png" />', `<link rel="icon" type="image/png" href="data:image/png;base64,${favicon.toString("base64")}" />`);
   output = inlineAsset(output, '<script src="./marked.min.js"></script>', script(marked));
   output = inlineAsset(output, '<script src="./morphdom.min.js"></script>', script(morphdom));
+  output = inlineAsset(output, '<script src="./mermaid.min.js"></script>', script(mermaid));
   output = inlineAsset(output, '<body data-view="run">', `<body data-view="run">\n  <script>window.__PIEWF_STATIC__ = ${JSON.stringify(state).replace(/</g, "\\u003c")};</script>`);
   return output;
 }

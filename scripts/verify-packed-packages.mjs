@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,9 @@ const output = process.argv[2] ? resolve(process.argv[2]) : resolve(work, "tarba
 const agentRoot = resolve(work, "agent");
 const installRoot = resolve(agentRoot, "npm");
 const workspaces = ["packages/core", "packages/cli", "packages/extensions/herdr"];
+const MERMAID_PATH = "dist/trajectory/src/assets/mermaid.min.js";
+const MERMAID_SIZE = 3_572_899;
+const MERMAID_SHA256 = "9bd6ad2cd11ed29822ccf5e2f6954b3b1e858b8e93f7148c6ae0bddc4df3aed4";
 
 function json(path) { return JSON.parse(readFileSync(path, "utf8")); }
 function packagePath(base, name) { return resolve(base, "node_modules", ...name.split("/")); }
@@ -57,6 +61,15 @@ try {
     execFileSync("tar", ["-xzf", tarball, "-C", extracted, "--strip-components=1"], { stdio: "pipe", timeout: 30_000 });
     const packed = json(resolve(extracted, "package.json"));
     const packedFiles = files(extracted);
+    if (manifest.name === "pi-extensible-workflows") {
+      const mermaidFiles = packedFiles.map((file) => file.slice(extracted.length + 1).replaceAll("\\", "/")).filter((file) => file.endsWith("mermaid.min.js"));
+      if (mermaidFiles.length !== 1 || mermaidFiles[0] !== MERMAID_PATH) errors.push(`${manifest.name}: expected exactly one packed Mermaid runtime at ${MERMAID_PATH}, found ${mermaidFiles.join(", ") || "none"}`);
+      else {
+        const mermaid = readFileSync(resolve(extracted, MERMAID_PATH));
+        const sha256 = createHash("sha256").update(mermaid).digest("hex");
+        if (mermaid.byteLength !== MERMAID_SIZE || sha256 !== MERMAID_SHA256) errors.push(`${manifest.name}: Mermaid runtime contract mismatch (size ${mermaid.byteLength}, sha256 ${sha256})`);
+      }
+    }
     const entrypoints = [packed.main, ...strings(packed.bin), ...strings(packed.exports), ...strings(packed.pi?.extensions)].filter((path) => typeof path === "string" && path.startsWith("./"));
     for (const entrypoint of entrypoints) if (!existsSync(resolve(extracted, entrypoint))) errors.push(`${manifest.name}: missing entrypoint ${entrypoint}`);
     for (const file of packedFiles.filter((path) => path.startsWith(resolve(extracted, "dist")) && (filePathHasTestDirectory(path.slice(extracted.length + 1)) || path.includes(".test.")))) errors.push(`${manifest.name}: published test artifact ${file.slice(extracted.length + 1)}`);

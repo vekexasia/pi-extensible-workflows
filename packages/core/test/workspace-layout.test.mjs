@@ -45,6 +45,7 @@ test("the repository keeps the public package in the core workspace", () => {
   assert.ok(core.files.includes("!dist/**/*.test.*"));
   assert.ok(core.files.includes("trajectory/index.ts"));
   assert.ok(core.files.includes("trajectory/src"));
+  assert.ok(core.files.includes("!trajectory/src/assets/mermaid.min.js"));
   assert.ok(core.files.includes("subagents/index.ts"));
   assert.ok(core.files.includes("subagents/src"));
   assert.ok(core.files.includes("subagents/README.md"));
