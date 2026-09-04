@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
@@ -15,7 +16,7 @@ import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
 import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
 import { loadAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
-import { agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
+import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
 import backgroundWidget, { type BackgroundWidgetAPI } from "./background-widget.js";
 import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult } from "./trajectory.js";
@@ -603,7 +604,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot(), agents: current.agents.map((agent) => agent.id === id ? { ...agent, lastEventAt } : agent) }));
         run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, tuiIndex, tuiLabel: options.requestedLabel ?? options.label, onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), ...(options.contextFiles ? { contextFiles: options.contextFiles } : {}), tools: options.tools, ...(options.skills ? { skills: options.skills } : {}), ...(options.extensions ? { extensions: options.extensions } : {}), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, skills, extensions) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}), ...(skills !== undefined ? { skills } : {}), ...(extensions !== undefined ? { extensions } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, tuiIndex, tuiLabel: options.requestedLabel ?? options.label, onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), ...(options.contextFiles ? { contextFiles: options.contextFiles } : {}), tools: options.tools, ...(options.skills ? { skills: options.skills } : {}), ...(options.extensions ? { extensions: options.extensions } : {}), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.sessionPath ? { sessionPath: options.sessionPath } : {}), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, skills, extensions) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}), ...(skills !== undefined ? { skills } : {}), ...(extensions !== undefined ? { extensions } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
       const before = (await run.store.load()).run;
       await persistAgentAttempts(run.store, id, result.attempts);
       const completed = (await run.store.load()).run;
@@ -647,7 +648,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         const lastEventAt = node.state === "running" ? previous?.state === "running" && previous.lastEventAt !== undefined ? previous.lastEventAt : now : previous?.lastEventAt;
         const startedAt = previous?.startedAt ?? (node.state === "running" ? now : undefined);
         const durationMs = previous?.durationMs ?? (SETTLED_AGENT_STATES.has(node.state) && startedAt !== undefined ? Math.max(0, now - startedAt) : undefined);
-        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(nodeRole ? { role: nodeRole } : {}), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
+        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.agentIdentity?.handle === undefined ? {} : { handle: node.options.agentIdentity.handle, ...(node.options.agentIdentity.turn === undefined ? {} : { turn: node.options.agentIdentity.turn }), ...(node.options.continuity ? { continuity: node.options.continuity } : {}) }), ...(nodeRole ? { role: nodeRole } : {}), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
       });
       return { ...current, agents };
     });
@@ -920,7 +921,9 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const label = displayAgentName(requestedLabel, role, resolved.model);
       const tools = resolved.tools;
       const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-      const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), agentOptions: options, agentIdentity: identity });
+      const sessionPath = identity.handle !== undefined && identity.turn !== undefined ? await handleTurnInput(store, identity.handle, identity.turn) : undefined;
+      const continuity = identity.handle === undefined ? undefined : sessionPath ? "continued" as const : "fresh" as const;
+      const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(sessionPath ? { sessionPath } : {}), ...(continuity ? { continuity } : {}), agentOptions: options, agentIdentity: identity });
       const cancel = () => { scheduler.cancel(spawned.id); };
       if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
       const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
@@ -1433,6 +1436,40 @@ class LiveAgentRegistry {
     if (Object.keys(state).length === 0) agents.delete(agentId);
     if (agents.size === 0) this.#byRun.delete(runId);
   }
+}
+
+/**
+ * Copies the transcript a handle turn continues from into the run directory.
+ *
+ * The agent appends to the copy, so the previous turn's file stays a frozen
+ * snapshot: a crash mid-send can never corrupt the input a recovery re-run
+ * reads, and recovery needs no special casing.
+ *
+ * Only journaled turns qualify as a source, so a turn that never completed is walked
+ * past; when no previous turn ever completed the send starts fresh, and a turn that
+ * completed without a usable session file fails the send instead of silently
+ * continuing from an older transcript.
+ */
+async function handleTurnInput(store: RunStore, handle: string, turn: number): Promise<string | undefined> {
+  if (turn <= 1) return undefined;
+  const files = await store.agentSessionFiles();
+  let source: string | undefined;
+  let completed = false;
+  for (let previous = turn - 1; previous >= 1; previous -= 1) {
+    const path = agentHandleTurnPath(handle, previous);
+    if (!files.has(path)) continue;
+    completed = true;
+    source = files.get(path);
+    break;
+  }
+  if (!completed) return undefined;
+  if (source === undefined) fail("AGENT_FAILED", `Agent handle ${handle} cannot continue from its previous turn: the completed turn recorded no session file`);
+  const target = join(store.directory, "handles", encodeURIComponent(handle), `turn-${String(turn)}-input.jsonl`);
+  try {
+    await mkdir(dirname(target), { recursive: true });
+    await copyFile(source, target);
+  } catch (error) { fail("AGENT_FAILED", `Agent handle ${handle} cannot continue from its previous turn: ${errorText(error)}`); }
+  return target;
 }
 
 function displayAgentName(label: string | undefined, role: string | undefined, model: ModelSpec): string {

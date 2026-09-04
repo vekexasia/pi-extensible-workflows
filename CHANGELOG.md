@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Runtime
+
+- Persistent agent handles: `agent.create({ name, ... })` returns a handle whose `send(prompt, { outputSchema?, timeoutMs? })` keeps one agent's transcript across turns. Each turn is journaled at `agent/handle/<name>/turn:<n>`, continues from a per-turn copy of the previous session file, and replays without contacting the model.
+
 ## [5.11.2] - 2026-08-31
 
 ### Fixes

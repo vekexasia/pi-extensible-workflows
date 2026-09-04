@@ -26,7 +26,7 @@ void test("large public and persisted records keep one property per line", () =>
   const source = readFileSync(typesPath, "utf8");
   const expected = {
     AgentResourcePolicy: ["globalSettingsPath", "projectSettingsPath", "projectTrusted", "global", "project", "effective", "selectedSkills", "selectedExtensions", "selectedTools", "unmatchedSkills", "unmatchedExtensions", "unmatchedTools", "selectorSources"],
-    AgentRecord: ["systemPrompt", "prompt", "id", "name", "label", "path", "state", "parentId", "structuralPath", "resultPath", "parentBreadcrumb", "worktreeOwner", "role", "requestedModel", "model", "tools", "toolDefinitions", "attempts", "startedAt", "durationMs", "attemptDetails", "accounting", "toolCalls", "activity", "lastEventAt"],
+    AgentRecord: ["systemPrompt", "prompt", "id", "name", "label", "path", "state", "parentId", "structuralPath", "resultPath", "parentBreadcrumb", "worktreeOwner", "handle", "turn", "continuity", "role", "requestedModel", "model", "tools", "toolDefinitions", "attempts", "startedAt", "durationMs", "attemptDetails", "accounting", "toolCalls", "activity", "lastEventAt"],
     RunRecord: ["id", "workflowName", "cwd", "sessionId", "state", "agentSessions", "parentRunId", "retry", "phase", "phaseHistory", "phaseHistoryIndex", "agents", "activeShells", "activeShellStartedAt", "activeShellsByPhase", "error", "failedAt", "budget", "budgetVersion", "usage", "budgetEvents", "events", "delivery"],
     LaunchSnapshot: ["identityVersion", "launchMode", "script", "args", "metadata", "settings", "settingsSources", "budget", "settingsPath", "modelAliases", "phases", "models", "tools", "agentTypes", "roles", "projectRoles", "schemas"],
   } as const;

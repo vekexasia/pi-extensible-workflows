@@ -110,6 +110,11 @@ const agentInflight = new Set();
 const shellOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
+const guardedAgentResult = result => Object.defineProperties(result, {
+  toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
+  toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
+  [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
+});
 const rejectShell = () => { throw workError("INVALID_METADATA", "Workflow shell calls must use a direct shell(...) call; aliases and indirect calls are unsupported"); };
 const rejectWorktree = () => { throw workError("INVALID_METADATA", "withWorktree calls must use a direct withWorktree(...) call; aliases and indirect calls are unsupported"); };
 const internalWithWorktree = async (...values) => {
@@ -143,12 +148,46 @@ const internalAgent = (...values) => {
     throw error;
   }
   void result.then(() => agentInflight.delete(occurrenceKey), () => agentInflight.delete(occurrenceKey));
-  Object.defineProperties(result, {
-    toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
-    toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
-    [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
-  });
-  return result;
+  return guardedAgentResult(result);
+};
+const AGENT_HANDLE_KEYS = ["name", "role", "model", "tools", "skills", "extensions", "contextFiles", "label"];
+const agentHandleNames = new Set();
+const agentHandleInflight = new Set();
+const internalAgentCreate = (...values) => {
+  if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("INVALID_METADATA", "agent.create requires one options object");
+  const options = values[0];
+  const name = named(options.name, "agent.create");
+  const unsupported = Object.keys(options).find(key => !AGENT_HANDLE_KEYS.includes(key));
+  if (unsupported) throw workError("INVALID_METADATA", "agent.create option is unsupported: " + unsupported);
+  if (agentHandleNames.has(name)) throw workError("INVALID_METADATA", "Duplicate agent handle name: " + name);
+  agentHandleNames.add(name);
+  const config = Object.freeze(Object.fromEntries(Object.entries(options).filter(([key]) => key !== "name")));
+  const worktreeOwner = worktreeOwners.getStore();
+  // The turn counter is arrival-ordered, so a handle must stay in the scope that created it: sends racing across
+  // parallel branches would otherwise take each other's journal path on replay.
+  const scope = JSON.stringify(inheritedAgentPath.getStore() || []);
+  let turn = 0;
+  const send = (...sent) => {
+    if (sent.length < 1 || sent.length > 2) throw workError("INVALID_METADATA", "send requires a prompt and optional options");
+    if (typeof sent[0] !== "string") throw workError("INVALID_METADATA", "send prompt must be a string");
+    const sendOptions = sent.length < 2 || sent[1] === undefined ? {} : sent[1];
+    if (!sendOptions || typeof sendOptions !== "object" || Array.isArray(sendOptions) || Object.keys(sendOptions).some(key => key !== "outputSchema" && key !== "timeoutMs")) throw workError("INVALID_METADATA", "send options must contain only outputSchema and timeoutMs");
+    if (JSON.stringify(inheritedAgentPath.getStore() || []) !== scope) throw workError("INVALID_METADATA", "Agent handle sends must run in the scope that created the handle: " + name);
+    if (agentHandleInflight.has(name)) throw workError("INVALID_METADATA", "Concurrent send(...) calls on one agent handle are unsupported; await each turn");
+    agentHandleInflight.add(name);
+    turn += 1;
+    const identity = { structuralPath: [...(inheritedAgentPath.getStore() || [])], callSite: "handle:" + name, occurrence: turn, handle: name, turn, ...(worktreeOwner ? { worktreeOwner } : {}) };
+    let result;
+    try {
+      result = rpc("agent", [sent[0], { ...config, ...sendOptions }, identity]).then(unwrap);
+    } catch (error) {
+      agentHandleInflight.delete(name);
+      throw error;
+    }
+    void result.then(() => agentHandleInflight.delete(name), () => agentHandleInflight.delete(name));
+    return guardedAgentResult(result);
+  };
+  return Object.freeze({ name, send });
 };
 const internalShell = (...values) => {
   const callSite = values.pop();
@@ -175,7 +214,7 @@ const internalShell = (...values) => {
   return result;
 };
 const shell = rejectShell;
-const agent = rejectAgent;
+const agent = Object.freeze(Object.assign(rejectAgent, { create: internalAgentCreate }));
 const promptPath = (at, key) => /^[A-Za-z_$][\w$]*$/.test(key) ? at + "." + key : at + "[" + JSON.stringify(key) + "]";
 const plainPromptObject = value => {
   const proto = Object.getPrototypeOf(value);
@@ -331,8 +370,10 @@ function readAgentIdentity(value: unknown): AgentIdentity {
   const occurrence = value.occurrence;
   const worktreeOwner = value.worktreeOwner;
   const parentBreadcrumb = value.parentBreadcrumb;
-  if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || typeof callSite !== "string" || !callSite || !positiveInteger(occurrence) || parentBreadcrumb !== undefined && (typeof parentBreadcrumb !== "string" || !parentBreadcrumb.trim()) || worktreeOwner !== undefined && (typeof worktreeOwner !== "string" || !worktreeOwner)) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
-  return { structuralPath: [...structuralPath], callSite, occurrence, ...(typeof parentBreadcrumb === "string" ? { parentBreadcrumb } : {}), ...(typeof worktreeOwner === "string" ? { worktreeOwner } : {}) };
+  const handle = value.handle;
+  const turn = value.turn;
+  if (!Array.isArray(structuralPath) || !structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || typeof callSite !== "string" || !callSite || !positiveInteger(occurrence) || parentBreadcrumb !== undefined && (typeof parentBreadcrumb !== "string" || !parentBreadcrumb.trim()) || worktreeOwner !== undefined && (typeof worktreeOwner !== "string" || !worktreeOwner) || handle !== undefined && (typeof handle !== "string" || !handle.trim() || !positiveInteger(turn))) fail("INTERNAL_ERROR", "Invalid workflow agent identity");
+  return { structuralPath: [...structuralPath], callSite, occurrence, ...(typeof parentBreadcrumb === "string" ? { parentBreadcrumb } : {}), ...(typeof worktreeOwner === "string" ? { worktreeOwner } : {}), ...(typeof handle === "string" ? { handle, turn: turn as number } : {}) };
 }
 function readFunctionIdentity(value: unknown): FunctionIdentity {
   if (!object(value)) fail("INTERNAL_ERROR", "Invalid workflow function identity");
@@ -347,7 +388,11 @@ function readShellIdentity(value: unknown): ShellIdentity {
   const identity = readAgentIdentity(value);
   return { structuralPath: identity.structuralPath, callSite: identity.callSite, occurrence: identity.occurrence, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) };
 }
+export function agentHandleTurnPath(handle: string, turn: number): string {
+  return operationPath("agent", "handle", handle, `turn:${String(turn)}`);
+}
 export function agentIdentityPath(identity: AgentIdentity): string {
+  if (identity.handle !== undefined && identity.turn !== undefined) return agentHandleTurnPath(identity.handle, identity.turn);
   return operationPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`);
 }
 export function shellIdentityPath(identity: ShellIdentity): string {

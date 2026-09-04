@@ -66,7 +66,7 @@ const reports = await parallel("review", {
 return agent(prompt("Summarize these reports:\n\n{reports}", { reports }));
 ```
 
-Runs are backgrounded by default; set `foreground: true` to wait for the final value. Use `pipeline()` for staged work, `withWorktree()` for isolation, and `checkpoint()` for approval.
+Runs are backgrounded by default; set `foreground: true` to wait for the final value. Use `pipeline()` for staged work, `withWorktree()` for isolation, `checkpoint()` for approval, and `agent.create({ name })` with `handle.send()` when one agent must keep its transcript across turns.
 
 ## Included capabilities
 

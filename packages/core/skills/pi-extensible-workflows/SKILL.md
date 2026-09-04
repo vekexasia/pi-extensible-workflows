@@ -95,9 +95,26 @@ Extensions may add JSON-compatible agent options such as `advisor: true`; core k
 
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
 
+## Persistent agent handles
+
+Use `agent.create(...)` when one agent must keep its transcript across several turns; use plain `agent(...)` calls for independent work.
+
+```js
+const author = agent.create({ name: "author", role: "developer" });
+const draft = await author.send("Create the first draft");
+const revised = await author.send(
+  prompt("Apply these findings:\n\n{findings}", { findings }),
+  { outputSchema },
+);
+```
+
+`agent.create({ name, ... })` takes a stable explicit string-literal `name` plus the `role`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, and `label` options frozen for every turn. Names must be unique in one run. `handle.send(prompt, options?)` accepts only `outputSchema` and `timeoutMs`, returns the same value shape as `agent(...)`, and must not overlap with another `send(...)` on the same handle: await each turn. Every `send(...)` must run in the scope that created the handle, so a handle created outside `parallel`/`pipeline` cannot send from inside one of their branches.
+
+Every turn is journaled at `agent/handle/<name>/turn:<n>`, so completed sends replay without contacting the model. Turn `n + 1` starts from a copy of the newest completed turn's session file, so continuity survives a host restart and `workflow_retry` re-runs an interrupted send from that same copy. A later send whose completed turn recorded no session file fails with `AGENT_FAILED` instead of silently continuing from an older transcript; if no prior turn ever completed, the send starts fresh. There is no automatic retry of a send; a re-prompt would append to the transcript.
+
 ## Passing agent results
 
-Use independent `agent(prompt, options)` calls and pass each completed result explicitly to the next prompt. This keeps workflow execution deterministic and makes replay state local to each call:
+Use independent `agent(prompt, options)` calls and pass each completed result explicitly to the next prompt, or one `agent.create(...)` handle when the same agent must keep its own context. This keeps workflow execution deterministic and makes replay state local to each call:
 
 ```js
 const findings = await agent("Inspect the implementation.");
