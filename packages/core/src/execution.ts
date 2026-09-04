@@ -163,12 +163,16 @@ const internalAgentCreate = (...values) => {
   agentHandleNames.add(name);
   const config = Object.freeze(Object.fromEntries(Object.entries(options).filter(([key]) => key !== "name")));
   const worktreeOwner = worktreeOwners.getStore();
+  // The turn counter is arrival-ordered, so a handle must stay in the scope that created it: sends racing across
+  // parallel branches would otherwise take each other's journal path on replay.
+  const scope = JSON.stringify(inheritedAgentPath.getStore() || []);
   let turn = 0;
   const send = (...sent) => {
     if (sent.length < 1 || sent.length > 2) throw workError("INVALID_METADATA", "send requires a prompt and optional options");
     if (typeof sent[0] !== "string") throw workError("INVALID_METADATA", "send prompt must be a string");
     const sendOptions = sent.length < 2 || sent[1] === undefined ? {} : sent[1];
     if (!sendOptions || typeof sendOptions !== "object" || Array.isArray(sendOptions) || Object.keys(sendOptions).some(key => key !== "outputSchema" && key !== "timeoutMs")) throw workError("INVALID_METADATA", "send options must contain only outputSchema and timeoutMs");
+    if (JSON.stringify(inheritedAgentPath.getStore() || []) !== scope) throw workError("INVALID_METADATA", "Agent handle sends must run in the scope that created the handle: " + name);
     if (agentHandleInflight.has(name)) throw workError("INVALID_METADATA", "Concurrent send(...) calls on one agent handle are unsupported; await each turn");
     agentHandleInflight.add(name);
     turn += 1;

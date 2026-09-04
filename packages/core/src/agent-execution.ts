@@ -1,4 +1,5 @@
 import { existsSync, realpathSync, readFileSync } from "node:fs";
+import { copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -808,6 +809,12 @@ function agentSetupSummary(setup: AgentSetup, hookNames: readonly string[]): Age
   return { hookNames: [...hookNames], model: { provider: model.provider, model: model.model, ...(model.thinking ? { thinking: model.thinking } : {}) }, tools: [...setup.sessionInput.tools, ...(setup.sessionInput.resultTool ? [setup.sessionInput.resultTool.name] : [])], cwd: setup.sessionInput.cwd, ...(setup.sessionInput.resourcePolicy ? { resourceSelectors: resourcePolicySummary(setup.sessionInput.resourcePolicy, setup.sessionInput.tools) } : {}) };
 }
 export type PreparedAgentSetup = { setup: AgentSetup; summary: AgentSetupSummary; failure?: { error: unknown; hook?: string } };
+/** Each attempt opens its own copy of the turn input, so messages a failed attempt appended never re-enter the next one. */
+async function attemptSessionInput(source: string, attempt: number): Promise<string> {
+  const target = join(dirname(source), `${basename(source, ".jsonl")}-attempt-${String(attempt)}.jsonl`);
+  await copyFile(source, target);
+  return target;
+}
 async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTransport, task: string, options: AgentExecutionOptions, resolved: { model: ModelSpec; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] }, cwd: string, attempt: number, signal: AbortSignal | undefined, customTools: readonly ToolDefinition[], resultTool: ToolDefinition | undefined, inspection = false, previousError?: string): Promise<PreparedAgentSetup> {
   const setupSignal = signal ?? root.runContext?.signal ?? new AbortController().signal;
   const baselineOptions = structuredClone(options.agentOptions ?? {});
@@ -842,7 +849,8 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
     resourcePolicy.unmatchedTools = unmatchedResourcePatterns(resourceSelectorLayers(resourcePolicy.selectorSources, "tools").flatMap((layer) => layer ?? []), [...root.tools]);
   }
   const resourcePolicyCeiling = resourcePolicy ? structuredClone(resourcePolicy) : undefined;
-  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(options.sessionPath ? { sessionPath: options.sessionPath } : {}), ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
+  const sessionPath = options.sessionPath === undefined || inspection ? options.sessionPath : await attemptSessionInput(options.sessionPath, attempt);
+  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(sessionPath ? { sessionPath } : {}), ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
   const setup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, prepared: await preparedAgentSession(sessionInput, task), transport };
   const base = fallbackSetupContext(root, options, setupSignal);
   const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal, ...(base.tuiIndex === undefined ? {} : { tuiIndex: base.tuiIndex }), ...(base.tuiLabel === undefined ? {} : { tuiLabel: base.tuiLabel }), ...(inspection ? { mode: "inspection" as const } : {}) });

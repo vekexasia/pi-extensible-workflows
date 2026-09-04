@@ -307,7 +307,8 @@ export class RunStore {
       for (const [path, file] of await source.agentSessionFilesFrom(nextSeen)) files.set(path, file);
     }
     for (const agent of loaded.run.agents) {
-      const locator = agent.attemptDetails?.at(-1)?.session?.locator;
+      // Failed attempts also record a session; their partial transcript must never become a continuation source.
+      const locator = agent.attemptDetails?.filter((detail) => !detail.error).at(-1)?.session?.locator;
       const file = object(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
       if (agent.resultPath && file) files.set(agent.resultPath, file);
     }

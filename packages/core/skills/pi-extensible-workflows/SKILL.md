@@ -108,7 +108,7 @@ const revised = await author.send(
 );
 ```
 
-`agent.create({ name, ... })` takes a stable explicit string-literal `name` plus the `role`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, and `label` options frozen for every turn. Names must be unique in one run. `handle.send(prompt, options?)` accepts only `outputSchema` and `timeoutMs`, returns the same value shape as `agent(...)`, and must not overlap with another `send(...)` on the same handle: await each turn.
+`agent.create({ name, ... })` takes a stable explicit string-literal `name` plus the `role`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, and `label` options frozen for every turn. Names must be unique in one run. `handle.send(prompt, options?)` accepts only `outputSchema` and `timeoutMs`, returns the same value shape as `agent(...)`, and must not overlap with another `send(...)` on the same handle: await each turn. Every `send(...)` must run in the scope that created the handle, so a handle created outside `parallel`/`pipeline` cannot send from inside one of their branches.
 
 Every turn is journaled at `agent/handle/<name>/turn:<n>`, so completed sends replay without contacting the model. Turn `n + 1` starts from a copy of turn `n`'s session file, so continuity survives a host restart and `workflow_retry` re-runs an interrupted send from that same copy. There is no automatic retry of a send; a re-prompt would append to the transcript.
 

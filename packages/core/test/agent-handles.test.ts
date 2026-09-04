@@ -17,24 +17,27 @@ const second = await author.send("apply findings");
 return { first, second };`;
 
 type TestTool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
-type Host = { readonly home: string; readonly workflow: TestTool; readonly retry: TestTool; readonly context: Record<string, unknown>; readonly opened: readonly SessionInput[]; readonly prompts: readonly string[] };
+type Host = { readonly home: string; readonly workflow: TestTool; readonly retry: TestTool; readonly context: Record<string, unknown>; readonly opened: readonly SessionInput[]; readonly openedInput: readonly string[]; readonly prompts: readonly string[] };
+const terminalProviderError = { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" };
 
 /** Hosts one workflow extension whose fake sessions persist their turns as JSONL, like Pi does. */
-function host(failTurn?: number): Host {
+function host(failTurn?: number, providerErrorSession?: number): Host {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-handles-"));
   const sessions = join(home, "sessions");
   mkdirSync(sessions, { recursive: true });
   const opened: SessionInput[] = [];
+  const openedInput: string[] = [];
   const prompts: string[] = [];
   let created = 0;
   const createSession = async (input: SessionInput): Promise<TestPiSession> => {
     opened.push(input);
+    openedInput.push(input.sessionPath ? readFileSync(input.sessionPath, "utf8") : "");
     const index = ++created;
     const sessionFile = input.sessionPath ?? join(sessions, `session-${String(index)}.jsonl`);
     if (!input.sessionPath) writeFileSync(sessionFile, "");
     return {
       sessionId: `session-${String(index)}`, sessionFile,
-      messages: [{ role: "assistant", content: [{ type: "text", text: `reply-${String(index)}` }] }],
+      messages: [index === providerErrorSession ? terminalProviderError : { role: "assistant", content: [{ type: "text", text: `reply-${String(index)}` }] }],
       getSessionStats: () => ({ tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 }, cost: 0 }),
       prompt: async (text: string) => {
         prompts.push(text);
@@ -49,7 +52,7 @@ function host(failTurn?: number): Host {
   const workflow = tools.find(({ name }) => name === "workflow");
   const retry = tools.find(({ name }) => name === "workflow_retry");
   assert.ok(workflow && retry);
-  return { home, workflow, retry, context: { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, opened, prompts };
+  return { home, workflow, retry, context: { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, opened, openedInput, prompts };
 }
 function launch(current: Host, name: string): Promise<unknown> {
   return current.workflow.execute(name, { name, script, foreground: true }, new AbortController().signal, undefined, current.context);
@@ -73,7 +76,7 @@ void test("sequential handle sends continue one transcript from a per-turn sessi
   const result = decodeTestToolResult(await launch(current, "handle-sequential"));
   const store = new RunStore(current.home, "session", decodeTestRunDetails(result.details).runId, current.home);
   assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { first: "reply-1", second: "reply-2" });
-  const turnInput = join(store.directory, "handles", "author", "turn-2-input.jsonl");
+  const turnInput = join(store.directory, "handles", "author", "turn-2-input-attempt-1.jsonl");
   assert.equal(current.opened[0]?.sessionPath, undefined);
   assert.equal(current.opened[1]?.sessionPath, turnInput);
   const transcript = readFileSync(turnInput, "utf8");
@@ -107,7 +110,7 @@ void test("retrying a crashed send replays completed turns and continues from th
   const run = await loadUntil(current.home, started.runId, "completed");
   const store = new RunStore(current.home, "session", started.runId, current.home);
   assert.deepEqual(current.prompts.filter((prompt) => prompt.includes("first draft")).length, 1);
-  const turnInput = join(store.directory, "handles", "author", "turn-2-input.jsonl");
+  const turnInput = join(store.directory, "handles", "author", "turn-2-input-attempt-1.jsonl");
   assert.equal(current.opened.at(-1)?.sessionPath, turnInput);
   assert.match(readFileSync(turnInput, "utf8"), /first draft/);
   assert.equal(handleAgent(run, 2).continuity, "continued");
@@ -133,4 +136,76 @@ return "accepted";`;
   assert.throws(() => preflight(`const a = agent.create({ name: args.name }); return a.send("x");`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight(`const a = agent.create(); return a.send("x");`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.deepEqual(preflight(`const a = agent.create({ name: "author", role: "reviewer", model: "openai/gpt:high", tools: ["read"] }); return a.send("x");`, capabilities).referenced, { phases: [], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+});
+
+void test("a provider-recovery attempt on a handle turn reopens a clean per-turn copy", async () => {
+  const current = host(undefined, 2);
+  const titles: string[] = [];
+  const context = { cwd: current.home, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" }, ui: { select: async (title: string) => { titles.push(title); return titles.length === 1 ? "Change model" : "anthropic/opus"; } } };
+  const result = decodeTestToolResult(await current.workflow.execute("handle-provider-recovery", { name: "handle-provider-recovery", script, foreground: true }, new AbortController().signal, undefined, context));
+  const store = new RunStore(current.home, "session", decodeTestRunDetails(result.details).runId, current.home);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { first: "reply-1", second: "reply-3" });
+  assert.equal(current.opened.length, 3);
+  assert.notEqual(current.opened[2]?.sessionPath, current.opened[1]?.sessionPath);
+  assert.match(current.openedInput[2] ?? "", /first draft/);
+  assert.doesNotMatch(current.openedInput[2] ?? "", /apply findings/);
+});
+
+void test("a send after a failed send continues from the last successful turn", async () => {
+  const current = host(2);
+  const recovering = `const author = agent.create({ name: "author" });
+const first = await author.send("first draft");
+let failure = "none";
+try { await author.send("boom"); } catch (error) { failure = error.code; }
+const third = await author.send("third pass");
+return { first, failure, third };`;
+  const result = decodeTestToolResult(await current.workflow.execute("handle-after-failure", { name: "handle-after-failure", script: recovering, foreground: true }, new AbortController().signal, undefined, current.context));
+  const store = new RunStore(current.home, "session", decodeTestRunDetails(result.details).runId, current.home);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { first: "reply-1", failure: "AGENT_FAILED", third: "reply-3" });
+  assert.match(current.openedInput.at(-1) ?? "", /first draft/);
+  assert.doesNotMatch(current.openedInput.at(-1) ?? "", /boom/);
+});
+
+void test("aliased and computed agent references fail preflight", () => {
+  const invalid = (error: unknown): boolean => error instanceof WorkflowError && error.code === "INVALID_METADATA";
+  assert.throws(() => preflight(`const create = agent.create; const a = create({ name: args.name }); return a.send("x");`, capabilities), invalid);
+  assert.throws(() => preflight(`const a = agent["create"]({ name: args.name }); return a.send("x");`, capabilities), invalid);
+  assert.throws(() => preflight(`const alias = agent; return alias("work");`, capabilities), invalid);
+});
+
+void test("sends from a structural scope other than the creating one are rejected", async () => {
+  const branched = `const author = agent.create({ name: "author" });
+await author.send("one");
+try { await parallel("branches", { left: () => author.send("two") }); } catch (failure) { return failure.code; }
+return "accepted";`;
+  assert.equal(await runWorkflow(branched, null, { agent: async () => "done" }).result, "INVALID_METADATA");
+});
+
+void test("handle send results reject serialization and interpolation before they are awaited", async () => {
+  const misuse = `const author = agent.create({ name: "author" });
+const pending = author.send("one");
+const codes = [];
+for (const misuse of [() => JSON.stringify(pending), () => pending.toString(), () => \`\${pending}\`, () => pending + ""]) {
+  try { misuse(); codes.push("accepted"); } catch (failure) { codes.push(failure.code); }
+}
+await pending;
+return codes;`;
+  assert.deepEqual(await runWorkflow(misuse, null, { agent: async () => "done" }).result, ["INVALID_METADATA", "INVALID_METADATA", "INVALID_METADATA", "INVALID_METADATA"]);
+});
+
+void test("a handle name needing encoding round-trips its journal path and turn copy", async () => {
+  const current = host();
+  const name = "my handle/á";
+  const encoded = `const author = agent.create({ name: ${JSON.stringify(name)} });
+const first = await author.send("first draft");
+const second = await author.send("apply findings");
+return { first, second };`;
+  const result = decodeTestToolResult(await current.workflow.execute("handle-encoded", { name: "handle-encoded", script: encoded, foreground: true }, new AbortController().signal, undefined, current.context));
+  const store = new RunStore(current.home, "session", decodeTestRunDetails(result.details).runId, current.home);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), { first: "reply-1", second: "reply-2" });
+  assert.equal(agentHandleTurnPath(name, 2), "agent/handle/my%20handle%2F%C3%A1/turn%3A2");
+  const turnInput = join(store.directory, "handles", encodeURIComponent(name), "turn-2-input-attempt-1.jsonl");
+  assert.equal(current.opened[1]?.sessionPath, turnInput);
+  assert.match(readFileSync(turnInput, "utf8"), /first draft/);
+  assert.deepEqual(await store.replay(agentHandleTurnPath(name, 2)), { path: agentHandleTurnPath(name, 2), value: "reply-2" });
 });
