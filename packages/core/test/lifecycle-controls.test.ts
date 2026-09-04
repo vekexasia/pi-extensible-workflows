@@ -168,8 +168,9 @@ void test("the searchable recovery model picker constructs against the installed
   const models = [{ provider: "openai", id: "gpt", name: "GPT" }, { provider: "anthropic", id: "opus", name: "Opus" }];
   type PickerFactory = (tui: { requestRender(): void }, theme: undefined, keybindings: undefined, done: (value: unknown) => void) => { handleInput(key: string): void; dispose?(): void };
   initTheme("dark", false);
+  let selectCalls = 0;
   const context = { cwd: home, mode: "tui", hasUI: true, model: models[0], modelRegistry: { getAvailable: () => models, find: (provider: string, id: string) => models.find((model) => model.provider === provider && model.id === id) }, sessionManager: { getSessionId: () => "session" }, ui: {
-    select: async () => "Change model",
+    select: async () => { selectCalls += 1; return selectCalls === 1 ? "Change model" : "Abort workflow"; },
     custom: (factory: PickerFactory) => new Promise((resolve) => {
       const picker = factory({ requestRender() {} }, undefined, undefined, resolve);
       picker.handleInput("opus");
@@ -181,6 +182,22 @@ void test("the searchable recovery model picker constructs against the installed
     const result = await workflow.execute("id", { name: "provider-recovery-model-picker", script: "return await agent('work', {label:'worker'});", foreground: true }, new AbortController().signal, undefined, context) as { details?: { value?: unknown } };
     assert.equal(result.details?.value, "done");
     assert.deepEqual(inputs.map(({ model }) => `${model.provider}/${model.model}`), ["openai/gpt", "anthropic/opus"]);
+  } finally {
+    await shutdown?.();
+  }
+});
+void test("a throwing recovery model picker surfaces its cause in the agent error", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-model-picker-throws-"));
+  let shutdown: (() => Promise<void>) | undefined;
+  const createSession = async (input: SessionInput): Promise<TestPiSession> => ({ sessionId: "recovery-model-picker-throws", sessionFile: "/sessions/recovery-model-picker-throws.jsonl", model: { provider: input.model.provider, model: input.model.model }, messages: [{ role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error", errorMessage: "MODEL_UNAVAILABLE" }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const models = [{ provider: "openai", id: "gpt", name: "GPT" }];
+  const context = { cwd: home, mode: "tui", hasUI: true, model: models[0], modelRegistry: { getAvailable: () => models }, sessionManager: { getSessionId: () => "session" }, ui: { select: async () => "Change model", custom: async () => { throw new TypeError("getAvailableSnapshot is not a function"); } } };
+  try {
+    await assert.rejects(workflow.execute("id", { name: "provider-recovery-model-picker-throws", script: "return await agent('work', {label:'worker'});", foreground: true }, new AbortController().signal, undefined, context), /MODEL_UNAVAILABLE \(provider recovery failed: getAvailableSnapshot is not a function\)/);
   } finally {
     await shutdown?.();
   }
