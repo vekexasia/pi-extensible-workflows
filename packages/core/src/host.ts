@@ -557,10 +557,12 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       }
     } finally { await lifecycle.leave(); }
   };
-  const lifecycleFor = (store: RunStore, state: RunState, budget: WorkflowBudgetRuntime, metadata: WorkflowMetadata) => new RunLifecycle(state, async (next, previous, reason) => {
-    if (next !== "pausing") budget.transition(next);
+  const lifecycleFor = (store: RunStore, state: RunState, metadata: WorkflowMetadata) => new RunLifecycle(state, async (next, previous, reason) => {
+    const run = runs.get(store.runId);
+    if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
+    if (next !== "pausing") run.budget.transition(next);
     const persisted = await persistRunState(store, metadata, (current) => {
-      const nextRun = { ...current, state: next, ...budget.snapshot() };
+      const nextRun = { ...current, state: next, ...run.budget.snapshot() };
       if (next === "running" || next === "completed") { delete nextRun.error; delete nextRun.failedAt; }
       if (next === "running" && (previous === "paused" || previous === "interrupted" || previous === "budget_exhausted") && nextRun.delivery?.state === "delivered") nextRun.delivery = { ...nextRun.delivery, state: "pending" };
       return nextRun;
@@ -1058,7 +1060,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const budget = validateBudget(loaded.run.budget ?? loaded.snapshot.budget);
       eventPublisher.seedBudget(runId, loaded.run.budgetEvents);
       const budgetRuntime = new WorkflowBudgetRuntime(budget, loaded.run.budgetVersion ?? 1, loaded.run.usage, loaded.run.budgetEvents, { active: loaded.run.state === "running" });
-      const lifecycle = lifecycleFor(store, loaded.run.state, budgetRuntime, loaded.snapshot.metadata);
+      const lifecycle = lifecycleFor(store, loaded.run.state, loaded.snapshot.metadata);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const roleDefinitions = loaded.snapshot.roles ?? {};
       const abortController = new AbortController();
@@ -1201,7 +1203,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         };
         deliveryController.foregroundDeliveries.set(toolCallId, delivery);
       }
-      const lifecycle = lifecycleFor(store, "running", budgetRuntime, checked.metadata);
+      const lifecycle = lifecycleFor(store, "running", checked.metadata);
       const backgroundLaunch = !params.foreground;
       const providerPause = async () => { if (!foregroundAttached) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
