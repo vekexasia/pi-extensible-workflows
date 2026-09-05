@@ -85,6 +85,8 @@ export interface AgentOptions {
 }
 ```
 
+A `role` already sets model, tools, skills, extensions, and context files; call-level options silently override them. Pass `{ role }` alone unless an override is indispensable for that call.
+
 Extensions may add JSON-compatible agent options such as `advisor: true`; core keys retain validation and role constraints. Extension options go to setup hooks/native setup and are not inherited by child agents.
 
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
