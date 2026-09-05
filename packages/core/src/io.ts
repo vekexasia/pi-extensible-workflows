@@ -43,6 +43,6 @@ export async function atomicPrettyJson(path: string, value: unknown): Promise<vo
 
 export async function json(path: string): Promise<unknown> { return JSON.parse(await readFile(path, "utf8")); }
 export async function git(cwd: string, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<string> {
-  const { stdout } = await execute("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd, env: { ...process.env, ...extraEnv }, encoding: "utf8" });
+  const { stdout } = await execute("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args], { cwd, env: { ...process.env, ...extraEnv }, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
   return stdout;
 }

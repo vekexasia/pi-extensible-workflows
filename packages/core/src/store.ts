@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowBudgetUsage, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, SerialLane } from "./utils.js";
 import {
@@ -652,37 +652,45 @@ export class RunStore {
       const existing = records.find((record) => record.owner === owner);
       if (existing) return this.validateWorktree(owner);
       const { path, branch } = this.expectedWorktree(owner);
-      const index = join(this.directory, `index-${basename(path)}`);
       const markerPath = this.markerPath(owner);
       let branchCreated = false;
       let worktreeCreated = false;
+      let markerWritten = false;
       try {
         const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
         const [canonicalRoot, canonicalCwd] = await Promise.all([realpath(root), realpath(this.cwd)]);
         const launchRelative = relative(canonicalRoot, canonicalCwd);
         if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
         await this.cleanupMarker(markerPath);
+        const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
+        if (dirty) {
+          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
+          const shownPaths = dirtyPaths.slice(0, 10);
+          const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
+          throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
+        }
+        let commit: string;
+        try {
+          commit = (await git(root, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
+        } catch {
+          throw new Error("repository has no commits");
+        }
         await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-        await git(root, ["read-tree", "HEAD"], { GIT_INDEX_FILE: index });
-        await git(root, ["add", "-A"], { GIT_INDEX_FILE: index });
-        const tree = (await git(root, ["write-tree"], { GIT_INDEX_FILE: index })).trim();
-        const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-extensible-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
         const record = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
         await atomicJson(markerPath, { owner, path, branch, base: commit });
+        markerWritten = true;
         await git(root, ["branch", branch, commit]);
         branchCreated = true;
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
-        await rm(index, { force: true });
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;
       } catch (error) {
-        await rm(index, { force: true });
         if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
         if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
-        await rm(markerPath, { force: true });
+        if (markerWritten) await rm(markerPath, { force: true });
         try {
           const persisted = await this.#loadWorktreeRecords();
           const match = persisted.filter((candidate) => candidate.owner === owner);

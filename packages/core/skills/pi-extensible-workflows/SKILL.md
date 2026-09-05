@@ -139,7 +139,7 @@ const result = await withWorktree("issue", async ({ path, branch }) => {
 });
 ```
 
-Entering the scope materializes its worktree before the callback. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
+Entering the scope materializes its worktree from the launch repository's current `HEAD`. The launch working tree must be clean: any tracked or untracked non-ignored change fails the scope with `WORKTREE_FAILED`. This check happens when the scope is entered, so agents that edit the launch cwd before a later `withWorktree` scope make it fail. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:
 

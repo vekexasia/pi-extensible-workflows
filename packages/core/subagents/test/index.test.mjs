@@ -1979,8 +1979,9 @@ test("session shutdown disposes active subagent sessions and rejects controls", 
 test("uses RunStore worktrees and removes them after a standalone run", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-"));
   await writeFile(join(cwd, "README.md"), "base\n");
+  await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
   execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["add", "README.md"], { cwd });
+  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
   execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   let worktreePath;
   let branch;
@@ -2012,8 +2013,9 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
 test("isolates concurrent real-git worktrees with the same name", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-concurrent-"));
   await writeFile(join(cwd, "README.md"), "base\n");
+  await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
   execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["add", "README.md"], { cwd });
+  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
   execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   const storageDir = join(cwd, "subagents-storage");
   const pending = deferred();
