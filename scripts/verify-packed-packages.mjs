@@ -68,6 +68,10 @@ try {
 
   const tarballs = packages.map(({ manifest }) => resolve(output, tarballName(manifest)));
   execFileSync("npm", ["install", "--prefix", installRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", ...tarballs], { stdio: "pipe", timeout: 120_000 });
+  const cli = spawnSync(resolve(installRoot, "node_modules", ".bin", "piewf"), ["run", "--help"], { cwd: work, encoding: "utf8" });
+  const cliOutput = `${cli.stdout ?? ""}${cli.stderr ?? ""}`;
+  if (cli.error) throw cli.error;
+  if (cli.status !== 0 || !cliOutput.includes("Usage: piewf run")) throw new Error(`Standalone CLI smoke test failed (${String(cli.status)}):\n${cliOutput}`);
   execFileSync("npm", ["audit", "--prefix", installRoot, "--omit=dev"], { stdio: "pipe", timeout: 60_000 });
 
   const localPackages = ["pi-extensible-workflows", "@piewf/herdr"].map((name) => packagePath(installRoot, name));
