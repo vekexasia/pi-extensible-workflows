@@ -1,6 +1,9 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- Keep the subagent Steer editor and selected action visible while navigating long detail panels. (#274)
 ## [5.13.0] - 2026-09-05
 
 ### Breaking changes

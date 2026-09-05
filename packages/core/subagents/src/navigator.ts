@@ -303,6 +303,24 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       }
       refreshGeneration += 1;
     };
+    const buildActionRows = (detail: readonly string[], options: readonly string[]): string[] => [
+      ...detail,
+      "",
+      theme.bold("Agent actions"),
+      ...options.map((option, index) => `${index === actionIndex ? "→ " : "  "}${index === actionIndex ? theme.fg("accent", option) : option}`),
+    ];
+    const scrollActionIntoView = (): void => {
+      const detail = detailLines(inspection, theme);
+      const options = actionOptions(manager, inspection, context);
+      if (actionIndex >= options.length) return;
+      const rows = buildActionRows(detail, options);
+      const viewport = Math.max(1, tuiRows(tui) - 1);
+      const maxOffset = Math.max(0, rows.length - viewport);
+      const actionRow = rows.length - options.length + actionIndex;
+      if (actionRow < offset) offset = actionRow;
+      else if (actionRow >= offset + viewport) offset = actionRow - viewport + 1;
+      offset = Math.max(0, Math.min(maxOffset, offset));
+    };
     const reportRefreshError = (error: unknown): void => {
       if (disposed) return;
       try { context.ui.notify(`Cannot refresh subagent ${entry.status.id}: ${errorText(error)}`, "warning"); } catch { /* The session UI may already be closing. */ }
@@ -319,6 +337,7 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
         if (actionMode) {
           const options = actionOptions(manager, inspection, context);
           actionIndex = Math.min(actionIndex, Math.max(0, options.length - 1));
+          scrollActionIntoView();
         }
         requestRender();
       } catch (error: unknown) {
@@ -343,19 +362,13 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       const renderWidth = Math.max(1, width);
       const options = actionMode ? actionOptions(manager, inspection, context) : [];
       const detail = detailLines(inspection, theme).map((line) => truncateToWidth(line, renderWidth, "…"));
-      const actionStart = detail.length + 2;
-      const rows = steerMode ? [...detail, "", theme.bold("Steer subagent"), ...steerEditor.render(renderWidth)] : actionMode ? [...detail, "", theme.bold("Agent actions"), ...options.map((option, index) => `${index === actionIndex ? "→ " : "  "}${index === actionIndex ? theme.fg("accent", option) : option}`)] : detail;
+      const actionRows = actionMode ? buildActionRows(detail, options) : undefined;
+      const rows = steerMode ? [...detail, "", theme.bold("Steer subagent"), ...steerEditor.render(renderWidth)] : actionRows ?? detail;
       const viewport = Math.max(1, tuiRows(tui) - 1);
       const maxOffset = Math.max(0, rows.length - viewport);
-      if (steerMode) offset = maxOffset;
-      else if (actionMode && actionIndex < options.length) {
-        const actionRow = actionStart + actionIndex;
-        if (actionRow < offset) offset = Math.max(0, actionRow - Math.max(0, viewport - 2));
-        else if (actionRow >= offset + viewport) offset = actionRow - viewport + 1;
-      }
-      offset = Math.max(0, Math.min(maxOffset, offset));
+      const visibleOffset = steerMode ? maxOffset : Math.max(0, Math.min(maxOffset, offset));
       const hint = theme.fg("dim", steerMode ? "enter submit · esc back" : actionMode ? "↑/↓ actions · enter run · esc back" : "↑/↓ scroll · a actions · enter actions · esc back");
-      return [...rows.slice(offset, offset + viewport), hint].map((line) => truncateToWidth(line, renderWidth, "…"));
+      return [...rows.slice(visibleOffset, visibleOffset + viewport), hint].map((line) => truncateToWidth(line, renderWidth, "…"));
     };
     const runAction = (action: string): void => {
       if (disposed) return;
@@ -388,25 +401,25 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       handleInput(data: string) {
         if (disposed || actionRunning) return;
         if (steerMode) {
-          if (keybindings.matches(data, "tui.select.cancel")) { steerMode = false; actionMode = true; steerEditor.setText(""); offset = 0; }
+          if (keybindings.matches(data, "tui.select.cancel")) { steerMode = false; actionMode = true; steerEditor.setText(""); offset = 0; scrollActionIntoView(); }
           else steerEditor.handleInput(data);
           requestRender();
           return;
         }
-        if (!actionMode && data === "a") { actionMode = true; actionIndex = 0; offset = 0; requestRender(); return; }
+        if (!actionMode && data === "a") { actionMode = true; actionIndex = 0; offset = 0; scrollActionIntoView(); requestRender(); return; }
         if (keybindings.matches(data, "tui.select.cancel")) {
           if (actionMode) { actionMode = false; actionIndex = 0; offset = 0; requestRender(); } else close(undefined);
           return;
         }
         if (!actionMode) {
-          if (keybindings.matches(data, "tui.select.confirm")) { actionMode = true; actionIndex = 0; offset = 0; requestRender(); }
+          if (keybindings.matches(data, "tui.select.confirm")) { actionMode = true; actionIndex = 0; offset = 0; scrollActionIntoView(); requestRender(); }
           else if (keybindings.matches(data, "tui.select.up")) { offset = Math.max(0, offset - 1); requestRender(); }
           else if (keybindings.matches(data, "tui.select.down")) { offset += 1; requestRender(); }
           return;
         }
         const options = actionOptions(manager, inspection, context);
-        if (keybindings.matches(data, "tui.select.up")) actionIndex = (actionIndex + options.length - 1) % options.length;
-        else if (keybindings.matches(data, "tui.select.down")) actionIndex = (actionIndex + 1) % options.length;
+        if (keybindings.matches(data, "tui.select.up")) { actionIndex = (actionIndex + options.length - 1) % options.length; scrollActionIntoView(); }
+        else if (keybindings.matches(data, "tui.select.down")) { actionIndex = (actionIndex + 1) % options.length; scrollActionIntoView(); }
         else if (keybindings.matches(data, "tui.select.confirm")) { const action = options[actionIndex]; if (action === "Steer") { steerMode = true; actionMode = false; steerEditor.setText(""); offset = 0; } else if (action && action !== "Back") runAction(action); else actionMode = false; }
         else if (keybindings.matches(data, "tui.select.pageUp")) offset = Math.max(0, offset - Math.max(1, tuiRows(tui) - 1));
         else if (keybindings.matches(data, "tui.select.pageDown")) offset += Math.max(1, tuiRows(tui) - 1);

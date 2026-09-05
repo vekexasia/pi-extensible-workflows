@@ -750,7 +750,7 @@ test("bounds every narrow detail-panel row while preserving scrolling and action
   const storageDir = join(cwd, "storage");
   const id = "run-narrow";
   await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "narrow", label: "narrow", mode: "background" }));
+  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `narrow\n${Array.from({ length: 40 }, (_, index) => `detail-${String(index)}`).join("\n")}`, label: "narrow", mode: "background" }));
   const status = { id, sessionId: "session-1", state: "running", startedAt: 1 };
   const manager = {
     async run() { throw new Error("unexpected run"); },
@@ -780,8 +780,17 @@ test("bounds every narrow detail-panel row while preserving scrolling and action
         component.handleInput("tui.select.down");
         assertNarrowRows(component.render(width));
         component.handleInput("a");
+        const actionScreen = component.render(width);
+        assert.equal(actionScreen.some((row) => row.includes("Agent")), true);
+        component.handleInput("tui.select.pageUp");
+        const detailScreen = component.render(width);
+        assertNarrowRows(detailScreen);
+        assert.equal(detailScreen.some((row) => row.includes("Agent")), false);
+        component.handleInput("tui.select.pageDown");
+        const actionAfterPageDown = component.render(width);
+        assert.equal(actionAfterPageDown.some((row) => row.includes("Agent")), true);
         assertNarrowRows(component.render(width));
-        let sawActionSection = false;
+        let sawActionSection = actionAfterPageDown.some((row) => row.includes("Agent"));
         let sawActionRow = false;
         for (let index = 0; index < 4; index += 1) {
           component.handleInput("tui.select.pageDown");
