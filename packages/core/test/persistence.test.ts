@@ -380,7 +380,7 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
   assert.deepEqual(await store.awaitingCheckpoints(), []);
 });
 
-void test("creates deterministic snapshot worktrees, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
+void test("creates worktrees from clean HEAD, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-"));
   const repo = join(home, "repo");
   const cwd = join(repo, "packages", "app");
@@ -389,23 +389,20 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
   execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "initial");
-  writeFileSync(join(cwd, "deleted.txt"), "remove before launch");
+  writeFileSync(join(repo, ".gitignore"), "ignored.txt\n");
   execFileSync("git", ["-C", repo, "add", "."]);
   execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
   const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  writeFileSync(join(cwd, "tracked.txt"), "changed");
-  rmSync(join(cwd, "deleted.txt"));
-  writeFileSync(join(cwd, "untracked.txt"), "new");
+  writeFileSync(join(cwd, "ignored.txt"), "local only");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
   const first = await store.worktree("agent/path");
   const second = await store.worktree("agent/path");
   assert.deepEqual(second, first);
-  assert.equal(readFileSync(join(first.cwd, "tracked.txt"), "utf8"), "changed");
-  assert.equal(readFileSync(join(first.cwd, "untracked.txt"), "utf8"), "new");
-  assert.equal(existsSync(join(first.cwd, "deleted.txt")), false);
-  assert.equal(execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
-  assert.equal(execFileSync("git", ["-C", first.path, "log", "-1", "--format=%an|%ae|%s"], { encoding: "utf8" }).trim(), "pi-extensible-workflows|pi-extensible-workflows@localhost|pi-extensible-workflows runtime snapshot");
+  assert.equal(first.base, head);
+  assert.equal(readFileSync(join(first.cwd, "tracked.txt"), "utf8"), "initial");
+  assert.equal(existsSync(join(first.cwd, "ignored.txt")), false);
+  assert.equal(execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), head);
   assert.deepEqual(await store.changedWorktrees(), []);
   writeFileSync(join(first.cwd, "agent.txt"), "post-creation");
   await store.snapshotWorktree("agent/path");
@@ -419,7 +416,31 @@ void test("creates deterministic snapshot worktrees, preserves launch subdirecto
   assert.equal(existsSync(first.path), false);
   assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", first.branch], { stdio: "ignore" }));
 });
-void test("creates snapshot worktrees from a symlinked repository cwd without rewriting the persisted cwd", { skip: process.platform === "win32" }, async () => {
+void test("rejects worktree creation when the launch working tree has tracked or untracked changes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-dirty-worktree-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const isDirtyFailure = (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes");
+  writeFileSync(join(repo, "tracked.txt"), "changed");
+  await assert.rejects(store.worktree("agent"), isDirtyFailure);
+  execFileSync("git", ["-C", repo, "checkout", "--", "tracked.txt"]);
+  writeFileSync(join(repo, "untracked.txt"), "new");
+  await assert.rejects(store.worktree("agent"), isDirtyFailure);
+  rmSync(join(repo, "untracked.txt"));
+  assert.deepEqual(await store.worktrees(), []);
+  assert.throws(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", "pi-extensible-workflows/run-a/agent"], { stdio: "ignore" }));
+  const reference = await store.worktree("agent");
+  assert.equal(existsSync(join(reference.path, "tracked.txt")), true);
+});
+void test("creates worktrees from a symlinked repository cwd without rewriting the persisted cwd", { skip: process.platform === "win32" }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlinked-worktree-"));
   const repo = join(home, "repo");
   const alias = join(home, "repo-alias");

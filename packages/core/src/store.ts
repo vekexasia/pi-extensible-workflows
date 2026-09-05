@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowBudgetUsage, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, SerialLane } from "./utils.js";
 import {
@@ -652,7 +652,6 @@ export class RunStore {
       const existing = records.find((record) => record.owner === owner);
       if (existing) return this.validateWorktree(owner);
       const { path, branch } = this.expectedWorktree(owner);
-      const index = join(this.directory, `index-${basename(path)}`);
       const markerPath = this.markerPath(owner);
       let branchCreated = false;
       let worktreeCreated = false;
@@ -661,12 +660,11 @@ export class RunStore {
         const [canonicalRoot, canonicalCwd] = await Promise.all([realpath(root), realpath(this.cwd)]);
         const launchRelative = relative(canonicalRoot, canonicalCwd);
         if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
+        const dirty = (await git(root, ["status", "--porcelain"])).trim();
+        if (dirty) throw new Error(`launch working tree has uncommitted changes; commit or stash them before using worktrees:\n${dirty}`);
+        const commit = (await git(root, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
         await this.cleanupMarker(markerPath);
         await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-        await git(root, ["read-tree", "HEAD"], { GIT_INDEX_FILE: index });
-        await git(root, ["add", "-A"], { GIT_INDEX_FILE: index });
-        const tree = (await git(root, ["write-tree"], { GIT_INDEX_FILE: index })).trim();
-        const commit = (await git(root, ["commit-tree", tree, "-p", "HEAD", "-m", "pi-extensible-workflows runtime snapshot"], { GIT_INDEX_FILE: index, ...gitIdentity })).trim();
         const record = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
         await atomicJson(markerPath, { owner, path, branch, base: commit });
         await git(root, ["branch", branch, commit]);
@@ -674,12 +672,10 @@ export class RunStore {
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
-        await rm(index, { force: true });
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;
       } catch (error) {
-        await rm(index, { force: true });
         if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
         if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
         await rm(markerPath, { force: true });

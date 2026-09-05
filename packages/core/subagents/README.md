@@ -98,7 +98,7 @@ Inspection is repeatable. Use the list form for ordered summaries and the ID for
 
 ## Worktrees
 
-Set `worktree` on `subagents_run` to create a named isolated Git worktree for that run. The default adapter uses the core `RunStore`; the executor runs in the worktree and inspection exposes its path and branch while materialized. Cleanup runs when the agent settles, stops, or the manager reconciles an interrupted record. After successful cleanup, the public and persisted worktree path, branch, and cleanup context are removed; if cleanup fails, all of that metadata is retained for a later retry. A run ID keeps concurrent worktrees separate even when their names are the same.
+Set `worktree` on `subagents_run` to create a named isolated Git worktree for that run. The default adapter uses the core `RunStore`: the worktree branches from the repository's clean `HEAD`, and a dirty working tree (tracked or untracked non-ignored changes) fails the run with `WORKTREE_FAILED`. The executor runs in the worktree and inspection exposes its path and branch while materialized. Cleanup runs when the agent settles, stops, or the manager reconciles an interrupted record. After successful cleanup, the public and persisted worktree path, branch, and cleanup context are removed; if cleanup fails, all of that metadata is retained for a later retry. A run ID keeps concurrent worktrees separate even when their names are the same.
 
 ## Agent options, roles, and settings
 

@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Runtime
+
+- Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. Git-ignored files are not copied. (#235)
+
 ### Fixes
 
 - "Change model" in the provider-failure recovery dialog opens the model picker again on Pi 0.85 (`ModelSelectorComponent` constructor changed). A failing recovery dialog now appends its cause to the reported agent error instead of being swallowed.
