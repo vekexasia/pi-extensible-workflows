@@ -47,7 +47,7 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist",
+    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets && cp -R trajectory/src/assets dist/trajectory/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist",
     "lint": "eslint .",
     "test": "npm run test:layout && npm run build && npm run test:widget && npm run test:run && npm run test:herdr && npm run test:subagents",
     "test:layout": "node --test --test-timeout=10000 --test-force-exit test/workspace-layout.test.mjs",

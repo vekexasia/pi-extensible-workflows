@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { exportTrajectoryRunHtml, shareTrajectoryRun } from "../src/export.js";
+import { exportTrajectoryRunHtml, shareTrajectoryRun } from "../index.js";
 import { RunStore } from "../../src/persistence.js";
 import { createLaunchSnapshot } from "../../src/utils.js";
 import type { PersistedRun } from "../../src/persistence.js";
