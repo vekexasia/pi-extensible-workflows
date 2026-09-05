@@ -240,7 +240,8 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     return { state: "running" };
   };
   const retryReservations = new Set<string>();
-  const retryWorkflowRunUnlocked = async (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string): Promise<{ runId: string; parentRunId: string; state: "running" | "completed"; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult }> => {
+  type PreparedRetryWorkflowRun = { childRun: WorkflowRunRecord; parentRunId: string; lineageRootRunId: string; concurrency: number; hostModel: { provider: string; id: string }; modelRegistry: WorkflowRecoveryContext["modelRegistry"]; currentAliases: Readonly<Record<string, string>>; blockedAliases: ReadonlySet<string>; blockedAliasTargets: Readonly<Record<string, string>> };
+  const retryWorkflowRunUnlocked = async (runId: string, context: unknown, signal?: AbortSignal, expectedState?: string): Promise<PreparedRetryWorkflowRun> => {
     if (typeof runId !== "string" || !runId.trim()) throw new WorkflowError("RESUME_INCOMPATIBLE", "workflow_retry requires an explicit run ID");
     const host = object(context) ? context : {};
     const cwd = typeof host.cwd === "string" ? host.cwd : undefined;
@@ -268,7 +269,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       }
     }
     retryReservations.add(lineageRootRunId);
-    let childStarted = false;
+    let childCreated = false;
     try {
       const trustedProject = projectTrusted(context);
       await sourceStore.validateRetrySource();
@@ -301,26 +302,36 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       const abortController = new AbortController();
       const providerErrorRecovery = createProviderErrorRecovery(context, availableModels, () => { abortController.abort(); });
       const providerPause = async () => { deliver(`Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const childRun = { executor: createAgentExecutor({ cwd, model, tools: activeSnapshotTools(loaded.snapshot.tools, active), resourceSelectors: currentPolicy.effective, availableModels, knownModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: loaded.snapshot.roles ?? {}, runStore: childStore, providerPause, agentResourcePolicy: frozenResourcePolicy(currentPolicy) }), store: childStore, metadata: loaded.snapshot.metadata, model, lifecycle, budget: childBudget, abortController, projectTrusted: () => projectTrusted(context), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) };
+      const childRun: WorkflowRunRecord = { executor: createAgentExecutor({ cwd, model, tools: activeSnapshotTools(loaded.snapshot.tools, active), resourceSelectors: currentPolicy.effective, availableModels, knownModels, modelAliases: currentAliases, blockedAliases, blockedAliasTargets, settingsPath, agentDefinitions: loaded.snapshot.roles ?? {}, runStore: childStore, providerPause, agentResourcePolicy: frozenResourcePolicy(currentPolicy) }), store: childStore, metadata: loaded.snapshot.metadata, model, lifecycle, budget: childBudget, abortController, projectTrusted: () => projectTrusted(context), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) };
       runs.set(childRunId, childRun);
-      scheduler.addRun(childRunId, loaded.snapshot.settings.concurrency, () => { childBudget.checkAgentLaunch(); });
-      await eventPublisher.runStarted(childStore, loaded.snapshot.metadata);
-      const { hasUI, ui } = recoveryUi(context);
-      const completed = await coldResumeRun(childRun, hasUI, ui, trustedProject, { model: hostModel, modelRegistry, deliveryContext: resumeHostContext(context).deliveryContext, resolvedAliases: currentAliases, blockedAliases, blockedAliasTargets, ...(signal ? { signal } : {}) }, modeOverride);
-      const completion = runs.get(childRunId)?.completion;
-      if (completion) {
-        childStarted = true;
-        void completion.then(() => { retryReservations.delete(lineageRootRunId); }, () => { retryReservations.delete(lineageRootRunId); });
-      } else if (completed) {
-        childStarted = true;
-        retryReservations.delete(lineageRootRunId);
-      }
-      if (completed) return { runId: childRunId, parentRunId: loaded.run.id, state: "completed", value: completed.value, run: (await childStore.load()).run, completion: completed.completion };
-      return { runId: childRunId, parentRunId: loaded.run.id, state: "running" };
+      childCreated = true;
+      return { childRun, parentRunId: loaded.run.id, lineageRootRunId, concurrency: loaded.snapshot.settings.concurrency, hostModel, modelRegistry, currentAliases, blockedAliases, blockedAliasTargets };
     } finally {
-      if (!childStarted) retryReservations.delete(lineageRootRunId);
+      if (!childCreated) retryReservations.delete(lineageRootRunId);
     }
   };
-  const retryWorkflowRun = (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string) => coordinateRunMutation(() => retryWorkflowRunUnlocked(runId, context, signal, modeOverride, expectedState));
+  const retryWorkflowRun = async (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string): Promise<{ runId: string; parentRunId: string; state: "running" | "completed"; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult }> => {
+    const prepared = await coordinateRunMutation(() => retryWorkflowRunUnlocked(runId, context, signal, expectedState));
+    let childStarted = false;
+    try {
+      scheduler.addRun(prepared.childRun.store.runId, prepared.concurrency, () => { prepared.childRun.budget.checkAgentLaunch(); });
+      await eventPublisher.runStarted(prepared.childRun.store, prepared.childRun.metadata);
+      const { hasUI, ui } = recoveryUi(context);
+      const recoveryContext = resumeHostContext(context);
+      const completed = await coldResumeRun(prepared.childRun, hasUI, ui, projectTrusted(context), { model: prepared.hostModel, modelRegistry: prepared.modelRegistry, deliveryContext: recoveryContext.deliveryContext, resolvedAliases: prepared.currentAliases, blockedAliases: prepared.blockedAliases, blockedAliasTargets: prepared.blockedAliasTargets, ...(signal ? { signal } : {}) }, modeOverride);
+      const completion = runs.get(prepared.childRun.store.runId)?.completion;
+      if (completion) {
+        childStarted = true;
+        void completion.then(() => { retryReservations.delete(prepared.lineageRootRunId); }, () => { retryReservations.delete(prepared.lineageRootRunId); });
+      } else if (completed) {
+        childStarted = true;
+        retryReservations.delete(prepared.lineageRootRunId);
+      }
+      if (completed) return { runId: prepared.childRun.store.runId, parentRunId: prepared.parentRunId, state: "completed", value: completed.value, run: (await prepared.childRun.store.load()).run, completion: completed.completion };
+      return { runId: prepared.childRun.store.runId, parentRunId: prepared.parentRunId, state: "running" };
+    } finally {
+      if (!childStarted) retryReservations.delete(prepared.lineageRootRunId);
+    }
+  };
   return { refreshPausedRunAliases, coldResumeRun, applyBudgetDecision, answerBudgetDecision, budgetDecisionDelivery, resumeWorkflowRun, retryWorkflowRun };
 }

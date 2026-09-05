@@ -56,7 +56,7 @@ function dependentRunId(targetRunId: string, entries: readonly NavigatorStoredRu
   }
   return undefined;
 }
-function manualDeletionPlan(entries: readonly NavigatorStoredRun[], state: "completed" | "failed", dependencies: NavigatorRunDependencies): ManualDeletionPlan {
+export function manualDeletionPlan(entries: readonly NavigatorStoredRun[], state: "completed" | "failed", dependencies: NavigatorRunDependencies): ManualDeletionPlan {
   const candidates = new Set(entries.filter(({ loaded }) => loaded.run.state === state).map(({ store }) => store.runId));
   const protectedRuns = new Set<string>();
   for (const entry of entries) {
@@ -298,7 +298,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             terminalRunStates.delete(entry.store.runId);
           }
           if (plan.skipped.length) ctx.ui.notify(`Skipped ${label} runs required by surviving workflows: ${formatSkippedDeletion(plan.skipped)}.`, "warning");
-          ctx.ui.notify(`Deleted all ${label} workflow runs.`, "info");
+          if (plan.ordered.length) ctx.ui.notify(`Deleted all ${label} workflow runs.`, "info");
         });
         stores = await loadStores();
       };

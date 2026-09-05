@@ -400,6 +400,35 @@ void test("failed retry children retain inherited and newly created named worktr
   assert.equal(child?.state, "completed");
   assert.deepEqual(child.retry?.namedWorktrees, ["inherited", "fresh"]);
 });
+void test("manual deletion is not blocked by a foreground retry execution", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-deletion-liveness-"));
+  const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "retry-liveness" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const source = new RunStore(home, "session", "source", home);
+  await source.create({ id: source.runId, workflowName: "retry-liveness", cwd: home, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
+  let releasePrompt!: () => void;
+  let markPromptStarted!: () => void;
+  const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve; });
+  const promptStarted = new Promise<void>((resolve) => { markPromptStarted = resolve; });
+  const createSession = async (): Promise<TestPiSession> => ({ sessionId: "retry-liveness-session", sessionFile: "/sessions/retry-liveness.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { markPromptStarted(); await promptGate; }, steer: async () => {}, dispose() {} });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, undefined, testTransport(createSession));
+  const retry = tools.find(({ name }) => name === "workflow_retry");
+  const command = commands[0]?.handler;
+  assert.ok(retry && command);
+  const notifications: string[] = [];
+  let pickerCall = 0;
+  const context = { cwd: home, mode: "rpc", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }] }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (prompt: string) => { if (prompt === "Workflows\n") { pickerCall += 1; return pickerCall === 1 ? "Delete all failed" : "Close"; } return "Back"; }, confirm: async () => true } };
+  const retrying = retry.execute("retry", { runId: source.runId, foreground: true }, new AbortController().signal, undefined, context);
+  await promptStarted;
+  const navigating = command("", context);
+  const outcome = await Promise.race([navigating.then(() => "finished" as const), new Promise<"timed out">((resolve) => { setTimeout(() => { resolve("timed out"); }, 500); })]);
+  releasePrompt();
+  await retrying;
+  await navigating;
+  assert.equal(outcome, "finished");
+  assert.ok(notifications.some((message) => message.includes(source.runId) && message.includes("surviving")));
+});
 void test("workflow_retry rejects concurrent children for one mutable retry lineage", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-concurrency-"));
   let sessions = 0;
