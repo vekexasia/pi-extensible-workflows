@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+## [5.13.1] - 2026-09-05
+
 ### Fixes
 
 - Portable bundles (`piewf bundle`) now bundle the extension module and its declared imports with esbuild instead of serialising `run.toString()`, so imported runtime values, module constants, and helpers work from the bundle. Extensions declare `source: import.meta.url` and `dependencies`; undeclared packages, Pi packages (`@earendil-works/*`), and non-literal dynamic imports fail at bundle time. esbuild is optional and loaded on demand only while bundling. The manifest is version 2; version 1 bundles still launch. The starter now imports `pi-extensible-workflows` by package name, so `dist/starter` relies on the package self-reference. (#271)
