@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
@@ -926,7 +927,8 @@ else {
 }` , { mode: 0o755 });
   chmodSync(piExecutable, 0o755);
   const workflow = { name: "install", version: "1.0.0", headline: "Bundle", description: "Bundle install", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
-  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", BUNDLE_ENGINE_SOURCE: process.cwd(), BUNDLE_CORE_SOURCE: join(process.cwd(), "../core"), BUNDLE_AGENT_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent"), BUNDLE_TYPEBOX_SOURCE: join(process.cwd(), "node_modules/typebox"), BUNDLE_PI_AI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-ai") };
+  const typeboxSource = dirname(dirname(createRequire(import.meta.url).resolve("typebox")));
+  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", BUNDLE_ENGINE_SOURCE: process.cwd(), BUNDLE_CORE_SOURCE: join(process.cwd(), "../core"), BUNDLE_AGENT_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent"), BUNDLE_TYPEBOX_SOURCE: typeboxSource, BUNDLE_PI_AI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-ai") };
   const create = (name: string): string => { const destination = join(root, name); writePortableWorkflowBundle({ destination, command: name, workflow, functionSource: "async run(input) { return input.value; }", piVersion: ">=0.82.0 <0.83.0", engineVersion: ">=5.0.0 <6.0.0" }); return destination; };
   const runSetup = (bundle: string, mode: string): ReturnType<typeof spawnSync> => spawnSync(join(bundle, basename(bundle)), ["setup", "--yes"], { env: { ...environment, BUNDLE_INSTALL_MODE: mode }, encoding: "utf8" });
   const installed = create("installed");
