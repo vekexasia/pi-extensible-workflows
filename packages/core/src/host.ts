@@ -1155,7 +1155,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const runContext = workflowRunContext(ctx.cwd, ctx.sessionManager.getSessionId(), runId, checked.metadata, args, runController.signal);
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const parentRunId = params.parentRunId;
-      if (parentRunId !== undefined) await store.validateParentRun(parentRunId);
       const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;
       const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
       const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model, modelAliases, knownModels, settingsPath)] : []; });
@@ -1176,7 +1175,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       };
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
-      await store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
+      const createRun = () => store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
+      // Parent validation and persistence share the mutation lane so a manual deletion cannot remove the parent between the two.
+      if (parentRunId !== undefined) await coordinateRunMutation(async () => { await store.validateParentRun(parentRunId); await createRun(); });
+      else await createRun();
       foregroundStore = params.foreground ? store : undefined;
       getTrajectoryHost()?.autoAttach(trajectoryProvider, ctx);
       if (params.foreground) {

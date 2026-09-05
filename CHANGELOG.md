@@ -5,6 +5,7 @@
 
 - Keep the subagent Steer editor and selected action visible while navigating long detail panels. (#274)
 - A rejected progress callback (e.g. run-state persistence failure) no longer crashes the Pi host; the agent run fails through its normal path and the session is aborted and disposed. (#265)
+- Manual deletion from `/workflow` refuses to delete a run that a surviving run depends on and skips such runs during bulk deletion; retry-child creation is serialised with deletion. (#263)
 ## [5.13.0] - 2026-09-05
 
 ### Breaking changes

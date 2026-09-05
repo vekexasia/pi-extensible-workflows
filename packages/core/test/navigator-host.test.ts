@@ -995,7 +995,7 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
   assert.ok(pickerOptions.includes("Delete all completed"));
 
   // Verify bulk delete removed the completed run
-  assert.ok(notified.some((n) => n.includes("Deleted all completed")));
+  assert.ok(notified.some((n) => n.includes("Deleted 1 completed workflow run(s).")));
   assert.equal(existsSync(storeA.directory), false);
   assert.equal(existsSync(storeB.directory), true);
   assert.equal(existsSync(storeC.directory), true);
@@ -1045,8 +1045,28 @@ void test("navigator bulk deletion protects dependencies of surviving runs", asy
   assert.equal(existsSync(source.directory), true);
   assert.equal(existsSync(child.directory), true);
   assert.ok(notifications.some((message) => message.includes(source.runId) && message.includes("surviving")));
-  assert.equal(notifications.includes("Deleted all failed workflow runs."), false);
+  assert.equal(notifications.some((message) => message.startsWith("Deleted ")), false);
   assert.deepEqual(await source.replay("agent/replayable"), { path: "agent/replayable", value: "kept" });
+});
+void test("navigator bulk deletion reports invalid run dependencies without leaving the picker", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-bulk-corrupt-"));
+  const cwd = join(home, "project");
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "corrupt-bulk" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+  const corrupt = new RunStore(cwd, "session", "corrupt-failed", home);
+  await corrupt.create({ id: corrupt.runId, workflowName: "corrupt", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
+  writeFileSync(join(corrupt.directory, "borrowed-worktrees.json"), "{}");
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const notifications: string[] = [];
+  const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => [] };
+  workflowExtension(testExtensionApi(pi), home);
+  let pickerCall = 0;
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (prompt: string) => { if (prompt === "Workflows\n") { pickerCall += 1; return pickerCall === 1 ? "Delete all failed" : "Close"; } return "Back"; }, confirm: async () => true } };
+  const command = commands[0]?.handler;
+  assert.ok(command);
+  await executeCommand(command, "", ctx);
+  assert.equal(pickerCall, 2);
+  assert.ok(notifications.some((message) => message.startsWith("Cannot delete failed runs:") && message.includes("Borrowed worktree bindings are invalid")));
+  assert.equal(existsSync(corrupt.directory), true);
 });
 void test("navigator bulk deletion protects borrowed worktrees of surviving retries", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-borrowed-worktree-"));
@@ -1127,7 +1147,7 @@ void test("navigator bulk deletes only failed runs after confirmation", async ()
   assert.equal(existsSync(stores[1]?.directory ?? ""), false);
   assert.equal(existsSync(failedArtifact), false);
   for (const store of stores.slice(2)) assert.equal(existsSync(store.directory), true);
-  assert.ok(notifications.some((message) => message.includes("Deleted all failed workflow runs.")));
+  assert.ok(notifications.some((message) => message.includes("Deleted 2 failed workflow run(s).")));
 });
 void test("navigator remains usable when retry provenance is unavailable", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-missing-retry-source-"));

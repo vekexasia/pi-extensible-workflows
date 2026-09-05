@@ -400,6 +400,41 @@ void test("failed retry children retain inherited and newly created named worktr
   assert.equal(child?.state, "completed");
   assert.deepEqual(child.retry?.namedWorktrees, ["inherited", "fresh"]);
 });
+void test("launch with parentRunId is serialised with manual deletion", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-parent-launch-deletion-"));
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "parent-launch" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const source = new RunStore(home, "session", "source", home);
+  await source.create({ id: source.runId, workflowName: "parent-launch", cwd: home, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const launch = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(launch && command);
+  let releaseValidation!: () => void;
+  let markValidated!: () => void;
+  const validationGate = new Promise<void>((resolve) => { releaseValidation = resolve; });
+  const validated = new Promise<void>((resolve) => { markValidated = resolve; });
+  const originalValidate = Object.getOwnPropertyDescriptor(RunStore.prototype, "validateParentRun");
+  assert.ok(originalValidate);
+  RunStore.prototype.validateParentRun = async function (parentRunId: string) { await Reflect.apply(originalValidate.value as (this: RunStore, value: string) => Promise<void>, this, [parentRunId]); markValidated(); await validationGate; };
+  const notifications: string[] = [];
+  let pickerCall = 0;
+  const context = { cwd: home, mode: "rpc", hasUI: true, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAvailable: () => [{ provider: "openai", id: "gpt" }] }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (prompt: string) => { if (prompt === "Workflows\n") { pickerCall += 1; return pickerCall === 1 ? "Delete all failed" : "Close"; } return "Back"; }, confirm: async () => true } };
+  try {
+    const launching = launch.execute("launch", { name: "parent-launch", script: "return true;", parentRunId: source.runId, foreground: true }, new AbortController().signal, undefined, context);
+    await validated;
+    const navigating = command("", context);
+    await new Promise((resolve) => { setTimeout(resolve, 100); });
+    releaseValidation();
+    await launching;
+    await navigating;
+  } finally {
+    Object.defineProperty(RunStore.prototype, "validateParentRun", originalValidate);
+  }
+  assert.equal(existsSync(source.directory), true);
+  assert.ok(notifications.some((message) => message.includes(source.runId) && message.includes("surviving")));
+});
 void test("manual deletion is not blocked by a foreground retry execution", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-deletion-liveness-"));
   const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "retry-liveness" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });

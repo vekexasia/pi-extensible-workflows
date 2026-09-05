@@ -288,18 +288,22 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
         const title = state === "failed" ? "Delete failed runs?" : "Delete completed runs?";
         const message = `Delete all ${label} workflow runs and their artifacts? This cannot be undone.`;
         if (!await confirmWithBlocked(ctx.ui, reportBlocked, title, message)) return;
-        await coordinateRunMutation(async () => {
-          const currentStores = await loadStores();
-          const dependencies = await navigatorRunDependencies(currentStores);
-          const plan = manualDeletionPlan(currentStores, state, dependencies);
-          for (const entry of plan.ordered) {
-            await entry.store.delete(true);
-            runs.delete(entry.store.runId);
-            terminalRunStates.delete(entry.store.runId);
-          }
-          if (plan.skipped.length) ctx.ui.notify(`Skipped ${label} runs required by surviving workflows: ${formatSkippedDeletion(plan.skipped)}.`, "warning");
-          if (plan.ordered.length) ctx.ui.notify(`Deleted all ${label} workflow runs.`, "info");
-        });
+        try {
+          await coordinateRunMutation(async () => {
+            const currentStores = await loadStores();
+            const dependencies = await navigatorRunDependencies(currentStores);
+            const plan = manualDeletionPlan(currentStores, state, dependencies);
+            for (const entry of plan.ordered) {
+              await entry.store.delete(true);
+              runs.delete(entry.store.runId);
+              terminalRunStates.delete(entry.store.runId);
+            }
+            if (plan.skipped.length) ctx.ui.notify(`Skipped ${label} runs required by surviving workflows: ${formatSkippedDeletion(plan.skipped)}.`, "warning");
+            if (plan.ordered.length) ctx.ui.notify(`Deleted ${String(plan.ordered.length)} ${label} workflow run(s).`, "info");
+          });
+        } catch (error) {
+          ctx.ui.notify(`Cannot delete ${label} runs: ${errorText(error)}`, "warning");
+        }
         stores = await loadStores();
       };
       const manageAliases = async (): Promise<void> => {
