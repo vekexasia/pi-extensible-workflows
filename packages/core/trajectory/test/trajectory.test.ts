@@ -351,12 +351,26 @@ type TrajectoryPreviewHelpers = {
   isDisplayableTranscriptEntry: (entry: { type?: unknown }) => boolean;
   renderAgentTimeline: (entries: readonly unknown[]) => string;
 };
+type TrajectoryRendererHelpers = Pick<TrajectoryPreviewHelpers, "renderAgentTimeline"> & {
+  renderToolPane: (detail: { entry: Record<string, unknown>; agent: Record<string, unknown> }, entries: readonly unknown[]) => void;
+  toolPane: { innerHTML: string };
+};
 
 function loadTrajectoryPreviewHelpers(source: string): TrajectoryPreviewHelpers {
   const helperStart = source.indexOf("    const esc");
   const helperEnd = source.indexOf("    function renderToolPane", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
   return runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; return { compactSkillReadPreview, eventPreview, eventPreviewParts, toolPreviewHtml, eventSearchText, eventLabel, entryDetails, isDisplayableTranscriptEntry, renderAgentTimeline }; })()`) as TrajectoryPreviewHelpers;
+}
+
+function loadTrajectoryRendererHelpers(source: string): TrajectoryRendererHelpers {
+  const helperStart = source.indexOf("    const esc");
+  const helperEnd = source.indexOf("    function renderSystemPane", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const toolPane = { innerHTML: "" };
+  const toolTabs = { querySelectorAll: () => [] };
+  const helpers = runInNewContext(`(() => { const state = { toolPane: "summary" }; const $ = (id) => id === "tool-pane" ? toolPane : toolTabs; const patch = (_root, html) => { toolPane.innerHTML = html; }; ${source.slice(helperStart, helperEnd)}; return { renderAgentTimeline, renderToolPane }; })()`, { toolPane, toolTabs }) as { renderAgentTimeline: (entries: readonly unknown[]) => string; renderToolPane: (detail: { entry: Record<string, unknown>; agent: Record<string, unknown> }, entries: readonly unknown[]) => void };
+  return { ...helpers, toolPane };
 }
 
 type TrajectoryMarkdownHelpers = { sanitizeMarkdown: (html: string) => string };
@@ -931,6 +945,15 @@ void test("Trajectory timeline clicks highlight the matching transcript event", 
   assert.match(source, /function highlightEvent\(index\)/);
   assert.match(source, /scrollIntoView\(\{ block: "nearest" \}\)/);
   assert.match(source, /\$\("agent-timeline"\)\.addEventListener\("click"/);
+});
+
+void test("Trajectory renders canonical failed tool results as failed", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryRendererHelpers(source);
+  const entry = { type: "message", message: { role: "toolResult", toolCallId: "call-1", toolName: "bash", isError: true, content: [{ type: "text", text: "failed" }] } };
+  helpers.renderToolPane({ entry, agent: {} }, [entry]);
+  assert.match(helpers.toolPane.innerHTML, /<div class="k">Status<\/div><div>Failed<\/div>/);
+  assert.match(helpers.renderAgentTimeline([entry]), /<i class="tick err"/);
 });
 
 void test("Trajectory clears timeline highlights when leaving the view", () => {
