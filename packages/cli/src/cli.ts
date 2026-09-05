@@ -553,7 +553,7 @@ async function runWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): 
 async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo): Promise<number> {
   const parsed = stripTrustOptions(rawArgs);
   const args = parsed.args;
-  if (args.includes("--bundle")) return bundleWorkflowCli(args.filter((arg) => arg !== "--bundle"), options);
+  if (args.includes("--bundle")) return bundleWorkflowCli(args.filter((arg) => arg !== "--bundle"), { ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) });
   if (!args.length || args[0] === "--help" || args[0] === "-h") { options.write(exportUsage()); return args.length ? 0 : 1; }
   const workflowName = requiredArg(args, 0);
   return withWorkflowRuntime({ ...options, ...(parsed.trustOverride !== undefined ? { trustOverride: parsed.trustOverride } : {}) }, async (runtime) => {

@@ -560,6 +560,15 @@ void test("export refuses existing files and replaces them only with --force", a
   assert.equal(await runCli(["export", "cliEcho", "--output", directory, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 1);
   assert.equal(lstatSync(directory).isDirectory(), true);
 });
+void test("export bundle forwards explicit trust override", async () => {
+  registerCliExtension();
+  const paths = fixture();
+  writeFileSync(join(paths.cwd, ".pi", "settings.json"), "{}");
+  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt:medium\n---\nReview the result");
+  const destination = join(paths.root, "bundle");
+  assert.equal(await runCli(["export", "cliEcho", "--bundle", "--approve", "--output", destination, "--role", "reviewer"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }, () => {}), 0);
+  assert.deepEqual(readCliTestManifest(join(destination, "manifest.json")).requirements.roles, ["reviewer"]);
+});
 void test("portable bundle export writes a self-contained payload and external-runtime launcher", async () => {
   registerCliExtension();
   const paths = fixture();
