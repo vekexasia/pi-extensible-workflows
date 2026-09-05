@@ -2,6 +2,7 @@ import { registerWorkflowExtension } from "pi-extensible-workflows";
 
 const templateExtension = {
   version: "1.0.0",
+  source: import.meta.url,
   headline: "Workflow extension template",
   functions: {
     greet: {

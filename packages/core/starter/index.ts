@@ -1,10 +1,12 @@
 import {
   registerWorkflowExtension,
   type WorkflowExtension,
-} from "../src/index.js";
+} from "pi-extensible-workflows";
 import { reviewLoop } from "./review-loop.js";
 
 const extension: WorkflowExtension = {
+  source: import.meta.url,
+  dependencies: ["typebox"],
   version: "1.0.0",
   headline: "Developer-review starter workflows",
   functions: { reviewLoop },

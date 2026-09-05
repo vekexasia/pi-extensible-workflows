@@ -2,7 +2,7 @@ import { Type, type Static } from "typebox";
 import {
   defineWorkflowFunction,
   type JsonValue,
-} from "../src/index.js";
+} from "pi-extensible-workflows";
 
 export const reviewLoop = defineWorkflowFunction({
   description:

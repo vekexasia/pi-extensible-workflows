@@ -8,7 +8,7 @@ import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionF
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, registeredWorkflowFunctions, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, registeredWorkflowFunctionSources, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
@@ -621,8 +621,8 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
     }
     const fn = runtime.catalog.functions.find((candidate) => candidate.name === workflowName);
     if (!fn) throw new Error(`Unknown workflow function: ${workflowName}`);
-    const registered = registeredWorkflowFunctions()[workflowName];
-    if (!registered) throw new Error(`Workflow ${workflowName} is not exportable because its registered implementation is unavailable`);
+    const source = registeredWorkflowFunctionSources()[workflowName];
+    if (!source) throw new Error(`Workflow ${workflowName} is not exportable; add \`source: import.meta.url\` to extension ${fn.headline}`);
     const definitions = requirements.roles.length ? loadAgentDefinitions(options.cwd ?? process.cwd(), options.agentDir ?? getAgentDir(), runtime.services.settingsManager.isProjectTrusted()) : {};
     const roles = Object.fromEntries(requirements.roles.map((role) => {
       if (!role || role === "." || role === ".." || role.includes("/") || role.includes("\\")) throw new Error(`Invalid role name for bundle: ${role}`);
@@ -638,7 +638,7 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
       return typeof target === "string" ? [[name, target]] : [];
     }));
     const selectedResources = Object.values(resources).some((entries) => entries.length) ? resources : undefined;
-    writePortableWorkflowBundle({ destination, command, workflow: fn, functionSource: registered.run.toString(), requirements, aliasTargets, roles, ...(selectedResources ? { resources: selectedResources } : {}), piVersion: portablePiVersion(), engineVersion: portableEngineVersion(), force });
+    await writePortableWorkflowBundle({ destination, command, workflow: fn, source: { module: source.module, export: source.export }, dependencies: source.dependencies, requirements, aliasTargets, roles, ...(selectedResources ? { resources: selectedResources } : {}), piVersion: portablePiVersion(), engineVersion: portableEngineVersion(), force });
     options.write(`Bundled ${workflowName} at ${destination}\n`);
     options.write(`Run ${join(destination, command)} setup before launching the workflow.\n`);
     return 0;

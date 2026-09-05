@@ -116,6 +116,7 @@
   <span class="tok-function">registerWorkflowExtension</span><span class="tok-punctuation">({</span>
     <span class="tok-property">version</span><span class="tok-punctuation">:</span> <span class="tok-string">"1.0.0"</span><span class="tok-punctuation">,</span>
     <span class="tok-property">headline</span><span class="tok-punctuation">:</span> <span class="tok-string">"Greeting workflow"</span><span class="tok-punctuation">,</span>
+    <span class="tok-property">source</span><span class="tok-punctuation">:</span> <span class="tok-function">import.meta.url</span><span class="tok-punctuation">,</span>
     <span class="tok-property">functions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
       <span class="tok-property">greet</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">{</span>
         <span class="tok-property">description</span><span class="tok-punctuation">:</span> <span class="tok-string">"Return a greeting for one person."</span><span class="tok-punctuation">,</span>
@@ -135,7 +136,8 @@
           <tbody>
             <tr><td><code>version</code></td><td>string</td><td>Required strict semantic version, such as <code>1.0.0</code>.</td></tr>
             <tr><td><code>headline</code></td><td>string</td><td>Required non-empty short label shown in trusted catalog details.</td></tr>
-            <tr><td><code>functions</code></td><td>record of <code>WorkflowFunction</code></td><td>Optional named reusable functions. Names must be identifier-shaped and globally unique.</td></tr>
+            <tr><td><code>source</code></td><td>string</td><td>Optional module provenance, normally <code>import.meta.url</code>. Required when a workflow is portable-bundled; it identifies the module whose default extension factory is replayed in the bundle.</td></tr>
+            <tr><td><code>dependencies</code></td><td>array of package names</td><td>Optional package imports used by the extension module. Portable bundling inlines declared packages; undeclared third-party imports fail during bundling. Node builtins, <code>pi-extensible-workflows</code>, and <code>@earendil-works/*</code> remain external.</td></tr>
             <tr><td><code>modelAliases</code></td><td>record of <code>WorkflowModelAlias</code></td><td>Optional named dynamic model resolvers. Alias names are case-sensitive and must match <code>[A-Za-z][A-Za-z0-9_-]*</code>; names are unique across extensions.</td></tr>
             <tr><td><code>agentSetupHooks</code></td><td>record of <code>AgentSetupHook</code></td><td>Optional trusted hooks. Hook names must be identifiers and unique across extensions.</td></tr>
             <tr><td><code>agentAttemptActions</code></td><td>record of <code>AgentAttemptAction</code></td><td>Optional collision-checked actions for selected agents in <code>/workflow</code> and standalone runs in <code>/subagents</code>. Every action requires <code>label</code>, <code>visible</code>, and <code>run</code>; standalone participation additionally requires both <code>visibleStandalone</code> and <code>runStandalone</code>.</td></tr>
@@ -321,7 +323,7 @@
       </section>
       <section id="catalog">
         <h2>Catalog and host integration</h2>
-        <p>There are two boundaries. <code>workflow_catalog</code> is an agent-facing Pi tool. Trusted host code can use the package APIs <code>workflowCatalog()</code>, <code>workflowCatalogIndex()</code>, <code>workflowCatalogDetail(name)</code>, and <code>registeredWorkflowFunctions()</code>.</p>
+        <p>There are two boundaries. <code>workflow_catalog</code> is an agent-facing Pi tool. Trusted host code can use the package APIs <code>workflowCatalog()</code>, <code>workflowCatalogIndex()</code>, <code>workflowCatalogDetail(name)</code>, <code>registeredWorkflowFunctions()</code>, and <code>registeredWorkflowFunctionSources()</code>.</p>
         <p><code>WorkflowRegistry</code>, <code>loadingRegistry()</code>, <code>resetWorkflowRegistry()</code>, <code>beginWorkflowExtensionLoading()</code>, and <code>WorkflowRegistryApi</code> are lower-level trusted host lifecycle controls exported for package integration. They are not the extension authoring surface. Use <code>registerWorkflowExtension()</code> and the documented interfaces instead; do not pass registry implementations or bridge internals to agents.</p>
         <div class="table-wrap"><table>
           <thead><tr><th>API</th><th>Result</th></tr></thead>
@@ -330,6 +332,7 @@
             <tr><td><code>workflowCatalogIndex()</code></td><td>Compact metadata: function names, descriptions, input schemas, and one winning static or dynamic alias entry per name. A static settings alias wins over a same-named dynamic resolver.</td></tr>
             <tr><td><code>workflowCatalogDetail(name)</code></td><td>One full function or alias definition. Missing names return a <code>NOT_FOUND</code> result object instead of throwing a workflow error.</td></tr>
             <tr><td><code>registeredWorkflowFunctions()</code></td><td>Trusted host access to registered function implementations keyed by name. This is not agent-facing metadata and must not be exposed to untrusted code.</td></tr>
+            <tr><td><code>registeredWorkflowFunctionSources()</code></td><td>Trusted host access to source module, export, and declared dependency metadata keyed by function name. This is used by the portable bundle exporter and must not be exposed to untrusted code.</td></tr>
           </tbody>
         </table></div>
         <p>The <code>workflow_catalog</code> tool returns the compact index by default. Pass <code>{ "name": "reviewTask" }</code> to request one full detail entry. Agents receive names, descriptions, schemas, and alias provenance, never implementations, source, resolver values, or opaque setup data. The tool is registered only when the active registry has functions, aliases, or effective settings.</p>

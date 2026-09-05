@@ -9,8 +9,9 @@ import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
 import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry, type WorkflowExtension } from "pi-extensible-workflows";
+import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry } from "pi-extensible-workflows";
 import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, type CliTestBundleExtension } from "./support.js";
+import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   return {
@@ -49,26 +50,6 @@ async function withHomeAndCwd<T>(home: string, cwd: string, action: () => Promis
   try { return await action(); }
   finally { process.chdir(previousCwd); if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; }
 }
-
-const cliExtension: WorkflowExtension = {
-  version: "1.0.0",
-  headline: "CLI test workflows",
-  functions: {
-    cliEcho: {
-      description: "Echo a CLI issue",
-      input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
-      output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false },
-      run: (input) => ({ issue: input.issue }),
-    },
-    cliRuntime: {
-      description: "Runtime progress",
-      input: { type: "object", additionalProperties: false },
-      output: { type: "boolean" },
-      run: async () => { await new Promise<void>((resolve) => setTimeout(resolve, 1_100)); return true; },
-    },
-  },
-};
-function registerCliExtension(): void { registerWorkflowExtension(cliExtension); }
 
 function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, functionDefinition: string, args: readonly string[], abort = false): { status: number | null; stdout: string; stderr: string } {
   const script = join(paths.root, "isolated-cli.mjs");
@@ -576,7 +557,7 @@ void test("portable bundle export writes a self-contained payload and external-r
   let output = "";
   assert.equal(await runCli(["bundle", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }, (text) => { output += text; } ), 0);
   const manifest = readCliTestManifest(join(destination, "manifest.json"));
-  assert.deepEqual({ format: manifest.format, version: manifest.version, command: manifest.command }, { format: "pi-extensible-workflows-bundle", version: 1, command: "cli-echo" });
+  assert.deepEqual({ format: manifest.format, version: manifest.version, command: manifest.command }, { format: "pi-extensible-workflows-bundle", version: 2, command: "cli-echo" });
   assert.equal(manifest.workflow.name, "cliEcho");
   assert.deepEqual(manifest.requirements, { roles: [], aliases: [], tools: [], commands: [], environment: [] });
   assert.notEqual(manifest.runtime.pi, "");
