@@ -99,14 +99,8 @@ export async function acquireSessionLease(cwd: string, sessionId: string, home =
       try {
         await rename(path, stale);
         const movedText = await readFile(stale, "utf8");
-        let moved: unknown;
-        try { moved = JSON.parse(movedText); }
-        catch {
-          if (movedText === existingText) await rm(stale, { force: true });
-          else await restoreLease(path, stale);
-          continue;
-        }
-        const movedOwner = decodeSessionOwner(moved);
+        let movedOwner: SessionOwner | undefined;
+        try { movedOwner = decodeSessionOwner(JSON.parse(movedText)); } catch { movedOwner = undefined; }
         if (movedOwner === undefined) {
           if (movedText === existingText) await rm(stale, { force: true });
           else await restoreLease(path, stale);
