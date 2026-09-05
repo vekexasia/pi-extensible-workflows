@@ -469,6 +469,24 @@ void test("workflow cancellation reaches an active top-level scheduler agent", a
   assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled"]);
 });
 
+void test("workflow failure aborts in-flight bridge work", async () => {
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  let markAborted!: () => void;
+  const aborted = new Promise<void>((resolve) => { markAborted = resolve; });
+  const run = runWorkflow(`await Promise.all([shell("wait"), Promise.reject(new Error("boom"))]);`, null, {
+    shell: async (_command, _options, signal) => {
+      markStarted();
+      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+      markAborted();
+      throw new WorkflowError("CANCELLED", "cancelled");
+    },
+  });
+  await started;
+  await assert.rejects(run.result, /boom/);
+  await aborted;
+});
+
 void test("worker watchdog terminates a synchronous heartbeat stall after five seconds", { timeout: 7000 }, async () => {
   const run = runWorkflow(`export const meta={name:'x',description:'x'}; while(true){}`);
   const started = performance.now();

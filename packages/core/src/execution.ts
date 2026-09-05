@@ -523,7 +523,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         const message = parsed;
         if (message.type === "heartbeat") { lastHeartbeatAt = performance.now(); return; }
         if (message.type === "result") { encoded(message.value); finish(); resolve(message.value); return; }
-        if (message.type === "error") { finish(); reject(workflowErrorFromWorker(message.error)); return; }
+        if (message.type === "error") { controller.abort(); finish(); reject(workflowErrorFromWorker(message.error)); return; }
         if (message.type === "rpc") void handleRpc(message.id, message.method, message.args);
       } catch (error) { stop(error instanceof WorkflowError ? error.code : "INTERNAL_ERROR", errorText(error)); }
     });
