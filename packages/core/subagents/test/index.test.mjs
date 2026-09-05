@@ -688,7 +688,7 @@ test("captures steering text inside the detail panel without nesting UI prompts"
   const storageDir = join(cwd, "storage");
   const id = "run-steer-focus";
   await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "control", label: "control", mode: "background" }));
+  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `control\n${Array.from({ length: 40 }, (_, index) => `detail-${String(index)}`).join("\n")}`, label: "control", mode: "background" }));
   const steers = [];
   const status = { id, sessionId: "session-1", state: "running", startedAt: 1 };
   const manager = {
@@ -714,7 +714,7 @@ test("captures steering text inside the detail panel without nesting UI prompts"
         customCount += 1;
         let finish;
         const completed = new Promise((resolve) => { finish = resolve; });
-        const component = factory({ terminal: { rows: 30 }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
+        const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
         if (customCount === 1) {
           component.handleInput("a");
           for (let index = 0; index < 10 && !component.render(140).join("\n").includes("→ Steer"); index += 1) component.handleInput("tui.select.down");
@@ -722,6 +722,8 @@ test("captures steering text inside the detail panel without nesting UI prompts"
           component.handleInput("tui.select.confirm");
           assert.match(component.render(140).join("\n"), /Steer subagent/);
           for (const character of "continue inside the panel") component.handleInput(character);
+          assert.match(component.render(140).join("\n"), /Steer subagent/);
+          assert.match(component.render(140).join("\n"), /continue inside the panel/);
           component.handleInput("\r");
         } else {
           component.handleInput("escape");

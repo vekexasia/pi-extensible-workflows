@@ -343,10 +343,17 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       const renderWidth = Math.max(1, width);
       const options = actionMode ? actionOptions(manager, inspection, context) : [];
       const detail = detailLines(inspection, theme).map((line) => truncateToWidth(line, renderWidth, "…"));
+      const actionStart = detail.length + 2;
       const rows = steerMode ? [...detail, "", theme.bold("Steer subagent"), ...steerEditor.render(renderWidth)] : actionMode ? [...detail, "", theme.bold("Agent actions"), ...options.map((option, index) => `${index === actionIndex ? "→ " : "  "}${index === actionIndex ? theme.fg("accent", option) : option}`)] : detail;
       const viewport = Math.max(1, tuiRows(tui) - 1);
       const maxOffset = Math.max(0, rows.length - viewport);
-      offset = Math.min(offset, maxOffset);
+      if (steerMode) offset = maxOffset;
+      else if (actionMode && actionIndex < options.length) {
+        const actionRow = actionStart + actionIndex;
+        if (actionRow < offset) offset = Math.max(0, actionRow - Math.max(0, viewport - 2));
+        else if (actionRow >= offset + viewport) offset = actionRow - viewport + 1;
+      }
+      offset = Math.max(0, Math.min(maxOffset, offset));
       const hint = theme.fg("dim", steerMode ? "enter submit · esc back" : actionMode ? "↑/↓ actions · enter run · esc back" : "↑/↓ scroll · a actions · enter actions · esc back");
       return [...rows.slice(offset, offset + viewport), hint].map((line) => truncateToWidth(line, renderWidth, "…"));
     };
