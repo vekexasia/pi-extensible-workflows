@@ -99,12 +99,10 @@ void test("narrow navigator drills from tree to details to agent actions", { ski
     assert.doesNotMatch(tree, /Agents\.\.\./);
     // Narrow mode is single-column: no details separator beside the tree.
     assert.doesNotMatch(tree, / \| /);
-    h.sendKey("enter");
-    await h.waitFor("Selected phase", 10_000);
+    // Enter on the workflow root opens run actions directly (#188).
     h.sendKey("enter");
     await h.waitFor("Run actions", 10_000);
     assert.match(h.readVisiblePane(), /Open script in editor/);
-    h.sendKey("escape");
     h.sendKey("escape");
     const selectedAgent = await selectAgentRow(h);
     assert.ok(selectedAgent, "expected an agent row to be selected");
