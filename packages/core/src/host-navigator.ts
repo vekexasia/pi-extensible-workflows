@@ -18,6 +18,65 @@ type UiSelect = (title: string, options: string[]) => Promise<string | undefined
 type UiInput = (title: string, placeholder?: string) => Promise<string | undefined>;
 type UiSetStatus = (key: string, text?: string) => void;
 type UiCustom = ExtensionUIContext["custom"];
+type NavigatorStoredRun = { store: RunStore; loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> }; resolvedAt: number | undefined };
+type NavigatorRunDependencies = ReadonlyMap<string, readonly string[]>;
+type ManualDeletionPlan = { ordered: readonly NavigatorStoredRun[]; skipped: readonly { entry: NavigatorStoredRun; dependentIds: readonly string[] }[] };
+function dependencyClosure(runId: string, dependencies: NavigatorRunDependencies): ReadonlySet<string> {
+  const closure = new Set<string>();
+  const pending = [runId];
+  while (pending.length) {
+    const current = pending.pop();
+    if (current === undefined) continue;
+    for (const dependency of dependencies.get(current) ?? []) {
+      if (closure.has(dependency)) continue;
+      closure.add(dependency);
+      pending.push(dependency);
+    }
+  }
+  return closure;
+}
+async function navigatorRunDependencies(entries: readonly NavigatorStoredRun[]): Promise<NavigatorRunDependencies> {
+  const dependencies = new Map<string, readonly string[]>();
+  for (const entry of entries) {
+    const run = entry.loaded.run;
+    const direct = new Set<string>();
+    if (run.parentRunId !== undefined) direct.add(run.parentRunId);
+    if (run.retry) {
+      direct.add(run.retry.sourceRunId);
+      direct.add(run.retry.lineageRootRunId);
+    }
+    for (const binding of await entry.store.borrowedWorktrees()) direct.add(binding.sourceRunId);
+    dependencies.set(run.id, [...direct]);
+  }
+  return dependencies;
+}
+function dependentRunId(targetRunId: string, entries: readonly NavigatorStoredRun[], dependencies: NavigatorRunDependencies): string | undefined {
+  for (const entry of entries) {
+    if (entry.store.runId !== targetRunId && dependencyClosure(entry.store.runId, dependencies).has(targetRunId)) return entry.store.runId;
+  }
+  return undefined;
+}
+function manualDeletionPlan(entries: readonly NavigatorStoredRun[], state: "completed" | "failed", dependencies: NavigatorRunDependencies): ManualDeletionPlan {
+  const candidates = new Set(entries.filter(({ loaded }) => loaded.run.state === state).map(({ store }) => store.runId));
+  const protectedRuns = new Set<string>();
+  for (const entry of entries) {
+    if (candidates.has(entry.store.runId)) continue;
+    for (const dependency of dependencyClosure(entry.store.runId, dependencies)) if (candidates.has(dependency)) protectedRuns.add(dependency);
+  }
+  const skipped = entries.filter(({ store }) => candidates.has(store.runId) && protectedRuns.has(store.runId)).map((entry) => ({ entry, dependentIds: entries.filter((candidate) => !candidates.has(candidate.store.runId) && dependencyClosure(candidate.store.runId, dependencies).has(entry.store.runId)).map(({ store }) => store.runId) }));
+  const remaining = new Set([...candidates].filter((runId) => !protectedRuns.has(runId)));
+  const ordered: NavigatorStoredRun[] = [];
+  while (remaining.size) {
+    const next = entries.find((entry) => remaining.has(entry.store.runId) && ![...remaining].some((childId) => (dependencies.get(childId) ?? []).includes(entry.store.runId)));
+    if (!next) throw new Error("Run dependency cycle prevents safe deletion");
+    ordered.push(next);
+    remaining.delete(next.store.runId);
+  }
+  return { ordered, skipped };
+}
+function formatSkippedDeletion(skipped: ManualDeletionPlan["skipped"]): string {
+  return skipped.map(({ entry, dependentIds }) => `${entry.store.runId} (needed by ${dependentIds.join(", ") || "a surviving workflow"})`).join(", ");
+}
 export type UiHostCapabilities = { select?: UiSelect; input?: UiInput; setStatus?: UiSetStatus; custom?: UiCustom };
 type UiConfirm = (title: string, message: string) => Promise<boolean>;
 type ReportBlocked = (active: boolean, label?: string) => void;
@@ -98,9 +157,11 @@ export type WorkflowNavigatorDependencies = {
   reportBlocked?: ReportBlocked;
   setNavigatorOpen?: (open: boolean) => void;
   trajectoryProvider: TrajectoryPublisherProvider;
+  coordinateRunMutation?: <T>(task: () => Promise<T>) => Promise<T>;
 };
 export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): void {
-  const { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates, ensureSessionLease, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground, isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked, setNavigatorOpen, trajectoryProvider } = deps;
+  const { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates, ensureSessionLease, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground, isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked, setNavigatorOpen, trajectoryProvider, coordinateRunMutation: coordinateRunMutationDependency } = deps;
+  const coordinateRunMutation = coordinateRunMutationDependency ?? (<T>(task: () => Promise<T>): Promise<T> => task());
   const command = {
     description: "Open the workflow picker; workflow actions are available contextually",
     handler: async (args, ctx) => {
@@ -119,7 +180,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
         return;
       }
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
-      const loadStores = async () => {
+      const loadStores = async (): Promise<NavigatorStoredRun[]> => {
         const entries = await Promise.all((await listRunIds(ctx.cwd, ctx.sessionManager.getSessionId(), home)).map(async (runId) => {
           const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
           try {
@@ -161,7 +222,25 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
           if (action === "delete" && stored) {
             if (!hardTerminalRunStates.has(stored.loaded.run.state)) { ctx.ui.notify("Stop the workflow before deleting it.", "warning"); return "dashboard"; }
             if (!await confirmWithBlocked(ctx.ui, reportBlocked, "Delete workflow?", `Delete ${stored.loaded.run.workflowName} (${stored.store.runId}) and all owned artifacts? This cannot be undone.`)) return "dashboard";
-            await stored.store.delete(true); runs.delete(stored.store.runId); terminalRunStates.delete(stored.store.runId); ctx.ui.notify(`Deleted workflow ${stored.store.runId}.`, "info"); return "picker";
+            const deleted = await coordinateRunMutation(async () => {
+              const currentStores = await loadStores();
+              const current = currentStores.find(({ store }) => store.runId === stored.store.runId);
+              if (!current) { ctx.ui.notify(`Workflow ${stored.store.runId} is no longer available.`, "warning"); return false; }
+              if (!hardTerminalRunStates.has(current.loaded.run.state)) { ctx.ui.notify("Stop the workflow before deleting it.", "warning"); return false; }
+              const dependencies = await navigatorRunDependencies(currentStores);
+              const dependent = dependentRunId(current.store.runId, currentStores, dependencies);
+              if (dependent) {
+                const dependentEntry = currentStores.find(({ store }) => store.runId === dependent);
+                ctx.ui.notify(`Cannot delete workflow ${current.store.runId}: surviving workflow ${dependent}${dependentEntry ? ` (${dependentEntry.loaded.run.workflowName})` : ""} depends on it.`, "warning");
+                return false;
+              }
+              await current.store.delete(true);
+              runs.delete(current.store.runId);
+              terminalRunStates.delete(current.store.runId);
+              ctx.ui.notify(`Deleted workflow ${current.store.runId}.`, "info");
+              return true;
+            });
+            return deleted ? "picker" : "dashboard";
           }
           if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return "dashboard"; }
           if (action === "resume" && run) {
@@ -203,6 +282,25 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
           ctx.ui.notify(`Cannot ${action ?? "workflow action"}${runId ? ` for ${runId}` : ""}: ${message}`, "warning");
           return "dashboard";
         }
+      };
+      const deleteBulkRuns = async (state: "completed" | "failed"): Promise<void> => {
+        const label = state === "failed" ? "failed" : "completed";
+        const title = state === "failed" ? "Delete failed runs?" : "Delete completed runs?";
+        const message = `Delete all ${label} workflow runs and their artifacts? This cannot be undone.`;
+        if (!await confirmWithBlocked(ctx.ui, reportBlocked, title, message)) return;
+        await coordinateRunMutation(async () => {
+          const currentStores = await loadStores();
+          const dependencies = await navigatorRunDependencies(currentStores);
+          const plan = manualDeletionPlan(currentStores, state, dependencies);
+          for (const entry of plan.ordered) {
+            await entry.store.delete(true);
+            runs.delete(entry.store.runId);
+            terminalRunStates.delete(entry.store.runId);
+          }
+          if (plan.skipped.length) ctx.ui.notify(`Skipped ${label} runs required by surviving workflows: ${formatSkippedDeletion(plan.skipped)}.`, "warning");
+          ctx.ui.notify(`Deleted all ${label} workflow runs.`, "info");
+        });
+        stores = await loadStores();
       };
       const manageAliases = async (): Promise<void> => {
         const settingsPath = workflowSettingsPath(extensionAgentDir);
@@ -285,18 +383,12 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
           if (!runChoice || runChoice === "Close") return;
           if (runChoice === "Model aliases") { await manageAliases(); stores = await loadStores(); continue; }
           if (runChoice === "Delete all completed") {
-            if (!await confirmWithBlocked(ctx.ui, reportBlocked, "Delete completed runs?", "Delete all completed workflow runs and their artifacts? This cannot be undone.")) continue;
-            for (const entry of sorted) {
-              if (entry.loaded.run.state === "completed") { await entry.store.delete(true); runs.delete(entry.store.runId); terminalRunStates.delete(entry.store.runId); }
-            }
-            ctx.ui.notify("Deleted all completed workflow runs.", "info"); stores = await loadStores(); continue;
+            await deleteBulkRuns("completed");
+            continue;
           }
           if (runChoice === "Delete all failed") {
-            if (!await confirmWithBlocked(ctx.ui, reportBlocked, "Delete failed runs?", "Delete all failed workflow runs and their artifacts? This cannot be undone.")) continue;
-            for (const entry of sorted) {
-              if (entry.loaded.run.state === "failed") { await entry.store.delete(true); runs.delete(entry.store.runId); terminalRunStates.delete(entry.store.runId); }
-            }
-            ctx.ui.notify("Deleted all failed workflow runs.", "info"); stores = await loadStores(); continue;
+            await deleteBulkRuns("failed");
+            continue;
           }
           const runIndex = labels.indexOf(runChoice);
           if (runIndex < 0) return;

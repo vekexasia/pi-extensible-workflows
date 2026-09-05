@@ -300,6 +300,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   let releaseWorkflowRegistry: (() => void) | undefined;
   const providerRecoveryLane = new SerialLane();
   const enqueueProviderRecovery = <T>(task: () => Promise<T>): Promise<T> => providerRecoveryLane.run(task);
+  const runMutationLane = new SerialLane();
+  const coordinateRunMutation = <T>(task: () => Promise<T>): Promise<T> => runMutationLane.run(task);
   // The recovery adapter implements only getAvailableSnapshot, refresh, getModel, and getError from ModelRuntime; the constructor below is the one third-party boundary because it cannot create another authenticated runtime.
   type ModelSelectorRuntimeAdapter = Pick<ModelRuntime, "getAvailableSnapshot" | "refresh" | "getModel" | "getError">;
   const createProviderErrorRecovery = (host: unknown, fallbackModels: ReadonlySet<string>, abort: () => void) => {
@@ -934,7 +936,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     } finally { await lifecycle.leave(); }
   };
   const recovery = createWorkflowRecovery({
-    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
+    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
   });
   const resumeSelectedWorkflow = async (runId: string, foreground: boolean, context: unknown, budgetPatch?: unknown): Promise<{ workflowName: string; state: "running" | "completed" | "awaiting_approval"; attached: boolean; value?: JsonValue }> => {
     const run = runs.get(runId);
@@ -1356,7 +1358,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     },
   };
   pi.registerTool(workflowTool);
-  registerWorkflowNavigator({ pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); } });
+  registerWorkflowNavigator({ pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, coordinateRunMutation, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); } });
   pi.on("session_shutdown", async () => {
     try {
       await Promise.all([...runs.entries()].map(async ([runId, run]) => {

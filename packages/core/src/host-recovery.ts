@@ -20,6 +20,7 @@ export type WorkflowRecoveryDependencies = {
   projectTrusted: (context: unknown) => boolean;
   resumeHostContext: (context: unknown) => WorkflowRecoveryContext;
   ensureSessionLease: (cwd: string, sessionId: string) => Promise<void>;
+  coordinateRunMutation?: <T>(task: () => Promise<T>) => Promise<T>;
   createAgentExecutor: (root: Omit<import("./agent-execution.js").AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => WorkflowAgentExecutor;
   activeSnapshotTools: (tools: readonly string[], active: ReadonlySet<string> | "session") => Set<string>;
   frozenResourcePolicy: (policy: import("./types.js").AgentResourcePolicy) => () => import("./types.js").AgentResourcePolicy;
@@ -61,6 +62,7 @@ export function persistedFailure(run: PersistedRun, error: WorkflowError): Persi
 
 export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
   const { pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver, deliverTerminal, workflowToolUpdate, registry, modelSpec } = deps;
+  const coordinateRunMutation = deps.coordinateRunMutation ?? (<T>(task: () => Promise<T>): Promise<T> => task());
   type BudgetDecisionResult = { state: "running" | "completed" | "budget_exhausted"; approved: boolean; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult };
   const budgetDecisionDelivery = (metadata: WorkflowMetadata, request: BudgetApprovalRequest) => `Workflow ${metadata.name} budget adjustment ${request.proposalId} for run ${request.runId} requires approval. Consumed usage: ${JSON.stringify(request.consumed)}. Previous limits: ${JSON.stringify(request.previous)}. Proposed limits: ${JSON.stringify(request.proposed)}. Respond with workflow_respond using proposalId ${request.proposalId}.`;
   const appendBudgetDecisionEvent = async (run: WorkflowRunRecord, request: BudgetApprovalRequest, type: "adjustment_requested" | "adjustment_approved" | "adjustment_rejected") => {
@@ -238,7 +240,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     return { state: "running" };
   };
   const retryReservations = new Set<string>();
-  const retryWorkflowRun = async (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string): Promise<{ runId: string; parentRunId: string; state: "running" | "completed"; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult }> => {
+  const retryWorkflowRunUnlocked = async (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string): Promise<{ runId: string; parentRunId: string; state: "running" | "completed"; value?: JsonValue; run?: PersistedRun; completion?: CompletionDeliveryResult }> => {
     if (typeof runId !== "string" || !runId.trim()) throw new WorkflowError("RESUME_INCOMPATIBLE", "workflow_retry requires an explicit run ID");
     const host = object(context) ? context : {};
     const cwd = typeof host.cwd === "string" ? host.cwd : undefined;
@@ -318,6 +320,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     } finally {
       if (!childStarted) retryReservations.delete(lineageRootRunId);
     }
-  }
+  };
+  const retryWorkflowRun = (runId: string, context: unknown, signal?: AbortSignal, modeOverride?: boolean, expectedState?: string) => coordinateRunMutation(() => retryWorkflowRunUnlocked(runId, context, signal, modeOverride, expectedState));
   return { refreshPausedRunAliases, coldResumeRun, applyBudgetDecision, answerBudgetDecision, budgetDecisionDelivery, resumeWorkflowRun, retryWorkflowRun };
 }
