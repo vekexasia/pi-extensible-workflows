@@ -135,10 +135,13 @@ void test("opens a completed session in a Herdr pane without taking ownership", 
 
 void test("falls back to the run cwd when a completed attempt worktree was removed", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-removed-worktree-"));
-  const worktree = join(root, "worktree");
-  mkdirSync(worktree);
-  await rm(worktree, { recursive: true, force: true });
+  const previousEnvironment = { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_CODING_AGENT_SESSION_DIR: process.env.PI_CODING_AGENT_SESSION_DIR };
+  Reflect.deleteProperty(process.env, "PI_CODING_AGENT_DIR");
+  Reflect.deleteProperty(process.env, "PI_CODING_AGENT_SESSION_DIR");
   try {
+    const worktree = join(root, "worktree");
+    mkdirSync(worktree);
+    await rm(worktree, { recursive: true, force: true });
     const calls = [];
     const runner = async (args) => {
       calls.push([...args]);
@@ -157,6 +160,10 @@ void test("falls back to the run cwd when a completed attempt worktree was remov
     ]);
     assert.equal(extension.agentAttemptActions.openSession.visible({ ...context, run: { cwd: join(root, "removed") } }), false);
   } finally {
+    for (const [name, value] of Object.entries(previousEnvironment)) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
