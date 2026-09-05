@@ -442,10 +442,8 @@ function extensionPackageShim(paths: readonly string[]): string {
     const source = readFileSync(path, "utf8");
     for (const match of source.matchAll(/import\s*\{([^}]+)\}\s*from\s*["']pi-extensible-workflows["']/g)) {
       for (const part of (match[1] ?? "").split(",")) {
-        const pieces = part.trim().split(/\s+as\s+/);
-        const imported = pieces[0]?.trim();
-        const local = pieces[1]?.trim() ?? imported;
-        if (imported && local && /^[A-Za-z_$][\w$]*$/.test(local)) importedNames.add(imported);
+        const imported = part.trim().split(/\s+as\s+/, 1)[0]?.trim();
+        if (imported && /^[A-Za-z_$][\w$]*$/.test(imported)) importedNames.add(imported);
       }
     }
   }

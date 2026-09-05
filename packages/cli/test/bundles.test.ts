@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -41,6 +41,29 @@ void test("bundle loads extensions with aliased workflow API imports", async () 
   } finally {
     if (previousApi === undefined) delete (globalThis as typeof globalThis & { __pi_bundle_api?: unknown }).__pi_bundle_api;
     else (globalThis as typeof globalThis & { __pi_bundle_api: unknown }).__pi_bundle_api = previousApi;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("bundle shim omits invalid emitted names", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-"));
+  try {
+    const extension = join(root, "invalid-extension.mjs");
+    writeFileSync(extension, 'import { "invalid-name" as validName } from "pi-extensible-workflows";\n');
+    const destination = join(root, "bundle");
+    writePortableWorkflowBundle({
+      destination,
+      command: "invalid-name-bundle",
+      workflow: { name: "bundle-test", version: "1.0.0", headline: "Bundle test", description: "Bundle test", input: { type: "object" }, output: { type: "string" } },
+      functionSource: "(input) => input",
+      piVersion: "unknown",
+      engineVersion: "unknown",
+      resources: { extensions: [extension] },
+    });
+
+    const shim = readFileSync(join(destination, "payload", "node_modules", "pi-extensible-workflows", "index.mjs"), "utf8");
+    assert.equal(shim, "\n");
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
