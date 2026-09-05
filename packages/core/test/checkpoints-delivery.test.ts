@@ -343,14 +343,14 @@ void test("a checkpoint answer persisted before resolver registration cannot han
 void test("foreground and background completion delivery share bounded results", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delivery-"));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId: string; value?: unknown } }> }> = [];
-  const messages: Array<{ message: { content: string }; options: { deliverAs: string; triggerTurn: boolean } }> = [];
+  const messages: Array<{ message: { content: string }; options: { deliverAs?: string; triggerTurn?: boolean } | undefined }> = [];
   let markDelivered!: () => void;
   const delivered = new Promise<void>((resolve) => { markDelivered = resolve; });
   let toolResultHandler: ((event: { toolName: string; toolCallId: string; isError: boolean }) => Promise<unknown>) | undefined;
   const pi = {
     registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "tool_result") toolResultHandler = handler as typeof toolResultHandler; },
     getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"],
-    sendMessage(message: { content: string }, options: { deliverAs: string; triggerTurn: boolean }) { messages.push({ message, options }); markDelivered(); }
+    sendMessage(message: { content: string }, options?: { deliverAs?: string; triggerTurn?: boolean }) { messages.push({ message, options }); markDelivered(); }
   };
   workflowExtension(testExtensionApi(pi), home);
   const execute = tools.find(({ name }) => name === "workflow")?.execute;

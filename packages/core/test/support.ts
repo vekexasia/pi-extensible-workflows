@@ -44,7 +44,7 @@ type TestTool = {
   promptSnippet?: string;
 };
 type TestWorkflowMessage = { customType: string; content: string; display: boolean };
-type TestWorkflowMessageOptions = { deliverAs: "followUp"; triggerTurn: true };
+type TestWorkflowMessageOptions = NonNullable<Parameters<ExtensionAPI["sendMessage"]>[1]>;
 type TestWorkflowLogEntry = { workflowName: string; message: string };
 type TestExtensionApiOptions = {
   registerTool?(tool: TestTool): void;
@@ -53,7 +53,7 @@ type TestExtensionApiOptions = {
   getThinkingLevel?: ExtensionAPI["getThinkingLevel"];
   getActiveTools?: ExtensionAPI["getActiveTools"];
   appendEntry?: (type: string, data: TestWorkflowLogEntry) => void;
-  sendMessage?: (message: TestWorkflowMessage, options: TestWorkflowMessageOptions) => void;
+  sendMessage?: (message: TestWorkflowMessage, options?: TestWorkflowMessageOptions) => void;
   registerEntryRenderer?(type: string, renderer: unknown): void;
   registerShortcut?: ExtensionAPI["registerShortcut"];
   events?: {
@@ -75,12 +75,11 @@ export function testExtensionApi(options: TestExtensionApiOptions = {}): Workflo
     on: options.on ?? (() => {}),
     registerCommand: options.registerCommand ?? (() => {}),
     registerTool(tool) { options.registerTool?.(tool); },
-    sendMessage(message) {
+    sendMessage(message, deliveryOptions) {
       if (typeof message.content !== "string") return;
       const customType = typeof message.customType === "string" ? message.customType : "workflow";
       const display = message.display;
-      const optionsForTest: TestWorkflowMessageOptions = { deliverAs: "followUp", triggerTurn: true };
-      options.sendMessage?.({ customType, content: message.content, display }, optionsForTest);
+      options.sendMessage?.({ customType, content: message.content, display }, deliveryOptions);
     },
   };
   const registerEntryRenderer: ExtensionAPI["registerEntryRenderer"] = (type, renderer) => { options.registerEntryRenderer?.(type, renderer); };
