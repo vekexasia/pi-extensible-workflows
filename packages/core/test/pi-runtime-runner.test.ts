@@ -376,6 +376,40 @@ void test("Pi runtime runner persists tool progress and live state", async () =>
   assert.ok(updates.some(({ toolCalls }) => toolCalls.some(({ state }) => state === "completed")));
   assert.ok(updates.some(({ state, persist }) => persist && state?.tools[0] === "read"));
 });
+void test("Pi runtime runner handles progress rejection during an active prompt", async () => {
+  const progressFailure = new Error("progress persistence failed");
+  let progressCalls = 0;
+  let promptPending = false;
+  let releasePrompt!: () => void;
+  const promptGate = new Promise<WorkflowAgentTurnResult>((resolve) => { releasePrompt = () => { resolve({ assistant: { role: "assistant", content: [{ type: "text", text: "done" }] } }); }; });
+  let aborts = 0;
+  let disposals = 0;
+  const session = sessionFor(async (_text, emit) => {
+    promptPending = true;
+    emit({ type: "state_changed", state: { model: { provider: "test", model: "model" }, tools: [] } });
+    setTimeout(releasePrompt, 20);
+    try { return await promptGate; } finally { promptPending = false; }
+  }, { abort: async () => { aborts += 1; releasePrompt(); }, dispose: async () => { disposals += 1; } });
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { runner, controller } = runnerFor(session);
+    await assert.rejects(runner.run(requestFor(controller.signal, { onProgress: async () => {
+      progressCalls += 1;
+      if (progressCalls > 1) {
+        assert.equal(promptPending, true);
+        throw progressFailure;
+      }
+    } })), (error: unknown) => error === progressFailure);
+    await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(aborts, 1);
+    assert.equal(disposals, 1);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
 void test("Pi runtime runner avoids progress materialization without a handler", async () => {
   let statsCalls = 0;
   const message: WorkflowAgentMessage = { role: "assistant", content: [{ type: "text", text: "done" }] };

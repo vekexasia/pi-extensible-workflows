@@ -183,6 +183,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
     let sessionReady = false;
     let successfulInvocation = false;
     let progress = Promise.resolve();
+    const progressState: { failed: boolean; error: unknown } = { failed: false, error: undefined };
     const eventNotifications = new Set<Promise<void>>();
     let systemPromptTurn = 0;
     let systemPromptWrite = Promise.resolve();
@@ -208,11 +209,22 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
     };
     const report = (value: RuntimeAgentProgress | (() => RuntimeAgentProgress)): void => {
       const progressHandler = request.onProgress;
-      if (!progressHandler) return;
+      if (!progressHandler || progressState.failed) return;
       const materialized = typeof value === "function" ? value() : value;
-      progress = progress.then(() => progressHandler(materialized)).then(() => undefined);
+      progress = progress.then(() => {
+        if (progressState.failed) return;
+        return progressHandler(materialized);
+      }).then(() => undefined).catch((error: unknown) => {
+        if (progressState.failed) return;
+        progressState.failed = true;
+        progressState.error = error;
+        if (session) void session.abort().catch(() => undefined);
+      });
     };
-    const flushProgress = async (): Promise<void> => { await progress; };
+    const flushProgress = async (): Promise<void> => {
+      await progress;
+      if (progressState.failed) throw progressState.error;
+    };
     const recordSystemPrompt = (entry: { readonly sessionId: string; readonly turn: number; readonly prompt: string }): void => {
       systemPromptWrite = systemPromptWrite.then(() => callbacks?.onSystemPrompt?.(entry)).catch((error: unknown) => { systemPromptWriteError ??= error; });
     };
@@ -385,7 +397,9 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
       session = undefined;
       return result;
     } catch (error) {
-      const typed = turnPolicyFailure ?? normalizePiRuntimeError(error, request.signal);
+      const progressFailedBeforeCleanup = progressState.failed;
+      const progressFailureBeforeCleanup = progressState.error;
+      const typed = progressFailedBeforeCleanup ? normalizePiRuntimeError(progressFailureBeforeCleanup, request.signal) : turnPolicyFailure ?? normalizePiRuntimeError(error, request.signal);
       if (session && sessionReady) {
         const activeSession = session;
         const activeAdapter = adapter;
@@ -411,7 +425,8 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         }
         if (callbackFailure !== undefined) throw callbackFailure instanceof Error ? callbackFailure : new Error(errorText(callbackFailure));
       }
-      throw turnPolicyFailure ?? (error instanceof Error ? error : new Error(errorText(error)));
+      const finalError = progressFailedBeforeCleanup ? progressFailureBeforeCleanup : turnPolicyFailure ?? error;
+      throw finalError instanceof Error ? finalError : new Error(errorText(finalError));
     }
   }
 }
