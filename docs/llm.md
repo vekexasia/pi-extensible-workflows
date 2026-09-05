@@ -140,7 +140,7 @@ The model-facing surface is exactly:
 | `subagents_stop` | Stop one run and clean its worktree. |
 | `subagents_retry` | Start a fresh run from a failed or stopped request, with a new ID and the original mode. |
 
-`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is a name string. Concrete models are `provider/model:thinking`.
+`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is a name string. Concrete models are `provider/model:thinking`. The `worktree` option requires a clean working tree at worktree creation or the run fails with `WORKTREE_FAILED`.
 
 Background calls return an ID immediately. Foreground calls return a terminal envelope and do not produce a background completion follow-up. Do not poll a running ID; call `subagents_inspect({ id })` only when current state or output is needed. Cross-session retry starts fresh and does not restore the old native conversation.
 ## Herdr integration

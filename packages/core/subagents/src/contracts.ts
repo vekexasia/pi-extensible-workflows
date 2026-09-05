@@ -33,7 +33,7 @@ export const SUBAGENTS_RUN_PARAMETERS = Type.Object({
   extensions: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered extension selectors; candidates start enabled and !* restricts the set" })),
   contextFiles: Type.Optional(Type.Array(Type.String(), { description: "Optional context-file scopes: global, project, cwd" })),
   role: Type.Optional(Type.String({ description: "Workflow role name" })),
-  worktree: Type.Optional(Type.String({ description: "Optional named worktree" })),
+  worktree: Type.Optional(Type.String({ description: "Optional named worktree; requires a clean working tree" })),
   outputSchema: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Optional JSON schema for the result" })),
   retries: Type.Optional(Type.Integer({ minimum: 0, maximum: SUBAGENT_MAX_RETRIES, description: "Optional retry count; at most 255 retries" })),
   timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1, description: "Optional execution timeout in milliseconds" }), Type.Null()])),

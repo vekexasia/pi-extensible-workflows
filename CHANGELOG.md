@@ -1,9 +1,9 @@
 # Changelog
 ## Unreleased
 
-### Runtime
+### Breaking changes
 
-- Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. Git-ignored files are not copied. (#235)
+- Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. (#235)
 
 ### Fixes
 
