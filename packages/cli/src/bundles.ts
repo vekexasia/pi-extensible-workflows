@@ -436,20 +436,18 @@ function copyResources(root: string, resources: PortableWorkflowBundleResources 
 }
 
 function extensionPackageShim(paths: readonly string[]): string {
-  const bindings = new Map<string, string>();
+  const importedNames = new Set<string>();
   for (const path of paths) {
     if (!/\.(?:c|m)?js$/.test(path)) throw new Error(`Selected extension must be a JavaScript module file: ${path}`);
     const source = readFileSync(path, "utf8");
     for (const match of source.matchAll(/import\s*\{([^}]+)\}\s*from\s*["']pi-extensible-workflows["']/g)) {
       for (const part of (match[1] ?? "").split(",")) {
-        const pieces = part.trim().split(/\s+as\s+/);
-        const imported = pieces[0]?.trim();
-        const local = pieces[1]?.trim() ?? imported;
-        if (imported && local && /^[A-Za-z_$][\w$]*$/.test(local)) bindings.set(local, imported);
+        const imported = part.trim().split(/\s+as\s+/, 1)[0]?.trim();
+        if (imported && /^[A-Za-z_$][\w$]*$/.test(imported)) importedNames.add(imported);
       }
     }
   }
-  return [...bindings.entries()].map(([local, imported]) => `export const ${local} = globalThis.__pi_bundle_api.${imported};`).join("\n") + "\n";
+  return [...importedNames].map((name) => `export const ${name} = globalThis.__pi_bundle_api.${name};`).join("\n") + "\n";
 }
 
 export function writePortableWorkflowBundle(input: PortableWorkflowBundleInput): PortableWorkflowManifest {
