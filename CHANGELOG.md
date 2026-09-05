@@ -5,20 +5,20 @@
 
 ### Breaking changes
 
-- Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. (#235)
+- Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. (#235, #262)
 
 ### Fixes
 
-- A workflow that fails while bridge work is still in flight now aborts that work (shell, agent, checkpoint, function, worktree) instead of letting it run on after the run is marked failed.
-- Host text blocks truncate by terminal display width, so CJK and other wide characters no longer overflow the line.
-- Lifecycle transitions persist the run's current budget runtime; after `workflow_resume` with a replacement budget, the adjusted usage and budget events are no longer overwritten by the pre-adjustment runtime.
-- The public `pi-extensible-workflows/trajectory` entry can find its UI assets: they are staged next to the bundled entry, not only next to the detached server, so `exportTrajectoryRunHtml` works from the installed package.
-- Trajectory recognizes failed tool results stored in the canonical Pi shape (`message.isError`) in the timeline, the tool summary pane, and the event ticks.
-- `piewf export --bundle` forwards an explicit `--approve` or `--no-approve` to bundle creation, so trust-dependent project resources (roles, extensions) are included or excluded as requested.
-- Portable bundles keep extensions that import the workflow API under an alias (`import { registerWorkflowExtension as register }`): the generated shim exports the original names.
-- `@piewf/cli` declares its Pi and TypeBox runtime dependencies directly instead of as peers, so a Pi-managed install without workspace hoisting loads `piewf`. The packed-package verification now runs the installed CLI as a smoke test.
-- "Change model" in the provider-failure recovery dialog opens the model picker again on Pi 0.85 (`ModelSelectorComponent` constructor changed). A failing recovery dialog now appends its cause to the reported agent error instead of being swallowed.
-- Aligned Pi development dependencies at `0.85.0`. `@earendil-works/pi-server` is a core devDependency because `pi-coding-agent@0.85.0` imports it without declaring it; `@piewf/cli` now declares it as well (see below).
+- A workflow that fails while bridge work is still in flight now aborts that work (shell, agent, checkpoint, function, worktree) instead of letting it run on after the run is marked failed. (#266)
+- Host text blocks truncate by terminal display width, so CJK and other wide characters no longer overflow the line. (#267)
+- Lifecycle transitions persist the run's current budget runtime; after `workflow_resume` with a replacement budget, the adjusted usage and budget events are no longer overwritten by the pre-adjustment runtime. (#269)
+- The public `pi-extensible-workflows/trajectory` entry can find its UI assets: they are staged next to the bundled entry, not only next to the detached server, so `exportTrajectoryRunHtml` works from the installed package. (#272)
+- Trajectory recognizes failed tool results stored in the canonical Pi shape (`message.isError`) in the timeline, the tool summary pane, and the event ticks. (#276)
+- `piewf export --bundle` forwards an explicit `--approve` or `--no-approve` to bundle creation, so trust-dependent project resources (roles, extensions) are included or excluded as requested. (#268)
+- Portable bundles keep extensions that import the workflow API under an alias (`import { registerWorkflowExtension as register }`): the generated shim exports the original names. (#275)
+- `@piewf/cli` declares its Pi and TypeBox runtime dependencies directly instead of as peers, so a Pi-managed install without workspace hoisting loads `piewf`. The packed-package verification now runs the installed CLI as a smoke test. (#273)
+- "Change model" in the provider-failure recovery dialog opens the model picker again on Pi 0.85 (`ModelSelectorComponent` constructor changed). A failing recovery dialog now appends its cause to the reported agent error instead of being swallowed. (#260)
+- Aligned Pi development dependencies at `0.85.0`. `@earendil-works/pi-server` is a core devDependency because `pi-coding-agent@0.85.0` imports it without declaring it; `@piewf/cli` now declares it as well (#273). (#260)
 
 ## [5.12.0] - 2026-09-04
 
