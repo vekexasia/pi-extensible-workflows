@@ -3,9 +3,10 @@ import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { contextualWorkflowAction, testExtensionApi, waitForIssue105 } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatAgentDetail, formatCost, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPhaseDashboard, formatWorkflowProgress, mergeBudget, RunStore, truncateWorkflowProgress, WORKFLOW_AGENT_STALL_THRESHOLD_MS, type AgentRecord, type PersistedRun } from "../src/index.js";
-import { navigatorRunLabels } from "../src/host-view.js";
+import { navigatorRunLabels, textBlock } from "../src/host-view.js";
 import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession, type TestPiSessionEvent } from "./test-transport.js";
 
@@ -16,6 +17,13 @@ function makeAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
 function makeRun(overrides: Partial<PersistedRun> = {}): PersistedRun {
   return { id: "run", workflowName: "test", cwd: "/repo", sessionId: "session", state: "running", agents: [], agentSessions: [], ...overrides };
 }
+
+void test("text blocks truncate wide characters by visible width", () => {
+  const width = 5;
+  const rendered = textBlock("工作流消息\nplain text").render(width);
+
+  assert.deepEqual(rendered.map((line) => visibleWidth(line)), [width, width]);
+});
 
 void test("workflow progress warns after ten minutes of agent silence and resets on events", () => {
   const now = 12 * 60 * 60 * 1000;

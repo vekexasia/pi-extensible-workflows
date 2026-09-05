@@ -1,4 +1,5 @@
 import { keyHint, truncateToVisualLines, type Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { type AwaitingCheckpoint, type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
 import { budgetUsage } from "./budget.js";
 import { formatCost } from "./background-widget.js";
@@ -177,7 +178,7 @@ const WORKFLOW_PROGRESS_REFRESH_MS = 1_000;
 export function textBlock(text: string) {
   return {
     render(width: number) {
-      return text.split("\n").map((line) => line.length <= width ? line : `${line.slice(0, Math.max(0, width - 1))}…`);
+      return text.split("\n").map((line) => truncateToWidth(line, Math.max(1, width), "…"));
     },
     invalidate() {},
   };
