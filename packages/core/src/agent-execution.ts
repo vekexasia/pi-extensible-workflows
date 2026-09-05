@@ -1290,17 +1290,19 @@ export class FairAgentScheduler {
     child.collecting = true;
     const childPromise = child.promise;
     const previousCollection = parent.resultQueue;
-    let releaseCollection!: () => void;
+    let releaseCollection: () => void = () => undefined;
     parent.resultQueue = new Promise<void>((resolve) => { releaseCollection = resolve; });
     try {
       await previousCollection;
+      // A queued collection may resume after the parent was cancelled or settled; it must not touch parent state or permits.
+      if (this.#cancelledOrSettled(parent)) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
       parent.state = "waiting_for_child";
       this.#persist(parent.runId);
       this.#release(parent.runId);
       const outcome = await childPromise;
       await new Promise<void>((resolve) => { this.#enqueue(parent.runId, undefined, () => { resolve(); }); });
+      if (this.#cancelledOrSettled(parent)) { this.#release(parent.runId); throw new WorkflowError("CANCELLED", "Parent agent cancelled"); }
       parent.state = "running";
-      if (parent.controller.signal.aborted) throw new WorkflowError("CANCELLED", "Parent agent cancelled");
       child.collected = true;
       child.collecting = false;
       this.releaseResult(child.id);
@@ -1493,6 +1495,8 @@ export class FairAgentScheduler {
     for (const childId of node.children) { const child = this.#nodes.get(childId); if (child) this.#cancelTree(child); }
     if (node.state === "queued" || node.restored) this.#settle(node, { id: node.id, ok: false, error: { code: "CANCELLED", message: "Agent cancelled" } });
   }
+
+  #cancelledOrSettled(node: ScheduledNode): boolean { return node.controller.signal.aborted || ["completed", "failed", "cancelled"].includes(node.state); }
 
   #node(id: string): ScheduledNode {
     const node = this.#nodes.get(id);

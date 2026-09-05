@@ -1785,6 +1785,36 @@ void test("serializes concurrent child result collection per parent", async () =
   scheduler.removeRun("run");
   assert.deepEqual(scheduler.snapshot(), []);
 });
+void test("cancelling a parent with queued child result collection settles it and frees its permit", async () => {
+  let childStarted!: () => void;
+  const started = new Promise<void>((resolve) => { childStarted = resolve; });
+  let resultCalls: Promise<Awaited<ReturnType<FairAgentScheduler["result"]>>>[] = [];
+  let scheduler: FairAgentScheduler;
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options, signal }) => {
+    const aborted = new Promise<never>((_resolve, reject) => { signal.addEventListener("abort", () => { reject(new WorkflowError("CANCELLED", "cancelled")); }, { once: true }); });
+    if (prompt === "parent") {
+      const childA = scheduler.spawn("run", "child-a", { label: "child-a", cwd: options.cwd, tools: [] }, id);
+      const childB = scheduler.spawn("run", "child-b", { label: "child-b", cwd: options.cwd, tools: [] }, id);
+      resultCalls = [scheduler.result(id, childA.id), scheduler.result(id, childB.id)];
+      return Promise.race([aborted, Promise.all(resultCalls)]);
+    }
+    if (prompt === "child-a") { childStarted(); return aborted; }
+    return prompt;
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  await started;
+  scheduler.cancel(parent.id);
+  assert.equal((await parent.result).ok, false);
+  const settled = await Promise.allSettled(resultCalls);
+  assert.deepEqual(settled.map(({ status }) => status), ["rejected", "rejected"]);
+  assert.deepEqual(scheduler.snapshot().map(({ state }) => state), ["cancelled", "cancelled", "cancelled"]);
+  const later = scheduler.spawn("run", "later", { label: "later", cwd: "/repo", tools: [] });
+  assert.deepEqual(await later.result, { id: later.id, ok: true, value: "later" });
+  scheduler.removeRun("run");
+  assert.deepEqual(scheduler.snapshot(), []);
+});
 void test("releases consumed scheduler result payloads while retaining node metadata", async () => {
   const references: WeakRef<object>[] = [];
   const scheduler = new FairAgentScheduler(async ({ prompt }) => {
