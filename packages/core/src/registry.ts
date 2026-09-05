@@ -11,8 +11,6 @@ const RESERVED_GLOBALS = new Set(["agent", "shell", "prompt", "checkpoint", "par
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
-type BundleExtensionCapture = (extension: WorkflowExtension) => void;
-const bundleGlobals = globalThis as typeof globalThis & { __pi_bundle_capture?: BundleExtensionCapture };
 export type SubagentStatusObserver = (status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>) => void;
 
 function normalizeRoleDirectory(value: unknown): string {
@@ -284,7 +282,6 @@ export function retainWorkflowRegistry(): () => void {
 export function loadingRegistry(): WorkflowRegistryApi { return workflowRegistryHost().api; }
 beginWorkflowExtensionLoading();
 export function registerWorkflowExtension(extension: WorkflowExtension): void {
-  if (bundleGlobals.__pi_bundle_capture) { bundleGlobals.__pi_bundle_capture(extension); return; }
   loadingRegistry().register(extension);
 }
 export function workflowCatalog(context?: WorkflowCatalogContext): WorkflowCatalog { return loadingRegistry().catalog(context); }

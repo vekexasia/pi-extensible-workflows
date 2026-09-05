@@ -2,7 +2,8 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { builtinModules } from "node:module";
-import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { AgentDefinition, WorkflowCatalogFunction } from "pi-extensible-workflows";
 
 export interface PortableWorkflowSource { module: string; export: string }
@@ -413,6 +414,7 @@ function bundledWorkflowModule(workflow: WorkflowCatalogFunction, source: Portab
     "  }",
     `  const extension = captured.find((candidate) => candidate?.functions?.[${JSON.stringify(workflow.name)}]);`,
     `  if (!extension) throw new Error("Bundled extension does not register workflow ${workflow.name}");`,
+    "  for (const candidate of captured) if (candidate !== extension) registerWorkflowExtension(candidate);",
     "  registerWorkflowExtension({",
     "    ...extension,",
     "    source: new URL(\"./extension.mjs\", import.meta.url).href,",
@@ -425,7 +427,24 @@ function bundledWorkflowModule(workflow: WorkflowCatalogFunction, source: Portab
   ].join("\n");
 }
 
-type EsbuildModule = typeof import("esbuild");
+type EsbuildPluginBuild = {
+  onLoad(options: { filter: RegExp }, callback: (args: { path: string }) => { errors: readonly { text: string }[] } | undefined): void;
+  onResolve(options: { filter: RegExp }, callback: (args: { path: string }) => { path: string; external: boolean } | undefined): void;
+};
+type EsbuildBuildOptions = {
+  entryPoints: readonly string[];
+  bundle: boolean;
+  format: "esm";
+  platform: "node";
+  nodePaths: readonly string[];
+  write: false;
+  metafile: true;
+  plugins: readonly [{ name: string; setup(build: EsbuildPluginBuild): void }];
+};
+type EsbuildModule = {
+  version: string;
+  build(options: EsbuildBuildOptions): Promise<{ outputFiles: readonly { text: string }[]; metafile: { outputs: Record<string, { exports: readonly string[] }> } }>;
+};
 type BundledExtension = { source: string; esbuild: string };
 const nodeBuiltins = new Set(builtinModules);
 
@@ -439,13 +458,22 @@ function isPackageSpecifier(specifier: string): boolean {
 }
 
 function isAllowedExternal(specifier: string): boolean {
-  return nodeBuiltins.has(specifier) || specifier.startsWith("@earendil-works/") || packageName(specifier) === "pi-extensible-workflows";
+  return nodeBuiltins.has(specifier) || packageName(specifier) === "pi-extensible-workflows";
 }
 const packageNamePattern = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 
 async function loadEsbuild(): Promise<EsbuildModule> {
-  try { return await import("esbuild"); }
-  catch (error) { throw new Error("Portable workflow bundling requires optional esbuild. Install it with `npm install --save-dev esbuild` and retry.", { cause: error }); }
+  let modulePath: string;
+  try {
+    modulePath = createRequire(join(process.cwd(), "package.json")).resolve("esbuild");
+  } catch (error) {
+    throw new Error("Portable workflow bundling requires optional esbuild. Install esbuild in the project where you run piewf bundle, for example with `npm install --save-dev esbuild`, and retry.", { cause: error });
+  }
+  try {
+    const loaded: unknown = await import(pathToFileURL(modulePath).href);
+    return loaded as EsbuildModule;
+  }
+  catch (error) { throw new Error("Portable workflow bundling could not load esbuild from the current project. Install it with `npm install --save-dev esbuild` and retry.", { cause: error }); }
 }
 
 function sourceModulePath(source: string): string {
@@ -467,14 +495,60 @@ function dependencyNames(dependencies: readonly string[] | undefined): readonly 
   if (names.some((dependency) => !packageNamePattern.test(dependency))) throw new Error("Workflow bundle dependencies must be package names");
   return names.sort();
 }
+function isNodeModulesPath(path: string): boolean { return path.split(/[\\/]/).includes("node_modules"); }
+function skipJavaScriptLiteral(source: string, start: number): number {
+  for (let index = start + 1; index < source.length; index += 1) {
+    if (source[index] === "\\") { index += 1; continue; }
+    if (source[index] === source[start]) return index + 1;
+  }
+  return source.length;
+}
+function skipJavaScriptComment(source: string, start: number): number {
+  if (source.startsWith("//", start)) {
+    const end = source.indexOf("\n", start + 2);
+    return end < 0 ? source.length : end;
+  }
+  const end = source.indexOf("*/", start + 2);
+  return end < 0 ? source.length : end + 2;
+}
+function skipJavaScriptSpace(source: string, start: number): number {
+  let index = start;
+  while (index < source.length) {
+    if (/\s/.test(source[index] ?? "")) { index += 1; continue; }
+    if (source.startsWith("//", index) || source.startsWith("/*", index)) { index = skipJavaScriptComment(source, index); continue; }
+    return index;
+  }
+  return index;
+}
+function dynamicImportEnd(source: string, opening: number): number {
+  let depth = 1;
+  for (let index = opening + 1; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "'" || character === '"' || character === "`") { index = skipJavaScriptLiteral(source, index) - 1; continue; }
+    if (character === "/" && (source.startsWith("//", index) || source.startsWith("/*", index))) { index = skipJavaScriptComment(source, index) - 1; continue; }
+    if (character === "(") depth += 1;
+    else if (character === ")" && --depth === 0) return index;
+  }
+  return -1;
+}
 function hasUnsupportedDynamicImport(source: string): boolean {
-  for (const match of source.matchAll(/\bimport\s*\(\s*([\s\S]*?)\)/g)) {
-    const expression = match[1] ?? "";
-    if (!/^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)\s*$/.test(expression) || expression.startsWith("`") && expression.includes("${")) return true;
+  const literal = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)\s*$/;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === "'" || character === '"' || character === "`") { index = skipJavaScriptLiteral(source, index) - 1; continue; }
+    if (character === "/" && (source.startsWith("//", index) || source.startsWith("/*", index))) { index = skipJavaScriptComment(source, index) - 1; continue; }
+    if (!source.startsWith("import", index) || /[\w$.]/.test(source[index - 1] ?? "")) continue;
+    const opening = skipJavaScriptSpace(source, index + "import".length);
+    if (source[opening] !== "(") continue;
+    const closing = dynamicImportEnd(source, opening);
+    if (closing < 0) return true;
+    const expression = source.slice(opening + 1, closing).trim();
+    if (!literal.test(expression) || expression.startsWith("`") && expression.includes("${")) return true;
+    index = closing;
   }
   return false;
 }
-async function bundleExtension(sourcePath: string, dependencies: readonly string[]): Promise<BundledExtension> {
+async function bundleExtension(sourcePath: string, sourceExport: string, dependencies: readonly string[]): Promise<BundledExtension> {
   const esbuild = await loadEsbuild();
   const undeclared = new Set<string>();
   const result = await esbuild.build({
@@ -489,11 +563,12 @@ async function bundleExtension(sourcePath: string, dependencies: readonly string
       join(dirname(fileURLToPath(import.meta.url)), "../../../../node_modules"),
     ],
     write: false,
+    metafile: true,
     plugins: [{
       name: "portable-workflow-dependencies",
       setup(build) {
         build.onLoad({ filter: /\.(?:[cm]?[jt]s|tsx?|jsx?)$/ }, (args) => {
-          if (hasUnsupportedDynamicImport(readFileSync(args.path, "utf8"))) return { errors: [{ text: "Unsupported dynamic import; use a static import or a string-literal module path" }] };
+          if ((args.path === sourcePath || !isNodeModulesPath(args.path)) && hasUnsupportedDynamicImport(readFileSync(args.path, "utf8"))) return { errors: [{ text: "Unsupported dynamic import; use a static import or a string-literal module path" }] };
           return undefined;
         });
         build.onResolve({ filter: /.*/ }, (args) => {
@@ -510,6 +585,8 @@ async function bundleExtension(sourcePath: string, dependencies: readonly string
   if (undeclared.size) throw new Error(`Undeclared dependencies: ${[...undeclared].sort().join(", ")}`);
   const output = result.outputFiles[0];
   if (!output) throw new Error("esbuild produced no workflow extension output");
+  const exports = Object.values(result.metafile.outputs).flatMap(({ exports: names }) => names);
+  if (!exports.includes(sourceExport)) throw new Error(`Bundled workflow extension does not export ${sourceExport}`);
   return { source: output.text, esbuild: esbuild.version };
 }
 
@@ -656,9 +733,10 @@ export function writePortableWorkflowBundle(input: PortableWorkflowBundleInput):
     return writeBundleFiles(input, manifest, workflowModule(input.workflow, input.functionSource, Object.keys(input.roles ?? {}).length > 0, input.aliasTargets ?? {}, input.resources?.extensions?.map((source) => basename(source)) ?? []));
   }
   return (async () => {
+    if (typeof input.source.export !== "string" || !input.source.export.trim()) throw new Error("Workflow source export must be a non-empty name");
     const sourcePath = sourceModulePath(input.source.module);
     const dependencies = dependencyNames(input.dependencies);
-    const bundled = await bundleExtension(sourcePath, dependencies);
+    const bundled = await bundleExtension(sourcePath, input.source.export, dependencies);
     const manifest = { ...baseManifest(input, 2), source: Object.freeze({ module: input.source.module, export: input.source.export }), bundler: { esbuild: bundled.esbuild }, dependencies: Object.freeze([...dependencies]) };
     return writeBundleFiles(input, manifest, bundledWorkflowModule(input.workflow, input.source, Object.keys(input.roles ?? {}).length > 0, input.aliasTargets ?? {}, input.resources?.extensions?.map((source) => basename(source)) ?? []), bundled.source);
   })();

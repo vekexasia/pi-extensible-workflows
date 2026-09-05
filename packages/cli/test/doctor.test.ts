@@ -550,6 +550,12 @@ void test("export bundle forwards explicit trust override", async () => {
   assert.equal(await runCli(["export", "cliEcho", "--bundle", "--approve", "--output", destination, "--role", "reviewer"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }, () => {}), 0);
   assert.deepEqual(readCliTestManifest(join(destination, "manifest.json")).requirements.roles, ["reviewer"]);
 });
+void test("portable bundle export rejects extensions without source provenance", () => {
+  const paths = fixture();
+  const result = runIsolatedCli(paths, `cliEcho: { description: "Echo", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["bundle", "cliEcho", "--output", join(paths.root, "bundle")]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /not exportable; add `source: import\.meta\.url`/);
+});
 void test("portable bundle export writes a self-contained payload and external-runtime launcher", async () => {
   registerCliExtension();
   const paths = fixture();
@@ -823,7 +829,7 @@ void test("portable bundles name dependency packages and entry points by their p
   assert.equal(readFileSync(join(destination, "payload", "node_modules", "@scope", "example", "index.js"), "utf8"), "export const dependency = true;\n");
   assert.equal(readFileSync(join(destination, "payload", "node_modules", "entry-point.mjs"), "utf8"), "export const entryPoint = true;\n");
 });
-void test("portable bundle setup resolves an external runtime, launches, and fails closed on requirements", () => {
+void test("portable bundle setup resolves an external runtime, launches, and fails closed on requirements", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-e2e-"));
   const agentDir = join(root, "agent");
   const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
@@ -839,6 +845,23 @@ void test("portable bundle setup resolves an external runtime, launches, and fai
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:@piewf/cli"] }));
   const workflow = { name: "e2e", version: "1.0.0", headline: "Bundle", description: "Bundle e2e", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
   const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" };
+  const v2Source = join(root, "v2-extension.mjs");
+  writeFileSync(v2Source, [
+    'import { registerWorkflowExtension } from "pi-extensible-workflows";',
+    'import { Type } from "typebox";',
+    "const increment = 1;",
+    "function normalize(value) { return value + increment - 1; }",
+    "export default function extension() {",
+    '  registerWorkflowExtension({ version: "1.0.0", headline: "Bundle v2", functions: { e2eV2: { description: "Bundle v2 e2e", input: Type.Object({ value: Type.Integer() }, { additionalProperties: false }), output: Type.Integer(), run(input) { return normalize(input.value); } } } });',
+    "}",
+    "",
+  ].join("\n"));
+  const v2Workflow = { ...workflow, name: "e2eV2", description: "Bundle v2 e2e" };
+  const v2Bundle = join(root, "v2-e2e");
+  await writePortableWorkflowBundle({ destination: v2Bundle, command: "v2-e2e", workflow: v2Workflow, source: { module: pathToFileURL(v2Source).href, export: "default" }, dependencies: ["typebox"], piVersion: ">=0.82.0 <0.83.0", engineVersion: ">=5.0.0 <6.0.0" });
+  assert.equal(readCliTestManifest(join(v2Bundle, "manifest.json")).version, 2);
+  execFileSync(join(v2Bundle, "v2-e2e"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  assert.equal(execFileSync(join(v2Bundle, "v2-e2e"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
   const create = (name: string, requirements: Record<string, readonly string[]>, piVersion = ">=0.82.0 <0.83.0", aliasTargets?: Readonly<Record<string, string>>) => { const destination = join(root, name); writePortableWorkflowBundle({ destination, command: name, workflow, functionSource: "async run(input) { return input.value; }", requirements, ...(aliasTargets ? { aliasTargets } : {}), piVersion, engineVersion: ">=5.0.0 <6.0.0" }); return destination; };
   const runFailure = (bundle: string): string => { try { execFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
   const launchFailure = (bundle: string): string => { try { execFileSync(bundle, ["7"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };

@@ -21,3 +21,4 @@ const extension: WorkflowExtension = {
 };
 
 export function registerCliExtension(): void { registerWorkflowExtension(extension); }
+export default function (): void { registerCliExtension(); }

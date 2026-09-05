@@ -65,6 +65,16 @@ void test("registers the starter function, aliases, and packaged roles", async (
   assert.match(registration[0]?.path ?? "", /starter[\\/]roles[\\/]?$/);
   assert.equal(registration[0]?.builtin, true);
 });
+void test("records and validates portable workflow source metadata", () => {
+  const workflow = { description: "Portable", input: { type: "object" }, output: { type: "boolean" }, run: () => true };
+  const extension = { version: "1.0.0", headline: "Portable extension", source: "file:///portable-extension.mjs", dependencies: ["typebox"], functions: { portable: workflow } };
+  const registry = new WorkflowRegistry();
+  registry.register(extension);
+  assert.deepEqual(registry.functionSources(), { portable: { module: "file:///portable-extension.mjs", export: "default", dependencies: ["typebox"] } });
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, source: "" }); }, /source/);
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, dependencies: ["typebox", "typebox"] }); }, /dependencies/);
+  assert.throws(() => { new WorkflowRegistry().register({ ...extension, dependencies: ["invalid package"] }); }, /dependencies/);
+});
 void test("marks a symlinked starter roles directory as builtin", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-role-link-"));
   const link = join(root, "roles");
