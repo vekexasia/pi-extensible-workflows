@@ -381,10 +381,12 @@ void test("Pi runtime runner handles progress rejection during an active prompt"
   let progressCalls = 0;
   let promptPending = false;
   let releasePrompt!: () => void;
-  const promptGate = new Promise<WorkflowAgentTurnResult>((resolve) => { releasePrompt = () => { resolve({ assistant: { role: "assistant", content: [{ type: "text", text: "done" }] } }); }; });
+  const promptGate = new Promise<WorkflowAgentTurnResult>((resolve) => { releasePrompt = () => { resolve({ assistant: { role: "assistant", content: [], stopReason: "aborted" } }); }; });
+  let prompts = 0;
   let aborts = 0;
   let disposals = 0;
   const session = sessionFor(async (_text, emit) => {
+    prompts += 1;
     promptPending = true;
     emit({ type: "state_changed", state: { model: { provider: "test", model: "model" }, tools: [] } });
     setTimeout(releasePrompt, 20);
@@ -394,7 +396,7 @@ void test("Pi runtime runner handles progress rejection during an active prompt"
   const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
   process.on("unhandledRejection", onUnhandled);
   try {
-    const { runner, controller } = runnerFor(session);
+    const { runner, controller } = runnerFor(session, undefined, undefined, undefined, false);
     await assert.rejects(runner.run(requestFor(controller.signal, { onProgress: async () => {
       progressCalls += 1;
       if (progressCalls > 1) {
@@ -403,6 +405,7 @@ void test("Pi runtime runner handles progress rejection during an active prompt"
       }
     } })), (error: unknown) => error === progressFailure);
     await new Promise<void>((resolve) => { setImmediate(resolve); });
+    assert.equal(prompts, 1);
     assert.equal(aborts, 1);
     assert.equal(disposals, 1);
     assert.deepEqual(unhandled, []);

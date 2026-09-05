@@ -225,6 +225,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
       await progress;
       if (progressState.failed) throw progressState.error;
     };
+    const throwIfProgressFailed = (): void => { if (progressState.failed) throw progressState.error; };
     const recordSystemPrompt = (entry: { readonly sessionId: string; readonly turn: number; readonly prompt: string }): void => {
       systemPromptWrite = systemPromptWrite.then(() => callbacks?.onSystemPrompt?.(entry)).catch((error: unknown) => { systemPromptWriteError ??= error; });
     };
@@ -335,6 +336,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         catch (error) { acceptAssistant(session?.getLastAssistant() ?? lastAssistant); promptFailed = true; promptError = error; }
         const handoffWasAttempted = runtimeHandoff.state !== "local-running";
         throwIfCancelled();
+        throwIfProgressFailed();
         const suppressHandoffAbort = handoffWasAttempted && !handoffAbortHandled && isHandoffAbort(lastAssistant);
         if (suppressHandoffAbort) handoffAbortHandled = true;
         const recovered = suppressHandoffAbort ? false : await recoverTerminal();
@@ -361,18 +363,21 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         if (promptFailed && !hasResult() && !recovered && !handoffRecovered && !runtimeHandoff.transferred) throw promptError instanceof Error ? promptError : new Error(errorText(promptError));
       };
 
+      throwIfProgressFailed();
       beginTurn(false);
       throwIfTurnPolicyFailed();
       await promptAndRecover(request.task, true);
       completeTurn(hasResult() || !hasToolCall(lastAssistant), false, true);
       if (turnPolicyFailure) throw turnPolicyFailure;
       if (!hasResult()) {
+        throwIfProgressFailed();
         beginTurn(false);
         throwIfTurnPolicyFailed();
         await promptAndRecover("Submit the final result now by calling workflow_result exactly once. Do not return prose.", true);
         completeTurn(true, false, true);
       }
       if (!hasResult()) {
+        throwIfProgressFailed();
         beginTurn(false);
         throwIfTurnPolicyFailed();
         await promptAndRecover("Your result was missing or invalid. Repair it by calling workflow_result exactly once with a schema-valid value.", true);
@@ -397,9 +402,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
       session = undefined;
       return result;
     } catch (error) {
-      const progressFailedBeforeCleanup = progressState.failed;
-      const progressFailureBeforeCleanup = progressState.error;
-      const typed = progressFailedBeforeCleanup ? normalizePiRuntimeError(progressFailureBeforeCleanup, request.signal) : turnPolicyFailure ?? normalizePiRuntimeError(error, request.signal);
+      const typed = turnPolicyFailure ?? normalizePiRuntimeError(error, request.signal);
       if (session && sessionReady) {
         const activeSession = session;
         const activeAdapter = adapter;
@@ -425,8 +428,7 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         }
         if (callbackFailure !== undefined) throw callbackFailure instanceof Error ? callbackFailure : new Error(errorText(callbackFailure));
       }
-      const finalError = progressFailedBeforeCleanup ? progressFailureBeforeCleanup : turnPolicyFailure ?? error;
-      throw finalError instanceof Error ? finalError : new Error(errorText(finalError));
+      throw turnPolicyFailure ?? (error instanceof Error ? error : new Error(errorText(error)));
     }
   }
 }

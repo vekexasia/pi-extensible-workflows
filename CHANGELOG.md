@@ -4,6 +4,7 @@
 ### Fixes
 
 - Keep the subagent Steer editor and selected action visible while navigating long detail panels. (#274)
+- A rejected progress callback (e.g. run-state persistence failure) no longer crashes the Pi host; the agent run fails through its normal path and the session is aborted and disposed. (#265)
 ## [5.13.0] - 2026-09-05
 
 ### Breaking changes
