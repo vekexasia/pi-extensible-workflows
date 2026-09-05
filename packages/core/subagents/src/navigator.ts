@@ -309,17 +309,24 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       theme.bold("Agent actions"),
       ...options.map((option, index) => `${index === actionIndex ? "→ " : "  "}${index === actionIndex ? theme.fg("accent", option) : option}`),
     ];
-    const scrollActionIntoView = (): void => {
+    const viewportRows = (): number => Math.max(1, tuiRows(tui) - 1);
+    const maxOffsetFor = (rows: readonly string[]): number => Math.max(0, rows.length - viewportRows());
+    const clampOffset = (rows: readonly string[]): void => {
+      offset = Math.max(0, Math.min(maxOffsetFor(rows), offset));
+    };
+    const actionView = (): { readonly detail: string[]; readonly options: string[]; readonly rows: string[] } => {
       const detail = detailLines(inspection, theme);
       const options = actionOptions(manager, inspection, context);
-      if (actionIndex >= options.length) return;
-      const rows = buildActionRows(detail, options);
-      const viewport = Math.max(1, tuiRows(tui) - 1);
-      const maxOffset = Math.max(0, rows.length - viewport);
+      return { detail, options, rows: buildActionRows(detail, options) };
+    };
+    const scrollActionIntoView = (view = actionView()): void => {
+      const { options, rows } = view;
+      if (actionIndex >= options.length) { clampOffset(rows); return; }
+      const viewport = viewportRows();
       const actionRow = rows.length - options.length + actionIndex;
       if (actionRow < offset) offset = actionRow;
       else if (actionRow >= offset + viewport) offset = actionRow - viewport + 1;
-      offset = Math.max(0, Math.min(maxOffset, offset));
+      clampOffset(rows);
     };
     const reportRefreshError = (error: unknown): void => {
       if (disposed) return;
@@ -329,6 +336,7 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       if (disposed || actionRunning || refreshing || inspection.entry.status.state !== "running") return;
       refreshing = true;
       const generation = ++refreshGeneration;
+      const actionIndexBeforeRefresh = actionIndex;
       try {
         const next = await inspectEntry(manager, storageDirectory, entry, context);
         if (generation !== refreshGeneration) return;
@@ -337,7 +345,9 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
         if (actionMode) {
           const options = actionOptions(manager, inspection, context);
           actionIndex = Math.min(actionIndex, Math.max(0, options.length - 1));
-          scrollActionIntoView();
+          const view = actionView();
+          if (actionIndex !== actionIndexBeforeRefresh) scrollActionIntoView(view);
+          else if (offset > maxOffsetFor(view.rows)) clampOffset(view.rows);
         }
         requestRender();
       } catch (error: unknown) {
@@ -360,12 +370,11 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
     const renderLines = (width: number): string[] => {
       if (disposed) return [];
       const renderWidth = Math.max(1, width);
-      const options = actionMode ? actionOptions(manager, inspection, context) : [];
-      const detail = detailLines(inspection, theme).map((line) => truncateToWidth(line, renderWidth, "…"));
-      const actionRows = actionMode ? buildActionRows(detail, options) : undefined;
-      const rows = steerMode ? [...detail, "", theme.bold("Steer subagent"), ...steerEditor.render(renderWidth)] : actionRows ?? detail;
-      const viewport = Math.max(1, tuiRows(tui) - 1);
-      const maxOffset = Math.max(0, rows.length - viewport);
+      const action = actionMode ? actionView() : undefined;
+      const detail = (action?.detail ?? detailLines(inspection, theme)).map((line) => truncateToWidth(line, renderWidth, "…"));
+      const rows = steerMode ? [...detail, "", theme.bold("Steer subagent"), ...steerEditor.render(renderWidth)] : action?.rows ?? detail;
+      const viewport = viewportRows();
+      const maxOffset = maxOffsetFor(rows);
       const visibleOffset = steerMode ? maxOffset : Math.max(0, Math.min(maxOffset, offset));
       const hint = theme.fg("dim", steerMode ? "enter submit · esc back" : actionMode ? "↑/↓ actions · enter run · esc back" : "↑/↓ scroll · a actions · enter actions · esc back");
       return [...rows.slice(visibleOffset, visibleOffset + viewport), hint].map((line) => truncateToWidth(line, renderWidth, "…"));
@@ -413,16 +422,16 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
         }
         if (!actionMode) {
           if (keybindings.matches(data, "tui.select.confirm")) { actionMode = true; actionIndex = 0; offset = 0; scrollActionIntoView(); requestRender(); }
-          else if (keybindings.matches(data, "tui.select.up")) { offset = Math.max(0, offset - 1); requestRender(); }
-          else if (keybindings.matches(data, "tui.select.down")) { offset += 1; requestRender(); }
+          else if (keybindings.matches(data, "tui.select.up")) { offset = Math.max(0, offset - 1); clampOffset(detailLines(inspection, theme)); requestRender(); }
+          else if (keybindings.matches(data, "tui.select.down")) { offset += 1; clampOffset(detailLines(inspection, theme)); requestRender(); }
           return;
         }
         const options = actionOptions(manager, inspection, context);
         if (keybindings.matches(data, "tui.select.up")) { actionIndex = (actionIndex + options.length - 1) % options.length; scrollActionIntoView(); }
         else if (keybindings.matches(data, "tui.select.down")) { actionIndex = (actionIndex + 1) % options.length; scrollActionIntoView(); }
         else if (keybindings.matches(data, "tui.select.confirm")) { const action = options[actionIndex]; if (action === "Steer") { steerMode = true; actionMode = false; steerEditor.setText(""); offset = 0; } else if (action && action !== "Back") runAction(action); else actionMode = false; }
-        else if (keybindings.matches(data, "tui.select.pageUp")) offset = Math.max(0, offset - Math.max(1, tuiRows(tui) - 1));
-        else if (keybindings.matches(data, "tui.select.pageDown")) offset += Math.max(1, tuiRows(tui) - 1);
+        else if (keybindings.matches(data, "tui.select.pageUp")) { offset = Math.max(0, offset - viewportRows()); clampOffset(actionView().rows); }
+        else if (keybindings.matches(data, "tui.select.pageDown")) { offset += viewportRows(); clampOffset(actionView().rows); }
         requestRender();
       },
       dispose() { if (!disposed) { disposed = true; stopRefresh(); } },
