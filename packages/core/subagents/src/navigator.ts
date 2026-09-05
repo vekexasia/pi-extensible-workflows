@@ -337,6 +337,9 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
       refreshing = true;
       const generation = ++refreshGeneration;
       const actionIndexBeforeRefresh = actionIndex;
+      const viewBeforeRefresh = actionMode ? actionView() : undefined;
+      const actionRowBeforeRefresh = viewBeforeRefresh === undefined ? -1 : viewBeforeRefresh.rows.length - viewBeforeRefresh.options.length + actionIndex;
+      const wasVisible = actionRowBeforeRefresh >= offset && actionRowBeforeRefresh < offset + viewportRows();
       try {
         const next = await inspectEntry(manager, storageDirectory, entry, context);
         if (generation !== refreshGeneration) return;
@@ -346,8 +349,8 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
           const options = actionOptions(manager, inspection, context);
           actionIndex = Math.min(actionIndex, Math.max(0, options.length - 1));
           const view = actionView();
-          if (actionIndex !== actionIndexBeforeRefresh) scrollActionIntoView(view);
-          else if (offset > maxOffsetFor(view.rows)) clampOffset(view.rows);
+          if (wasVisible || actionIndex !== actionIndexBeforeRefresh) scrollActionIntoView(view);
+          else clampOffset(view.rows);
         }
         requestRender();
       } catch (error: unknown) {

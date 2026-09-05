@@ -3,10 +3,11 @@
 
 ### Fixes
 
-- Keep the subagent Steer editor and selected action visible while navigating long detail panels. (#274)
+- Keep the subagent Steer editor and selected action visible while navigating long detail panels, including across live refreshes; detail scrolling is bounded to the content. (#274)
 - A rejected progress callback (e.g. run-state persistence failure) no longer crashes the Pi host; the agent run fails through its normal path and the session is aborted and disposed. (#265)
 - Manual deletion from `/workflow` refuses to delete a run that a surviving run depends on and skips such runs during bulk deletion; retry-child creation is serialised with deletion. (#263)
 - Concurrent `get_subagent_result` calls no longer release the parent's scheduler permit more than once, so run/session concurrency limits hold and the parent no longer deadlocks. (#264)
+
 ## [5.13.0] - 2026-09-05
 
 ### Breaking changes

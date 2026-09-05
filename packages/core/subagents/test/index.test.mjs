@@ -762,8 +762,9 @@ test("bounds every narrow detail-panel row while preserving scrolling and action
     async stop() {},
     async retry() {},
   };
-  globalThis.setInterval = (callback, delay) => { assert.equal(delay, 1000); timerCallbacks.push(callback); return {}; };
-  globalThis.clearInterval = () => {};
+  const fakeTimer = {};
+  globalThis.setInterval = (callback, delay, ...args) => { if (delay !== 1000) return originalSetInterval(callback, delay, ...args); timerCallbacks.push(callback); return fakeTimer; };
+  globalThis.clearInterval = (timer) => { if (timer !== fakeTimer) originalClearInterval(timer); };
   const commands = [];
   registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
   const command = commands.find(({ name }) => name === "subagents");
@@ -778,10 +779,17 @@ test("bounds every narrow detail-panel row while preserving scrolling and action
       async select(_title, options) { pickerCount += 1; return pickerCount === 1 ? options[0] : "Close"; },
       async custom(factory) {
         let closed = false;
-        const tui = { terminal: { rows: 5 }, requestRender() {} };
+        let renders = 0;
+        const tui = { terminal: { rows: 5 }, requestRender() { renders += 1; } };
         const component = factory(tui, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, () => { closed = true; });
         assert.equal(timerCallbacks.length, 1);
-        const flush = async () => { for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setImmediate(resolve)); };
+        const refreshWithToolCalls = async (count) => {
+          status.progress = { accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: Array.from({ length: count }, (_, index) => ({ id: `tool-${String(index)}`, name: `tool-${String(index)}`, state: "completed" })) };
+          const rendersBefore = renders;
+          timerCallbacks[0]();
+          for (let index = 0; index < 400 && renders === rendersBefore; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+          assert.equal(renders, rendersBefore + 1);
+        };
         const assertNarrowRows = (rows) => assert.ok(rows.every((row) => visibleWidth(row) <= width), rows.join("\n"));
         assertNarrowRows(component.render(width));
         for (let index = 0; index < 60; index += 1) component.handleInput("tui.select.down");
@@ -794,12 +802,14 @@ test("bounds every narrow detail-panel row while preserving scrolling and action
         component.handleInput("a");
         const actionScreen = component.render(width);
         assert.equal(actionScreen.some((row) => row.includes("Agent")), true);
+        assert.equal(actionScreen.some((row) => row.includes("→ Open")), true);
+        await refreshWithToolCalls(6);
+        assert.equal(component.render(width).some((row) => row.includes("→ Open")), true);
         component.handleInput("tui.select.pageUp");
         const detailScreen = component.render(width);
         assertNarrowRows(detailScreen);
         assert.equal(detailScreen.some((row) => row.includes("Agent")), false);
-        timerCallbacks[0]();
-        await flush();
+        await refreshWithToolCalls(7); // grows detail by one row: enough to move the action row, not enough to push "Agent actions" past the next pageDown
         assert.equal(component.render(width).some((row) => row.includes("Agent")), false);
         component.handleInput("tui.select.pageDown");
         const actionAfterPageDown = component.render(width);
