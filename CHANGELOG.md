@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- Trajectory shows a `TOPOLOGY` tree in the run view (workflow, phases, scopes, nested agents, aggregated tool chips) and a per-turn tool-call flow strip in the agent view whose chips select the matching transcript event. Rendered with plain HTML/CSS; no graph runtime is bundled. (#257)
+
 ### Breaking changes
 
 - Worktrees (`withWorktree()` and `subagents_run({ worktree })`) now branch from the launch repository's clean `HEAD` instead of a synthetic runtime snapshot commit. A dirty launch working tree (tracked or untracked non-ignored changes) fails worktree creation with `WORKTREE_FAILED`; commit or stash first. (#235)

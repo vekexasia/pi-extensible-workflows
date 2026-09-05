@@ -135,7 +135,7 @@ void test("Trajectory preference storage failures preserve defaults", () => {
     saveRunLayout: () => void;
     saveSidebarCollapsed: () => void;
   };
-  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, logsCollapsed: false });
+  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, topologyCollapsed: false, logsCollapsed: false });
   assert.deepEqual([...helpers.loadSidebarCollapsed()], []);
   assert.doesNotThrow(() => { helpers.saveRunLayout(); });
   assert.doesNotThrow(() => { helpers.saveSidebarCollapsed(); });
@@ -350,6 +350,8 @@ type TrajectoryPreviewHelpers = {
   entryDetails: (entry: unknown, agent: unknown, entries?: readonly unknown[]) => { kind: string; entry: unknown; agent: unknown };
   isDisplayableTranscriptEntry: (entry: { type?: unknown }) => boolean;
   renderAgentTimeline: (entries: readonly unknown[]) => string;
+  renderTopology: (record: Record<string, unknown>, timingsByAgent: Map<string, unknown[]>) => string;
+  renderToolCallFlow: (entries: readonly unknown[], selectedEvent: number | null) => string;
 };
 type TrajectoryRendererHelpers = Pick<TrajectoryPreviewHelpers, "renderAgentTimeline"> & {
   renderToolPane: (detail: { entry: Record<string, unknown>; agent: Record<string, unknown> }, entries: readonly unknown[]) => void;
@@ -360,7 +362,7 @@ function loadTrajectoryPreviewHelpers(source: string): TrajectoryPreviewHelpers 
   const helperStart = source.indexOf("    const esc");
   const helperEnd = source.indexOf("    function renderToolPane", helperStart);
   assert.ok(helperStart >= 0 && helperEnd > helperStart);
-  return runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; return { compactSkillReadPreview, eventPreview, eventPreviewParts, toolPreviewHtml, eventSearchText, eventLabel, entryDetails, isDisplayableTranscriptEntry, renderAgentTimeline }; })()`) as TrajectoryPreviewHelpers;
+  return runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; return { compactSkillReadPreview, eventPreview, eventPreviewParts, toolPreviewHtml, eventSearchText, eventLabel, entryDetails, isDisplayableTranscriptEntry, renderAgentTimeline, renderTopology, renderToolCallFlow }; })()`) as TrajectoryPreviewHelpers;
 }
 
 function loadTrajectoryRendererHelpers(source: string): TrajectoryRendererHelpers {
@@ -945,6 +947,35 @@ void test("Trajectory timeline clicks highlight the matching transcript event", 
   assert.match(source, /function highlightEvent\(index\)/);
   assert.match(source, /scrollIntoView\(\{ block: "nearest" \}\)/);
   assert.match(source, /\$\("agent-timeline"\)\.addEventListener\("click"/);
+});
+
+void test("Trajectory topology nests phases, scopes, child agents, and aggregated tools", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryPreviewHelpers(source);
+  const record = { run: { workflowName: "flow", state: "running", phaseHistory: [{ phase: "review", afterAgent: 0 }], agents: [
+    { id: "a", label: "Lead", state: "completed", structuralPath: ["parallel"] },
+    { id: "b", label: "Child", state: "running", parentId: "a", structuralPath: ["parallel"] },
+    { id: "c", label: "Other", state: "failed", parentId: "missing" },
+  ] } };
+  const timings = new Map([["a", [{ name: "bash", timing: { isError: false } }, { name: "bash", timing: { isError: true } }, { name: "read", timing: { isError: false } }]]]);
+  const html = helpers.renderTopology(record, timings);
+  assert.match(html, /PHASE review/);
+  assert.match(html, /topo-node scope">parallel</);
+  assert.match(html, /data-agent="a">.*Lead<\/span><span class="topo-node tool fail">bash ×2<\/span><span class="topo-node tool">read<\/span><ul><li><span class="topo-node" data-agent="b">/);
+  assert.match(html, /data-agent="c"/);
+});
+
+void test("Trajectory tool call flow groups calls by assistant turn and links results", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryPreviewHelpers(source);
+  const entries = [
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "read" }, { type: "toolCall", id: "c2", name: "bash" }] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "c1", isError: false, content: [] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "c2", isError: true, content: [] } },
+    { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "c3", name: "grep" }] } },
+  ];
+  assert.equal(helpers.renderToolCallFlow(entries, 2), '<div class="topo-turn"><span class="sec">#1</span><span class="topo-node" data-event="1">read</span><span class="topo-node fail on" data-event="2">bash</span></div><div class="topo-turn"><span class="sec">#4</span><span class="topo-node" data-event="3">grep …</span></div>');
+  assert.equal(helpers.renderToolCallFlow([{ type: "message", message: { role: "user", content: "hi" } }], null), "");
 });
 
 void test("Trajectory renders canonical failed tool results as failed", () => {
