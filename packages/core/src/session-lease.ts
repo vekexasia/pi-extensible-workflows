@@ -3,7 +3,7 @@ import { link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { WorkflowError } from "./types.js";
-import { isNodeError, object } from "./utils.js";
+import { isNodeError } from "./utils.js";
 import { decodeSessionOwner, type SessionOwner } from "./decoders.js";
 import { json } from "./io.js";
 import { runsDirectory } from "./paths.js";
@@ -30,8 +30,8 @@ export async function hasLiveSessionLease(cwd: string, sessionId: string, home =
   return processAlive(candidate.pid, candidate.startedAt);
 }
 
-function sameOwner(left: unknown, right: unknown): boolean {
-  if (!object(left) || !object(right)) return false;
+function sameOwner(left: SessionOwner | undefined, right: SessionOwner | undefined): boolean {
+  if (left === undefined || right === undefined) return false;
   return left.pid === right.pid && left.token === right.token;
 }
 
@@ -80,19 +80,20 @@ export async function acquireSessionLease(cwd: string, sessionId: string, home =
       return new SessionLease(path, token);
     } catch (error) {
       if (!isNodeError(error, "EEXIST")) throw error;
-      let existing: unknown;
+      let existingOwner: SessionOwner | undefined;
       let existingText = "";
       try {
         existingText = await readFile(path, "utf8");
-        existing = JSON.parse(existingText);
-        const candidate = decodeSessionOwner(existing);
-        if (candidate && await processAlive(candidate.pid, candidate.startedAt)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} is already owned by process ${String(candidate.pid)}`);
+        existingOwner = decodeSessionOwner(JSON.parse(existingText));
+        if (existingOwner && await processAlive(existingOwner.pid, existingOwner.startedAt)) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} is already owned by process ${String(existingOwner.pid)}`);
       } catch (readError) {
         if (readError instanceof WorkflowError) throw readError;
         if (isNodeError(readError, "ENOENT")) continue;
+        existingOwner = undefined;
+      }
+      if (existingOwner === undefined) {
         const age = await stat(path).then((value) => Date.now() - value.mtimeMs).catch(() => 0);
         if (age < SESSION_OWNER_WRITE_GRACE_MS) throw new WorkflowError("RUN_OWNED", `Pi session ${sessionId} has an active ownership lease`);
-        existing = undefined;
       }
       const stale = `${path}.${randomUUID()}.stale`;
       try {
@@ -105,7 +106,13 @@ export async function acquireSessionLease(cwd: string, sessionId: string, home =
           else await restoreLease(path, stale);
           continue;
         }
-        if (!sameOwner(existing, moved)) { await restoreLease(path, stale); continue; }
+        const movedOwner = decodeSessionOwner(moved);
+        if (movedOwner === undefined) {
+          if (movedText === existingText) await rm(stale, { force: true });
+          else await restoreLease(path, stale);
+          continue;
+        }
+        if (!sameOwner(existingOwner, movedOwner)) { await restoreLease(path, stale); continue; }
         await rm(stale, { force: true });
       }
       catch (reclaimError) { if (isNodeError(reclaimError, "ENOENT")) continue; throw reclaimError; }

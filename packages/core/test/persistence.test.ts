@@ -14,6 +14,7 @@ const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',des
 function run(cwd: string, sessionId = "session-a") {
   return { id: "run-a", workflowName: "x", cwd, sessionId, state: "running" as const, agents: [], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/sessions/native-a.jsonl" } }] };
 }
+function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> { return new Promise((resolve) => { const timer = setTimeout(() => { resolve(false); }, timeoutMs); promise.then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); resolve(true); }); }); }
 
 void test("session leases reject live owners, reclaim malformed or dead owners, and release only their own token", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lease-"));
@@ -41,6 +42,22 @@ void test("session leases reject live owners, reclaim malformed or dead owners, 
   utimesSync(ownerPath, new Date(0), new Date(0));
   const invalidReclaimed = await acquireSessionLease(cwd, "session-a", home);
   await invalidReclaimed.release();
+});
+void test("reclaims stale valid but undecodable session leases", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-invalid-lease-"));
+  const cwd = join(home, "project");
+  const directory = runsDirectory(cwd, "session-a", home);
+  const ownerPath = join(directory, "owner.json");
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(ownerPath, "null\n");
+  const recentAcquisition = acquireSessionLease(cwd, "session-a", home);
+  assert.equal(await settlesWithin(recentAcquisition, 1_000), true);
+  await assert.rejects(recentAcquisition, (error: unknown) => error instanceof WorkflowError && error.code === "RUN_OWNED");
+  utimesSync(ownerPath, new Date(0), new Date(0));
+  const acquisition = acquireSessionLease(cwd, "session-a", home);
+  assert.equal(await settlesWithin(acquisition, 1_000), true);
+  const lease = await acquisition;
+  await lease.release();
 });
 void test("cleans orphaned run creation directories without listing them as runs", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-run-temp-"));
