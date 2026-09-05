@@ -3,6 +3,7 @@
 
 ### Fixes
 
+- Portable bundles (`piewf bundle`) now bundle the extension module and its declared imports with esbuild instead of serialising `run.toString()`, so imported runtime values, module constants, and helpers work from the bundle. Extensions declare `source: import.meta.url` and `dependencies`; undeclared packages, Pi packages (`@earendil-works/*`), and non-literal dynamic imports fail at bundle time. esbuild is optional and loaded on demand only while bundling. The manifest is version 2; version 1 bundles still launch. The starter now imports `pi-extensible-workflows` by package name, so `dist/starter` relies on the package self-reference. (#271)
 - A session ownership lease containing valid JSON of the wrong shape (e.g. `null`) no longer makes lease acquisition loop forever; it is rejected while fresh and reclaimed once stale. (#270)
 - Keep the subagent Steer editor and selected action visible while navigating long detail panels, including across live refreshes; detail scrolling is bounded to the content. (#274)
 - A rejected progress callback (e.g. run-state persistence failure) no longer crashes the Pi host; the agent run fails through its normal path and the session is aborted and disposed. (#265)

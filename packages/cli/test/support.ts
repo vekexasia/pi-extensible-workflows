@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { isPersistedRun, type PersistedRun } from "pi-extensible-workflows/persistence";
 
 export type CliTestPackageMetadata = { version?: string; bin?: Record<string, string> };
@@ -126,4 +127,15 @@ export function cliTestErrorOutput(error: unknown): string {
     return cliTestString(stderr ?? error);
   }
   return cliTestString(error);
+}
+
+export function writeCliTestExtensionSource(path: string, workflow: { name: string; description: string; input: Record<string, unknown>; output: Record<string, unknown> }, run: string): { module: string; export: string } {
+  writeFileSync(path, [
+    'import { registerWorkflowExtension } from "pi-extensible-workflows";',
+    "export default function extension() {",
+    `  registerWorkflowExtension({ version: "1.0.0", headline: "CLI test bundle", functions: { ${JSON.stringify(workflow.name)}: { description: ${JSON.stringify(workflow.description)}, input: ${JSON.stringify(workflow.input)}, output: ${JSON.stringify(workflow.output)}, ${run} } } });`,
+    "}",
+    "",
+  ].join("\n"));
+  return { module: pathToFileURL(path).href, export: "default" };
 }

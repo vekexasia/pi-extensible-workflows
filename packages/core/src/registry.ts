@@ -281,9 +281,7 @@ export function retainWorkflowRegistry(): () => void {
 }
 export function loadingRegistry(): WorkflowRegistryApi { return workflowRegistryHost().api; }
 beginWorkflowExtensionLoading();
-export function registerWorkflowExtension(extension: WorkflowExtension): void {
-  loadingRegistry().register(extension);
-}
+export function registerWorkflowExtension(extension: WorkflowExtension): void { loadingRegistry().register(extension); }
 export function workflowCatalog(context?: WorkflowCatalogContext): WorkflowCatalog { return loadingRegistry().catalog(context); }
 export function workflowCatalogIndex(context?: WorkflowCatalogContext): WorkflowCatalogIndex { return loadingRegistry().catalogIndex(context); }
 export function workflowCatalogDetail(name: string, context?: WorkflowCatalogContext): WorkflowCatalogFunction | WorkflowCatalogModelAlias | WorkflowCatalogError { return loadingRegistry().catalogDetail(name, context); }

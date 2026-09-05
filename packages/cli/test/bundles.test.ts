@@ -20,12 +20,20 @@ void test("bundle loads extensions with aliased workflow API imports", async () 
       "}",
       "",
     ].join("\n"));
+    const source = join(root, "source-extension.mjs");
+    writeFileSync(source, [
+      'import { registerWorkflowExtension } from "pi-extensible-workflows";',
+      "export default function extension() {",
+      '  registerWorkflowExtension({ version: "1.0.0", headline: "Source extension", functions: { "bundle-test": { description: "Bundle test", input: { type: "object" }, output: { type: "string" }, run: (input) => input } } });',
+      "}",
+      "",
+    ].join("\n"));
     const destination = join(root, "bundle");
-    writePortableWorkflowBundle({
+    await writePortableWorkflowBundle({
       destination,
       command: "aliased-bundle",
       workflow: { name: "bundle-test", version: "1.0.0", headline: "Bundle test", description: "Bundle test", input: { type: "object" }, output: { type: "string" } },
-      functionSource: "(input) => input",
+      source: { module: pathToFileURL(source).href, export: "default" },
       piVersion: "unknown",
       engineVersion: "unknown",
       resources: { extensions: [extension] },
@@ -84,7 +92,7 @@ void test("bundles an extension module with runtime and local lexical dependenci
       resources: { extensions: [resource] },
     });
     assert.equal(manifest.version, 2);
-    assert.deepEqual(manifest.source, { module: pathToFileURL(extension).href, export: "default" });
+    assert.deepEqual(manifest.source, { module: "source-extension.mjs", export: "default" });
     assert.deepEqual(manifest.dependencies, ["typebox"]);
     assert.equal(typeof manifest.bundler?.esbuild, "string");
     const registered: Array<{ functions?: Record<string, { run: (input: { value: string }) => string }> }> = [];
@@ -102,19 +110,22 @@ void test("bundles an extension module with runtime and local lexical dependenci
   }
 });
 
-void test("bundle rejects external engine-package imports unless declared", async () => {
+void test("bundle rejects Pi package imports even when declared", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-external-dependency-"));
   try {
     const extension = join(root, "external-extension.mjs");
     writeFileSync(extension, 'import { something } from "@earendil-works/pi-ai"; export default function () { return something; }\n');
-    await assert.rejects(writePortableWorkflowBundle({
-      destination: join(root, "bundle"),
-      command: "external-bundle",
-      workflow: { name: "sourceWorkflow", version: "1.0.0", headline: "Source extension", description: "Source extension", input: { type: "object" }, output: { type: "string" } },
-      source: { module: pathToFileURL(extension).href, export: "default" },
-      piVersion: "unknown",
-      engineVersion: "unknown",
-    }), /Undeclared dependencies: @earendil-works\/pi-ai/);
+    for (const dependencies of [undefined, ["@earendil-works/pi-ai"]]) {
+      await assert.rejects(writePortableWorkflowBundle({
+        destination: join(root, "bundle"),
+        command: "external-bundle",
+        workflow: { name: "sourceWorkflow", version: "1.0.0", headline: "Source extension", description: "Source extension", input: { type: "object" }, output: { type: "string" } },
+        source: { module: pathToFileURL(extension).href, export: "default" },
+        ...(dependencies ? { dependencies } : {}),
+        piVersion: "unknown",
+        engineVersion: "unknown",
+      }), /Pi packages \(@earendil-works\/\*\) cannot be bundled; use the pi-extensible-workflows API instead/);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -193,32 +204,40 @@ void test("bundle ignores dynamic import text in comments and strings", async ()
 void test("bundle rejects unsupported dynamic imports", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-dynamic-"));
   try {
-    const extension = join(root, "dynamic-extension.mjs");
-    writeFileSync(extension, 'export default function extension(specifier) { return import(specifier); }\n');
-    await assert.rejects(writePortableWorkflowBundle({
-      destination: join(root, "bundle"),
-      command: "dynamic-bundle",
-      workflow: { name: "sourceWorkflow", version: "1.0.0", headline: "Source extension", description: "Source workflow", input: { type: "object" }, output: { type: "string" } },
-      source: { module: pathToFileURL(extension).href, export: "default" },
-      piVersion: "unknown",
-      engineVersion: "unknown",
-    }), /Unsupported dynamic import/);
+    const sources = {
+      "dynamic-extension.mjs": 'export default function extension(specifier) { return import(specifier); }\n',
+      "regex-extension.mjs": "const quote = /'/;\nexport default function extension(s) { return [quote, import(s)]; }\n",
+    };
+    for (const [name, source] of Object.entries(sources)) {
+      const extension = join(root, name);
+      writeFileSync(extension, source);
+      await assert.rejects(writePortableWorkflowBundle({
+        destination: join(root, "bundle"),
+        command: "dynamic-bundle",
+        workflow: { name: "sourceWorkflow", version: "1.0.0", headline: "Source extension", description: "Source workflow", input: { type: "object" }, output: { type: "string" } },
+        source: { module: pathToFileURL(extension).href, export: "default" },
+        piVersion: "unknown",
+        engineVersion: "unknown",
+      }), new RegExp(`Unsupported dynamic import in .*${name}: dynamic imports must use a string-literal module path`));
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-void test("bundle shim omits invalid emitted names", () => {
+void test("bundle shim omits invalid emitted names", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-"));
   try {
     const extension = join(root, "invalid-extension.mjs");
     writeFileSync(extension, 'import { "invalid-name" as validName } from "pi-extensible-workflows";\n');
+    const source = join(root, "source-extension.mjs");
+    writeFileSync(source, "export default function extension() {}\n");
     const destination = join(root, "bundle");
-    writePortableWorkflowBundle({
+    await writePortableWorkflowBundle({
       destination,
       command: "invalid-name-bundle",
       workflow: { name: "bundle-test", version: "1.0.0", headline: "Bundle test", description: "Bundle test", input: { type: "object" }, output: { type: "string" } },
-      functionSource: "(input) => input",
+      source: { module: pathToFileURL(source).href, export: "default" },
       piVersion: "unknown",
       engineVersion: "unknown",
       resources: { extensions: [extension] },

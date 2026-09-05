@@ -1,10 +1,11 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { builtinModules } from "node:module";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { AgentDefinition, WorkflowCatalogFunction } from "pi-extensible-workflows";
+import type { BuildFailure, BuildOptions, BuildResult } from "esbuild";
 
 export interface PortableWorkflowSource { module: string; export: string }
 export interface PortableWorkflowManifest {
@@ -28,10 +29,12 @@ export interface PortableWorkflowBundleResources {
   dependencies?: readonly string[];
 }
 
-interface PortableWorkflowBundleInputBase {
+export interface PortableWorkflowBundleInput {
   destination: string;
   command: string;
   workflow: WorkflowCatalogFunction;
+  source: PortableWorkflowSource;
+  dependencies?: readonly string[];
   piVersion?: string;
   engineVersion?: string;
   force?: boolean;
@@ -40,9 +43,6 @@ interface PortableWorkflowBundleInputBase {
   roles?: Readonly<Record<string, AgentDefinition>>;
   resources?: PortableWorkflowBundleResources;
 }
-export type PortableWorkflowBundleInput =
-  | (PortableWorkflowBundleInputBase & { functionSource: string; source?: never; dependencies?: never })
-  | (PortableWorkflowBundleInputBase & { source: PortableWorkflowSource; dependencies?: readonly string[]; functionSource?: never });
 
 
 type PackageMetadata = {
@@ -361,40 +361,7 @@ function runnerSource(): string {
   ].join("\n") + "\n";
 }
 
-export function normalizePortableFunctionSource(functionSource: string): string {
-  const source = functionSource.trim();
-  if (!source || source.includes("[native code]")) throw new Error("Workflow function source is unavailable");
-  if (/^(async\s+)?run\s*\(/.test(source)) return source.replace(/^(async\s+)?run\s*\(/, "$1function run(");
-  if (/^\*\s*run\s*\(/.test(source)) return source.replace(/^\*\s*run\s*\(/, "function* run(");
-  return source;
-}
 
-function workflowModule(workflow: WorkflowCatalogFunction, functionSource: string, withRoles: boolean, aliasTargets: Readonly<Record<string, string>>, extensionModules: readonly string[]): string {
-  const aliases = Object.entries(aliasTargets);
-  const source = normalizePortableFunctionSource(functionSource);
-  return [
-    `const run = ${source};`,
-    "export async function register(registerWorkflowExtension) {",
-    ...extensionModules.map((name, index) => `  const extension${String(index)} = await import(${JSON.stringify(`./extensions/${name}`)});`),
-    ...extensionModules.map((_name, index) => `  if (typeof extension${String(index)}.default === "function") await extension${String(index)}.default();`),
-    "  registerWorkflowExtension({",
-    `    version: ${JSON.stringify("1.0.0")},`,
-    `    headline: ${JSON.stringify("Portable workflow bundle")},`,
-    ...(withRoles ? [`    roleDirectories: [new URL("./roles", import.meta.url)],`] : []),
-    ...(aliases.length ? [`    modelAliases: { ${aliases.map(([name, target]) => `${JSON.stringify(name)}: { resolve: () => ${JSON.stringify(target)} }`).join(", ")} },`] : []),
-    "    functions: {",
-    `      [${JSON.stringify(workflow.name)}]: {`,
-    `        description: ${JSON.stringify(workflow.description)},`,
-    `        input: ${JSON.stringify(workflow.input)},`,
-    `        output: ${JSON.stringify(workflow.output)},`,
-    "        run,",
-    "      },",
-    "    },",
-    "  });",
-    "}",
-    "",
-  ].join("\n");
-}
 function bundledWorkflowModule(workflow: WorkflowCatalogFunction, source: PortableWorkflowSource, withRoles: boolean, aliasTargets: Readonly<Record<string, string>>, extensionModules: readonly string[]): string {
   const aliases = Object.entries(aliasTargets);
   const modules = ["./extension.mjs", ...extensionModules.map((name) => `./extensions/${name}`)];
@@ -427,23 +394,10 @@ function bundledWorkflowModule(workflow: WorkflowCatalogFunction, source: Portab
   ].join("\n");
 }
 
-type EsbuildPluginBuild = {
-  onLoad(options: { filter: RegExp }, callback: (args: { path: string }) => { errors: readonly { text: string }[] } | undefined): void;
-  onResolve(options: { filter: RegExp }, callback: (args: { path: string }) => { path: string; external: boolean } | undefined): void;
-};
-type EsbuildBuildOptions = {
-  entryPoints: readonly string[];
-  bundle: boolean;
-  format: "esm";
-  platform: "node";
-  nodePaths: readonly string[];
-  write: false;
-  metafile: true;
-  plugins: readonly [{ name: string; setup(build: EsbuildPluginBuild): void }];
-};
+type EsbuildBuildOptions = BuildOptions & { write: false; metafile: true };
 type EsbuildModule = {
   version: string;
-  build(options: EsbuildBuildOptions): Promise<{ outputFiles: readonly { text: string }[]; metafile: { outputs: Record<string, { exports: readonly string[] }> } }>;
+  build(options: EsbuildBuildOptions): Promise<BuildResult<EsbuildBuildOptions>>;
 };
 type BundledExtension = { source: string; esbuild: string };
 const nodeBuiltins = new Set(builtinModules);
@@ -495,58 +449,15 @@ function dependencyNames(dependencies: readonly string[] | undefined): readonly 
   if (names.some((dependency) => !packageNamePattern.test(dependency))) throw new Error("Workflow bundle dependencies must be package names");
   return names.sort();
 }
-function isNodeModulesPath(path: string): boolean { return path.split(/[\\/]/).includes("node_modules"); }
-function skipJavaScriptLiteral(source: string, start: number): number {
-  for (let index = start + 1; index < source.length; index += 1) {
-    if (source[index] === "\\") { index += 1; continue; }
-    if (source[index] === source[start]) return index + 1;
-  }
-  return source.length;
+function isBuildFailure(error: unknown): error is BuildFailure {
+  return error instanceof Error && Array.isArray((error as Partial<BuildFailure>).errors);
 }
-function skipJavaScriptComment(source: string, start: number): number {
-  if (source.startsWith("//", start)) {
-    const end = source.indexOf("\n", start + 2);
-    return end < 0 ? source.length : end;
-  }
-  const end = source.indexOf("*/", start + 2);
-  return end < 0 ? source.length : end + 2;
-}
-function skipJavaScriptSpace(source: string, start: number): number {
-  let index = start;
-  while (index < source.length) {
-    if (/\s/.test(source[index] ?? "")) { index += 1; continue; }
-    if (source.startsWith("//", index) || source.startsWith("/*", index)) { index = skipJavaScriptComment(source, index); continue; }
-    return index;
-  }
-  return index;
-}
-function dynamicImportEnd(source: string, opening: number): number {
-  let depth = 1;
-  for (let index = opening + 1; index < source.length; index += 1) {
-    const character = source[index];
-    if (character === "'" || character === '"' || character === "`") { index = skipJavaScriptLiteral(source, index) - 1; continue; }
-    if (character === "/" && (source.startsWith("//", index) || source.startsWith("/*", index))) { index = skipJavaScriptComment(source, index) - 1; continue; }
-    if (character === "(") depth += 1;
-    else if (character === ")" && --depth === 0) return index;
-  }
-  return -1;
-}
-function hasUnsupportedDynamicImport(source: string): boolean {
-  const literal = /^(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)\s*$/;
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index];
-    if (character === "'" || character === '"' || character === "`") { index = skipJavaScriptLiteral(source, index) - 1; continue; }
-    if (character === "/" && (source.startsWith("//", index) || source.startsWith("/*", index))) { index = skipJavaScriptComment(source, index) - 1; continue; }
-    if (!source.startsWith("import", index) || /[\w$.]/.test(source[index - 1] ?? "")) continue;
-    const opening = skipJavaScriptSpace(source, index + "import".length);
-    if (source[opening] !== "(") continue;
-    const closing = dynamicImportEnd(source, opening);
-    if (closing < 0) return true;
-    const expression = source.slice(opening + 1, closing).trim();
-    if (!literal.test(expression) || expression.startsWith("`") && expression.includes("${")) return true;
-    index = closing;
-  }
-  return false;
+function bundleFailure(error: unknown): Error {
+  if (!isBuildFailure(error)) return error instanceof Error ? error : new Error(String(error));
+  const dynamicImport = error.errors.find((message) => message.id === "unsupported-dynamic-import");
+  if (!dynamicImport) return error;
+  const file = dynamicImport.location ? resolve(dynamicImport.location.file) : "the workflow extension";
+  return new Error(`Unsupported dynamic import in ${file}: dynamic imports must use a string-literal module path, otherwise the module is not bundleable`, { cause: error });
 }
 async function bundleExtension(sourcePath: string, sourceExport: string, dependencies: readonly string[]): Promise<BundledExtension> {
   const esbuild = await loadEsbuild();
@@ -564,24 +475,23 @@ async function bundleExtension(sourcePath: string, sourceExport: string, depende
     ],
     write: false,
     metafile: true,
+    logLevel: "silent",
+    logOverride: { "unsupported-dynamic-import": "error" },
     plugins: [{
       name: "portable-workflow-dependencies",
       setup(build) {
-        build.onLoad({ filter: /\.(?:[cm]?[jt]s|tsx?|jsx?)$/ }, (args) => {
-          if ((args.path === sourcePath || !isNodeModulesPath(args.path)) && hasUnsupportedDynamicImport(readFileSync(args.path, "utf8"))) return { errors: [{ text: "Unsupported dynamic import; use a static import or a string-literal module path" }] };
-          return undefined;
-        });
         build.onResolve({ filter: /.*/ }, (args) => {
           if (!isPackageSpecifier(args.path)) return undefined;
           const name = packageName(args.path);
           if (isAllowedExternal(args.path)) return { path: args.path, external: true };
+          if (name.startsWith("@earendil-works/")) return { errors: [{ text: `Pi packages (@earendil-works/*) cannot be bundled; use the pi-extensible-workflows API instead: ${name}` }] };
           if (dependencies.includes(name)) return undefined;
           undeclared.add(name);
           return { path: args.path, external: true };
         });
       },
     }],
-  });
+  }).catch((error: unknown) => { throw bundleFailure(error); });
   if (undeclared.size) throw new Error(`Undeclared dependencies: ${[...undeclared].sort().join(", ")}`);
   const output = result.outputFiles[0];
   if (!output) throw new Error("esbuild produced no workflow extension output");
@@ -638,13 +548,13 @@ function copyResources(root: string, resources: PortableWorkflowBundleResources 
   return Object.keys(payload).length ? payload : undefined;
 }
 
-function extensionPackageShim(paths: readonly string[], bundledSource?: string): string {
+function extensionPackageShim(paths: readonly string[], bundledSource: string): string {
   const importedNames = new Set<string>();
   const sources = paths.map((path) => {
     if (!/\.(?:c|m)?js$/.test(path)) throw new Error(`Selected extension must be a JavaScript module file: ${path}`);
     return readFileSync(path, "utf8");
   });
-  if (bundledSource !== undefined) sources.push(bundledSource);
+  sources.push(bundledSource);
   for (const source of sources) {
     for (const match of source.matchAll(/import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+["']pi-extensible-workflows["']/g)) {
       for (const part of (match[1] ?? "").split(",")) {
@@ -675,7 +585,7 @@ function baseManifest(input: PortableWorkflowBundleInput, version: 1 | 2): Porta
   };
 }
 
-function writeBundleFiles(input: PortableWorkflowBundleInput, manifest: PortableWorkflowManifest, workflowSource: string, bundledExtensionSource?: string): PortableWorkflowManifest {
+function writeBundleFiles(input: PortableWorkflowBundleInput, manifest: PortableWorkflowManifest, workflowSource: string, bundledExtensionSource: string): PortableWorkflowManifest {
   const parent = dirname(input.destination);
   mkdirSync(parent, { recursive: true });
   if (existsSync(input.destination) && !input.force) throw new Error(`Destination already exists: ${input.destination}; use --force to replace it`);
@@ -695,18 +605,11 @@ function writeBundleFiles(input: PortableWorkflowBundleInput, manifest: Portable
     const copiedPayload = copyResources(temporary, input.resources);
     if (copiedPayload) manifest.payload = copiedPayload;
     const extensionPaths = input.resources?.extensions ?? [];
-    if (bundledExtensionSource !== undefined) {
-      writeFileSync(join(payload, "extension.mjs"), bundledExtensionSource, { encoding: "utf8", mode: 0o600 });
-      const packageDirectory = join(payload, "node_modules", "pi-extensible-workflows");
-      mkdirSync(packageDirectory, { recursive: true });
-      writeFileSync(join(packageDirectory, "package.json"), '{"type":"module","exports":"./index.mjs"}\n', { encoding: "utf8", mode: 0o600 });
-      writeFileSync(join(packageDirectory, "index.mjs"), extensionPackageShim(extensionPaths, bundledExtensionSource), { encoding: "utf8", mode: 0o600 });
-    } else if (extensionPaths.length) {
-      const packageDirectory = join(payload, "node_modules", "pi-extensible-workflows");
-      mkdirSync(packageDirectory, { recursive: true });
-      writeFileSync(join(packageDirectory, "package.json"), '{"type":"module","exports":"./index.mjs"}\n', { encoding: "utf8", mode: 0o600 });
-      writeFileSync(join(packageDirectory, "index.mjs"), extensionPackageShim(extensionPaths), { encoding: "utf8", mode: 0o600 });
-    }
+    writeFileSync(join(payload, "extension.mjs"), bundledExtensionSource, { encoding: "utf8", mode: 0o600 });
+    const packageDirectory = join(payload, "node_modules", "pi-extensible-workflows");
+    mkdirSync(packageDirectory, { recursive: true });
+    writeFileSync(join(packageDirectory, "package.json"), '{"type":"module","exports":"./index.mjs"}\n', { encoding: "utf8", mode: 0o600 });
+    writeFileSync(join(packageDirectory, "index.mjs"), extensionPackageShim(extensionPaths, bundledExtensionSource), { encoding: "utf8", mode: 0o600 });
     writeFileSync(join(temporary, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
     writeFileSync(join(payload, "workflow.mjs"), workflowSource, { encoding: "utf8", mode: 0o600 });
     writeFileSync(join(payload, "runner.mjs"), runnerSource(), { encoding: "utf8", mode: 0o700 });
@@ -722,22 +625,11 @@ function writeBundleFiles(input: PortableWorkflowBundleInput, manifest: Portable
   return manifest;
 }
 
-type LegacyPortableWorkflowBundleInput = Extract<PortableWorkflowBundleInput, { functionSource: string }>;
-type BundledPortableWorkflowBundleInput = Extract<PortableWorkflowBundleInput, { source: PortableWorkflowSource }>;
-
-export function writePortableWorkflowBundle(input: LegacyPortableWorkflowBundleInput): PortableWorkflowManifest;
-export function writePortableWorkflowBundle(input: BundledPortableWorkflowBundleInput): Promise<PortableWorkflowManifest>;
-export function writePortableWorkflowBundle(input: PortableWorkflowBundleInput): PortableWorkflowManifest | Promise<PortableWorkflowManifest> {
-  if (input.source === undefined) {
-    const manifest = baseManifest(input, 1);
-    return writeBundleFiles(input, manifest, workflowModule(input.workflow, input.functionSource, Object.keys(input.roles ?? {}).length > 0, input.aliasTargets ?? {}, input.resources?.extensions?.map((source) => basename(source)) ?? []));
-  }
-  return (async () => {
-    if (typeof input.source.export !== "string" || !input.source.export.trim()) throw new Error("Workflow source export must be a non-empty name");
-    const sourcePath = sourceModulePath(input.source.module);
-    const dependencies = dependencyNames(input.dependencies);
-    const bundled = await bundleExtension(sourcePath, input.source.export, dependencies);
-    const manifest = { ...baseManifest(input, 2), source: Object.freeze({ module: input.source.module, export: input.source.export }), bundler: { esbuild: bundled.esbuild }, dependencies: Object.freeze([...dependencies]) };
-    return writeBundleFiles(input, manifest, bundledWorkflowModule(input.workflow, input.source, Object.keys(input.roles ?? {}).length > 0, input.aliasTargets ?? {}, input.resources?.extensions?.map((source) => basename(source)) ?? []), bundled.source);
-  })();
+export async function writePortableWorkflowBundle(input: PortableWorkflowBundleInput): Promise<PortableWorkflowManifest> {
+  if (typeof input.source.export !== "string" || !input.source.export.trim()) throw new Error("Workflow source export must be a non-empty name");
+  const sourcePath = sourceModulePath(input.source.module);
+  const dependencies = dependencyNames(input.dependencies);
+  const bundled = await bundleExtension(sourcePath, input.source.export, dependencies);
+  const manifest = { ...baseManifest(input, 2), source: Object.freeze({ module: basename(sourcePath), export: input.source.export }), bundler: { esbuild: bundled.esbuild }, dependencies: Object.freeze([...dependencies]) };
+  return writeBundleFiles(input, manifest, bundledWorkflowModule(input.workflow, input.source, Object.keys(input.roles ?? {}).length > 0, input.aliasTargets ?? {}, input.resources?.extensions?.map((source) => basename(source)) ?? []), bundled.source);
 }
