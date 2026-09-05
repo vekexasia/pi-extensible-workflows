@@ -1204,6 +1204,7 @@ type ScheduledNode = {
   options: Readonly<ScheduledAgentOptions>;
   children: Set<string>;
   collected: boolean;
+  resultQueue: Promise<void>;
   collecting: boolean;
   state: AgentState;
   controller: AbortController;
@@ -1260,7 +1261,7 @@ export class FairAgentScheduler {
     const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
     let resolveCompletion: () => void = () => undefined;
     const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
-    const node: ScheduledNode = { id, runId, ...(parentId ? { parentId } : {}), prompt, options: effective, children: new Set<string>(), collected: false, collecting: false, state: "queued", controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: false };
+    const node: ScheduledNode = { id, runId, ...(parentId ? { parentId } : {}), prompt, options: effective, children: new Set<string>(), collected: false, collecting: false, resultQueue: Promise.resolve(), state: "queued", controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: false };
     node.task = async () => {
       if (node.controller.signal.aborted) { this.#release(node.runId); return; }
       node.state = "running";
@@ -1288,7 +1289,11 @@ export class FairAgentScheduler {
     if (child.collecting) throw new WorkflowError("AGENT_FAILED", "Child result is already being collected");
     child.collecting = true;
     const childPromise = child.promise;
+    const previousCollection = parent.resultQueue;
+    let releaseCollection!: () => void;
+    parent.resultQueue = new Promise<void>((resolve) => { releaseCollection = resolve; });
     try {
+      await previousCollection;
       parent.state = "waiting_for_child";
       this.#persist(parent.runId);
       this.#release(parent.runId);
@@ -1304,6 +1309,8 @@ export class FairAgentScheduler {
     } catch (error) {
       child.collecting = false;
       throw error;
+    } finally {
+      releaseCollection();
     }
   }
 
@@ -1406,7 +1413,7 @@ export class FairAgentScheduler {
       const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
       let resolveCompletion: () => void = () => undefined;
       const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
-      const node: ScheduledNode = { id: record.id, runId, ...(record.parentId ? { parentId: record.parentId } : {}), ...(record.prompt === undefined ? {} : { prompt: record.prompt }), options: this.#inherit(undefined, record.options), children: new Set(), collected: false, collecting: false, state: record.state, controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: true };
+      const node: ScheduledNode = { id: record.id, runId, ...(record.parentId ? { parentId: record.parentId } : {}), ...(record.prompt === undefined ? {} : { prompt: record.prompt }), options: this.#inherit(undefined, record.options), children: new Set(), collected: false, collecting: false, resultQueue: Promise.resolve(), state: record.state, controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: true };
       this.#nodes.set(node.id, node);
       run.logical += 1;
       this.#nextId = Math.max(this.#nextId, Number(node.id.slice(node.id.lastIndexOf(":") + 1)) || 0);

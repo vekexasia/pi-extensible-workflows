@@ -1740,6 +1740,51 @@ void test("scheduler flush without a run reports any pending persistence failure
   await assert.rejects(scheduler.flush(), (error: unknown) => error instanceof Error && error.message === "ownership write failed");
   await scheduler.flush();
 });
+void test("serializes concurrent child result collection per parent", async () => {
+  let releaseChildA!: () => void;
+  let releaseChildB!: () => void;
+  let markChildAStarted!: () => void;
+  let markChildBStarted!: () => void;
+  let activeChildren = 0;
+  let peakChildren = 0;
+  const childAStarted = new Promise<void>((resolve) => { markChildAStarted = resolve; });
+  const childBStarted = new Promise<void>((resolve) => { markChildBStarted = resolve; });
+  let resultCalls!: Promise<Awaited<ReturnType<FairAgentScheduler["result"]>>>[];
+  let scheduler: FairAgentScheduler;
+  // eslint-disable-next-line prefer-const
+  scheduler = new FairAgentScheduler(async ({ id, prompt, options }) => {
+    if (prompt === "parent") {
+      const childA = scheduler.spawn("run", "child-a", { label: "child-a", cwd: options.cwd, tools: [] }, id);
+      const childB = scheduler.spawn("run", "child-b", { label: "child-b", cwd: options.cwd, tools: [] }, id);
+      const first = scheduler.result(id, childA.id);
+      const second = scheduler.result(id, childB.id);
+      resultCalls = [first, second];
+      return Promise.all(resultCalls);
+    }
+    if (prompt !== "child-a" && prompt !== "child-b") return prompt;
+    activeChildren += 1;
+    peakChildren = Math.max(peakChildren, activeChildren);
+    (prompt === "child-a" ? markChildAStarted : markChildBStarted)();
+    await new Promise<void>((resolve) => { if (prompt === "child-a") releaseChildA = resolve; else releaseChildB = resolve; });
+    activeChildren -= 1;
+    return prompt;
+  }, 1);
+  scheduler.addRun("run", 1);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  await childAStarted;
+  assert.equal(peakChildren, 1);
+  releaseChildA();
+  await childBStarted;
+  assert.equal(peakChildren, 1);
+  releaseChildB();
+  const parentOutcome = await parent.result;
+  assert.equal(parentOutcome.ok, true);
+  assert.deepEqual(await Promise.all(resultCalls), (parentOutcome as { ok: true; value: unknown }).value);
+  const later = scheduler.spawn("run", "later", { label: "later", cwd: "/repo", tools: [] });
+  assert.equal((await later.result).ok, true);
+  scheduler.removeRun("run");
+  assert.deepEqual(scheduler.snapshot(), []);
+});
 void test("releases consumed scheduler result payloads while retaining node metadata", async () => {
   const references: WeakRef<object>[] = [];
   const scheduler = new FairAgentScheduler(async ({ prompt }) => {
