@@ -30,7 +30,7 @@ export type WorkflowRecoveryDependencies = {
   checkpointBridge: (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean, ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless?: boolean) => (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => Promise<boolean>;
   phaseBridge: (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle) => (phase: string) => Promise<void>;
   logBridge: (store: RunStore, lifecycle: RunLifecycle, workflowName: string) => (message: string) => Promise<void>;
-  lifecycleFor: (store: RunStore, state: RunState, budget: WorkflowBudgetRuntime, metadata: WorkflowMetadata) => RunLifecycle;
+  lifecycleFor: (store: RunStore, state: RunState, metadata: WorkflowMetadata) => RunLifecycle;
   createProviderErrorRecovery: (host: unknown, fallbackModels: ReadonlySet<string>, abort: () => void) => ((failure: AgentProviderFailure) => Promise<AgentProviderRecovery>) | undefined;
   cleanupTerminalRun: (runId: string) => Promise<void>;
   deliver: (content: string) => void;
@@ -295,7 +295,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       await childStore.create({ id: childRunId, workflowName: loaded.snapshot.metadata.name, cwd, sessionId, state: "interrupted", parentRunId: loaded.run.id, retry, agents: [], agentSessions: [], ...(budget ? { budget } : {}), budgetVersion: loaded.run.budgetVersion ?? 1, ...childInitialBudget }, childSnapshot);
       const fallbackModel: ModelSpec = { provider: hostModel.provider, model: hostModel.id, thinking: pi.getThinkingLevel() };
       const model = modelSpec(loaded.snapshot.models[0] ?? "", fallbackModel);
-      const lifecycle = lifecycleFor(childStore, "interrupted", childBudget, loaded.snapshot.metadata);
+      const lifecycle = lifecycleFor(childStore, "interrupted", loaded.snapshot.metadata);
       const abortController = new AbortController();
       const providerErrorRecovery = createProviderErrorRecovery(context, availableModels, () => { abortController.abort(); });
       const providerPause = async () => { deliver(`Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };

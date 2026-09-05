@@ -232,7 +232,7 @@ void test("completed final overruns complete, while later budgeted work reaches 
   assert.ok(sessionCount >= 2);
 });
 
-void test("workflow_resume persists exact proposals and approval or rejection controls exhausted runs", async () => {
+void test("workflow_resume preserves replacement budget accounting through terminal persistence", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-resume-"));
   const cwd = join(home, "project");
   const runId = "budget-run";
@@ -240,14 +240,14 @@ void test("workflow_resume persists exact proposals and approval or rejection co
   const usage = { tokens: 4, costUsd: 0, durationMs: 0, agentLaunches: 1 };
   const exhausted = { type: "hard_exhausted" as const, budgetVersion: 1, dimensions: ["tokens"] as const, usage, limits: budget, at: 0 };
   const store = new RunStore(cwd, "session", runId, home);
-  await store.create({ id: runId, workflowName: "resume-budget", cwd, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [], budget, budgetVersion: 1, usage, budgetEvents: [exhausted] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "resume-budget" }, launchMode: "foreground", settings: { concurrency: 1 }, budget, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: runId, workflowName: "resume-budget", cwd, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [], budget, budgetVersion: 1, usage, budgetEvents: [exhausted] }, createLaunchSnapshot({ script: "return await agent('work');", args: null, metadata: { name: "resume-budget" }, launchMode: "foreground", settings: { concurrency: 1 }, budget, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   const agentDir = join(home, "agent");
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const events: Array<{ channel: string; data: unknown }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, undefined, undefined, agentDir);
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_respond"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, undefined, testTransport(async () => budgetSession([{ content: [{ type: "text", text: "done" }], usage: budgetUsage(2, 0) }])), agentDir);
   let resolverCalls = 0;
   registerWorkflowExtension({ version: "1.0.0", headline: "Budget model policy", modelAliases: { "reviewer-model": { resolve(context) { resolverCalls += 1; assert.equal(context.projectTrusted, false); assert.ok(context.availableModels.has("new/model")); return "new/model"; } } } });
   const context = { cwd, model: { provider: "openai", id: "gpt" }, isProjectTrusted: () => false, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }, { provider: "new", id: "model" }], getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "new", id: "model" }] }, sessionManager: { getSessionId: () => "session" } };
@@ -277,7 +277,7 @@ void test("workflow_resume persists exact proposals and approval or rejection co
   assert.equal(approvedDetails.state, "completed");
   assert.equal(approvedDetails.approved, true);
   assert.equal(approvedDetails.reason, "approved");
-  assert.equal(approvedDetails.value, true);
+  assert.equal(approvedDetails.value, "done");
   const approvedContent = JSON.parse((approved as { content: Array<{ text: string }> }).content[0]?.text ?? "null") as { state: string; approved: boolean; runId: string; value: { state: string; runId: string; resultPath: string; resultBytes: number; inlined: boolean } };
   assert.equal(approvedContent.state, "completed");
   assert.equal(approvedContent.approved, true);
@@ -291,6 +291,12 @@ void test("workflow_resume persists exact proposals and approval or rejection co
   assert.equal(loaded.run.state, "completed");
   assert.equal(loaded.run.budgetVersion, 2);
   assert.deepEqual(loaded.run.budget, { tokens: { soft: 2, hard: 10 } });
+  assert.ok(loaded.run.usage);
+  assert.equal(loaded.run.usage.tokens, 6);
+  assert.equal(loaded.run.usage.agentLaunches, 2);
+  assert.ok(loaded.run.budgetEvents);
+  assert.equal(loaded.run.budgetEvents.some((event) => event.budgetVersion === 1 && event.type === "soft_crossed"), false);
+  assert.ok(loaded.run.budgetEvents.some((event) => event.budgetVersion === 2 && event.type === "soft_crossed"));
   assert.deepEqual(loaded.snapshot.modelAliases, { "reviewer-model": "new/model" });
   assert.equal(resolverCalls, 1);
   assert.equal(events.filter(({ channel }) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 0);
