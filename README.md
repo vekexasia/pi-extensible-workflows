@@ -84,7 +84,7 @@ npm ci
 npm run check
 ```
 
-See [RELEASING.md](RELEASING.md) for the release process.
+Start with [AGENTS.md](AGENTS.md) for the code map and completion rules. See the [verification guide](https://vekexasia.github.io/pi-extensible-workflows/developers.html#evaluation) for focused tests, package checks, and checks that need external services. Release approvals and publishing stay in [RELEASING.md](RELEASING.md).
 
 ## License
 

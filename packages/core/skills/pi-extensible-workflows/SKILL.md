@@ -1,13 +1,13 @@
 ---
 name: pi-extensible-workflows
-description: Use when the task is complex enough to require multiple subagents or when the user explicitly asks for a workflow.
+description: Author, run, inspect, and recover deterministic Pi workflows. Load when a task needs multi-agent orchestration or the user explicitly requests a workflow; not for ordinary single-agent repository edits.
 ---
 
 # pi-extensible-workflows
 
 ## Default path
 
-Use `workflow` only for genuinely multi-agent orchestration; a single agent uses ordinary tools or `Agent` directly. Give phases distinct responsibilities and keep result flow explicit.
+Use ordinary tools for work one agent can finish; use `subagents_run` for one independent delegated task. Use `workflow` for orchestration, with distinct phase responsibilities and explicit result flow.
 
 For most multi-agent tasks, start with a named inline workflow: provide a non-empty `name` and a `script` that fans out independent work with `parallel(...)`, awaits the keyed results, passes them into one summarizing `agent(...)`, and returns.
 

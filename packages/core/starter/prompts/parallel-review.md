@@ -9,7 +9,7 @@ If a target or focus is given below, review that; otherwise review the current u
 
 Choose 2-3 distinct review angles from the actual change (for example correctness and regressions, tests and validation, simplicity and maintainability; add security, performance, or docs when the change calls for it). Prefer three strong reviewers over many vague ones.
 
-Launch a named workflow whose script fans out one `agent({ role: "reviewer" })` per angle with `parallel(...)`, each told its angle and to inspect the repository and diff directly with its own tools. Await the keyed reviews, then synthesize them yourself into:
+Launch a named workflow whose script fans out one `agent(taskPrompt, { role: "reviewer" })` per angle with `parallel(...)`, each told its angle in `taskPrompt` and to inspect the repository and diff directly with its own tools. Await the keyed reviews, then synthesize them yourself into:
 
 - fixes worth doing now;
 - optional improvements;

@@ -54,7 +54,7 @@
 <span class="tok-command">pi</span> install "$PWD/packages/core"</code></pre>
         <p>For a one-session trial without changing Pi settings:</p>
         <pre><code class="language-shell"><span class="tok-command">pi</span> --no-extensions --extension "$PWD/packages/core/src/index.ts"</code></pre>
-        <p>The public packages declare Pi runtime packages as peers. Repository development pins Pi packages to 0.84.1. This npm-workspaces monorepo publishes <code>pi-extensible-workflows</code> from <code>packages/core</code>, <code>@piewf/cli</code> from <code>packages/cli</code>, and <code>@piewf/herdr</code> from <code>packages/extensions/herdr</code>. Standalone subagent tools live in the core package; the private subagents workspace is only a build and test runner.</p>
+        <p>Workspace manifests and <code>package-lock.json</code> are authoritative for Pi dependency versions. Core and Herdr declare Pi runtime peers; the standalone CLI installs its runtime dependencies. This npm-workspaces monorepo publishes <code>pi-extensible-workflows</code> from <code>packages/core</code>, <code>@piewf/cli</code> from <code>packages/cli</code>, and <code>@piewf/herdr</code> from <code>packages/extensions/herdr</code>. Standalone subagent tools and their tests live in <code>packages/core/subagents</code>; there is no separate subagents workspace.</p>
         <h3 id="updates">Updates and bundled changelog</h3>
         <p>Pi has no post-update extension hook for <code>pi update --extensions</code> or <code>pi update --all</code>. After either command, the next <code>session_start</code> compares the installed package version and uses the package-local <code>CHANGELOG.md</code> to show a non-blocking notice once for that version. The first interactive startup also shows the current release section; later starts stay quiet until the version changes. A source checkout installed directly from <code>packages/core</code> normally has no package-local changelog because that file is generated only during packing, so its startup notice is silent until a packed package supplies it.</p>
         <p>The notice is offline, is skipped without UI and in print or JSON mode, and stores its marker at <code>&lt;agentDir&gt;/pi-extensible-workflows/changelog-state.json</code>. Missing or malformed changelog data and state read/write failures are best-effort and never prevent Pi startup. A failed state write can repeat the notice on the next startup.</p>
@@ -311,13 +311,25 @@
         <p>Invocation options override settings defaults, and the session-wide active-agent ceiling is 16. Host-facing failures are <code>WorkflowError</code> values with stable codes such as <code>CONFIG_ERROR</code>, <code>INVALID_SYNTAX</code>, <code>UNKNOWN_MODEL</code>, <code>UNKNOWN_TOOL</code>, <code>AGENT_FAILED</code>, <code>AGENT_RESULT_COLLECTED</code>, <code>AGENT_TIMEOUT</code>, <code>RESULT_INVALID</code>, <code>CANCELLED</code>, <code>WORKTREE_FAILED</code>, <code>BUDGET_EXHAUSTED</code>, and <code>RESUME_INCOMPATIBLE</code>. Fix the reported trust, model, tool, role, budget, settings, or script issue before retrying.</p>
       </section>
       <section id="evaluation">
-        <h2>Evaluation and package checks</h2>
-        <p>Deterministic evaluation helpers use a fake bridge and make zero model calls during normal tests. Model-backed evaluations are opt-in and require an explicit provider and model.</p>
-        <pre><code class="language-shell"><span class="tok-command">npm</span> run check
-<span class="tok-command">npm</span> run acceptance
-<span class="tok-command">npm</span> run evals -- --provider <span class="tok-variable">"$PROVIDER"</span> --model <span class="tok-variable">"$MODEL"</span> --case direct-answer,parallel
+        <h2>Contributor verification</h2>
+        <p>Start with the repository's <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/AGENTS.md">code map and completion rules</a>. Commands below run from the repository root; their implementations live in the workspace manifests, not in a separate CI test runner.</p>
+        <pre><code class="language-shell"><span class="tok-command">npm</span> ci
+<span class="tok-command">npm</span> run check
+<span class="tok-command">npm</span> run test:packages</code></pre>
+        <p>Pull requests and main-branch pushes run these same commands on Node.js 24. <code>check</code> builds and type-checks all packages, lints, runs the workspace and template tests, and validates documentation links. <code>test:packages</code> additionally packs and installs all three artifacts in temporary directories, checks imports and entrypoints, exercises the installed CLI and Pi package discovery, and runs npm audit. It requires npm registry access but does not publish anything. Release checks remain in <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/RELEASING.md">RELEASING.md</a>.</p>
+        <h3>Focused iteration</h3>
+        <p>Build before running compiled tests; otherwise <code>test:run</code> can exercise stale output. <code>TEST_FILES</code> paths are relative to the selected workspace. For example:</p>
+        <pre><code class="language-shell"><span class="tok-command">npm</span> run build --workspace=packages/core
+TEST_FILES='dist/test/starter.test.js' <span class="tok-command">npm</span> run test:run --workspace=packages/core
+<span class="tok-command">npm</span> run build --workspace=packages/cli
+TEST_FILES='dist/test/doctor.test.js' <span class="tok-command">npm</span> run test:run --workspace=packages/cli</code></pre>
+        <p>Match additional checks to the affected boundary: <code>npm run acceptance</code> exercises deterministic runtime acceptance; <code>npm run docs:check</code> checks documentation links and markup conventions. Keep a regression that fails before a behavior fix and passes after it. Existing starter tests execute the role-call examples from shipped prompts; do not replace behavioral checks with prose-only assertions.</p>
+        <h3>What a green check does not prove</h3>
+        <p>Core <code>test:herdr</code> skips navigator integration unless run inside a real Herdr pane with <code>HERDR_ENV=1</code>. Run <code>npm run test:herdr --workspace=packages/core</code> there after building when changing that UI; do not set the variable merely to bypass the skip. Ordinary CI does not prove live Herdr behavior. Inspect the actual TUI or browser target for UI changes.</p>
+        <p>Model-backed evaluations are separate, opt-in checks. Deterministic tests do not prove live provider behavior. Run these only with an explicitly approved provider/model and external cost:</p>
+        <pre><code class="language-shell"><span class="tok-command">npm</span> run evals -- --provider <span class="tok-variable">"$PROVIDER"</span> --model <span class="tok-variable">"$MODEL"</span> --case direct-answer,parallel
 PI_WORKFLOW_EVAL_AMBIENT=1 <span class="tok-command">npm</span> run evals:ambient -- --provider <span class="tok-variable">"$PROVIDER"</span> --model <span class="tok-variable">"$MODEL"</span></code></pre>
-        <p>The ambient tier is separately opt-in. Do not enable it in ordinary CI unless its external model cost and cleanup are intentional.</p>
+        <p>Before handoff, report the user outcome exercised, exact checks and failures, and any skipped or unverified paths. A reviewer verdict is not execution evidence; optional improvements are not blockers. Do not merge or deploy as part of verification.</p>
       </section>
       <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
     </article>

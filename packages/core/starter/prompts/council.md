@@ -7,7 +7,7 @@ Convene a bounded advisory council on this decision. You are the supervisor: you
 
 If the question is trivial or already settled, answer directly instead of convening a council.
 
-Pick 2-3 distinct lenses suited to the decision (for example: simplicity and maintenance cost, correctness and failure modes, migration and compatibility risk). Launch a named workflow whose script fans out one `agent({ role: "oracle" })` per lens with `parallel(...)`, each given the decision, the relevant context, and its lens. One pass only; do not run advisor rounds.
+Pick 2-3 distinct lenses suited to the decision (for example: simplicity and maintenance cost, correctness and failure modes, migration and compatibility risk). Launch a named workflow whose script fans out one `agent(taskPrompt, { role: "oracle" })` per lens with `parallel(...)`, each given the decision, the relevant context, and its lens in `taskPrompt`. One pass only; do not run advisor rounds.
 
 Synthesize the returned opinions yourself into a short decision memo: the recommendation, the strongest argument against it, what each lens surfaced, and the decision that remains mine.
 

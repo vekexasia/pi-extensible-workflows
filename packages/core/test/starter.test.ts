@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import starter from "../starter/index.js";
 import { reviewLoop } from "../starter/review-loop.js";
+import { runWorkflow } from "../src/execution.js";
 import {
   beginWorkflowExtensionLoading,
   loadingRegistry,
@@ -16,6 +17,22 @@ import {
   type WorkflowFunctionContext,
   WorkflowRegistry,
 } from "../src/index.js";
+
+void test("starter prompt agent examples execute with a task and role", async () => {
+  for (const [name, role] of [["council", "oracle"], ["deep-research", "researcher"], ["parallel-review", "reviewer"], ["parallel-scout", "scout"]] as const) {
+    const source = readFileSync(new URL(`../../starter/prompts/${name}.md`, import.meta.url), "utf8");
+    const call = /`(agent\([^`]*role:[^`]*\))`/.exec(source)?.[1];
+    assert.ok(call, `${name}: missing role example`);
+    const result = await runWorkflow(`const taskPrompt = "Bounded task with context"; return await ${call};`, null, {
+      agent: async (task, options) => {
+        assert.equal(task, "Bounded task with context");
+        assert.equal(options.role, role);
+        return "verified";
+      },
+    }).result;
+    assert.equal(result, "verified");
+  }
+});
 
 function registerStarter() {
   resetWorkflowRegistry();

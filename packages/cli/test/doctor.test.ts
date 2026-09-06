@@ -455,6 +455,37 @@ void test("CLI workflow arguments cover schema types, defaults, enums, and missi
   assert.ok(help.includes("  --no-approve".padEnd(28) + "Do not trust project resources for this launch"));
   assert.ok(help.includes("  --".padEnd(28) + "End launcher option parsing; pass later tokens to workflow input"));
 });
+void test("CLI number arguments reject blanks without changing valid numeric inputs", () => {
+  const schema = { type: "object", properties: { value: { type: "number" }, values: { type: "array", items: { type: "number" } } } };
+  for (const raw of ["", " ", "\t\n", "NaN", "Infinity", "1e309", "1oops"]) {
+    for (const args of [[`--value=${raw}`], ["--value", raw], ["--values", raw]]) {
+      assert.throws(() => parseWorkflowCliArgs(schema, args), /Invalid number/, JSON.stringify(args));
+    }
+    assert.throws(() => parseWorkflowCliArgs({ ...schema, required: ["value"] }, [raw]), /Invalid number/);
+  }
+  for (const [raw, value] of [["0", 0], ["-1.5", -1.5], ["1e2", 100], [" 2.5 ", 2.5]] as const) {
+    assert.deepEqual(parseWorkflowCliArgs(schema, ["--value", raw, "--values", raw]), { value, values: [value] });
+  }
+});
+void test("headless CLI rejects blank numbers before creating a run and persists valid results", () => {
+  const paths = fixture();
+  const definition = 'numericEcho: { description: "Echo a number", input: { type: "object", properties: { value: { type: "number" } }, required: ["value"], additionalProperties: false }, output: { type: "number" }, run: (input) => input.value }';
+  try {
+    const invalid = runIsolatedCli(paths, definition, ["run", "numericEcho", "--value="]);
+    assert.equal(invalid.status, 1, invalid.stderr);
+    assert.equal(invalid.stdout, "");
+    assert.match(invalid.stderr, /Error: Invalid number/);
+    assert.doesNotMatch(invalid.stderr, /Run ID:/);
+    assert.equal(readdirSync(paths.root, { recursive: true }).some((path) => String(path).endsWith("snapshot.json")), false);
+    const valid = runIsolatedCli(paths, definition, ["run", "numericEcho", "--value=0"]);
+    assert.equal(valid.status, 0, valid.stderr);
+    assert.equal(valid.stdout, "0\n");
+    assert.match(valid.stderr, /Run ID: [0-9a-f-]+/);
+    const results = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith("/result.json"));
+    assert.equal(results.length, 1);
+    assert.equal(readFileSync(join(paths.root, results[0] ?? ""), "utf8").trim(), "0");
+  } finally { rmSync(paths.root, { recursive: true, force: true }); }
+});
 void test("CLI parser handles delimiter passthrough, negated booleans, and negative numeric positionals", () => {
   const stringSchema = { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false };
   const booleanSchema = { type: "object", properties: { issue: { type: "integer" }, verbose: { type: "boolean", default: true } }, required: ["issue"], additionalProperties: false };

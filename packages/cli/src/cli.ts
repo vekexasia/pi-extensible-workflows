@@ -94,7 +94,7 @@ function coerce(raw: string, type: CliScalar, schema: Record<string, unknown>): 
   let value: JsonValue;
   if (type === "string") value = raw;
   else if (type === "integer") { if (!/^-?(?:0|[1-9]\d*)$/.test(raw)) throw new Error(`Invalid integer: ${raw}`); value = Number(raw); if (!Number.isSafeInteger(value)) throw new Error(`Invalid integer: ${raw}`); }
-  else if (type === "number") { value = Number(raw); if (!Number.isFinite(value)) throw new Error(`Invalid number: ${raw}`); }
+  else if (type === "number") { value = Number(raw); if (!raw.trim() || !Number.isFinite(value)) throw new Error(`Invalid number: ${raw}`); }
   else { if (raw !== "true" && raw !== "false") throw new Error(`Invalid boolean: ${raw}`); value = raw === "true"; }
   if (!enumAllows(schema, value)) throw new Error(`Invalid value for enum: ${raw}`);
   return value;
