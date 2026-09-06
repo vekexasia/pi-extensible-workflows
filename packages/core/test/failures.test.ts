@@ -419,7 +419,8 @@ void test("background failure diagnostics drive workflow_retry with the advertis
   const context = { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
   await workflow.execute("background-retry", { name: "background-retry", script: `return withWorktree("background-tree", async () => parallel("branches", { good: () => agent("good", {label:"good"}), bad: () => agent("bad", {label:"bad"}) }));` }, undefined, undefined, context);
   let diagnosticMessage: string | undefined;
-  for (let attempt = 0; attempt < 100 && !diagnosticMessage; attempt += 1) {
+  // Background delivery includes worktree creation; the bound covers slow CI runners, not a fixed expected latency.
+  for (let attempt = 0; attempt < 1_000 && !diagnosticMessage; attempt += 1) {
     diagnosticMessage = delivered.find((message) => message.includes(" failed (runId="));
     if (!diagnosticMessage) await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
