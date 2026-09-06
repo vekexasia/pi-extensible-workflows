@@ -495,8 +495,11 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
         filtered.push(arg);
       }
-      return [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
+      // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
+      return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
     })(),
+    // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
+    env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
     stdio: ["ignore", "ignore", "ignore", "ipc"],
     serialization: "advanced",
   });
