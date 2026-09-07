@@ -114,7 +114,7 @@
       </section>
       <section id="worktrees">
         <h2>Worktrees, storage, and inspection</h2>
-        <p>Set <code>worktree</code> to create an isolated named Git worktree for the run. The run executes there, inspection exposes its path and branch while materialized, and cleanup runs when the agent settles, stops, or is reconciled. Failed cleanup retains its metadata for a later retry.</p>
+        <p>Set <code>worktree</code> to create an isolated named Git worktree for the run. The optional global or trusted-project <code>worktreePostCreateCommand</code> setting runs its executable and arguments directly once after checkout from the launch-relative directory inside the new worktree; missing executables, nonzero exits, spawn failures, and the fixed 60-second timeout fail creation with <code>WORKTREE_FAILED</code> and roll back its artifacts. The run executes there, inspection exposes its path and branch while materialized, and cleanup runs when the agent settles, stops, or is reconciled. Failed cleanup retains its metadata for a later retry.</p>
         <p>Run records are stored below the agent directory's private <code>subagents/&lt;id&gt;/</code> directory. Normalized requests, launch mode, status, results, and failures remain inspectable after manager restart. Treat this storage as private because requests and results can contain project data.</p>
       </section>
       <section class="callout">

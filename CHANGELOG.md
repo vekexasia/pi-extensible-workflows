@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- Optionally run a trusted workflow-settings command after newly created worktrees are checked out; failures roll back the worktree and report `WORKTREE_FAILED`.
+
 ## [5.13.1] - 2026-09-05
 
 ### Fixes

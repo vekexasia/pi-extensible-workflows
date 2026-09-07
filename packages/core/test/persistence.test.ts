@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -15,6 +15,33 @@ function run(cwd: string, sessionId = "session-a") {
   return { id: "run-a", workflowName: "x", cwd, sessionId, state: "running" as const, agents: [], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/sessions/native-a.jsonl" } }] };
 }
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> { return new Promise((resolve) => { const timer = setTimeout(() => { resolve(false); }, timeoutMs); promise.then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); resolve(true); }); }); }
+function gitFixture(prefix: string, relativeCwd = ""): { home: string; repo: string; cwd: string } {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  const repo = join(home, "repo");
+  const cwd = relativeCwd ? join(repo, relativeCwd) : repo;
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  return { home, repo, cwd };
+}
+function commandSnapshot(command: readonly string[] | undefined, source = "global") {
+  return createLaunchSnapshot({ ...snapshot, settings: { ...DEFAULT_SETTINGS, ...(command === undefined ? {} : { worktreePostCreateCommand: command }) }, ...(command === undefined ? {} : { settingsSources: { concurrency: "global", modelAliases: "global", worktreePostCreateCommand: source } }) });
+}
+function worktreeArtifacts(store: RunStore, owner: string): { path: string; branch: string; marker: string } {
+  const key = createHash("sha256").update(`${store.sessionId}\0${store.runId}\0${owner}`).digest("hex").slice(0, 16);
+  return { path: join(store.directory, "worktrees", key), branch: `pi-extensible-workflows/${store.runId}/${key}`, marker: join(store.directory, `worktree-${key}.creating`) };
+}
+async function assertWorktreeRollback(store: RunStore, repo: string, owner: string): Promise<void> {
+  const artifacts = worktreeArtifacts(store, owner);
+  assert.equal(existsSync(artifacts.path), false);
+  assert.equal(execFileSync("git", ["-C", repo, "branch", "--list", artifacts.branch], { encoding: "utf8" }).trim(), "");
+  assert.equal(existsSync(artifacts.marker), false);
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+}
 
 void test("session leases reject live owners, reclaim malformed or dead owners, and release only their own token", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-lease-"));
@@ -397,6 +424,125 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
   assert.deepEqual(await store.awaitingCheckpoints(), []);
 });
 
+void test("runs a configured post-create command once from the launch subdirectory", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-post-create-"));
+  const repo = join(home, "repo");
+  const cwd = join(repo, "packages", "app");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const invocations = join(home, "invocations");
+  const script = "const fs=require('node:fs'); fs.appendFileSync(process.argv[1], process.cwd()+'\\n'); fs.writeFileSync('prepared.json', JSON.stringify({cwd:process.cwd(), argument:process.argv[2]}));";
+  const command = [process.execPath, "-e", script, invocations, "argument with spaces"];
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  const launch = createLaunchSnapshot({ ...snapshot, settings: { ...DEFAULT_SETTINGS, worktreePostCreateCommand: command }, settingsSources: { concurrency: "global", modelAliases: "global", worktreePostCreateCommand: "global" } });
+  await store.create(run(cwd), launch);
+  const first = await store.worktree("agent");
+  assert.deepEqual(JSON.parse(readFileSync(join(first.cwd, "prepared.json"), "utf8")), { cwd: realpathSync(first.cwd), argument: "argument with spaces" });
+  assert.equal(readFileSync(invocations, "utf8").split("\\n").filter(Boolean).length, 1);
+  assert.deepEqual(await store.worktree("agent"), first);
+  assert.equal(readFileSync(invocations, "utf8").split("\\n").filter(Boolean).length, 1);
+});
+void test("rolls back worktree artifacts when post-create preparation fails", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-post-create-failure-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  const command = [process.execPath, "-e", "console.error('preparation failed'); process.exit(7)"];
+  const launch = createLaunchSnapshot({ ...snapshot, settings: { ...DEFAULT_SETTINGS, worktreePostCreateCommand: command }, settingsSources: { concurrency: "global", modelAliases: "global", worktreePostCreateCommand: `${repo}/nested/../.pi/pi-extensible-workflows/settings.json` } });
+  await store.create(run(repo), launch);
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("trusted project settings") && error.message.includes("exited with status 7") && error.message.includes("preparation failed"));
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+  assert.equal(execFileSync("git", ["-C", repo, "branch", "--list", "pi-extensible-workflows/run-a/*"], { encoding: "utf8" }).trim(), "");
+  assert.deepEqual(readdirSync(store.directory).filter((name) => name.startsWith("worktree-") && name.endsWith(".creating")), []);
+});
+void test("does not launch a post-create command when the setting is absent", async () => {
+  const { home, repo } = gitFixture("pi-extensible-workflows-worktree-post-create-noop-");
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), commandSnapshot(undefined));
+  await store.worktree("agent");
+  assert.equal(existsSync(join(home, "invocations")), false);
+});
+void test("copies ignored local context from the launch subdirectory without tracking it", async () => {
+  const { home, repo, cwd } = gitFixture("pi-extensible-workflows-worktree-post-create-copy-", "packages/app");
+  writeFileSync(join(repo, ".gitignore"), "local-skill.md\ncopied-skill.md\n");
+  execFileSync("git", ["-C", repo, "add", ".gitignore"]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "ignore local context"]);
+  writeFileSync(join(cwd, "local-skill.md"), "private skill");
+  const invocations = join(home, "invocations");
+  const command = [process.execPath, "-e", "const fs=require('node:fs'); fs.copyFileSync(process.argv[2], 'copied-skill.md'); fs.appendFileSync(process.argv[1], process.cwd()+'\\n');", invocations, join(cwd, "local-skill.md")];
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), commandSnapshot(command));
+  const worktree = await store.worktree("agent");
+  assert.equal(readFileSync(join(worktree.cwd, "copied-skill.md"), "utf8"), "private skill");
+  assert.equal(readFileSync(invocations, "utf8"), realpathSync(worktree.cwd) + "\n");
+  assert.doesNotThrow(() => execFileSync("git", ["-C", worktree.path, "check-ignore", "--", "packages/app/copied-skill.md"], { stdio: "ignore" }));
+});
+void test("runs preparation once for each newly created worktree and never on reuse", async () => {
+  const { home, repo } = gitFixture("pi-extensible-workflows-worktree-post-create-separate-");
+  const invocations = join(home, "invocations");
+  const command = [process.execPath, "-e", "require('node:fs').appendFileSync(process.argv[1], process.cwd()+'\\n')", invocations];
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), commandSnapshot(command));
+  const first = await store.worktree("first");
+  const second = await store.worktree("second");
+  assert.notEqual(first.path, second.path);
+  assert.equal(readFileSync(invocations, "utf8").split("\n").filter(Boolean).length, 2);
+  assert.deepEqual(await store.worktree("first"), first);
+  assert.equal(readFileSync(invocations, "utf8").split("\n").filter(Boolean).length, 2);
+});
+void test("does not reseed borrowed, inherited, retry, or cold-resumed worktrees", async () => {
+  const { home, repo } = gitFixture("pi-extensible-workflows-worktree-post-create-reuse-");
+  const invocations = join(home, "invocations");
+  const command = [process.execPath, "-e", "require('node:fs').appendFileSync(process.argv[1], process.cwd()+'\\n')", invocations];
+  const owner = structuralPath("worktree", "named", "shared");
+  const source = new RunStore(repo, "session-a", "source", home);
+  await source.create({ ...run(repo), id: "source", state: "failed" }, commandSnapshot(command));
+  const original = await source.worktree(owner);
+  const borrowed = new RunStore(repo, "session-a", "borrowed", home);
+  await borrowed.create({ ...run(repo), id: "borrowed", parentRunId: "source", state: "completed" }, commandSnapshot(command));
+  assert.deepEqual(await borrowed.worktree(owner), original);
+  const inherited = new RunStore(repo, "session-a", "inherited", home);
+  await inherited.create({ ...run(repo), id: "inherited", parentRunId: "borrowed", state: "completed" }, commandSnapshot(command));
+  assert.deepEqual(await inherited.worktree(owner), original);
+  const retry = new RunStore(repo, "session-a", "retry", home);
+  await retry.create({ ...run(repo), id: "retry", parentRunId: "source", state: "failed", retry: { sourceRunId: "source", lineageRootRunId: "source", completedPaths: [], incompletePaths: [], namedWorktrees: ["shared"] } }, commandSnapshot(command));
+  assert.deepEqual(await retry.worktree(owner), original);
+  assert.deepEqual(await new RunStore(repo, "session-a", "source", home).worktree(owner), original);
+  assert.equal(readFileSync(invocations, "utf8").split("\n").filter(Boolean).length, 1);
+});
+void test("rolls back worktree artifacts for missing executable, signal, and non-zero failures", async () => {
+  const scenarios = [
+    { name: "missing executable", command: [join(tmpdir(), "pi-extensible-workflows-no-such-executable")], detail: "was not found" },
+    { name: "spawn failure", command: ["."], detail: "could not be started" },
+    { name: "signal", command: [process.execPath, "-e", "process.kill(process.pid, 'SIGTERM')"], detail: "terminated by SIGTERM" },
+    { name: "non-zero exit", command: [process.execPath, "-e", "process.stderr.write('x'.repeat(5000)); process.exit(7)"], detail: "exited with status 7" },
+  ];
+  for (const scenario of scenarios) {
+    const { home, repo } = gitFixture(`pi-extensible-workflows-worktree-post-create-${scenario.name.replaceAll(" ", "-")}-`);
+    const store = new RunStore(repo, "session-a", "run-a", home);
+    await store.create(run(repo), commandSnapshot(scenario.command));
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes(scenario.detail) && error.message.includes("global settings") && error.message.includes("failed in") && error.message.length < 6000);
+    await assertWorktreeRollback(store, repo, "agent");
+  }
+});
+void test("reports and rolls back a post-create timeout", { timeout: 70_000 }, async () => {
+  const { home, repo } = gitFixture("pi-extensible-workflows-worktree-post-create-timeout-");
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), commandSnapshot([process.execPath, "-e", "setTimeout(() => {}, 120_000)"]));
+  await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("timed out after 60 seconds") && error.message.includes("global settings"));
+  await assertWorktreeRollback(store, repo, "agent");
+});
 void test("creates worktrees from clean HEAD, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-"));
   const repo = join(home, "repo");

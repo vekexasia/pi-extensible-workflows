@@ -230,10 +230,6 @@ function executionOptions(request: Readonly<SubagentRunRequest>, onAttempt: NonN
   };
 }
 
-function effectiveConcurrency(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>): number {
-  return resolveWorkflowSettings(context.extensionContext.cwd, context.extensionContext.isProjectTrusted(), workflowSettingsPath(dependencies.agentDir ?? getAgentDir())).effective.concurrency;
-}
-
 function storageDirectory(dependencies: Readonly<SubagentManagerDependencies>): string {
   return dependencies.storageDir ?? join(dependencies.agentDir ?? getAgentDir(), STORAGE_DIRECTORY);
 }
@@ -639,8 +635,10 @@ function worktreeValue(value: unknown): { path: string; branch: string } | undef
 function worktreeContextValue(value: unknown): SubagentWorktreeContext | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const context = typeof record.cwd === "string" && typeof record.sessionId === "string" && typeof record.runId === "string" && typeof record.name === "string" && typeof record.owner === "string" ? { cwd: record.cwd, sessionId: record.sessionId, runId: record.runId, name: record.name, owner: record.owner } : undefined;
-  if (!context || !context.cwd.trim() || !context.sessionId.trim() || !context.runId.trim() || !context.name.trim() || !context.owner.trim()) return undefined;
+  const command = record.worktreePostCreateCommand === undefined ? undefined : Array.isArray(record.worktreePostCreateCommand) && record.worktreePostCreateCommand.length > 0 && record.worktreePostCreateCommand.every((argument) => typeof argument === "string" && Boolean(argument.trim())) ? record.worktreePostCreateCommand as string[] : undefined;
+  const source = record.worktreePostCreateCommandSource === undefined ? undefined : typeof record.worktreePostCreateCommandSource === "string" && record.worktreePostCreateCommandSource.trim() ? record.worktreePostCreateCommandSource : undefined;
+  const context = typeof record.cwd === "string" && typeof record.sessionId === "string" && typeof record.runId === "string" && typeof record.name === "string" && typeof record.owner === "string" ? { cwd: record.cwd, sessionId: record.sessionId, runId: record.runId, name: record.name, owner: record.owner, ...(command === undefined ? {} : { worktreePostCreateCommand: command }), ...(source === undefined ? {} : { worktreePostCreateCommandSource: source }) } : undefined;
+  if (!context || !context.cwd.trim() || !context.sessionId.trim() || !context.runId.trim() || !context.name.trim() || !context.owner.trim() || record.worktreePostCreateCommand !== undefined && command === undefined || record.worktreePostCreateCommandSource !== undefined && source === undefined) return undefined;
   return context;
 }
 function decodeStatus(value: unknown, id: string, includeAttemptMetadata = true): PersistedSubagentStatus | undefined {
@@ -938,7 +936,8 @@ class PersistentSubagentManager implements SubagentManager {
     if (!sessionId.trim()) throw new WorkflowError("INTERNAL_ERROR", "Current Pi session identity is unavailable");
     const owner = this.runOwner;
     if (!owner) throw new WorkflowError("INTERNAL_ERROR", "Subagent storage owner identity is unavailable");
-    const concurrency = effectiveConcurrency(context, this.dependencies);
+    const settings = resolveWorkflowSettings(context.extensionContext.cwd, context.extensionContext.isProjectTrusted(), workflowSettingsPath(this.dependencies.agentDir ?? getAgentDir()));
+    const concurrency = settings.effective.concurrency;
     if (this.activeRunCount >= concurrency) throw new WorkflowError("AGENT_FAILED", `Subagent concurrency limit reached (${String(this.activeRunCount)}/${String(concurrency)} active runs); no queue is maintained. Retry after an active run settles.`);
     this.activeRunCount += 1;
     const controller = new AbortController();
@@ -964,6 +963,8 @@ class PersistentSubagentManager implements SubagentManager {
         runId: id,
         name: snapshot.worktree,
         owner: structuralPath("worktree", "named", snapshot.worktree),
+        ...(settings.effective.worktreePostCreateCommand === undefined ? {} : { worktreePostCreateCommand: settings.effective.worktreePostCreateCommand }),
+        ...(settings.sources.worktreePostCreateCommand === undefined ? {} : { worktreePostCreateCommandSource: settings.sources.worktreePostCreateCommand }),
       };
       if (worktreeContext !== undefined) {
         live.worktreeContext = worktreeContext;

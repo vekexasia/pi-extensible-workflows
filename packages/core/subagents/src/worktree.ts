@@ -7,6 +7,8 @@ export interface SubagentWorktreeContext {
   readonly runId: string;
   readonly name: string;
   readonly owner: string;
+  readonly worktreePostCreateCommand?: readonly string[];
+  readonly worktreePostCreateCommandSource?: string;
 }
 
 export interface SubagentWorktreeRunStore {
@@ -41,14 +43,15 @@ function syntheticRun(context: Readonly<SubagentWorktreeContext>): PersistedRun 
   };
 }
 
-function syntheticSnapshot(): LaunchSnapshot {
+function syntheticSnapshot(context: Readonly<SubagentWorktreeContext>): LaunchSnapshot {
   return {
     identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION,
     launchMode: "background",
     script: "return null;",
     args: null,
     metadata: { name: "subagents" },
-    settings: { concurrency: 1 },
+    settings: { concurrency: 1, ...(context.worktreePostCreateCommand === undefined ? {} : { worktreePostCreateCommand: context.worktreePostCreateCommand }) },
+    ...(context.worktreePostCreateCommandSource === undefined ? {} : { settingsSources: { concurrency: "subagents", modelAliases: "subagents", worktreePostCreateCommand: context.worktreePostCreateCommandSource } }),
     models: [],
     tools: [],
     agentTypes: [],
@@ -61,7 +64,7 @@ export function createRunStoreWorktreeAdapter(home: string): SubagentWorktreeAda
     create(context) {
       const operation = createQueue.then(async () => {
         const store = new RunStore(context.cwd, context.sessionId, context.runId, home);
-        await store.create(syntheticRun(context), syntheticSnapshot());
+        await store.create(syntheticRun(context), syntheticSnapshot(context));
         try {
           const reference = await store.worktree(context.owner);
           let cleaned = false;
