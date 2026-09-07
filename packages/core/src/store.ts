@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { promisify } from "node:util";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
@@ -16,6 +18,9 @@ import {
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
 
+const executeFile = promisify(execFile);
+const WORKTREE_POST_CREATE_TIMEOUT_MS = 60_000;
+const WORKTREE_POST_CREATE_OUTPUT_LIMIT = 4096;
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
 const SYSTEM_PROMPT_BODIES = "bodies";
@@ -417,6 +422,29 @@ export class RunStore {
     }
   }
 
+  private async runWorktreePostCreateCommand(command: readonly string[], cwd: string, source?: string): Promise<void> {
+    const executable = command[0];
+    if (!executable) return;
+    const display = command.map((argument) => JSON.stringify(argument)).join(" ");
+    try {
+      await executeFile(executable, [...command.slice(1)], { cwd, env: process.env, encoding: "utf8", timeout: WORKTREE_POST_CREATE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+    } catch (error: unknown) {
+      const record = typeof error === "object" && error !== null ? error as Record<string, unknown> : {};
+      const code = record.code;
+      const signal = typeof record.signal === "string" ? record.signal : undefined;
+      const stderr = typeof record.stderr === "string" ? record.stderr.trim() : "";
+      const stdout = typeof record.stdout === "string" ? record.stdout.trim() : "";
+      const output = [stderr, stdout].filter(Boolean).join("\n").slice(0, WORKTREE_POST_CREATE_OUTPUT_LIMIT);
+      const provenance = source !== undefined && resolve(source) === resolve(this.cwd, ".pi", "pi-extensible-workflows", "settings.json") ? "trusted project settings" : "global settings";
+      let category: string;
+      if (code === "ENOENT") category = `executable ${JSON.stringify(executable)} was not found`;
+      else if (code === "ETIMEDOUT" || record.killed === true && signal === "SIGTERM") category = `timed out after ${String(WORKTREE_POST_CREATE_TIMEOUT_MS / 1000)} seconds`;
+      else if (typeof code === "number") category = `exited with status ${String(code)}`;
+      else if (signal) category = `was terminated by ${signal}`;
+      else category = `could not be started${typeof code === "string" ? ` (${code})` : ""}`;
+      throw new Error(`worktree post-create command ${display} from ${provenance} failed in ${cwd}: ${category}${output ? `; output: ${output}` : ""}`, { cause: error });
+    }
+  }
   private structuralWorktree(owner: string, record: WorktreeReference): WorktreeReference {
     const expected = this.expectedWorktree(owner);
     const relativePath = relative(this.directory, record.path);
@@ -683,6 +711,7 @@ export class RunStore {
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
+        if (loaded.snapshot.settings.worktreePostCreateCommand) await this.runWorktreePostCreateCommand(loaded.snapshot.settings.worktreePostCreateCommand, record.cwd, loaded.snapshot.settingsSources?.worktreePostCreateCommand);
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;

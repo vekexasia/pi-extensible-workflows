@@ -1,7 +1,7 @@
 /* global setTimeout, setImmediate */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -2016,20 +2016,27 @@ test("session shutdown disposes active subagent sessions and rejects controls", 
 
 test("uses RunStore worktrees and removes them after a standalone run", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-"));
+  const agentDir = join(cwd, "agent");
+  const invocations = join(cwd, "invocations");
+  await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ worktreePostCreateCommand: [process.execPath, "-e", "require('node:fs').writeFileSync('prepared.txt', process.cwd()); require('node:fs').appendFileSync(process.argv[1], 'x')", invocations] }));
   await writeFile(join(cwd, "README.md"), "base\n");
-  await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
+  await writeFile(join(cwd, ".gitignore"), "subagents-storage/\nagent/\n");
   execFileSync("git", ["init", "-q"], { cwd });
   execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
   execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   let worktreePath;
+  let preparedCwd;
   let branch;
   const manager = createSubagentManager({
+    agentDir,
     storageDir: join(cwd, "subagents-storage"),
     createExecutor(root) {
       return {
         async execute(_task, options) {
           const reference = await root.runStore.validateWorktree(options.worktreeOwner);
           worktreePath = reference.cwd;
+          preparedCwd = await readFile(join(reference.cwd, "prepared.txt"), "utf8");
           branch = reference.branch;
           return { value: { cwd: reference.cwd }, attempts: [], cwd: reference.cwd };
         },
@@ -2041,6 +2048,8 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
     const launched = await manager.run({ prompt: "work", worktree: "actual" }, context);
     await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
     assert.equal(typeof worktreePath, "string");
+    assert.equal(preparedCwd, await realpath(worktreePath));
+    assert.equal(await readFile(invocations, "utf8"), "x");
     await waitFor(async () => typeof worktreePath === "string" && !(await stat(worktreePath).then(() => true, () => false)));
     await waitFor(() => typeof branch === "string" && execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
   } finally {

@@ -256,6 +256,29 @@ void test("workflow extension wires the background widget from global settings",
   assert.deepEqual(install("{"), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: ["alt+o"] });
 });
 
+void test("resolves trusted worktree post-create commands with provenance and ignores untrusted overrides", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-command-settings-"));
+  const cwd = join(root, "project");
+  const globalPath = join(root, "home", ".pi", "agent", "pi-extensible-workflows", "settings.json");
+  const projectPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(root, "home", ".pi", "agent", "pi-extensible-workflows"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+  const globalCommand = ["git-worktreeinclude", "apply"];
+  const projectCommand = ["project-worktreeinclude", "apply", "--local"];
+  writeFileSync(globalPath, JSON.stringify({ worktreePostCreateCommand: globalCommand }));
+  writeFileSync(projectPath, JSON.stringify({ worktreePostCreateCommand: projectCommand }));
+  assert.deepEqual(loadSettings(globalPath).worktreePostCreateCommand, globalCommand);
+  const trusted = resolveWorkflowSettings(cwd, true, globalPath);
+  assert.deepEqual(trusted.effective.worktreePostCreateCommand, projectCommand);
+  assert.equal(trusted.sources.worktreePostCreateCommand, projectPath);
+  const untrusted = resolveWorkflowSettings(cwd, false, globalPath);
+  assert.deepEqual(untrusted.effective.worktreePostCreateCommand, globalCommand);
+  assert.equal(untrusted.sources.worktreePostCreateCommand, globalPath);
+  for (const value of [[], [""], ["  "], ["git", 1]]) {
+    writeFileSync(globalPath, JSON.stringify({ worktreePostCreateCommand: value }));
+    assert.throws(() => loadSettings(globalPath), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
+  }
+});
 void test("composes trusted resource selectors and ignores untrusted project selectors", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resources-"));
   const home = join(root, "home");
@@ -581,6 +604,18 @@ void test("resolves trusted project settings with replacement and inheritance se
   writeFileSync(projectPath, "{ malformed");
   assert.doesNotThrow(() => resolveWorkflowSettings(cwd, false, globalPath));
   assert.throws(() => resolveWorkflowSettings(cwd, true, globalPath), /Invalid workflow settings JSON/);
+});
+void test("workflow catalog keeps global alias provenance when only the trusted project command changes", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-catalog-command-provenance-"));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  const globalPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(globalPath, JSON.stringify({ modelAliases: { reviewer: "openai/gpt" } }));
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ worktreePostCreateCommand: ["git-worktreeinclude", "apply"] }));
+  const catalog = new WorkflowRegistry().catalog({ cwd, projectTrusted: true, globalSettingsPath: globalPath });
+  assert.deepEqual(catalog.modelAliasEntries, [{ name: "reviewer", kind: "static", provenance: "global settings" }]);
 });
 void test("workflow_catalog reports effective project settings without registered functions", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-project-catalog-"));

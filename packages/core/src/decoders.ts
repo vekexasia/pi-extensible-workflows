@@ -44,6 +44,10 @@ function decodeArray<T>(value: unknown, decoder: (value: unknown) => T | undefin
   return decoded;
 }
 function decodeStringArray(value: unknown): string[] | undefined { return decodeArray(value, (entry) => typeof entry === "string" ? entry : undefined); }
+function decodeWorktreePostCreateCommand(value: unknown): string[] | undefined {
+  const command = decodeStringArray(value);
+  return command && command.length > 0 && command.every((entry) => Boolean(entry.trim())) ? command : undefined;
+}
 function decodeJsonValue(value: unknown): JsonValue | undefined { return jsonValue(value) ? value : undefined; }
 // jsonValue() already validated every entry; the copy detaches the result from the parsed input.
 function decodeJsonObject(value: unknown): Record<string, JsonValue> | undefined { return object(value) && jsonValue(value) ? { ...value } : undefined; }
@@ -156,11 +160,12 @@ function decodeWorkflowSettings(value: unknown): LaunchSnapshot["settings"] | un
   const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
   const effectiveExtensionSettings = extensionSettings ?? legacyExtensionSettings;
   const retention = value.retention === undefined ? undefined : decodeRetention(value.retention);
-  if (backgroundWidget === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE) return undefined;
+  const worktreePostCreateCommand = value.worktreePostCreateCommand === undefined ? undefined : decodeWorktreePostCreateCommand(value.worktreePostCreateCommand);
+  if (backgroundWidget === INVALID_PERSISTED_VALUE || (value.modelAliases !== undefined && !modelAliases) || value.skills !== undefined && !skills || value.tools !== undefined && !tools || value.extensions !== undefined && !extensions && !legacyExtensionSettings || value.extensionSettings !== undefined && !extensionSettings || retention === INVALID_PERSISTED_VALUE || value.worktreePostCreateCommand !== undefined && !worktreePostCreateCommand) return undefined;
   return {
     concurrency: value.concurrency,
     ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(modelAliases === undefined ? {} : { modelAliases }), ...(skills === undefined ? {} : { skills }), ...(tools === undefined ? {} : { tools }),
-    ...(extensions === undefined ? {} : { extensions }), ...(effectiveExtensionSettings === undefined ? {} : { extensionSettings: effectiveExtensionSettings }), ...(retention === undefined ? {} : { retention }),
+    ...(extensions === undefined ? {} : { extensions }), ...(effectiveExtensionSettings === undefined ? {} : { extensionSettings: effectiveExtensionSettings }), ...(retention === undefined ? {} : { retention }), ...(worktreePostCreateCommand === undefined ? {} : { worktreePostCreateCommand }),
   };
 }
 function decodeWorkflowSettingsSources(value: unknown): NonNullable<LaunchSnapshot["settingsSources"]> | undefined {
@@ -170,8 +175,9 @@ function decodeWorkflowSettingsSources(value: unknown): NonNullable<LaunchSnapsh
   const tools = value.tools === undefined ? undefined : typeof value.tools === "string" ? value.tools : undefined;
   const extensionSettings = value.extensionSettings === undefined ? undefined : typeof value.extensionSettings === "string" ? value.extensionSettings : undefined;
   const retention = value.retention === undefined ? undefined : typeof value.retention === "string" ? value.retention : undefined;
-  if (value.skills !== undefined && skills === undefined || value.extensions !== undefined && extensions === undefined || value.tools !== undefined && tools === undefined || value.extensionSettings !== undefined && extensionSettings === undefined || value.retention !== undefined && retention === undefined) return undefined;
-  return { concurrency: value.concurrency, modelAliases: value.modelAliases, ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(retention === undefined ? {} : { retention }) };
+  const worktreePostCreateCommand = value.worktreePostCreateCommand === undefined ? undefined : typeof value.worktreePostCreateCommand === "string" ? value.worktreePostCreateCommand : undefined;
+  if (value.skills !== undefined && skills === undefined || value.extensions !== undefined && extensions === undefined || value.tools !== undefined && tools === undefined || value.extensionSettings !== undefined && extensionSettings === undefined || value.retention !== undefined && retention === undefined || value.worktreePostCreateCommand !== undefined && worktreePostCreateCommand === undefined) return undefined;
+  return { concurrency: value.concurrency, modelAliases: value.modelAliases, ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(retention === undefined ? {} : { retention }), ...(worktreePostCreateCommand === undefined ? {} : { worktreePostCreateCommand }) };
 }
 function decodeIdentity(value: unknown): PersistedIdentity | undefined {
   if (!object(value) || typeof value.callSite !== "string" || !positiveInteger(value.occurrence)) return undefined;

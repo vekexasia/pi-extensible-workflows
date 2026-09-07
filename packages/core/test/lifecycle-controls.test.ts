@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -61,6 +61,10 @@ void test("orchestration lifecycle events cover phase, worktree, retry, checkpoi
   execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
   execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  writeFileSync(join(cwd, ".gitignore"), "prepared.txt\n");
+  const invocations = join(home, "invocations");
+  mkdirSync(join(home, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(join(home, "pi-extensible-workflows", "settings.json"), JSON.stringify({ worktreePostCreateCommand: [process.execPath, "-e", "const fs=require('node:fs'); fs.writeFileSync('prepared.txt', process.cwd()); fs.appendFileSync(process.argv[1], process.cwd()+'\\n');", invocations] }));
   execFileSync("git", ["-C", cwd, "add", "."]);
   execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
   const events: Array<{ channel: string; data: unknown }> = [];
@@ -70,11 +74,13 @@ void test("orchestration lifecycle events cover phase, worktree, retry, checkpoi
     return { sessionId: `event-session-${String(attempt)}`, sessionFile: `/sessions/event-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (attempt === 1) throw new Error("PROMPT_SECRET"); }, steer: async () => {}, dispose() {} };
   };
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, async () => {}, testTransport(createSession));
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, async () => {}, testTransport(createSession), home);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const result = await workflow.execute("id", { name: "orchestration-events", args: { secret: "ARG_SECRET" }, script: "phase('build'); return withWorktree('OWNER_SECRET', async () => { const value = await agent('PROMPT_SECRET', {label:'worker', retries:1}); const approved = await checkpoint({name:'ship', prompt:'CHECKPOINT_SECRET', context:{secret:'CONTEXT_SECRET'}}); const rejected = await checkpoint({name:'reject', prompt:'Reject?', context:{secret:'REJECT_CONTEXT_SECRET'}}); return {value, approved, rejected}; });", foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { select: async (prompt: string) => prompt === "Reject?" ? "Reject" : "Approve" } }) as { details?: { value?: unknown } };
   assert.deepEqual(result.details?.value, { value: "done", approved: "approved", rejected: "rejected" });
+  assert.equal(readFileSync(invocations, "utf8").split("\n").filter(Boolean).length, 1);
+  assert.match(readFileSync(invocations, "utf8"), /worktrees/);
   const channels = events.map(({ channel }) => channel);
   assert.equal(channels.filter((channel) => channel === WORKFLOW_RUN_STARTED_EVENT).length, 1);
   assert.ok(channels.includes(WORKFLOW_PHASE_CHANGED_EVENT));

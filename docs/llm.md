@@ -81,11 +81,12 @@ Supported settings shape:
   "extensions": ["**/*", "!**/unsafe.mjs"],
   "extensionSettings": { "herdr": { "enableFullyInspectableMode": true }, "trajectory": { "port": 7432, "themes": true } },
   "tools": ["*", "!write"],
+  "worktreePostCreateCommand": ["git-worktreeinclude", "apply"],
   "retention": { "olderThanDays": 30, "maxTerminalRuns": 200 }
 }
 ```
 The supported resource fields are direct `skills`, `extensions`, and `tools` arrays. `skills` matches discovered skill names, `extensions` matches discovered normalized extension paths, and `tools` matches only the current root or parent tool boundary. Selectors never create unavailable resources. The legacy `disabledAgentResources` field is rejected; it is not an alias for these fields. Extension configuration belongs under `extensionSettings.herdr` or `extensionSettings.trajectory`; the obsolete `extensions.herdr` object is rejected.
-The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` is accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
+The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, `worktreePostCreateCommand`, and `retention`. `backgroundWidget` is accepted only in the global file, and project settings may use the other keys. `worktreePostCreateCommand` is an optional non-empty executable-and-arguments array; it is disabled by default, and the configured external executable must be installed separately. A trusted project value replaces the global value. The effective command and its source are frozen in each workflow launch snapshot. It runs directly after a newly created worktree is checked out, from the launch-relative directory in that worktree, with a fixed 60-second timeout; failure is `WORKTREE_FAILED` and rolls back creation. Existing, borrowed, retried, or resumed worktrees are not reseeded. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
 
 ### Trajectory
 
