@@ -168,7 +168,7 @@ async function loadRuns(cwd: string, sessionId: string, home: string): Promise<M
   return runs;
 }
 
-async function agentReport(agent: PersistedRun["agents"][number]): Promise<AgentReport> {
+function agentReport(agent: PersistedRun["agents"][number]): AgentReport {
   const fallbackModel = `${agent.model.provider}/${agent.model.model}`;
   const fallbackThinking = agent.model.thinking;
   const attempts: AttemptReport[] = [];
@@ -176,15 +176,10 @@ async function agentReport(agent: PersistedRun["agents"][number]): Promise<Agent
     const setup = attempt.setup;
     const path = attemptTranscriptPath(attempt);
     const log = path ? readTranscript(path) : undefined;
-    if (log) {
-      const model = log.model ?? `${setup.model.provider}/${setup.model.model}`;
-      const cost = log.cost;
-      attempts.push({ attempt: attempt.attempt, prompt: log.prompt ?? "(transcript unavailable)", model, ...(log.thinking !== undefined ? { thinking: log.thinking } : {}), cost, models: log.models.length ? log.models : [{ model, cost }], ...(attempt.error ? { error: `${attempt.error.code}: ${attempt.error.message}` } : {}), setup });
-      continue;
-    }
-    const model = `${setup.model.provider}/${setup.model.model}`;
-    const cost = attempt.accounting.cost;
-    attempts.push({ attempt: attempt.attempt, prompt: "(transcript unavailable)", model, ...(setup.model.thinking !== undefined ? { thinking: setup.model.thinking } : {}), cost, models: [{ model, cost }], ...(attempt.error ? { error: `${attempt.error.code}: ${attempt.error.message}` } : {}), setup });
+    const model = log?.model ?? `${setup.model.provider}/${setup.model.model}`;
+    const thinking = log ? log.thinking : setup.model.thinking;
+    const cost = log?.cost ?? attempt.accounting.cost;
+    attempts.push({ attempt: attempt.attempt, prompt: log?.prompt ?? "(transcript unavailable)", model, ...(thinking !== undefined ? { thinking } : {}), cost, models: log?.models.length ? log.models : [{ model, cost }], ...(attempt.error ? { error: `${attempt.error.code}: ${attempt.error.message}` } : {}), setup });
   }
   if (!attempts.length) {
     const cost = agent.accounting?.cost ?? 0;
@@ -216,7 +211,7 @@ export async function loadSessionReport(path: string, home = homedir()): Promise
     const runId = resultRunId(result);
     const loaded = runId ? runs.get(runId) : undefined;
     const args = call.arguments;
-    const agents = loaded ? await Promise.all(loaded.run.agents.map(agentReport)) : [];
+    const agents = loaded ? loaded.run.agents.map(agentReport) : [];
     const models = mergedModels(agents.flatMap(({ attempts }) => attempts.map(({ models: attemptModels }) => attemptModels)));
     const name = loaded?.run.workflowName ?? (typeof args.name === "string" ? args.name : "workflow");
     const description = typeof args.description === "string" ? args.description : loaded?.snapshot.metadata.description;

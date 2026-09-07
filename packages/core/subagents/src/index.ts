@@ -18,7 +18,7 @@ import {
 } from "./contracts.js";
 
 export * from "./contracts.js";
-export * from "./decode.js";
+export { attemptValue, statusValue, subagentErrorValue } from "./decode.js";
 export { createSubagentManager, createUnavailableSubagentManager } from "./manager.js";
 export { createRunStoreWorktreeAdapter, defaultWorktreeHome } from "./worktree.js";
 export type { SubagentWorktreeAdapter, SubagentWorktreeContext, SubagentWorktreeHandle, SubagentWorktreeRunStore } from "./worktree.js";

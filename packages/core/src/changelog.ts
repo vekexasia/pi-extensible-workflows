@@ -81,14 +81,6 @@ function noticeText(version: string, entries: readonly ChangelogEntry[]): string
   return `pi-extensible-workflows updated to ${version}\n\n${bounded}`;
 }
 
-function noticeFunction(context: ChangelogContext): ((message: string) => Promise<void>) | undefined {
-  if (!context.hasUI || (context.mode !== "tui" && context.mode !== "rpc")) return undefined;
-  const { ui } = context;
-  return (message: string) => {
-    ui.notify(message, "info");
-    return Promise.resolve();
-  };
-}
 
 async function lastNotifiedVersion(path: string): Promise<string | undefined> {
   try {
@@ -100,8 +92,8 @@ async function lastNotifiedVersion(path: string): Promise<string | undefined> {
 }
 
 export async function showChangelogNotice(context: ChangelogContext, agentDir: string, packageDirectory?: string): Promise<void> {
-  const notify = noticeFunction(context);
-  if (!notify) return;
+  if (!context.hasUI || (context.mode !== "tui" && context.mode !== "rpc")) return;
+  const { ui } = context;
   try {
     const metadata = packageDirectory === undefined ? await installedPackageMetadata() : await packageMetadataAt(packageDirectory);
     if (!metadata) return;
@@ -110,7 +102,7 @@ export async function showChangelogNotice(context: ChangelogContext, agentDir: s
     if (previousVersion === metadata.version) return;
     const entries = releaseEntries(await readChangelog(metadata.directory), metadata.version, previousVersion);
     if (!entries.length) return;
-    await notify(noticeText(metadata.version, entries));
+    ui.notify(noticeText(metadata.version, entries), "info");
     try {
       await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
       await atomicJson(statePath, { lastNotifiedVersion: metadata.version });

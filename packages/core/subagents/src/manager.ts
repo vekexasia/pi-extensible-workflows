@@ -23,7 +23,6 @@ import {
   WorkflowAgentExecutor,
   WorkflowError,
   workflowSettingsPath,
-  type AgentActivity,
   type AgentAccounting,
   type AgentAttempt,
   type AgentAttemptSummary,
@@ -39,6 +38,7 @@ import {
   SerialLane,
 } from "../../src/index.js";
 import { atomicJson, json as readJson, processAlive } from "../../src/persistence.js";
+import { accountingValue, activityValue, legacyAccountingValue, worktreeValue } from "./decode.js";
 import {
   SUBAGENT_ATTEMPT_DETAILS_LIMIT,
   SUBAGENT_MAX_RETRIES,
@@ -452,39 +452,6 @@ function finalizedAttemptValue(value: unknown): boolean {
   const record = recordValue(value);
   return record !== undefined && (Object.prototype.hasOwnProperty.call(record, "result") || Object.prototype.hasOwnProperty.call(record, "error"));
 }
-function accountingValue(value: unknown): AgentAccounting | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  const input = record.input;
-  const output = record.output;
-  const cacheRead = record.cacheRead;
-  const cacheWrite = record.cacheWrite;
-  const cost = record.cost;
-  if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(cost)) return undefined;
-  return { input, output, cacheRead, cacheWrite, cost };
-}
-function legacyAccountingValue(record: Record<string, unknown>): AgentAccounting | undefined {
-  const accounting = accountingValue(record.accounting);
-  if (record.accounting !== undefined && !accounting) return undefined;
-  const usage = record.usage;
-  if (usage === undefined) return accounting;
-  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return undefined;
-  const tokens = (usage as Record<string, unknown>).tokens;
-  if (typeof tokens !== "object" || tokens === null || Array.isArray(tokens)) return undefined;
-  const tokenRecord = tokens as Record<string, unknown>;
-  const input = tokenRecord.input;
-  const output = tokenRecord.output;
-  const cacheRead = tokenRecord.cacheRead;
-  const cacheWrite = tokenRecord.cacheWrite;
-  const cost = (usage as Record<string, unknown>).cost;
-  if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(tokenRecord.total) || !finiteNumber(cost)) return undefined;
-  return accounting ?? { input, output, cacheRead, cacheWrite, cost };
-}
-function activityValue(value: unknown): AgentActivity | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  return (record.kind === "reasoning" || record.kind === "tool" || record.kind === "text") && typeof record.text === "string" ? { kind: record.kind, text: record.text } : undefined;
-}
 function toolCallsValue(value: unknown): readonly AgentToolCallProgress[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const calls: AgentToolCallProgress[] = [];
@@ -630,11 +597,6 @@ function legacyProgressValue(record: Record<string, unknown>): SubagentProgress 
   if (record.activity !== undefined && activity === undefined) return undefined;
   if (record.lastEventAt !== undefined && (!Number.isSafeInteger(record.lastEventAt) || (record.lastEventAt as number) < 0)) return undefined;
   return { accounting, toolCalls, ...(activity === undefined ? {} : { activity }), ...(record.lastEventAt === undefined ? {} : { lastEventAt: record.lastEventAt as number }) };
-}
-function worktreeValue(value: unknown): { path: string; branch: string } | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const record = value as Record<string, unknown>;
-  return typeof record.path === "string" && record.path.trim() && typeof record.branch === "string" && record.branch.trim() ? { path: record.path, branch: record.branch } : undefined;
 }
 function worktreeContextValue(value: unknown): SubagentWorktreeContext | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;

@@ -20,7 +20,7 @@ function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["
 }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function stringArrayValue(value: unknown): readonly string[] | undefined { return Array.isArray(value) && value.length <= 256 && value.every((item) => typeof item === "string") ? value : undefined; }
-function accountingValue(value: unknown): SubagentProgress["accounting"] | undefined {
+export function accountingValue(value: unknown): SubagentProgress["accounting"] | undefined {
   const record = objectValue(value);
   if (!record) return undefined;
   const input = record.input;
@@ -31,7 +31,7 @@ function accountingValue(value: unknown): SubagentProgress["accounting"] | undef
   if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(cost)) return undefined;
   return { input, output, cacheRead, cacheWrite, cost };
 }
-function legacyAccountingValue(record: Record<string, unknown>): SubagentProgress["accounting"] | undefined {
+export function legacyAccountingValue(record: Record<string, unknown>): SubagentProgress["accounting"] | undefined {
   const accounting = accountingValue(record.accounting);
   if (record.accounting !== undefined && !accounting) return undefined;
   const usage = record.usage;
@@ -41,7 +41,7 @@ function legacyAccountingValue(record: Record<string, unknown>): SubagentProgres
   if (!usageRecord || !tokens || !finiteNumber(tokens.input) || !finiteNumber(tokens.output) || !finiteNumber(tokens.cacheRead) || !finiteNumber(tokens.cacheWrite) || !finiteNumber(tokens.total) || !finiteNumber(usageRecord.cost)) return undefined;
   return accounting ?? { input: tokens.input, output: tokens.output, cacheRead: tokens.cacheRead, cacheWrite: tokens.cacheWrite, cost: usageRecord.cost };
 }
-function activityValue(value: unknown): NonNullable<SubagentProgress["activity"]> | undefined {
+export function activityValue(value: unknown): NonNullable<SubagentProgress["activity"]> | undefined {
   const record = objectValue(value);
   return record && (record.kind === "reasoning" || record.kind === "tool" || record.kind === "text") && typeof record.text === "string" ? { kind: record.kind, text: record.text } : undefined;
 }
@@ -66,7 +66,7 @@ export function subagentErrorValue(value: unknown): { readonly code: string; rea
   const record = objectValue(value);
   return record && typeof record.code === "string" && typeof record.message === "string" ? { code: record.code, message: record.message } : undefined;
 }
-function worktreeValue(value: unknown): { readonly path: string; readonly branch: string } | undefined {
+export function worktreeValue(value: unknown): { readonly path: string; readonly branch: string } | undefined {
   const record = objectValue(value);
   return record && typeof record.path === "string" && record.path.trim() && typeof record.branch === "string" && record.branch.trim() ? { path: record.path, branch: record.branch } : undefined;
 }
