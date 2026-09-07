@@ -6,7 +6,12 @@ export type RunState = (typeof RUN_STATES)[number];
 export type AgentState = (typeof AGENT_STATES)[number];
 // Shared terminal-state vocabularies: a hard-terminal run and a settled agent are decided here once,
 // so display, persistence, and lifecycle code cannot drift apart on what "finished" means.
-export const HARD_TERMINAL_RUN_STATES: ReadonlySet<RunState> = new Set(["completed", "failed", "stopped"]);
+export type HardTerminalRunState = "completed" | "failed" | "stopped";
+export const HARD_TERMINAL_RUN_STATES: ReadonlySet<RunState> = new Set<HardTerminalRunState>(["completed", "failed", "stopped"]);
+export function isHardTerminalRunState(state: RunState): state is HardTerminalRunState { return HARD_TERMINAL_RUN_STATES.has(state); }
+// Ended by a stop, a host shutdown, or budget exhaustion rather than by its own failure: a failing execution must not overwrite these with "failed".
+export type ExternallyEndedRunState = "stopped" | "interrupted" | "budget_exhausted";
+export function isExternallyEndedRunState(state: RunState): state is ExternallyEndedRunState { return state === "stopped" || state === "interrupted" || state === "budget_exhausted"; }
 export const SETTLED_AGENT_STATES: ReadonlySet<AgentState> = new Set(["completed", "failed", "cancelled"]);
 export const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
 export type WorkflowCallKind = (typeof WORKFLOW_CALL_KINDS)[number];
@@ -58,12 +63,14 @@ export type PipelineStages<Input extends JsonValue, Output extends JsonValue> = 
 export type PipelineResult<Items extends PipelineItems, Output extends JsonValue> = { [Key in keyof Items]: Output };
 export interface ShellOptions { timeoutMs?: number; env?: Record<string, string> }
 export interface ShellResult { exitCode: number | null; stdout: string; stderr: string }
-export type BudgetDimension = "tokens" | "costUsd" | "durationMs" | "agentLaunches";
+export const BUDGET_DIMENSIONS = ["tokens", "costUsd", "durationMs", "agentLaunches"] as const;
+export type BudgetDimension = (typeof BUDGET_DIMENSIONS)[number];
 export interface BudgetLimits { soft?: number; hard?: number }
 export type WorkflowBudget = Partial<Record<BudgetDimension, BudgetLimits>>;
 export type WorkflowBudgetPatch = Partial<Record<BudgetDimension, BudgetLimits | { soft?: number | null; hard?: number | null } | null>>;
 export interface WorkflowBudgetUsage { tokens: number; costUsd: number; durationMs: number; agentLaunches: number }
-export type BudgetEventType = "soft_crossed" | "hard_overrun" | "hard_exhausted" | "adjustment_requested" | "adjustment_approved" | "adjustment_rejected";
+export const BUDGET_EVENT_TYPES = ["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"] as const;
+export type BudgetEventType = (typeof BUDGET_EVENT_TYPES)[number];
 export interface BudgetEvent { type: BudgetEventType; budgetVersion: number; dimensions: readonly BudgetDimension[]; usage: WorkflowBudgetUsage; limits: WorkflowBudget; at: number; proposalId?: string; previous?: WorkflowBudget; proposed?: WorkflowBudget }
 export interface BudgetApprovalRequest { kind: "budget"; proposalId: string; runId: string; consumed: WorkflowBudgetUsage; previous: WorkflowBudget; proposed: WorkflowBudget; budgetVersion: number; foreground?: boolean }
 export interface WorkflowErrorShape { code: WorkflowErrorCode; message: string; failedAt?: string }
@@ -87,13 +94,15 @@ export interface TrajectoryExtensionSettings { port?: number; themes?: boolean }
 export interface WorkflowExtensionSettings { herdr?: Readonly<HerdrExtensionSettings>; trajectory?: Readonly<TrajectoryExtensionSettings> }
 export interface WorkflowRetentionSettings { olderThanDays?: number; maxTerminalRuns?: number }
 export interface WorkflowSettings { concurrency: number; backgroundWidget?: boolean; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
-export interface WorkflowSettingsOverrides { concurrency?: number; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
+export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget">>;
 export interface WorkflowSettingsSources { concurrency: string; modelAliases: string; skills?: string; extensions?: string; tools?: string; extensionSettings?: string; retention?: string }
 export interface WorkflowSettingsResolution { globalSettingsPath: string; projectSettingsPath: string; projectTrusted: boolean; global: Readonly<WorkflowSettings>; project: Readonly<WorkflowSettingsOverrides>; effective: Readonly<WorkflowSettings>; sources: Readonly<WorkflowSettingsSources> }
 export interface AgentResourceSelectors { skills?: readonly string[]; extensions?: readonly string[]; tools?: readonly string[] }
 export interface AgentResourceSelectorSet { skills: readonly string[]; extensions: readonly string[]; tools?: readonly string[] }
 export interface AgentResourceSelectorSources { global: AgentResourceSelectors; project: AgentResourceSelectors; role?: AgentResourceSelectors; call?: AgentResourceSelectors }
-export type ContextFileScope = "global" | "project" | "cwd";
+export const CONTEXT_FILE_SCOPES = ["global", "project", "cwd"] as const;
+export type ContextFileScope = (typeof CONTEXT_FILE_SCOPES)[number];
+export function isContextFileScope(value: unknown): value is ContextFileScope { return CONTEXT_FILE_SCOPES.some((scope) => scope === value); }
 export interface AgentResourcePolicy {
   globalSettingsPath: string;
   projectSettingsPath: string;
@@ -153,7 +162,7 @@ export interface AgentRecord {
   startedAt?: number;
   durationMs?: number;
   attemptDetails?: readonly AgentAttemptSummary[];
-  accounting?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+  accounting?: AgentAccounting;
   toolCalls?: readonly { id: string; name: string; state: "running" | "completed" | "failed" }[];
   activity?: AgentActivity | undefined;
   lastEventAt?: number;

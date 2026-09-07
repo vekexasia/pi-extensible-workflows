@@ -58,3 +58,9 @@ void test("persistence keeps one name for the persisted run type", () => {
   assert.doesNotMatch(store, /\bLoadedPersistedRun\b/, "RunStore must use PersistedRun for loaded runs");
   assert.match(store, /async load\(\): Promise<\{ run: PersistedRun;/, "RunStore.load() must return the canonical run type");
 });
+
+void test("project settings overrides are derived from the global settings shape", () => {
+  const source = readFileSync(typesPath, "utf8");
+  assert.match(source, /export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget">>;/);
+  assert.doesNotMatch(source, /export interface WorkflowSettingsOverrides/);
+});

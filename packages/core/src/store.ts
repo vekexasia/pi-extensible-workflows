@@ -2,12 +2,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowBudgetUsage, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
-import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, SerialLane } from "./utils.js";
+import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
+import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
+import { budgetUsage } from "./budget.js";
 import {
   decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
   decodeOwnershipRecords, decodePersistedRun, decodeSummaryProjection, decodeSystemPromptArtifact,
-  decodeWorktreeReferences, positiveInteger,
+  decodeWorktreeReferences,
   type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CompletedOperation, type EffectiveSystemPrompt,
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference,
@@ -15,8 +16,6 @@ import {
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
 
-const TERMINAL_SUMMARY_STATES = new Set(["completed", "failed", "stopped"]);
-const EMPTY_USAGE: WorkflowBudgetUsage = { tokens: 0, costUsd: 0, durationMs: 0, agentLaunches: 0 };
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
 const SYSTEM_PROMPT_BODIES = "bodies";
@@ -28,7 +27,7 @@ function summaryFromRun(run: PersistedRun, directory: string, journal: Journal, 
   const failedAt = run.failedAt ?? run.error?.failedAt;
   const replayablePaths = [...new Set([...(run.retry?.completedPaths ?? []), ...Object.keys(journal.completed)])];
   const incompletePaths = [...new Set([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])])];
-  return { schemaVersion: 1, runId: run.id, sessionId: run.sessionId, workflowName: run.workflowName, state: run.state, createdAt, updatedAt: now, ...(previous?.terminalAt || TERMINAL_SUMMARY_STATES.has(run.state) ? { terminalAt: previous?.terminalAt ?? now } : {}), usage: { ...EMPTY_USAGE, ...(run.usage ?? {}) }, agents: run.agents.map(({ id, name, label, state, role, attempts }) => ({ id, name, ...(label ? { label } : {}), state, ...(role ? { role } : {}), attempts })), ...(run.error ? { error: run.error } : {}), ...(failedAt ? { failedAt } : {}), replayablePaths, incompletePaths, artifacts: summaryArtifacts(directory) };
+  return { schemaVersion: 1, runId: run.id, sessionId: run.sessionId, workflowName: run.workflowName, state: run.state, createdAt, updatedAt: now, ...(previous?.terminalAt || HARD_TERMINAL_RUN_STATES.has(run.state) ? { terminalAt: previous?.terminalAt ?? now } : {}), usage: budgetUsage(run.usage), agents: run.agents.map(({ id, name, label, state, role, attempts }) => ({ id, name, ...(label ? { label } : {}), state, ...(role ? { role } : {}), attempts })), ...(run.error ? { error: run.error } : {}), ...(failedAt ? { failedAt } : {}), replayablePaths, incompletePaths, artifacts: summaryArtifacts(directory) };
 }
 function systemPromptStoragePath(directory: string): string { return join(directory, SYSTEM_PROMPT_STORAGE); }
 function systemPromptRecordsPath(directory: string): string { return join(systemPromptStoragePath(directory), SYSTEM_PROMPT_RECORDS); }
@@ -261,14 +260,23 @@ export class RunStore {
     throw new Error("Persisted system prompts are invalid");
   }
 
+  async #decodeJournal(): Promise<Journal> {
+    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
+    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
+    return journal;
+  }
+  /** Reads the journal after every queued journal write has settled. */
+  async #readJournal(): Promise<Journal> {
+    await this.journalLane.run(async () => undefined);
+    return this.#decodeJournal();
+  }
+
   private async updateJournal<T>(update: (journal: Journal) => T | Promise<T>): Promise<T> {
     const write = this.journalLane.run(async () => {
-      const journalPath = join(this.directory, "journal.json");
-      const journal = decodeJournal(await json(journalPath));
-      if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
+      const journal = await this.#decodeJournal();
       journal.awaiting ??= {};
       const result = await update(journal);
-      await atomicJson(journalPath, journal);
+      await atomicJson(join(this.directory, "journal.json"), journal);
       this.refreshSummaryBestEffort();
       return result;
     });
@@ -283,8 +291,8 @@ export class RunStore {
   }
 
   async replay(path: string): Promise<CompletedOperation | undefined> {
-    const operations = await this.replayableOperations();
-    return operations.find((operation) => operation.path === path);
+    const [operation] = await this.replayableOperationsFrom(new Set(), path);
+    return operation;
   }
 
   async replayableOperations(): Promise<readonly CompletedOperation[]> {
@@ -306,9 +314,7 @@ export class RunStore {
       const source = await this.sourceRun(loaded.run.retry.sourceRunId);
       for (const [path, file] of await source.agentSessionFilesFrom(nextSeen)) files.set(path, file);
     }
-    await this.journalLane.run(async () => undefined);
-    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
-    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
+    const journal = await this.#readJournal();
     for (const agent of loaded.run.agents) {
       // Only a journaled operation completed: an attempt a dying host left running records no error either.
       if (!agent.resultPath || !journal.completed[agent.resultPath]) continue;
@@ -319,20 +325,19 @@ export class RunStore {
     return files;
   }
 
-  private async replayableOperationsFrom(seen: Set<string>): Promise<readonly CompletedOperation[]> {
+  /** Source lineage first, own journal last (it overrides); `path` narrows to one operation without cloning the rest. */
+  private async replayableOperationsFrom(seen: Set<string>, path?: string): Promise<readonly CompletedOperation[]> {
     if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
     const nextSeen = new Set(seen);
     nextSeen.add(this.runId);
-    await this.journalLane.run(async () => undefined);
     const loaded = await this.load();
     const operations = new Map<string, CompletedOperation>();
     if (loaded.run.retry?.sourceRunId) {
       const source = await this.sourceRun(loaded.run.retry.sourceRunId);
-      for (const operation of await source.replayableOperationsFrom(nextSeen)) operations.set(operation.path, operation);
+      for (const operation of await source.replayableOperationsFrom(nextSeen, path)) operations.set(operation.path, operation);
     }
-    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
-    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
-    for (const operation of Object.values(journal.completed)) operations.set(operation.path, operation);
+    const journal = await this.#readJournal();
+    for (const operation of Object.values(journal.completed)) if (path === undefined || operation.path === path) operations.set(operation.path, operation);
     return [...operations.values()].map((operation) => structuredClone(operation));
   }
 
@@ -357,19 +362,13 @@ export class RunStore {
   }
 
   async awaitingCheckpoints(): Promise<readonly AwaitingCheckpoint[]> {
-    await this.journalLane.run(async () => undefined);
-    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
-    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
-    return Object.values(journal.awaiting ?? {});
+    return Object.values((await this.#readJournal()).awaiting ?? {});
   }
   async requestWorkflowDecision(request: PendingWorkflowDecision): Promise<void> {
     await this.updateJournal((journal) => { journal.decisions ??= {}; journal.decisions[request.proposalId] = request; });
   }
   async pendingWorkflowDecisions(): Promise<readonly PendingWorkflowDecision[]> {
-    await this.journalLane.run(async () => undefined);
-    const journal = decodeJournal(await json(join(this.directory, "journal.json")));
-    if (!journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted journal is invalid");
-    return Object.values(journal.decisions ?? {});
+    return Object.values((await this.#readJournal()).decisions ?? {});
   }
   async answerWorkflowDecision(proposalId: string, approved: boolean): Promise<PendingWorkflowDecision | undefined> {
     return this.updateJournal((journal) => {
@@ -391,15 +390,14 @@ export class RunStore {
     });
   }
 
+  #worktreeKey(owner: string): string { return createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16); }
+
   private expectedWorktree(owner: string): Pick<WorktreeReference, "path" | "branch"> {
-    const key = createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16);
+    const key = this.#worktreeKey(owner);
     return { path: join(this.directory, "worktrees", key), branch: `pi-extensible-workflows/${safePart(this.runId)}/${key}` };
   }
 
-  private markerPath(owner: string): string {
-    const key = createHash("sha256").update(`${this.sessionId}\0${this.runId}\0${owner}`).digest("hex").slice(0, 16);
-    return join(this.directory, `worktree-${key}.creating`);
-  }
+  private markerPath(owner: string): string { return join(this.directory, `worktree-${this.#worktreeKey(owner)}.creating`); }
 
   private namedWorktreeOwner(name: string): string {
     if (!name.trim()) throw new WorkflowError("WORKTREE_FAILED", "Named worktree names must be non-empty");
@@ -458,7 +456,7 @@ export class RunStore {
     const source = new RunStore(this.cwd, this.sessionId, sourceRunId, this.home);
     try {
       const loaded = await source.load();
-      if (!["completed", "failed", "stopped"].includes(loaded.run.state)) throw new Error(`Source run ${sourceRunId} is not terminal`);
+      if (!HARD_TERMINAL_RUN_STATES.has(loaded.run.state)) throw new Error(`Source run ${sourceRunId} is not terminal`);
       return source;
     } catch (error) {
       throw coerceWorkflowError("WORKTREE_FAILED", error);
@@ -474,7 +472,8 @@ export class RunStore {
       const loaded = await current.load();
       const retry = loaded.run.retry;
       if (!retry) return;
-      if (typeof retry.sourceRunId !== "string" || !retry.sourceRunId || retry.sourceRunId === current.runId || typeof retry.lineageRootRunId !== "string" || !retry.lineageRootRunId || !Array.isArray(retry.completedPaths) || retry.completedPaths.some((path) => typeof path !== "string") || !Array.isArray(retry.incompletePaths) || retry.incompletePaths.some((path) => typeof path !== "string") || !Array.isArray(retry.namedWorktrees) || retry.namedWorktrees.some((name) => typeof name !== "string")) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance is incomplete");
+      // decodeRetry() already guarantees the field shapes; only the semantic constraints remain to check here.
+      if (!retry.sourceRunId || retry.sourceRunId === current.runId || !retry.lineageRootRunId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance is incomplete");
       const source = await current.sourceRun(retry.sourceRunId);
       const sourceRun = (await source.load()).run;
       if (loaded.run.parentRunId !== retry.sourceRunId) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry parent run does not match its source run");

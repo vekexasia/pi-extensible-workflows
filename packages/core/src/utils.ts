@@ -63,9 +63,11 @@ export function asWorkflowError(error: unknown): WorkflowError {
   return markWorkflowAuthored(error instanceof WorkflowError && code ? error : new WorkflowError(code ?? "INTERNAL_ERROR", errorText(error)), isWorkflowAuthored(error) || !code);
 }
 export function fail(code: WorkflowErrorCode, message: string): never { throw new WorkflowError(code, message); }
+/** Sort order for agent setup hooks: lower priority first, ties broken by name so registration order never matters. */
+export function byPriorityThenName(left: { priority: number; name: string }, right: { priority: number; name: string }): number { return left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0); }
 
-function isThinkingLevel(value: unknown): value is ThinkingLevel { return typeof value === "string" && THINKING_LEVELS.some((level) => level === value); }
-const MODEL_ALIAS_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export function isThinkingLevel(value: unknown): value is ThinkingLevel { return THINKING_LEVELS.some((level) => level === value); }
+export const MODEL_ALIAS_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
 export function parseThinking(value: unknown): ModelSpec["thinking"] | undefined { return isThinkingLevel(value) ? value : undefined; }
 export function parseModelReference(value: string): ModelSpec {
   const match = /^([^/:\s]+)\/([^:\s]+)(?::([^:\s]+))?$/.exec(value);

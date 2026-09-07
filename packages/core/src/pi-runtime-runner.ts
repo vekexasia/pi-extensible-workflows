@@ -1,8 +1,8 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createPiRuntimeSessionAdapter, isTurnBoundaryStart, isTurnEnd, normalizePiMessage, type PiRuntimeSessionAdapter } from "./pi-runtime-adapter.js";
+import { createPiRuntimeSessionAdapter, isEmptyAbortedAssistant, isTurnBoundaryStart, isTurnEnd, normalizePiMessage, type PiRuntimeSessionAdapter } from "./pi-runtime-adapter.js";
 import type { RuntimeAgentProgress, RuntimeAgentProviderFailure, RuntimeAgentProviderRecovery, RuntimeAgentRunRequest, RuntimeAgentRunResult, RuntimeAgentRunner, RuntimeJsonSchema, RuntimeJsonValue, RuntimeTool, RuntimeToolCall, RuntimeUsage } from "./runtime/agent-runner.js";
 import { RuntimeAgentProviderError } from "./runtime/agent-runner.js";
-import { jsonValue } from "./utils.js";
+import { errorText, jsonValue } from "./utils.js";
 import { WorkflowError, type AgentTransport, type AgentTransportContext, type JsonValue, type LiveSessionHandoff, type PreparedAgentSession, type WorkflowAgentMessage, type WorkflowAgentSession, type WorkflowAgentSessionEvent } from "./types.js";
 
 const providerContinuationPrompt = "The provider error was transient. Continue the task from your current state.";
@@ -47,7 +47,6 @@ function hasToolCall(message: unknown): boolean {
   return typeof message === "object" && message !== null && Array.isArray((message as { content?: unknown }).content) && (message as { content: unknown[] }).content.some((part) => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "toolCall");
 }
 
-function isEmptyAbortedAssistant(message: WorkflowAgentMessage | undefined): boolean { return message?.stopReason === "aborted" && Array.isArray(message.content) && message.content.length === 0; }
 function isHandoffAbort(message: WorkflowAgentMessage | undefined): boolean { return message?.role === "assistant" && message.stopReason === "error" && Array.isArray(message.content) && message.content.length === 0 && typeof message.errorMessage === "string" && /abort/i.test(message.errorMessage); }
 function isTerminalAssistant(message: WorkflowAgentMessage | undefined): boolean { return Boolean(message) && message?.stopReason !== "aborted" && !hasToolCall(message); }
 function runtimeUsage(session: WorkflowAgentSession): RuntimeUsage {
@@ -74,7 +73,6 @@ function providerLimited(error: unknown): boolean {
   const candidate = error as { status?: unknown; code?: unknown };
   return candidate.status === 429 || candidate.code === 429 || candidate.code === "rate_limit_exceeded" || candidate.code === "RATE_LIMITED";
 }
-function errorText(error: unknown): string { return error instanceof Error ? error.message : typeof error === "string" ? error : String(error); }
 function isToolError(result: unknown): boolean { return typeof result === "object" && result !== null && "isError" in result && (result as { readonly isError?: unknown }).isError === true; }
 function piToolFromRuntime(definition: RuntimeTool, signal: AbortSignal): ToolDefinition {
   if (typeof definition.name !== "string" || !definition.name || typeof definition.description !== "string" || !jsonValue(definition.parameters) || typeof definition.execute !== "function") throw new WorkflowError("INVALID_METADATA", `Runtime tool ${definition.name || "<unnamed>"} is not JSON-compatible`);

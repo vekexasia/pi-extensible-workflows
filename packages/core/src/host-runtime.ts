@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor } from "./agent-execution.js";
+import { type WorkflowBudgetRuntime } from "./budget.js";
 import { type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
 import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
@@ -7,18 +8,18 @@ import { type WorkflowRegistryApi } from "./registry.js";
 import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentOptions, type AgentRecord, type BudgetEvent, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
-type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
+export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
 const inheritedHostAgentPath = new AsyncLocalStorage<readonly string[]>();
 const inheritedHostWorktreeOwner = new AsyncLocalStorage<string>();
 
-export type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: import("./persistence.js").PersistedRun } };
+export type WorkflowToolUpdate = { content: [{ type: "text"; text: string }]; details: { runId: string; run: PersistedRun } };
 export type WorkflowRunRecord = {
   executor: WorkflowAgentExecutor;
   store: RunStore;
   metadata: WorkflowMetadata;
   model: ModelSpec;
   lifecycle: RunLifecycle;
-  budget: import("./budget.js").WorkflowBudgetRuntime;
+  budget: WorkflowBudgetRuntime;
   abortController: AbortController;
   projectTrusted: () => boolean;
   providerErrorRecovery?: (failure: AgentProviderFailure) => Promise<AgentProviderRecovery>;
@@ -28,6 +29,24 @@ export type WorkflowRunRecord = {
   checkpointResolvers: Map<string, (value: boolean) => void>;
   update?: (result: WorkflowToolUpdate) => void;
 };
+
+/** Drops the transient shell-activity counters a run only holds while its host process is alive. */
+export function withoutActiveShells(run: PersistedRun): PersistedRun {
+  const next = { ...run };
+  delete next.activeShells;
+  delete next.activeShellStartedAt;
+  delete next.activeShellsByPhase;
+  return next;
+}
+
+/** Reads the project cwd and Pi session ID that an extension context exposes, when present. */
+export function hostSessionContext(context: unknown): { cwd?: string; sessionId?: string } {
+  const host = object(context) ? context : {};
+  const cwd = typeof host.cwd === "string" ? host.cwd : undefined;
+  const sessionManager = object(host.sessionManager) ? host.sessionManager : undefined;
+  const sessionId = typeof sessionManager?.getSessionId === "function" ? String(Reflect.apply(sessionManager.getSessionId, sessionManager, [])) : undefined;
+  return { ...(cwd === undefined ? {} : { cwd }), ...(sessionId === undefined ? {} : { sessionId }) };
+}
 
 export class RunLifecycle {
   #state: RunState;

@@ -110,11 +110,13 @@ const agentInflight = new Set();
 const shellOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
-const guardedAgentResult = result => Object.defineProperties(result, {
-  toJSON: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before serialization"); } },
-  toString: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
-  [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow agent result is a Promise; await it before interpolation"); } },
+// A pending result that reaches JSON.stringify or a template literal is a forgotten await; fail loudly instead of persisting "[object Promise]".
+const guardedResult = (result, kind) => Object.defineProperties(result, {
+  toJSON: { value() { throw workError("INVALID_METADATA", "Workflow " + kind + " result is a Promise; await it before serialization"); } },
+  toString: { value() { throw workError("INVALID_METADATA", "Workflow " + kind + " result is a Promise; await it before interpolation"); } },
+  [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow " + kind + " result is a Promise; await it before interpolation"); } },
 });
+const guardedAgentResult = result => guardedResult(result, "agent");
 const rejectShell = () => { throw workError("INVALID_METADATA", "Workflow shell calls must use a direct shell(...) call; aliases and indirect calls are unsupported"); };
 const rejectWorktree = () => { throw workError("INVALID_METADATA", "withWorktree calls must use a direct withWorktree(...) call; aliases and indirect calls are unsupported"); };
 const internalWithWorktree = async (...values) => {
@@ -205,13 +207,7 @@ const internalShell = (...values) => {
   const occurrence = (shellOccurrences.get(occurrenceKey) || 0) + 1;
   shellOccurrences.set(occurrenceKey, occurrence);
   const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}) };
-  const result = rpc("shell", [command, options, identity]);
-  Object.defineProperties(result, {
-    toJSON: { value() { throw workError("INVALID_METADATA", "Workflow shell result is a Promise; await it before serialization"); } },
-    toString: { value() { throw workError("INVALID_METADATA", "Workflow shell result is a Promise; await it before interpolation"); } },
-    [Symbol.toPrimitive]: { value() { throw workError("INVALID_METADATA", "Workflow shell result is a Promise; await it before interpolation"); } },
-  });
-  return result;
+  return guardedResult(rpc("shell", [command, options, identity]), "shell");
 };
 const shell = rejectShell;
 const agent = Object.freeze(Object.assign(rejectAgent, { create: internalAgentCreate }));
@@ -474,6 +470,10 @@ export function executeShellCommand(command: string, options: ShellOptions, sign
     if (options.timeoutMs !== undefined) timeout = setTimeout(() => { timedOut = true; shellProcessKill(child); }, options.timeoutMs);
   });
 }
+/** The wire shape of a host-side failure: the code, the message, and the authored flag that tells the worker whether the text is safe to surface verbatim. */
+function workerErrorShape(typed: WorkflowError): WorkerErrorShape {
+  return { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) };
+}
 function workflowErrorFromWorker(error: WorkerErrorShape): WorkflowError {
   const code = isWorkflowErrorCode(error.code) ? error.code : "INTERNAL_ERROR";
   const typed = markWorkflowAuthored(new WorkflowError(code, error.message), Boolean(error.authored) || error.code === undefined);
@@ -559,7 +559,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         } catch (error) {
           const typed = asWorkflowError(error);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
-          value = branded({ name: label, ok: false, failedAt: path, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } });
+          value = branded({ name: label, ok: false, failedAt: path, error: workerErrorShape(typed) });
         }
       } else if (method === "shell") {
         if (!bridge.shell) fail("SHELL_FAILED", "No shell bridge is available");
@@ -579,7 +579,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         } catch (error) {
           const typed = asWorkflowError(error);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
-          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } });
+          value = branded({ name, ok: false, failedAt: name, error: workerErrorShape(typed) });
         }
       } else if (method === "function") {
         if (!bridge.function || typeof values[0] !== "string" || !object(values[1])) fail("INTERNAL_ERROR", "function requires an available bridge, name, and object input");
@@ -593,7 +593,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         } catch (error) {
           const typed = asWorkflowError(error);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
-          value = branded({ name, ok: false, failedAt: name, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } });
+          value = branded({ name, ok: false, failedAt: name, error: workerErrorShape(typed) });
         }
       } else if (method === "worktree") {
         if (!bridge.worktree || typeof values[0] !== "string" || !values[0]) fail("INTERNAL_ERROR", "worktree requires an active host bridge and scope");
@@ -610,7 +610,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       child.send(encodedRpcResult(id, value));
     } catch (error) {
       const typed = asWorkflowError(error);
-      child.send(encoded({ type: "rpcResult", id, ok: false, error: { code: typed.code, message: typed.message, ...(isWorkflowAuthored(typed) ? { authored: true } : {}) } }));
+      child.send(encoded({ type: "rpcResult", id, ok: false, error: workerErrorShape(typed) }));
     }
   }
   function cancel() {

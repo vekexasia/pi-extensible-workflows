@@ -8,7 +8,7 @@ import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionF
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, registeredWorkflowFunctionSources, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, object, registeredWorkflowFunctionSources, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
@@ -21,7 +21,6 @@ type CliScalar = "string" | "integer" | "number" | "boolean";
 type CliField = { name: string; option: string; schema: Record<string, unknown>; type: CliScalar | "array"; itemType?: CliScalar; required: boolean };
 type CliSchemaPlan = { fields: readonly CliField[]; positional?: CliField };
 
-function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function has(value: object, key: string): boolean { return Object.prototype.hasOwnProperty.call(value, key); }
 function requiredArg(args: readonly string[], index: number): string {
   const value = args[index];

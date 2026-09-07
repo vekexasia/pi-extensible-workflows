@@ -1,6 +1,6 @@
-import { AGENT_STATES, RUN_STATES, THINKING_LEVELS, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
-import { finiteNumber, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
+import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger } from "./utils.js";
 
 export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
 export type PersistedRun = RunRecord;
@@ -24,15 +24,12 @@ const INVALID_PERSISTED_VALUE = Symbol("invalid persisted value");
 
 function integer(value: unknown): value is number { return finiteNumber(value) && Number.isInteger(value); }
 function safePositiveInteger(value: unknown): value is number { return integer(value) && Number.isSafeInteger(value) && value > 0; }
-export function positiveInteger(value: unknown): value is number { return integer(value) && value > 0; }
-function isThinking(value: unknown): value is NonNullable<ModelSpec["thinking"]> { return THINKING_LEVELS.some((level) => level === value); }
-function isContextFileScope(value: unknown): value is ContextFileScope { return ["global", "project", "cwd"].some((candidate) => candidate === value); }
 function isLaunchMode(value: unknown): value is NonNullable<LaunchSnapshot["launchMode"]> { return value === "foreground" || value === "background"; }
 function isRunState(value: unknown): value is RunRecord["state"] { return RUN_STATES.some((candidate) => candidate === value); }
 function isAgentState(value: unknown): value is PersistedAgent["state"] { return AGENT_STATES.some((candidate) => candidate === value); }
 function isAgentContinuity(value: unknown): value is AgentContinuity { return value === "fresh" || value === "continued"; }
-function isBudgetDimension(value: unknown): value is BudgetDimension { return ["tokens", "costUsd", "durationMs", "agentLaunches"].some((candidate) => candidate === value); }
-function isBudgetEventType(value: unknown): value is NonNullable<RunRecord["budgetEvents"]>[number]["type"] { return ["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"].some((candidate) => candidate === value); }
+function isBudgetDimension(value: unknown): value is BudgetDimension { return BUDGET_DIMENSIONS.some((candidate) => candidate === value); }
+function isBudgetEventType(value: unknown): value is BudgetEventType { return BUDGET_EVENT_TYPES.some((candidate) => candidate === value); }
 function optionalString(value: unknown): string | undefined | typeof INVALID_PERSISTED_VALUE { return value === undefined || typeof value === "string" ? value : INVALID_PERSISTED_VALUE; }
 function optionalNumber(value: unknown): number | undefined | typeof INVALID_PERSISTED_VALUE { return value === undefined || finiteNumber(value) ? value : INVALID_PERSISTED_VALUE; }
 function optionalBoolean(value: unknown): boolean | undefined | typeof INVALID_PERSISTED_VALUE { return value === undefined || typeof value === "boolean" ? value : INVALID_PERSISTED_VALUE; }
@@ -48,24 +45,9 @@ function decodeArray<T>(value: unknown, decoder: (value: unknown) => T | undefin
 }
 function decodeStringArray(value: unknown): string[] | undefined { return decodeArray(value, (entry) => typeof entry === "string" ? entry : undefined); }
 function decodeJsonValue(value: unknown): JsonValue | undefined { return jsonValue(value) ? value : undefined; }
-function decodeJsonObject(value: unknown): Record<string, JsonValue> | undefined {
-  if (!object(value) || !jsonValue(value)) return undefined;
-  const entries: Array<[string, JsonValue]> = [];
-  for (const [key, entry] of Object.entries(value)) {
-    if (!jsonValue(entry)) return undefined;
-    entries.push([key, entry]);
-  }
-  return Object.fromEntries(entries);
-}
-function decodeStringMap(value: unknown): Record<string, string> | undefined {
-  if (!object(value)) return undefined;
-  const entries: Array<[string, string]> = [];
-  for (const [key, entry] of Object.entries(value)) {
-    if (typeof entry !== "string") return undefined;
-    entries.push([key, entry]);
-  }
-  return Object.fromEntries(entries);
-}
+// jsonValue() already validated every entry; the copy detaches the result from the parsed input.
+function decodeJsonObject(value: unknown): Record<string, JsonValue> | undefined { return object(value) && jsonValue(value) ? { ...value } : undefined; }
+function decodeStringMap(value: unknown): Record<string, string> | undefined { return decodeRecord(value, (entry) => typeof entry === "string" ? entry : undefined); }
 function decodeRecord<T>(value: unknown, decoder: (value: unknown) => T | undefined): Record<string, T> | undefined {
   if (!object(value)) return undefined;
   const entries: Array<[string, T]> = [];
@@ -80,8 +62,8 @@ function decodeRecord<T>(value: unknown, decoder: (value: unknown) => T | undefi
 function decodeModelSpec(value: unknown): ModelSpec | undefined {
   if (!object(value) || typeof value.provider !== "string" || typeof value.model !== "string") return undefined;
   const thinking = value.thinking;
-  if (thinking !== undefined && !isThinking(thinking)) return undefined;
-  return { provider: value.provider, model: value.model, ...(isThinking(thinking) ? { thinking } : {}) };
+  if (thinking !== undefined && !isThinkingLevel(thinking)) return undefined;
+  return { provider: value.provider, model: value.model, ...(isThinkingLevel(thinking) ? { thinking } : {}) };
 }
 function decodeAgentResourceSelectors(value: unknown): AgentResourceSelectors | undefined {
   if (!object(value)) return undefined;
@@ -91,15 +73,7 @@ function decodeAgentResourceSelectors(value: unknown): AgentResourceSelectors | 
   if (value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.tools !== undefined && !tools) return undefined;
   return { ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }) };
 }
-function decodeContextFileScopes(value: unknown): ContextFileScope[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const scopes: ContextFileScope[] = [];
-  for (const scope of value) {
-    if (!isContextFileScope(scope)) return undefined;
-    scopes.push(scope);
-  }
-  return scopes;
-}
+function decodeContextFileScopes(value: unknown): ContextFileScope[] | undefined { return decodeArray(value, (scope) => isContextFileScope(scope) ? scope : undefined); }
 function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
   if (!object(value)) return undefined;
   const prompt = optionalString(value.prompt);
@@ -112,7 +86,7 @@ function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
   const overrideSystemPrompt = optionalBoolean(value.overrideSystemPrompt);
   const contextFiles = value.contextFiles === undefined ? undefined : decodeContextFileScopes(value.contextFiles);
   if (prompt === INVALID_PERSISTED_VALUE || description === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || overrideSystemPrompt === INVALID_PERSISTED_VALUE) return undefined;
-  if (thinking !== undefined && !isThinking(thinking) || value.tools !== undefined && !tools || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.contextFiles !== undefined && !contextFiles) return undefined;
+  if (thinking !== undefined && !isThinkingLevel(thinking) || value.tools !== undefined && !tools || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.contextFiles !== undefined && !contextFiles) return undefined;
   const foldedModel = typeof model === "string" && thinking !== undefined && !model.includes(":") ? `${model}:${thinking}` : model;
   return {
     ...(prompt === undefined ? {} : { prompt }), ...(description === undefined ? {} : { description }), ...(foldedModel === undefined ? {} : { model: foldedModel }),
@@ -155,7 +129,7 @@ function decodeBudgetLimits(value: unknown): NonNullable<NonNullable<RunRecord["
 function decodeBudget(value: unknown): NonNullable<RunRecord["budget"]> | undefined {
   if (!object(value)) return undefined;
   const budget: NonNullable<RunRecord["budget"]> = {};
-  for (const dimension of ["tokens", "costUsd", "durationMs", "agentLaunches"] as const) {
+  for (const dimension of BUDGET_DIMENSIONS) {
     const raw = value[dimension];
     if (raw === undefined) continue;
     const limits = decodeBudgetLimits(raw);

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, loadSettings, retainTerminalRuns, RunStore, type RunState } from "../src/index.js";
+import { runDependencyIds } from "../src/retention.js";
 import { testExtensionApi } from "./support.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -105,4 +106,10 @@ void test("automatic retention covers inactive sessions", async () => {
   const report = await retainTerminalRuns({ ...paths, sessionId: "session", allSessions: true, retention: { olderThanDays: 30 }, now: NOW });
   assert.deepEqual(report.deleted, ["other-session-run"]);
   assert.equal(existsSync(old.directory), false);
+});
+
+void test("runDependencyIds lists the parent, retry lineage, and borrowed worktree sources once each", () => {
+  assert.deepEqual(runDependencyIds({}, []), []);
+  assert.deepEqual(runDependencyIds({ parentRunId: "parent" }, []), ["parent"]);
+  assert.deepEqual(runDependencyIds({ parentRunId: "source", retry: { sourceRunId: "source", lineageRootRunId: "root", completedPaths: [], incompletePaths: [], namedWorktrees: [] } }, [{ name: "shared", sourceRunId: "lender", owner: "worktree/named/shared" }]), ["source", "root", "lender"]);
 });

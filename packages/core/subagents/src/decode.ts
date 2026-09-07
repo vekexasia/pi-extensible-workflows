@@ -1,9 +1,8 @@
-import { jsonValue } from "../../src/utils.js";
+import { finiteNumber, jsonValue, parseThinking } from "../../src/utils.js";
 import type { AgentAttemptSummary } from "../../src/types.js";
 import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, type SubagentProgress, type SubagentStatus } from "./contracts.js";
 
 function objectValue(value: unknown): Record<string, unknown> | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
-type ModelThinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["setup"]["resourceSelectors"]> | undefined {
   const record = objectValue(value);
   const selectors = objectValue(record?.selectors);
@@ -19,8 +18,6 @@ function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["
   if (!record || !selectors || !skills || !extensions || !tools || !selectorSkills || !selectorExtensions || !selectorTools || !unmatchedSkills || !unmatchedExtensions || !unmatchedTools) return undefined;
   return { selectors: { skills: selectorSkills, extensions: selectorExtensions, tools: selectorTools }, skills, extensions, tools, unmatchedSkills, unmatchedExtensions, unmatchedTools };
 }
-function thinkingValue(value: unknown): ModelThinking | undefined { return value === "off" || value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" ? value : undefined; }
-function finiteNumber(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function stringArrayValue(value: unknown): readonly string[] | undefined { return Array.isArray(value) && value.length <= 256 && value.every((item) => typeof item === "string") ? value : undefined; }
 function accountingValue(value: unknown): SubagentProgress["accounting"] | undefined {
@@ -88,7 +85,7 @@ function progressValue(value: unknown): SubagentProgress | undefined {
     const model = objectValue(stateRecord?.model);
     const tools = stringArrayValue(stateRecord?.tools);
     if (!stateRecord || !model || !tools || typeof model.provider !== "string" || typeof model.model !== "string") return undefined;
-    const thinking = thinkingValue(model.thinking);
+    const thinking = parseThinking(model.thinking);
     if (model.thinking !== undefined && thinking === undefined) return undefined;
     state = { model: { provider: model.provider, model: model.model, ...(thinking === undefined ? {} : { thinking }) }, tools };
   }
@@ -115,7 +112,7 @@ export function attemptValue(value: unknown): AgentAttemptSummary | undefined {
   const accounting = accountingValue(record?.accounting);
   const session = record?.session === undefined ? undefined : sessionReferenceValue(record.session);
   const error = record?.error === undefined ? undefined : subagentErrorValue(record.error);
-  const thinking = thinkingValue(model?.thinking);
+  const thinking = parseThinking(model?.thinking);
   if (!record || !nonnegativeInteger(record.attempt) || record.attempt < 1 || typeof record.transport !== "string" || !record.transport.trim() || !setup || typeof setup.cwd !== "string" || !setup.cwd.trim() || !model || typeof model.provider !== "string" || !model.provider.trim() || typeof model.model !== "string" || !model.model.trim() || model.thinking !== undefined && thinking === undefined || !hookNames || !tools || setup.resourceSelectors !== undefined && resources === undefined || !accounting || record.session !== undefined && session === undefined || record.error !== undefined && error === undefined) return undefined;
   return {
     attempt: record.attempt,

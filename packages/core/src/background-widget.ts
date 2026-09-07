@@ -21,6 +21,9 @@ import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@e
 import type { AgentRecord, AgentState, RunRecord, RunState } from "./types.js";
 import { listRunIds, RunStore } from "./persistence.js";
 import {
+  BUDGET_DIMENSIONS,
+  HARD_TERMINAL_RUN_STATES,
+  SETTLED_AGENT_STATES,
   WORKFLOW_AGENT_STALL_THRESHOLD_MS,
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
   WORKFLOW_BUDGET_EVENT,
@@ -31,7 +34,7 @@ import {
   WORKFLOW_RUN_STARTED_EVENT,
   WORKFLOW_RUN_STATE_CHANGED_EVENT,
 } from "./types.js";
-import { object } from "./utils.js";
+import { finiteNumber, object } from "./utils.js";
 
 export type BackgroundWidgetAPI = Pick<ExtensionAPI, "appendEntry" | "on"> & {
   events?: { on?: (name: string, handler: (event: unknown) => void) => () => void; emit?: ExtensionAPI["events"]["emit"] };
@@ -151,15 +154,12 @@ type Paint = (role: Parameters<Theme["fg"]>[0], text: string) => string;
  * — the safe direction, since drawing a finished run costs a stale row while
  * missing a live one loses the display entirely.
  */
-const TERMINAL_RUN = new Set<RunState>(["completed", "failed", "stopped"]);
-const DONE_AGENT = new Set<AgentState>(["completed", "failed", "cancelled"]);
-
 const isRunTerminal = (state: string | undefined): boolean =>
-  state !== undefined && TERMINAL_RUN.has(state as RunState);
+  state !== undefined && HARD_TERMINAL_RUN_STATES.has(state as RunState);
 const isRunLive = (state: string | undefined): boolean =>
   state !== undefined && !isRunTerminal(state);
 const isAgentLive = (state: string | undefined): boolean =>
-  state !== undefined && !DONE_AGENT.has(state as AgentState);
+  state !== undefined && !SETTLED_AGENT_STATES.has(state as AgentState);
 
 /**
  * Braille wheel, one glyph per repaint.
@@ -237,7 +237,7 @@ function formatElapsed(ms: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function formatTokens(tokens: number | undefined): string {
+export function formatTokens(tokens: number | undefined): string {
   if (!tokens) return "";
   if (tokens < 1000) return `${String(tokens)}t`;
   const thousands = tokens / 1000;
@@ -276,10 +276,6 @@ function truncate(text: string, limit: number): string {
   return `${truncateToWidth(text, limit, "…")}${RESET}`;
 }
 
-function finiteNumber(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
 function optionalNumber(value: unknown): boolean {
   return value === undefined || finiteNumber(value);
 }
@@ -305,7 +301,7 @@ function renderableRun(value: unknown): value is Partial<RunRecord> {
   const history = value.phaseHistory;
   if (history !== undefined && (!Array.isArray(history) || history.some((entry) => !object(entry) || typeof entry.phase !== "string" || !finiteNumber(entry.afterAgent)))) return false;
   const usage = value.usage;
-  if (usage !== undefined && (!object(usage) || !["tokens", "costUsd", "durationMs", "agentLaunches"].every((key) => optionalNumber(usage[key])))) return false;
+  if (usage !== undefined && (!object(usage) || !BUDGET_DIMENSIONS.every((key) => optionalNumber(usage[key])))) return false;
   const delivery = value.delivery;
   if (delivery !== undefined && (!object(delivery) || typeof delivery.mode !== "string" || typeof delivery.state !== "string")) return false;
   const budgetEvents = value.budgetEvents;

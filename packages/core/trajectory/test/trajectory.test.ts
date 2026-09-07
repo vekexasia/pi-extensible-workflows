@@ -981,3 +981,48 @@ void test("Trajectory clears timeline highlights when leaving the view", () => {
   })()`) as { highlighted: boolean; stateAfterHighlight: number; timeoutCleared: boolean; removed: boolean; stateAfterClear: null };
   assert.deepEqual(JSON.parse(JSON.stringify(result)), { highlighted: true, stateAfterHighlight: 0, timeoutCleared: true, removed: true, stateAfterClear: null });
 });
+void test("trajectory run loaders serve cached runs until state, journal, or transcript files change", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-cache-"));
+  const cwd = join(root, "project");
+  const home = join(root, "home");
+  const sessionFile = join(root, "session.jsonl");
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(sessionFile, `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "one" }] } })}\n`);
+  const store = new RunStore(cwd, "session", "run", home);
+  const model = { provider: "fixture", model: "fixture-model" };
+  const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "running", agentSessions: [], phase: "first", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { hookNames: [], model, tools: [], cwd }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
+  try {
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    const loadRuns = createTrajectoryRunLoader(cwd, "session", home);
+    const loadMetadata = createTrajectoryRunMetadataLoader(cwd, "session", home);
+    const [first] = await loadRuns();
+    const [firstMetadata] = await loadMetadata();
+    assert.ok(first && firstMetadata);
+    assert.equal(first.run.phase, "first");
+    assert.equal(firstMetadata.run.phase, "first");
+    assert.equal(first.transcripts.agent?.length, 1);
+    const firstRevision = firstMetadata.transcripts.agent?.revision;
+    assert.equal(firstMetadata.transcripts.agent?.status, "available");
+
+    const [cached] = await loadRuns();
+    assert.equal(cached, first, "an unchanged run is served from the cache");
+    assert.equal((await loadMetadata())[0], firstMetadata);
+
+    await store.updateState((current) => ({ ...current, phase: "second" }));
+    assert.equal((await loadRuns())[0]?.run.phase, "second", "a state.json change invalidates the run cache");
+    assert.equal((await loadMetadata())[0]?.run.phase, "second", "a state.json change invalidates the metadata cache");
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    writeFileSync(sessionFile, `${readFileSync(sessionFile, "utf8")}${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "two" }] } })}\n`);
+    assert.equal((await loadRuns())[0]?.transcripts.agent?.length, 2, "a transcript change invalidates the run cache");
+    assert.notEqual((await loadMetadata())[0]?.transcripts.agent?.revision, firstRevision, "a transcript change invalidates the metadata cache");
+
+    await store.complete("agent/callsite:x/occurrence:1", "done");
+    assert.equal((await loadRuns())[0]?.run.phase, "second", "a journal change reloads without losing state");
+    await store.delete(true);
+    assert.deepEqual(await loadRuns(), [], "a removed run leaves the cache");
+    assert.deepEqual(await loadMetadata(), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
