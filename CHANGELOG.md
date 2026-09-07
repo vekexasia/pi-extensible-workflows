@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+## [5.13.2] - 2026-09-07
+
 ### Fixes
 
 - A pending pause can be cancelled: resuming a `pausing` run (the `/workflow` picker offers "Cancel pause", Trajectory offers the same, and the resume path accepts the state) returns it to `running` before the active operation finishes. The picker now reports "Pausing workflow ..." while the pause is pending instead of "Paused workflow ...". (#283)
