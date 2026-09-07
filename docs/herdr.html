@@ -81,7 +81,7 @@
       <section id="handoff">
         <h2>Live handoff and ownership</h2>
         <p>Live handoff pauses the local SDK at a turn boundary while the Herdr pane owns the task. The originating Pi TUI reports the handed-off agent as working, then idle or completed before handback.</p>
-        <p>Ownership returns when the pane exits, the user runs <code>/quit</code>, or Herdr observes a pane return to idle after it has been working. The local SDK then resumes the same session. If the last assistant message was aborted or ended on a tool call without the expected result, the workflow asks the local session to continue.</p>
+        <p>A generated bridge reports Pi's <code>agent_settled</code> event directly to the transport, independently of extension filters and Herdr screen detection. The transport closes the owned pane and resumes the same local session. Accepting <code>workflow_result</code> alone does not end execution. Pane exit, <code>/quit</code>, and cancellation remain fallback paths. If the last assistant message was aborted or ended on a tool call without the expected result, the workflow asks the local session to continue.</p>
         <p>Stopping or disposing the workflow closes active Herdr panes, bridges, and owned workspaces before the underlying local session is disposed.</p>
       </section>
       <section id="preserved">

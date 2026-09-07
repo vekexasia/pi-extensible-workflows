@@ -59,15 +59,16 @@ type ToolCallContent = { type: "toolCall"; name?: string };
 type LifecycleState = "idle" | "working" | "blocked";
 type LifecycleReport = { state: LifecycleState; message: string | undefined };
 type HerdrBlockedEvent = { active: boolean; label?: string };
-type ExtensionBridge = { extensionPath: string; close(): Promise<void> };
+type ExtensionBridge = { extensionPath: string; settled?: Promise<void>; close(): Promise<void> };
 type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; command(value: string): string; close(): Promise<void> };
 type HerdrToolDefinition = NonNullable<PreparedAgentSession["customTools"]>[number];
 type HerdrCommandResult = Awaited<ReturnType<typeof openHerdrLivePane>>;
 type ToolBridgeRequest = { toolCallId: string; name: string; params: unknown };
-type ToolBridgeMessage = { type: "update"; value: unknown } | { type: "error"; error: string } | { type: "result"; value: unknown };
+type LifecycleBridgeRequest = { type: "agent_settled" };
+type ToolBridgeMessage = { type: "update"; value: unknown } | { type: "error"; error: string } | { type: "result"; value: unknown } | { type: "ack" };
 type WorkspaceManager = { open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane>; close(runId: string): Promise<void>; closeAll(): Promise<void> };
 type LaunchPaneOptions = { session: HerdrSession; prepared: Readonly<PreparedAgentSession>; identity: Readonly<AgentIdentity>; run?: Readonly<WorkflowRunContext> | undefined; attempt: number; runner: HerdrCommandRunner; fullyInspectable: boolean; env: NodeJS.ProcessEnv; signal: AbortSignal; prompt?: string | undefined; workspaces?: WorkspaceManager | undefined; tuiIndex?: number | undefined; tuiLabel?: string | undefined; directPrompt?: boolean | undefined; onStatus?: ((state: HerdrAgentStatus) => void | Promise<void>) | undefined };
-type PaneHandle = { pane: string; monitor: Promise<"closed" | "exited" | "idle" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
+type PaneHandle = { pane: string; monitor: Promise<"closed" | "exited" | "idle" | "settled" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
 type HerdrBreadcrumbIdentity = Omit<AgentIdentity, "structuralPath"> & { structuralPath?: readonly string[] };
 type CompletedSessionContext = { attempt?: { setup?: { cwd?: string } }; run?: { cwd?: string } };
 type HerdrAttemptActionContext = AgentAttemptActionContext | StandaloneAgentAttemptActionContext;
@@ -205,54 +206,63 @@ function createInlineExtensionBridge(prepared: Readonly<PreparedAgentSession>): 
 function isToolBridgeRequest(value: unknown): value is ToolBridgeRequest {
   return value !== null && typeof value === "object" && typeof (value as Record<string, unknown>).toolCallId === "string" && typeof (value as Record<string, unknown>).name === "string";
 }
+function isLifecycleBridgeRequest(value: unknown): value is LifecycleBridgeRequest {
+  return value !== null && typeof value === "object" && (value as Record<string, unknown>).type === "agent_settled";
+}
 function toolBridgeRequest(value: unknown): ToolBridgeRequest {
   if (isToolBridgeRequest(value)) return value;
   const name = value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).name : undefined;
   throw new Error(`Unknown Herdr tool: ${String(name)}`);
 }
 
-async function createToolBridge(session: HerdrSession, prepared: Readonly<PreparedAgentSession>): Promise<ExtensionBridge | undefined> {
+async function createToolBridge(session: HerdrSession, prepared: Readonly<PreparedAgentSession>): Promise<ExtensionBridge> {
   const definitions: HerdrToolDefinition[] = [...(prepared.customTools ?? []), ...(prepared.resultTool ? [prepared.resultTool] : [])];
-  if (!definitions.length) return undefined;
-  const bridgeContext = await createBridgeContext(session, prepared);
+  const bridgeContext = definitions.length ? await createBridgeContext(session, prepared) : undefined;
   const specs = definitions.map((definition: HerdrToolDefinition) => {
     const { name, label, description, promptSnippet, promptGuidelines, parameters, renderShell, executionMode } = definition;
     return { name, label, description, ...(promptSnippet === undefined ? {} : { promptSnippet }), ...(promptGuidelines === undefined ? {} : { promptGuidelines }), parameters, ...(renderShell === undefined ? {} : { renderShell }), ...(executionMode === undefined ? {} : { executionMode }) };
   });
   const socketPath = join(tmpdir(), `pi-herdr-tools-${String(process.pid)}-${randomBytes(6).toString("hex")}.sock`);
   const extensionPath = join(tmpdir(), `pi-herdr-tools-${String(process.pid)}-${randomBytes(6).toString("hex")}.mjs`);
-  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return new Promise((resolve, reject) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const abort = () => finish(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ toolCallId, name, params }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch { continue; } if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); } });\n    socket.on("error", (error) => finish(error));\n    socket.on("close", () => finish(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); }\n`;
+  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return new Promise((resolve, reject) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const abort = () => finish(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ toolCallId, name, params }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch { continue; } if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); } });\n    socket.on("error", (error) => finish(error));\n    socket.on("close", () => finish(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nfunction reportSettled() {\n  return new Promise((resolve) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let finished = false;\n    const finish = () => { if (finished) return; finished = true; socket.destroy(); resolve(); };\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ type: "agent_settled" }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { if (JSON.parse(line).type === "ack") finish(); } catch {} } });\n    socket.on("error", finish);\n    socket.on("close", finish);\n  });\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); pi.on("agent_settled", reportSettled); }\n`;
   writeFileSync(extensionPath, source, { encoding: "utf8", mode: 0o600 });
   const sockets = new Set<Socket>();
+  let markSettled = (): void => {};
+  const settled = new Promise<void>((resolve) => { markSettled = resolve; });
   const server = createServer((socket) => {
     sockets.add(socket);
     const controller = new AbortController();
     let buffer = "";
     let handled = false;
+    let reportedSettled = false;
     const send = (message: ToolBridgeMessage): void => { if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`); };
     const handle = async (value: unknown): Promise<void> => {
       if (handled) return;
       handled = true;
       try {
+        if (isLifecycleBridgeRequest(value)) { reportedSettled = true; send({ type: "ack" }); return; }
         const request = toolBridgeRequest(value);
         const definition = definitions.find(({ name }) => name === request.name);
         if (!definition) { send({ type: "error", error: `Unknown Herdr tool: ${request.name}` }); return; }
+        if (!bridgeContext) { send({ type: "error", error: "Herdr tool bridge context is unavailable" }); return; }
         const result = await definition.execute(request.toolCallId, request.params, controller.signal, (update: unknown) => { send({ type: "update", value: update }); }, bridgeContext(controller.signal, () => { controller.abort(); }));
         send({ type: "result", value: result });
       } catch (error) {
         send({ type: "error", error: errorText(error) });
       }
     };
+    const close = (): void => { controller.abort(); sockets.delete(socket); if (reportedSettled) markSettled(); };
     socket.setEncoding("utf8");
     socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { void handle(JSON.parse(line)); } catch (error) { send({ type: "error", error: errorText(error) }); } } });
-    socket.on("close", () => { controller.abort(); sockets.delete(socket); });
-    socket.on("error", () => { controller.abort(); sockets.delete(socket); });
+    socket.on("close", close);
+    socket.on("error", close);
   });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); }); });
   let closed = false;
-  return { extensionPath, async close() {
+  return { extensionPath, settled, async close() {
     if (closed) return;
     closed = true;
+    markSettled();
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => { resolve(); }));
     try { unlinkSync(extensionPath); } catch { /* Cleanup is best effort after the child exits. */ }
@@ -331,7 +341,7 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
     inlineBridge = createInlineExtensionBridge(prepared);
     const selectedContextFiles = prepared.contextFiles === undefined ? undefined : session.getHerdrContextFiles?.() ?? [];
     commandFiles = createCommandFiles(prepared, prompt, directPrompt, selectedContextFiles);
-    const bridges = [bridge, inlineBridge].filter((value): value is ExtensionBridge => Boolean(value));
+    const bridges = [inlineBridge, bridge].filter((value): value is ExtensionBridge => Boolean(value));
     const command = commandFiles.command(sessionCommand(session, prepared, prompt, bridges, commandFiles, directPrompt));
     let opened: HerdrCommandResult;
     if (fullyInspectable) {
@@ -359,25 +369,30 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
       await closeRemote();
       throw error;
     }
-    const monitor = waitForHerdrPane(openedPane, runner, { signal, ...(prepared.piRuntime?.entrypoint ? { originatingEntrypoint: prepared.piRuntime.entrypoint } : {}), ...(onStatus ? { onStatus } : {}) }).then(async (reason) => {
-      await closeRemote();
+    const monitorController = new AbortController();
+    const abortMonitor = (): void => { monitorController.abort(); };
+    if (signal.aborted) abortMonitor();
+    else signal.addEventListener("abort", abortMonitor, { once: true });
+    let cleanup: Promise<void> | undefined;
+    const closeResources = (): Promise<void> => cleanup ??= (async () => {
       await reporter.release();
-      await bridge?.close();
+      await bridge.close();
       await inlineBridge?.close();
       await commandFiles?.close();
+    })();
+    const monitor = waitForHerdrPane(openedPane, runner, { signal: monitorController.signal, ...(bridge.settled ? { settled: bridge.settled } : {}), ...(prepared.piRuntime?.entrypoint ? { originatingEntrypoint: prepared.piRuntime.entrypoint } : {}), ...(onStatus ? { onStatus } : {}) }).then(async (reason) => {
+      await closeRemote();
+      await closeResources();
       return reason;
     }).catch(async (error: unknown) => {
       await closeRemote();
-      await reporter.release().catch(() => undefined);
-      await bridge?.close();
-      await inlineBridge?.close();
-      await commandFiles?.close();
+      await closeResources().catch(() => undefined);
       throw error;
-    });
-    return { pane: openedPane, monitor, reporter, closeRemote, close: async () => { await bridge?.close(); await inlineBridge?.close(); await commandFiles?.close(); } };
+    }).finally(() => { signal.removeEventListener("abort", abortMonitor); });
+    return { pane: openedPane, monitor, reporter, closeRemote, close: async () => { monitorController.abort(); await monitor.then(() => undefined, () => undefined); } };
   } catch (error) {
     if (pane && !fullyInspectable) await runner(["pane", "close", pane]).catch(() => undefined);
-    await bridge?.close();
+    await bridge.close();
     await inlineBridge?.close();
     await commandFiles?.close();
     throw error;

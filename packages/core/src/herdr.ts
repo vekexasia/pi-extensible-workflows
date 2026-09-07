@@ -135,41 +135,75 @@ function herdrAgentStatus(value: unknown): HerdrPaneStatus | undefined {
   const state: HerdrAgentStatus = isHerdrStatus(rawState) ? rawState : "unknown";
   return { state };
 }
-export async function waitForHerdrPane(paneId: string, runner: HerdrCommandRunner = herdrCommandRunner, options: { signal?: AbortSignal; intervalMs?: number; startupTimeoutMs?: number; exitGraceMs?: number; originatingEntrypoint?: string; onStatus?: (state: HerdrAgentStatus) => void | Promise<void> } = {}): Promise<"closed" | "exited" | "idle" | "aborted"> {
+export async function waitForHerdrPane(paneId: string, runner: HerdrCommandRunner = herdrCommandRunner, options: { signal?: AbortSignal; settled?: Promise<void>; intervalMs?: number; startupTimeoutMs?: number; exitGraceMs?: number; originatingEntrypoint?: string; onStatus?: (state: HerdrAgentStatus) => void | Promise<void> } = {}): Promise<"closed" | "exited" | "idle" | "settled" | "aborted"> {
   const intervalMs = options.intervalMs ?? 250;
   const startupTimeoutMs = options.startupTimeoutMs ?? 10000;
   const exitGraceMs = options.exitGraceMs ?? 5000;
   const startedAt = Date.now();
-  let sawPi = false;
-  let sawWorking = false;
-  let missingSince: number | undefined;
-  for (;;) {
-    if (options.signal?.aborted) return "aborted";
-    let piRunning: boolean;
-    try {
-      const output = await runner(["pane", "process-info", "--pane", paneId]);
-      piRunning = hasPiProcess(json(output), options.originatingEntrypoint);
-    } catch { return "closed"; }
-    if (!piRunning) {
-      if (sawPi) {
-        missingSince ??= Date.now();
-        if (Date.now() - missingSince >= exitGraceMs) return "exited";
-      }
-    } else {
-      missingSince = undefined;
-      if (!sawPi) { sawPi = true; }
+  const monitorController = new AbortController();
+  const isAborted = (): boolean => monitorController.signal.aborted;
+  let markAborted = (): void => {};
+  const aborted = new Promise<"aborted">((resolve) => { markAborted = () => { resolve("aborted"); }; });
+  const abortMonitor = (): void => { monitorController.abort(); markAborted(); };
+  if (options.signal?.aborted) abortMonitor();
+  else options.signal?.addEventListener("abort", abortMonitor, { once: true });
+  const delay = (): Promise<void> => new Promise((resolve) => {
+    if (isAborted()) { resolve(); return; }
+    const timer = setTimeout(finish, intervalMs);
+    function finish(): void { clearTimeout(timer); monitorController.signal.removeEventListener("abort", finish); resolve(); }
+    monitorController.signal.addEventListener("abort", finish, { once: true });
+  });
+  const poll = async (): Promise<"closed" | "exited" | "idle" | "aborted"> => {
+    let sawPi = false;
+    let sawWorking = false;
+    let missingSince: number | undefined;
+    for (;;) {
+      if (isAborted()) return "aborted";
+      let piRunning: boolean;
       try {
-        const status = herdrAgentStatus(json(await runner(["agent", "get", paneId])));
-        if (status) {
-          if (status.state === "working") sawWorking = true;
-          const shouldHandBack = sawWorking && (status.state === "idle" || status.state === "done");
-          try { await options.onStatus?.(status.state); } catch { /* Status notifications must not suppress pane handback. */ }
-          if (shouldHandBack) return "idle";
+        const output = await runner(["pane", "process-info", "--pane", paneId]);
+        if (isAborted()) return "aborted";
+        piRunning = hasPiProcess(json(output), options.originatingEntrypoint);
+      } catch {
+        if (isAborted()) return "aborted";
+        return "closed";
+      }
+      if (!piRunning) {
+        if (sawPi) {
+          missingSince ??= Date.now();
+          if (Date.now() - missingSince >= exitGraceMs) return "exited";
         }
-      } catch { /* The process monitor remains authoritative when no agent report is available. */ }
+      } else {
+        missingSince = undefined;
+        if (!sawPi) { sawPi = true; }
+        try {
+          const output = await runner(["agent", "get", paneId]);
+          if (isAborted()) return "aborted";
+          const status = herdrAgentStatus(json(output));
+          if (status) {
+            if (status.state === "working") sawWorking = true;
+            const shouldHandBack = options.settled === undefined && sawWorking && (status.state === "idle" || status.state === "done");
+            try { await options.onStatus?.(status.state); } catch { /* Status notifications must not suppress pane handback. */ }
+            if (isAborted()) return "aborted";
+            if (shouldHandBack) return "idle";
+          }
+        } catch {
+          if (isAborted()) return "aborted";
+          /* The process monitor remains authoritative when no agent report is available. */
+        }
+      }
+      if (!piRunning && !sawPi && Date.now() - startedAt >= startupTimeoutMs) throw new Error("Herdr pane did not start Pi.");
+      await delay();
     }
-    if (!piRunning && !sawPi && Date.now() - startedAt >= startupTimeoutMs) throw new Error("Herdr pane did not start Pi.");
-    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  };
+  const polling = poll();
+  try {
+    const result = await Promise.race(options.settled ? [polling, aborted, options.settled.then(() => "settled" as const)] : [polling, aborted]);
+    if (result === "settled" || result === "aborted") monitorController.abort();
+    return result;
+  } finally {
+    monitorController.abort();
+    options.signal?.removeEventListener("abort", abortMonitor);
   }
 }
 

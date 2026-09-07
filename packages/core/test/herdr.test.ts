@@ -168,6 +168,116 @@ void test("does not treat startup idle as a finished turn", async () => {
   assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, signal: controller.signal }), "aborted");
 });
 
+void test("honors cancellation during in-flight Herdr reads", async () => {
+  const processInfo = JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } });
+  const idle = JSON.stringify({ result: { agent: { agent_status: "idle" } } });
+  const assertAborted = async (pendingCommand: "pane" | "agent", reject: boolean): Promise<void> => {
+    const controller = new AbortController();
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let resolveRead!: (value: string) => void;
+    let rejectRead!: (reason?: unknown) => void;
+    const pendingRead = new Promise<string>((resolve, reject) => { resolveRead = resolve; rejectRead = reject; });
+    const calls: string[] = [];
+    const states: string[] = [];
+    const runner = async (args: readonly string[]): Promise<string> => {
+      calls.push(args[0] ?? "");
+      if (args[0] === pendingCommand) { enter(); return pendingRead; }
+      return processInfo;
+    };
+    const monitor = waitForHerdrPane("pane", runner, { signal: controller.signal, onStatus: (state) => { states.push(state); } });
+    await entered;
+    controller.abort();
+    if (reject) rejectRead(new Error("read failed"));
+    else resolveRead(pendingCommand === "pane" ? processInfo : idle);
+    assert.equal(await monitor, "aborted");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(calls, pendingCommand === "pane" ? ["pane"] : ["pane", "agent"]);
+    assert.deepEqual(states, []);
+  };
+  await assertAborted("pane", false);
+  await assertAborted("pane", true);
+  await assertAborted("agent", false);
+  await assertAborted("agent", true);
+});
+void test("does not issue late status reads or notifications after settlement", async () => {
+  for (const pendingCommand of ["pane", "agent"]) {
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => { settle = resolve; });
+    let release!: (value: string) => void;
+    const pendingRead = new Promise<string>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const readEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const calls: string[] = [];
+    const states: string[] = [];
+    const processInfo = JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } });
+    const runner = async (args: readonly string[]): Promise<string> => {
+      calls.push(args[0] ?? "");
+      if (args[0] === pendingCommand) { entered(); return pendingRead; }
+      return processInfo;
+    };
+    const monitor = waitForHerdrPane("pane", runner, { settled, onStatus: (state) => { states.push(state); } });
+    await readEntered;
+    settle();
+    assert.equal(await monitor, "settled");
+    const count = calls.length;
+    release(pendingCommand === "pane" ? processInfo : JSON.stringify({ result: { agent: { agent_status: "idle" } } }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, count);
+    assert.deepEqual(states, []);
+  }
+});
+
+void test("retains early explicit settlement without requiring Herdr activity", async () => {
+  const runner = async (args: readonly string[]): Promise<string> => args[0] === "pane"
+    ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } })
+    : JSON.stringify({ result: { agent: { agent_status: "idle" } } });
+  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, settled: Promise.resolve() }), "settled");
+});
+
+void test("does not let Herdr status finish an explicitly settled pane", async () => {
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => { settle = resolve; });
+  let report = 0;
+  let observeIdle!: () => void;
+  const idleObserved = new Promise<void>((resolve) => { observeIdle = resolve; });
+  const states: string[] = [];
+  const runner = async (args: readonly string[]): Promise<string> => {
+    if (args[0] === "pane") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } });
+    report += 1;
+    const state = report === 1 ? "working" : "idle";
+    if (state === "idle") observeIdle();
+    return JSON.stringify({ result: { agent: { agent_status: state } } });
+  };
+  const monitor = waitForHerdrPane("pane", runner, { intervalMs: 0, settled, onStatus: (state) => { states.push(state); } });
+  let completed = false;
+  void monitor.then(() => { completed = true; });
+  await idleObserved;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(completed, false);
+  settle();
+  assert.equal(await monitor, "settled");
+  assert.deepEqual(states.slice(0, 2), ["working", "idle"]);
+});
+
+void test("keeps cancellation, process exit, and pane closure fallbacks with explicit settlement", async () => {
+  const neverSettled = new Promise<void>(() => {});
+  const controller = new AbortController();
+  controller.abort();
+  assert.equal(await waitForHerdrPane("pane", async () => { throw new Error("must not poll"); }, { signal: controller.signal, settled: neverSettled }), "aborted");
+  const activeController = new AbortController();
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const activeMonitor = waitForHerdrPane("pane", async () => { markStarted(); return new Promise<string>(() => {}); }, { signal: activeController.signal, settled: neverSettled });
+  await started;
+  activeController.abort();
+  assert.equal(await activeMonitor, "aborted");
+  let processReports = 0;
+  const exitingRunner = async (): Promise<string> => JSON.stringify({ result: { process_info: { foreground_processes: processReports++ === 0 ? [{ name: "pi", argv: ["pi"] }] : [] } } });
+  assert.equal(await waitForHerdrPane("pane", exitingRunner, { intervalMs: 0, exitGraceMs: 0, settled: neverSettled }), "exited");
+  assert.equal(await waitForHerdrPane("pane", async () => { throw new Error("pane closed"); }, { settled: neverSettled }), "closed");
+});
+
 void test("detects a running Herdr agent returning idle after a turn", async () => {
   let reports = 0;
   const states: string[] = [];
@@ -181,13 +291,11 @@ void test("detects a running Herdr agent returning idle after a turn", async () 
 });
 
 void test("does not let status notifications suppress idle handback", async () => {
-  const controller = new AbortController();
   let reports = 0;
   const runner = async (args: readonly string[]): Promise<string> => {
     if (args[0] === "pane") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } });
     reports += 1;
-    if (reports === 2) controller.abort();
     return JSON.stringify({ result: { agent: { agent_status: reports === 1 ? "working" : "idle" } } });
   };
-  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, signal: controller.signal, onStatus: () => { throw new Error("notification failed"); } }), "idle");
+  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, onStatus: () => { throw new Error("notification failed"); } }), "idle");
 });

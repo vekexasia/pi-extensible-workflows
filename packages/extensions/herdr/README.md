@@ -47,7 +47,7 @@ This setting is global-only: a project-scope value is accepted by the generic wo
 
 ## Live handoff and ownership
 
-Live handoff pauses the local SDK at a turn boundary while the Herdr pane owns the task. The originating Pi TUI reports the handed-off agent as working, then idle or completed before handback. Pane exit, `/quit`, or a pane that returns idle after Herdr has observed it working returns ownership to the local SDK.
+Live handoff pauses the local SDK at a turn boundary while the Herdr pane owns the task. A generated bridge reports Pi's `agent_settled` event directly to the transport, independently of user extension filters and Herdr screen detection. This returns ownership to the local SDK and closes the owned pane; accepting `workflow_result` alone does not end the execution. Pane exit, `/quit`, and cancellation remain fallback paths.
 
 The extension preserves the originating Pi executable and entrypoint, model, tools, role/resource policy, context selection, prompt configuration, custom result tools, and transferable inline extensions. Temporary bridge files use private permissions; files and sockets are cleaned after the pane closes.
 
