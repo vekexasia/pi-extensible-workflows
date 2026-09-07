@@ -233,7 +233,12 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             });
             return deleted ? "picker" : "dashboard";
           }
-          if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return "dashboard"; }
+          if (action === "pause" && run) {
+            await run.lifecycle.pause();
+            ctx.ui.notify(run.lifecycle.state === "pausing" ? `Pausing workflow ${run.store.runId}; it pauses once the active operation finishes.` : `Paused workflow ${run.store.runId}.`, "info");
+            return "dashboard";
+          }
+          if (action === "cancel-pause" && run?.lifecycle.state === "pausing") { await run.lifecycle.resume(); ctx.ui.notify(`Cancelled the pending pause of workflow ${run.store.runId}.`, "info"); return "dashboard"; }
           if (action === "resume" && run) {
             if (run.lifecycle.state === "budget_exhausted") {
               const patch: unknown = rest.length ? JSON.parse(rest.join(" ")) as unknown : undefined;
@@ -417,6 +422,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
             const addCopy = (label: string, value: string, artifact: string) => { actions.set(label, "copy"); copies.set(label, { value, artifact }); };
             if (liveRun.state === "running") add("Pause", "pause");
+            if (liveRun.state === "pausing") add("Cancel pause", "cancel-pause");
             if (["paused", "interrupted"].includes(liveRun.state)) add("Resume", "resume");
             if (liveRun.state === "budget_exhausted") { actions.set("Resume unchanged", `resume ${store.runId}`); actions.set("Adjust budget", `adjust ${store.runId}`); }
             for (const decision of await store.pendingWorkflowDecisions()) {

@@ -86,8 +86,9 @@ export class RunLifecycle {
     if (this.#active === 0 && this.state === "pausing") await this.#set("paused", "pause");
   }
 
+  /** Resumes a paused, interrupted, or budget-exhausted run; on a `pausing` run it cancels the pending pause instead. */
   async resume(): Promise<void> {
-    if (this.#state !== "paused" && this.#state !== "interrupted" && this.#state !== "budget_exhausted") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot resume ${this.#state} run`);
+    if (this.#state !== "pausing" && this.#state !== "paused" && this.#state !== "interrupted" && this.#state !== "budget_exhausted") throw new WorkflowError("RESUME_INCOMPATIBLE", `Cannot resume ${this.#state} run`);
     await this.#set("running", "resume");
     for (const resolve of this.#waiters.splice(0)) resolve();
   }

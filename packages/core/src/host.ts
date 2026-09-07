@@ -14,7 +14,7 @@ import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
 import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
 import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
-import { loadAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
+import { loadAgentDefinitions, loadProjectAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
 import backgroundWidget, { type BackgroundWidgetAPI } from "./background-widget.js";
@@ -132,6 +132,26 @@ function completionControlContent(result: unknown, controlRunId?: string): strin
   delete record.completion;
   delete record.run;
   return JSON.stringify({ ...record, value });
+}
+type RoleCapture = { readonly snapshot: Readonly<LaunchSnapshot>; capture(role: string, model: ModelSpec): Promise<void> };
+/** Persists a role definition (and its model) into the launch snapshot the first time an agent uses it, so later replays and retries see the definition the run actually ran with. */
+function roleCapture(store: RunStore, initial: Readonly<LaunchSnapshot>, definitions: Readonly<Record<string, AgentDefinition>>, projectDefinitions: Readonly<Record<string, AgentDefinition>>): RoleCapture {
+  let persisted = initial;
+  return {
+    get snapshot() { return persisted; },
+    async capture(role, model) {
+      const definition = definitions[role];
+      if (!definition) return;
+      const modelName = `${model.provider}/${model.model}`;
+      const hasProjectRole = projectDefinitions[role] !== undefined;
+      if (persisted.roles?.[role] !== undefined && (!hasProjectRole || persisted.projectRoles?.includes(role)) && persisted.models.includes(modelName)) return;
+      const roles = { ...(persisted.roles ?? {}), [role]: definition };
+      const projectRoles = hasProjectRole ? [...new Set([...(persisted.projectRoles ?? []), role])] : persisted.projectRoles ?? [];
+      const models = [...new Set([...persisted.models, modelName])];
+      persisted = createLaunchSnapshot({ ...persisted, models, roles, projectRoles });
+      await store.saveSnapshot(persisted);
+    },
+  };
 }
 export function formatWorkflowPreview(args: { script?: unknown; scriptPath?: unknown; name?: unknown; description?: unknown }): string {
   const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "workflow";
@@ -856,6 +876,19 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     catalogRegistered = true;
   };
   const createAgentExecutor = (root: Omit<AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks(), onResourceWarning: (message) => { deliverWarning(pi, message); } }, transport);
+  // Resumed runs keep the role definitions frozen in their snapshot and fall back to the current definitions for roles a
+  // registered function reaches for the first time after the restart; those are captured into the snapshot like at launch.
+  const resumeRoles = (store: RunStore, snapshot: Readonly<LaunchSnapshot>, cwd: string, trustedProject: boolean) => {
+    let current: Readonly<Record<string, AgentDefinition>> = {};
+    let project: Readonly<Record<string, AgentDefinition>> = {};
+    try {
+      current = loadAgentDefinitions(cwd, extensionAgentDir, trustedProject, registry.roleDirectoryRegistrations());
+      project = trustedProject ? loadProjectAgentDefinitions(cwd) : {};
+    } catch { /* Unreadable current roles leave the resume with the snapshot roles, as before. */ }
+    const definitions = { ...current, ...(snapshot.roles ?? {}) };
+    const captured = roleCapture(store, snapshot, definitions, project);
+    return { definitions, capture: (role: string, model: ModelSpec) => captured.capture(role, model) };
+  };
   const activeSnapshotTools = (tools: readonly string[], active: ReadonlySet<string> | "session") => active === "session"
     ? new Set(tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog"))
     : new Set(tools.filter((tool) => active.has(tool) || tool === "workflow_catalog"));
@@ -934,7 +967,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     };
   };
   const recovery = createWorkflowRecovery({
-    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
+    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, resumeRoles, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
   });
   const resumeSelectedWorkflow = async (runId: string, foreground: boolean, context: unknown, budgetPatch?: unknown): Promise<{ workflowName: string; state: "running" | "completed" | "awaiting_approval"; attached: boolean; value?: JsonValue }> => {
     const run = runs.get(runId);
@@ -944,6 +977,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const capabilities = uiHostCapabilities(host.ui);
     const ui = capabilities?.select ? { select: capabilities.select } : {};
     const recoveryContext = { ...resumeHostContext(context) };
+    if (run.lifecycle.state === "pausing") {
+      await run.lifecycle.resume();
+      return { workflowName: run.metadata.name, state: "running", attached: deliveryController.isForegroundAttached(runId) };
+    }
     if (run.lifecycle.state === "paused") {
       const wasAttached = deliveryController.isForegroundAttached(runId);
       if (!foreground && wasAttached) await deliveryController.moveForegroundToBackground(runId);
@@ -1145,19 +1182,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model, modelAliases, knownModels, settingsPath)] : []; });
       const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models, ...roleModels])];
       const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, launchMode: params.foreground ? "foreground" : "background", settings, settingsPath, settingsSources: { ...launch.resolution.sources, concurrency: params.concurrency === undefined ? launch.resolution.sources.concurrency : "per-run options" }, ...(Object.keys(modelAliases).length ? { modelAliases } : {}), ...(budget ? { budget } : {}), ...(checked.referenced.phases.length ? { phases: checked.referenced.phases } : {}), models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, schemas: checked.schemas });
-      let persistedSnapshot = snapshot;
-      const captureRole = async (role: string, model: ModelSpec): Promise<void> => {
-        const definition = agentDefinitions[role];
-        if (!definition) return;
-        const modelName = `${model.provider}/${model.model}`;
-        const hasProjectRole = projectAgentDefinitions[role] !== undefined;
-        if (persistedSnapshot.roles?.[role] !== undefined && (!hasProjectRole || persistedSnapshot.projectRoles?.includes(role)) && persistedSnapshot.models.includes(modelName)) return;
-        const roles = { ...(persistedSnapshot.roles ?? {}), [role]: definition };
-        const projectRoles = hasProjectRole ? [...new Set([...(persistedSnapshot.projectRoles ?? []), role])] : persistedSnapshot.projectRoles ?? [];
-        const models = [...new Set([...persistedSnapshot.models, modelName])];
-        persistedSnapshot = createLaunchSnapshot({ ...persistedSnapshot, models, roles, projectRoles });
-        await store.saveSnapshot(persistedSnapshot);
-      };
+      const capturedRoles = roleCapture(store, snapshot, agentDefinitions, projectAgentDefinitions);
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       const createRun = () => store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
@@ -1181,7 +1206,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             delivery.detached = true;
             const activeRun = runs.get(runId);
             if (activeRun) { activeRun.foreground = false; delete activeRun.update; }
-            await store.saveSnapshot(createLaunchSnapshot({ ...persistedSnapshot, launchMode: "background" }));
+            await store.saveSnapshot(createLaunchSnapshot({ ...capturedRoles.snapshot, launchMode: "background" }));
             for (const checkpoint of await store.awaitingCheckpoints()) deliverBackgroundCheckpoint(checked.metadata.name, runId, checkpoint);
             signal?.removeEventListener("abort", onForegroundAbort);
             const run = (await store.load()).run;
@@ -1201,7 +1226,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
-      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, captureRole), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry), runController.signal);
+      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, (role, model) => capturedRoles.capture(role, model)), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {

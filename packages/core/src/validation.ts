@@ -324,6 +324,7 @@ function readRoleDefinitions(dirs: readonly WorkflowRoleDirectoryInput[], extens
   }));
   return extension ? { ...read(starterFiles), ...read(regularFiles) } : read(files);
 }
+export function loadProjectAgentDefinitions(cwd: string): Readonly<Record<string, AgentDefinition>> { return readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))); }
 export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), projectTrusted = true, extensionRoleDirectories: readonly WorkflowRoleDirectoryInput[] = registeredWorkflowRoleDirectoryRegistrations()): Readonly<Record<string, AgentDefinition>> {
   return deepFreeze({ ...readRoleDefinitions(extensionRoleDirectories, true), ...readRoleDefinitions(workflowRoleDirectories(agentDir)), ...(projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))) : {}) });
 }
@@ -858,7 +859,7 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   if (!script) fail("INVALID_SYNTAX", "Provide script or scriptPath");
   const metadata = validateWorkflowMetadata({ name: explicitName, ...(typeof params.description === "string" ? { description: params.description } : {}) });
   const globalAgentDefinitions = loadAgentDefinitions(context.cwd, context.agentDir, false, registry && typeof registry.roleDirectoryRegistrations === "function" ? registry.roleDirectoryRegistrations() : registry && typeof registry.roleDirectories === "function" ? registry.roleDirectories() : undefined);
-  const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};
+  const projectAgentDefinitions = context.projectTrusted ? loadProjectAgentDefinitions(context.cwd) : {};
   const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
   const aliases = context.modelAliases ?? {};
   const knownModels = context.knownModels ?? context.availableModels;
