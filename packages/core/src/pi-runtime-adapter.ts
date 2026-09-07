@@ -1,8 +1,7 @@
 import type { RuntimeAgentHandoff, RuntimeAgentProgress, RuntimeAgentState, RuntimeHandoffState, RuntimeToolCallProgress } from "./runtime/agent-runner.js";
 import type { AgentProgress } from "./agent-execution.js";
 import type { LiveSessionHandoff, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionState } from "./types.js";
-import { THINKING_LEVELS } from "./types.js";
-import { sanitizeDisplayText } from "./utils.js";
+import { isThinkingLevel, sanitizeDisplayText } from "./utils.js";
 const TURN_START_EVENTS = new Set(["turn_start", "turn_started", "turnStarted"]);
 const MAX_ACTIVITY_TEXT_CHARS = 200;
 const AGENT_START_EVENTS = new Set(["agent_start"]);
@@ -11,7 +10,6 @@ type RecordValue = Record<string, unknown>;
 
 function record(value: unknown): RecordValue | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as RecordValue : undefined; }
 function stringValue(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
-function isThinking(value: unknown): value is NonNullable<WorkflowAgentSessionState["thinking"]> { return THINKING_LEVELS.some((level) => level === value); }
 function finiteNumber(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
 
 function normalizeMessage(value: unknown): WorkflowAgentMessage | undefined {
@@ -38,6 +36,8 @@ function normalizeMessage(value: unknown): WorkflowAgentMessage | undefined {
 }
 
 export function normalizePiMessage(value: unknown): WorkflowAgentMessage | undefined { return normalizeMessage(value); }
+/** An assistant turn Pi aborted before it produced any content; it carries no usable result. */
+export function isEmptyAbortedAssistant(message: WorkflowAgentMessage | undefined): boolean { return message?.stopReason === "aborted" && Array.isArray(message.content) && message.content.length === 0; }
 
 function normalizeState(value: unknown): WorkflowAgentSessionState | undefined {
   const candidate = record(value);
@@ -48,7 +48,7 @@ function normalizeState(value: unknown): WorkflowAgentSessionState | undefined {
   const tools = Array.isArray(rawTools) ? rawTools.filter((tool): tool is string => typeof tool === "string") : undefined;
   if (!candidate || !model || provider === undefined || modelName === undefined || tools === undefined || !Array.isArray(rawTools) || tools.length !== rawTools.length) return undefined;
   const thinking = candidate.thinking === undefined ? model.thinking : candidate.thinking;
-  if (thinking !== undefined && !isThinking(thinking)) return undefined;
+  if (thinking !== undefined && !isThinkingLevel(thinking)) return undefined;
   const systemPrompt = candidate.systemPrompt;
   if (systemPrompt !== undefined && typeof systemPrompt !== "string") return undefined;
   return {
@@ -112,11 +112,13 @@ function runtimeHandoffState(state: LiveSessionHandoff["state"]): RuntimeHandoff
 }
 
 export function isTurnBoundaryStart(type: string): boolean { return TURN_START_EVENTS.has(type); }
+/** A turn boundary start or an agent start: either one means the session is busy until the next turn end. */
+export function isTurnActivityStart(type: string): boolean { return TURN_START_EVENTS.has(type) || AGENT_START_EVENTS.has(type); }
 export function isTurnBoundaryEnd(type: string): boolean { return TURN_END_EVENTS.has(type); }
 export function isTurnEnd(type: string): boolean { return type === "turn_end" || type === "turnEnded"; }
 
 function boundaryEvent(type: string): "turn_started" | "turn_end" | undefined {
-  if (isTurnBoundaryStart(type) || AGENT_START_EVENTS.has(type)) return "turn_started";
+  if (isTurnActivityStart(type)) return "turn_started";
   if (isTurnBoundaryEnd(type)) return "turn_end";
   return undefined;
 }

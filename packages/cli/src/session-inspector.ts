@@ -4,7 +4,7 @@ import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { highlightCode, initTheme, SessionManager, truncateToVisualLines, type SessionEntry, type SessionInfo } from "@earendil-works/pi-coding-agent";
-import { errorText, formatBudgetStatus, inspectWorkflowScript, type AgentSetupSummary, type ModelSpec, type StaticWorkflowCall } from "pi-extensible-workflows";
+import { errorText, formatBudgetStatus, inspectWorkflowScript, parseThinking, type AgentSetupSummary, type ModelSpec, type StaticWorkflowCall } from "pi-extensible-workflows";
 import { listPersistedSessionIds, listRunIds, RunStore, type PersistedRun, type RunSummary } from "pi-extensible-workflows/persistence";
 
 export interface ModelUsage { model: string; cost: number }
@@ -79,14 +79,6 @@ function mergedModels(groups: readonly (readonly ModelUsage[])[]): ModelUsage[] 
   return [...totals].map(([model, cost]) => ({ model, cost })).sort((a, b) => b.cost - a.cost || a.model.localeCompare(b.model));
 }
 
-type ThinkingLevel = NonNullable<ModelSpec["thinking"]>;
-const thinkingLevels: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-function isThinkingLevel(value: unknown): value is ThinkingLevel {
-  return typeof value === "string" && thinkingLevels.some((level) => level === value);
-}
-function parsedThinking(value: unknown): ModelSpec["thinking"] | undefined {
-  return isThinkingLevel(value) ? value : undefined;
-}
 
 function modelName(provider: unknown, model: unknown): string | undefined {
   return typeof provider === "string" && provider && typeof model === "string" && model ? `${provider}/${model}` : undefined;
@@ -105,7 +97,7 @@ function transcript(manager: SessionManager): TranscriptSummary {
       continue;
     }
     if (entry.type === "thinking_level_change") {
-      thinking = parsedThinking(entry.thinkingLevel);
+      thinking = parseThinking(entry.thinkingLevel);
       if (thinking === undefined) throw new Error("Invalid thinking policy");
       continue;
     }

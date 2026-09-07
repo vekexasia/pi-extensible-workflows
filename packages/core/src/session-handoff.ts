@@ -1,4 +1,5 @@
 import type { LiveSessionHandoff, WorkflowAgentSessionEvent } from "./types.js";
+import { isTurnActivityStart, isTurnBoundaryEnd } from "./pi-runtime-adapter.js";
 
 export function createLiveSessionHandoff(): LiveSessionHandoff {
   let state: LiveSessionHandoff["state"] = "local-running";
@@ -35,8 +36,8 @@ export function createLiveSessionHandoff(): LiveSessionHandoff {
     get state() { return state; },
     get transferred() { return takenOver; },
     observe(event: WorkflowAgentSessionEvent) {
-      if (["turn_start", "turn_started", "turnStarted", "agent_start"].includes(event.type)) turnActive = true;
-      if (["turn_end", "turnEnded", "agent_end", "agent_settled"].includes(event.type)) finishBoundary();
+      if (isTurnActivityStart(event.type)) turnActive = true;
+      if (isTurnBoundaryEnd(event.type)) finishBoundary();
     },
     async request(launch: () => Promise<void>): Promise<void> {
       if (request) return request;

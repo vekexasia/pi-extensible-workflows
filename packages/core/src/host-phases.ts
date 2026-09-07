@@ -2,7 +2,8 @@ import { type PersistedRun } from "./persistence.js";
 import { type AgentRecord, type LaunchSnapshot, type RunState, type WorkflowPhaseShellActivity } from "./types.js";
 import { object } from "./utils.js";
 
-export type WorkflowPhaseState = "not started" | "running" | "completed" | "failed" | "cancelled" | "interrupted" | "budget_exhausted";
+export const WORKFLOW_PHASE_STATES = ["not started", "running", "completed", "failed", "cancelled", "interrupted", "budget_exhausted"] as const;
+export type WorkflowPhaseState = (typeof WORKFLOW_PHASE_STATES)[number];
 export interface WorkflowPhaseAgentCounts { total: number; completed: number; running: number; failed: number; cancelled: number; pending: number }
 export interface WorkflowPhaseView { id: string; name: string; occurrence: number; state: WorkflowPhaseState; observed: boolean; afterAgent?: number; agents: readonly AgentRecord[]; counts: WorkflowPhaseAgentCounts; shellActivity?: WorkflowPhaseShellActivity }
 export interface WorkflowPhaseModel { runState: RunState; declaredPhases: readonly string[]; phases: readonly WorkflowPhaseView[]; currentPhaseIndex?: number; currentPhaseId?: string; counts: Readonly<Partial<Record<WorkflowPhaseState, number>>>; unassignedAgents?: readonly AgentRecord[] }
@@ -22,7 +23,8 @@ export function phaseAgentCounts(agents: readonly AgentRecord[]): WorkflowPhaseA
   }
   return counts;
 }
-function shellActivityFor(run: Pick<PersistedRun, "activeShellsByPhase">, phaseIndex: number): WorkflowPhaseShellActivity | undefined {
+/** The live shell activity recorded for one phase index; `-1` is the preflight scope before any phase. */
+export function shellActivityFor(run: Pick<PersistedRun, "activeShellsByPhase">, phaseIndex: number): WorkflowPhaseShellActivity | undefined {
   return run.activeShellsByPhase?.find((activity) => activity.phaseIndex === phaseIndex && activity.active > 0);
 }
 function phaseState(runState: RunState, counts: WorkflowPhaseAgentCounts, isLatest: boolean, shellActive = false): WorkflowPhaseState {

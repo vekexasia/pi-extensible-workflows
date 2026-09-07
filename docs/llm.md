@@ -95,7 +95,7 @@ Trajectory also publishes current-session durable standalone subagents as first-
 
 ### Concurrency
 
-`concurrency` is an integer from `1` through `16`. The default is `8`.
+`concurrency` is an integer from `1` through `16`. The default is `8`. Agents queue in the order the workflow calls `agent(...)`: when a script issues several calls concurrently (for example inside `parallel(...)`), the limit admits them in call order rather than in the order their replay lookups happen to finish.
 
 ### Background workflow widget
 

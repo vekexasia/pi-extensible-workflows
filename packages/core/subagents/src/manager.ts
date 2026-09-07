@@ -8,6 +8,7 @@ import {
   errorText,
   finiteNumber,
   isNodeError,
+  isThinkingLevel,
   jsonValue,
   loadAgentDefinitions,
   loadingRegistry,
@@ -436,7 +437,6 @@ function decodeFailure(value: unknown): SubagentFailure | undefined {
   const code = errorCode(value);
   return code && typeof record.message === "string" ? { code, message: record.message } : undefined;
 }
-function finite(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
@@ -456,7 +456,7 @@ function accountingValue(value: unknown): AgentAccounting | undefined {
   const cacheRead = record.cacheRead;
   const cacheWrite = record.cacheWrite;
   const cost = record.cost;
-  if (!finite(input) || !finite(output) || !finite(cacheRead) || !finite(cacheWrite) || !finite(cost)) return undefined;
+  if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(cost)) return undefined;
   return { input, output, cacheRead, cacheWrite, cost };
 }
 function legacyAccountingValue(record: Record<string, unknown>): AgentAccounting | undefined {
@@ -473,7 +473,7 @@ function legacyAccountingValue(record: Record<string, unknown>): AgentAccounting
   const cacheRead = tokenRecord.cacheRead;
   const cacheWrite = tokenRecord.cacheWrite;
   const cost = (usage as Record<string, unknown>).cost;
-  if (!finite(input) || !finite(output) || !finite(cacheRead) || !finite(cacheWrite) || !finite(tokenRecord.total) || !finite(cost)) return undefined;
+  if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(tokenRecord.total) || !finiteNumber(cost)) return undefined;
   return accounting ?? { input, output, cacheRead, cacheWrite, cost };
 }
 function activityValue(value: unknown): AgentActivity | undefined {
@@ -501,7 +501,7 @@ function modelValue(value: unknown): ModelSpec | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
   const thinking = record.thinking;
-  if (typeof record.provider !== "string" || !record.provider.trim() || typeof record.model !== "string" || !record.model.trim() || thinking !== undefined && thinking !== "off" && thinking !== "minimal" && thinking !== "low" && thinking !== "medium" && thinking !== "high" && thinking !== "xhigh" && thinking !== "max") return undefined;
+  if (typeof record.provider !== "string" || !record.provider.trim() || typeof record.model !== "string" || !record.model.trim() || thinking !== undefined && !isThinkingLevel(thinking)) return undefined;
   return { provider: record.provider, model: record.model, ...(thinking === undefined ? {} : { thinking }) };
 }
 function sessionReferenceValue(value: unknown): AgentAttemptSummary["session"] | undefined {

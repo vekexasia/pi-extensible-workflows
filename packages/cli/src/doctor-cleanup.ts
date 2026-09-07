@@ -2,22 +2,18 @@ import { createHash } from "node:crypto";
 import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { validateBudget } from "pi-extensible-workflows";
-import { RUN_STATES, type RunState } from "pi-extensible-workflows";
-import { errorText, isNodeError, jsonValue, validateModelAliases } from "pi-extensible-workflows";
-import { validateSchema } from "pi-extensible-workflows";
+import { AGENT_STATES as CORE_AGENT_STATES, BUDGET_DIMENSIONS as CORE_BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES as CORE_BUDGET_EVENT_TYPES, HARD_TERMINAL_RUN_STATES, RUN_STATES, errorText, isNodeError, isThinkingLevel, jsonValue, object, validateBudget, validateModelAliases, validateSchema, type AgentState, type ModelSpec, type RunState } from "pi-extensible-workflows";
 import { acquireSessionLease, hasLiveSessionLease, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "pi-extensible-workflows/persistence";
 
-const TERMINAL_STATES = new Set<RunState>(["completed", "failed", "stopped"]);
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_RUN_FILES = ["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"] as const;
 const OPTIONAL_RUN_FILES = new Set(["result.json", "summary.json"]);
 const RUN_DIRECTORIES = new Set(["worktrees", ".system-prompts"]);
 const RUN_FILES = new Set<string>([...REQUIRED_RUN_FILES, ...OPTIONAL_RUN_FILES]);
-const AGENT_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
-const SCHEDULER_STATES = new Set(["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"]);
-const BUDGET_DIMENSIONS = new Set(["tokens", "costUsd", "durationMs", "agentLaunches"]);
-const BUDGET_EVENT_TYPES = new Set(["soft_crossed", "hard_overrun", "hard_exhausted", "adjustment_requested", "adjustment_approved", "adjustment_rejected"]);
+// String-keyed views of the core vocabularies: persisted files are read as unknown, so membership is checked on plain strings.
+const AGENT_STATES = new Set<string>(CORE_AGENT_STATES);
+const BUDGET_DIMENSIONS = new Set<string>(CORE_BUDGET_DIMENSIONS);
+const BUDGET_EVENT_TYPES = new Set<string>(CORE_BUDGET_EVENT_TYPES);
 
 export interface DoctorCleanupOptions { cwd?: string; home?: string; olderThanDays?: number; yes?: boolean; now?: number }
 export interface CleanupRunResult { sessionId: string; runId: string; action: "candidate" | "skipped" | "deleted" | "failed"; state: string; stateMtimeMs: number; path: string; reason?: string }
@@ -29,12 +25,9 @@ type StoredRun = { sessionId: string; runId: string; store: RunStore; run: Persi
 type SessionScan = { sessionId: string; path: string; runs: readonly StoredRun[]; liveLease: boolean };
 type SessionPlan = { candidates: readonly StoredRun[]; skipped: readonly CleanupRunResult[] };
 
-type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-type AgentState = "queued" | "running" | "waiting_for_child" | "paused" | "retrying" | "completed" | "failed" | "cancelled";
-type SchedulerState = "queued" | "running" | "waiting_for_child" | "paused" | "retrying" | "completed" | "failed" | "cancelled";
 type ToolCallState = "running" | "completed" | "failed";
 type ActivityKind = "reasoning" | "tool" | "text";
-type ValidatedModel = { provider: string; model: string; thinking?: ThinkingLevel | undefined };
+type ValidatedModel = { provider: string; model: string; thinking?: ModelSpec["thinking"] | undefined };
 type ValidatedAccounting = { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
 type ValidatedResourceSelectors = { skills?: string[] | undefined; extensions?: string[] | undefined; tools?: string[] | undefined };
 type ValidatedRole = string;
@@ -44,13 +37,10 @@ type ValidatedAgentSetup = { hookNames: string[]; model: ValidatedModel; tools: 
 type ValidatedAgent = { id: string; name: string; path: string; state: AgentState; parentId?: string | undefined };
 type ValidatedUsage = { tokens: number; costUsd: number; durationMs: number; agentLaunches: number };
 type ValidatedRunRecord = { id: string; workflowName: string; cwd: string; sessionId: string; state: RunState; agents: ValidatedAgent[]; agentSessions: ValidatedSessionReference[] };
-type ValidatedOwnershipRecord = { id: string; label: string; state: SchedulerState; parentId?: string | undefined; prompt?: string | undefined; options: ValidatedScheduledOptions };
-function object(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
+type ValidatedOwnershipRecord = { id: string; label: string; state: AgentState; parentId?: string | undefined; prompt?: string | undefined; options: ValidatedScheduledOptions };
 function isList(value: unknown): value is unknown[] { return Array.isArray(value); }
-function isThinking(value: unknown): value is ThinkingLevel { return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].some((candidate) => candidate === value); }
 function isRunState(value: unknown): value is RunState { return RUN_STATES.some((candidate) => candidate === value); }
 function isAgentState(value: unknown): value is AgentState { return typeof value === "string" && AGENT_STATES.has(value); }
-function isSchedulerState(value: unknown): value is SchedulerState { return typeof value === "string" && SCHEDULER_STATES.has(value); }
 function isToolCallState(value: unknown): value is ToolCallState { return ["running", "completed", "failed"].some((candidate) => candidate === value); }
 function isActivityKind(value: unknown): value is ActivityKind { return ["reasoning", "tool", "text"].some((candidate) => candidate === value); }
 function positiveDays(value: number): number { if (!Number.isSafeInteger(value) || value < 1 || !Number.isFinite(value * DAY_MS)) throw new Error("older-than-days must be a positive integer"); return value; }
@@ -63,15 +53,15 @@ function optionalString(value: unknown, label: string): asserts value is string 
 function nonNegativeInteger(value: unknown, label: string): asserts value is number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new Error(`${label} is invalid`); }
 function positiveInteger(value: unknown, label: string): asserts value is number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) throw new Error(`${label} is invalid`); }
 function finiteNumber(value: unknown, label: string): asserts value is number { if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`${label} is invalid`); }
-function model(value: unknown, label: string): asserts value is ValidatedModel { if (!object(value) || typeof value.provider !== "string" || !value.provider || typeof value.model !== "string" || !value.model || (value.thinking !== undefined && !isThinking(value.thinking))) throw new Error(`${label} is invalid`); }
+function model(value: unknown, label: string): asserts value is ValidatedModel { if (!object(value) || typeof value.provider !== "string" || !value.provider || typeof value.model !== "string" || !value.model || (value.thinking !== undefined && !isThinkingLevel(value.thinking))) throw new Error(`${label} is invalid`); }
 function accounting(value: unknown, label: string): asserts value is ValidatedAccounting { if (!object(value)) throw new Error(`${label} is invalid`); for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"]) finiteNumber(value[key], `${label}.${key}`); }
 function resourceSelectors(value: unknown, label: string): asserts value is ValidatedResourceSelectors | undefined { if (value === undefined) return; if (!object(value)) throw new Error(`${label} is invalid`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); if (value.tools !== undefined) stringList(value.tools, `${label}.tools`); }
-function agentDefinition(value: unknown, label: string): asserts value is Record<string, unknown> { if (!object(value)) throw new Error(`${label} is invalid`); optionalString(value.prompt, `${label}.prompt`); optionalString(value.description, `${label}.description`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !isThinking(value.thinking)) throw new Error(`${label}.thinking is invalid`); if (value.tools !== undefined) stringList(value.tools, `${label}.tools`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); }
+function agentDefinition(value: unknown, label: string): asserts value is Record<string, unknown> { if (!object(value)) throw new Error(`${label} is invalid`); optionalString(value.prompt, `${label}.prompt`); optionalString(value.description, `${label}.description`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !isThinkingLevel(value.thinking)) throw new Error(`${label}.thinking is invalid`); if (value.tools !== undefined) stringList(value.tools, `${label}.tools`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); }
 function optionalRole(value: unknown, label: string): asserts value is ValidatedRole | undefined {
   if (value === undefined) return;
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is invalid`);
 }
-function validateScheduledOptions(value: unknown, label: string): asserts value is ValidatedScheduledOptions { if (!object(value) || typeof value.label !== "string" || !value.label || typeof value.cwd !== "string" || !value.cwd) throw new Error(`${label} is invalid`); optionalString(value.requestedLabel, `${label}.requestedLabel`); optionalString(value.parentBreadcrumb, `${label}.parentBreadcrumb`); stringList(value.tools, `${label}.tools`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); if (value.contextFiles !== undefined) stringList(value.contextFiles, `${label}.contextFiles`); optionalString(value.worktreeOwner, `${label}.worktreeOwner`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !isThinking(value.thinking)) throw new Error(`${label}.thinking is invalid`); optionalRole(value.role, `${label}.role`); if (value.schema !== undefined) validateSchema(value.schema, `${label}.schema`); if (value.retries !== undefined) nonNegativeInteger(value.retries, `${label}.retries`); if (value.timeoutMs !== undefined && value.timeoutMs !== null) positiveInteger(value.timeoutMs, `${label}.timeoutMs`); if (value.agentOptions !== undefined && (!object(value.agentOptions) || !jsonValue(value.agentOptions))) throw new Error(`${label}.agentOptions is invalid`); if (value.agentIdentity !== undefined) { if (!object(value.agentIdentity) || !isList(value.agentIdentity.structuralPath) || value.agentIdentity.structuralPath.some((part) => typeof part !== "string") || typeof value.agentIdentity.callSite !== "string") throw new Error(`${label}.agentIdentity is invalid`); positiveInteger(value.agentIdentity.occurrence, `${label}.agentIdentity.occurrence`); optionalString(value.agentIdentity.parentBreadcrumb, `${label}.agentIdentity.parentBreadcrumb`); optionalString(value.agentIdentity.worktreeOwner, `${label}.agentIdentity.worktreeOwner`); } }
+function validateScheduledOptions(value: unknown, label: string): asserts value is ValidatedScheduledOptions { if (!object(value) || typeof value.label !== "string" || !value.label || typeof value.cwd !== "string" || !value.cwd) throw new Error(`${label} is invalid`); optionalString(value.requestedLabel, `${label}.requestedLabel`); optionalString(value.parentBreadcrumb, `${label}.parentBreadcrumb`); stringList(value.tools, `${label}.tools`); if (value.skills !== undefined) stringList(value.skills, `${label}.skills`); if (value.extensions !== undefined) stringList(value.extensions, `${label}.extensions`); if (value.contextFiles !== undefined) stringList(value.contextFiles, `${label}.contextFiles`); optionalString(value.worktreeOwner, `${label}.worktreeOwner`); optionalString(value.model, `${label}.model`); if (value.thinking !== undefined && !isThinkingLevel(value.thinking)) throw new Error(`${label}.thinking is invalid`); optionalRole(value.role, `${label}.role`); if (value.schema !== undefined) validateSchema(value.schema, `${label}.schema`); if (value.retries !== undefined) nonNegativeInteger(value.retries, `${label}.retries`); if (value.timeoutMs !== undefined && value.timeoutMs !== null) positiveInteger(value.timeoutMs, `${label}.timeoutMs`); if (value.agentOptions !== undefined && (!object(value.agentOptions) || !jsonValue(value.agentOptions))) throw new Error(`${label}.agentOptions is invalid`); if (value.agentIdentity !== undefined) { if (!object(value.agentIdentity) || !isList(value.agentIdentity.structuralPath) || value.agentIdentity.structuralPath.some((part) => typeof part !== "string") || typeof value.agentIdentity.callSite !== "string") throw new Error(`${label}.agentIdentity is invalid`); positiveInteger(value.agentIdentity.occurrence, `${label}.agentIdentity.occurrence`); optionalString(value.agentIdentity.parentBreadcrumb, `${label}.agentIdentity.parentBreadcrumb`); optionalString(value.agentIdentity.worktreeOwner, `${label}.agentIdentity.worktreeOwner`); } }
 function validateSessionReference(value: unknown, label: string): asserts value is ValidatedSessionReference { if (!object(value) || typeof value.transport !== "string" || !value.transport || typeof value.sessionId !== "string" || !value.sessionId || (value.locator !== undefined && !jsonValue(value.locator))) throw new Error(`${label} is invalid`); }
 function validateAgentSetup(value: unknown, label: string): asserts value is ValidatedAgentSetup {
   if (!object(value)) throw new Error(`${label} is invalid`);
@@ -102,7 +92,7 @@ function validateAgent(value: unknown, label: string): asserts value is Validate
   if (value.activity !== undefined) { if (!object(value.activity) || !isActivityKind(value.activity.kind) || typeof value.activity.text !== "string") throw new Error(`${label}.activity is invalid`); }
   if (value.lastEventAt !== undefined) finiteNumber(value.lastEventAt, `${label}.lastEventAt`);
 }
-function validateUsage(value: unknown, label: string): asserts value is ValidatedUsage { if (!object(value)) throw new Error(`${label} is invalid`); for (const key of ["tokens", "costUsd", "durationMs", "agentLaunches"]) finiteNumber(value[key], `${label}.${key}`); }
+function validateUsage(value: unknown, label: string): asserts value is ValidatedUsage { if (!object(value)) throw new Error(`${label} is invalid`); for (const key of BUDGET_DIMENSIONS) finiteNumber(value[key], `${label}.${key}`); }
 function validateBudgetEvents(value: unknown): void { if (value === undefined) return; if (!isList(value)) throw new Error("Persisted budget events are invalid"); for (const [index, event] of value.entries()) { const label = `budgetEvents[${String(index)}]`; if (!object(event) || typeof event.type !== "string" || !BUDGET_EVENT_TYPES.has(event.type) || !Number.isSafeInteger(event.budgetVersion) || Number(event.budgetVersion) < 1 || !isList(event.dimensions) || event.dimensions.some((dimension) => typeof dimension !== "string" || !BUDGET_DIMENSIONS.has(dimension)) || typeof event.at !== "number" || !Number.isFinite(event.at) || event.limits === undefined) throw new Error(`${label} is invalid`); validateUsage(event.usage, `${label}.usage`); validateBudget(event.limits); } }
 function validateRunRecord(value: unknown): asserts value is ValidatedRunRecord {
   if (!object(value) || typeof value.id !== "string" || !value.id || typeof value.workflowName !== "string" || !value.workflowName || typeof value.cwd !== "string" || !value.cwd || typeof value.sessionId !== "string" || !value.sessionId || !isRunState(value.state) || !isList(value.agents) || !isList(value.agentSessions) || Object.hasOwn(value, "nativeSessions")) throw new Error("Persisted run state is invalid");
@@ -192,7 +182,7 @@ async function validateRunDirectory(store: RunStore): Promise<void> {
   }
 }
 function validateOwnershipRecord(value: unknown, label: string, ownershipIds: ReadonlySet<string>): asserts value is ValidatedOwnershipRecord {
-  if (!object(value) || typeof value.id !== "string" || !value.id || ownershipIds.has(value.id) || typeof value.label !== "string" || !value.label || !isSchedulerState(value.state)) throw new Error(`${label} is invalid`);
+  if (!object(value) || typeof value.id !== "string" || !value.id || ownershipIds.has(value.id) || typeof value.label !== "string" || !value.label || !isAgentState(value.state)) throw new Error(`${label} is invalid`);
   optionalString(value.parentId, `${label}.parentId`);
   optionalString(value.prompt, `${label}.prompt`);
   validateScheduledOptions(value.options, `${label}.options`);
@@ -293,7 +283,7 @@ async function recheckCandidate(entry: StoredRun, cutoffMs: number): Promise<str
   if (!before) return "State record disappeared before deletion";
   const loaded = await entry.store.load().catch((error: unknown) => { throw new Error(`Candidate could not be reloaded: ${errorText(error)}`); });
   validateRunRecord(loaded.run);
-  if (loaded.run.id !== entry.runId || loaded.run.state !== entry.run.state || !TERMINAL_STATES.has(loaded.run.state)) return "Candidate state changed before deletion";
+  if (loaded.run.id !== entry.runId || loaded.run.state !== entry.run.state || !HARD_TERMINAL_RUN_STATES.has(loaded.run.state)) return "Candidate state changed before deletion";
   const after = await stat(join(entry.store.directory, "state.json"));
   if (before.mtimeMs !== after.mtimeMs || after.mtimeMs !== entry.stateMtimeMs) return "Candidate state record changed before deletion";
   if (after.mtimeMs >= cutoffMs) return "Candidate is no longer older than the cutoff";
@@ -302,13 +292,13 @@ async function recheckCandidate(entry: StoredRun, cutoffMs: number): Promise<str
 
 function planSession(scan: SessionScan, cutoffMs: number): SessionPlan {
   if (scan.liveLease) return { candidates: [], skipped: scan.runs.map((entry) => runItem(entry, "skipped", "Session has a live ownership lease")) };
-  const oldTerminal = new Set(scan.runs.filter(({ run, stateMtimeMs }) => TERMINAL_STATES.has(run.state) && stateMtimeMs < cutoffMs).map(({ runId }) => runId));
+  const oldTerminal = new Set(scan.runs.filter(({ run, stateMtimeMs }) => HARD_TERMINAL_RUN_STATES.has(run.state) && stateMtimeMs < cutoffMs).map(({ runId }) => runId));
   const protectedRuns = new Set<string>();
   const visit = (runId: string) => { if (protectedRuns.has(runId)) return; protectedRuns.add(runId); const entry = scan.runs.find(({ runId: current }) => current === runId); for (const dependency of entry?.dependencies ?? []) visit(dependency); };
   for (const entry of scan.runs) if (!oldTerminal.has(entry.runId)) for (const dependency of entry.dependencies) visit(dependency);
   const skipped: CleanupRunResult[] = [];
   for (const entry of scan.runs) {
-    if (!TERMINAL_STATES.has(entry.run.state)) skipped.push(runItem(entry, "skipped", `Run state ${entry.run.state} is active or resumable`));
+    if (!HARD_TERMINAL_RUN_STATES.has(entry.run.state)) skipped.push(runItem(entry, "skipped", `Run state ${entry.run.state} is active or resumable`));
     else if (entry.stateMtimeMs >= cutoffMs) skipped.push(runItem(entry, "skipped", "State record is not older than the cutoff"));
     else if (protectedRuns.has(entry.runId)) skipped.push(runItem(entry, "skipped", "A retained run depends on this run"));
   }

@@ -565,3 +565,19 @@ void test("production shell does not journal results that exceed the complete RP
   const journal = JSON.parse(readFileSync(join(new RunStore(cwd, "session", runId, home).directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
   assert.deepEqual(journal.completed, {});
 });
+
+void test("unawaited agent, shell, and function results refuse serialization and interpolation with a typed error", async () => {
+  const bridge = { agent: async () => "agent-value" as JsonValue, shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), function: async () => "function-value" as JsonValue, functions: { helper: { name: "helper" } } };
+  const cases: readonly [string, RegExp][] = [
+    [`const pending = agent("a"); return JSON.stringify({ pending });`, /Workflow agent result is a Promise; await it before serialization/],
+    [`const pending = agent("a"); return \`\${pending}\`;`, /Workflow agent result is a Promise; await it before interpolation/],
+    [`const pending = agent("a"); return "" + pending;`, /Workflow agent result is a Promise; await it before interpolation/],
+    [`const pending = shell("true"); return JSON.stringify({ pending });`, /Workflow shell result is a Promise; await it before serialization/],
+    [`const pending = shell("true"); return \`\${pending}\`;`, /Workflow shell result is a Promise; await it before interpolation/],
+    [`const pending = helper({}); return JSON.stringify({ pending });`, /Workflow function result is a Promise; await it before serialization/],
+  ];
+  for (const [script, message] of cases) {
+    await assert.rejects(runWorkflow(script, null, bridge).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && message.test(error.message), script);
+  }
+  assert.equal(await runWorkflow(`const [a, s, f] = await Promise.all([agent("a"), shell("true"), helper({})]); return JSON.stringify([a, s.exitCode, f]);`, null, bridge).result, JSON.stringify(["agent-value", 0, "function-value"]));
+});

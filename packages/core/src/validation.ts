@@ -10,7 +10,7 @@ import type { AgentDefinition, AgentResourceSelectors, AgentResourceSelectorSet,
 import type { WorkflowRegistryApi } from "./registry.js";
 import { registeredWorkflowRoleDirectoryRegistrations } from "./registry.js";
 import { annotateModelAliasError, assertModelThinking, deepFreeze, errorText, fail, isNodeError, jsonObject, jsonValue, modelAliasName, modelCapability, object, positiveInteger, resolveModelReference, resourcePatternHasMagic, unknownModel, validateModelAliases, validateResourcePattern } from "./utils.js";
-import { WORKFLOW_CALL_KINDS } from "./types.js";
+import { WORKFLOW_CALL_KINDS, isContextFileScope } from "./types.js";
 
 export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, backgroundWidget: true });
 export function validateCheckpoint(value: unknown): CheckpointInput {
@@ -72,15 +72,10 @@ function selectorsFromSettings(settings: Readonly<WorkflowSettings | WorkflowSet
   };
 }
 function selectorSet(value: AgentResourceSelectors | undefined): AgentResourceSelectorSet { return { skills: [...(value?.skills ?? [])], extensions: [...(value?.extensions ?? [])], ...(value?.tools === undefined ? {} : { tools: [...value.tools] }) }; }
-const CONTEXT_FILE_SCOPES = ["global", "project", "cwd"] as const;
-function isContextFileScope(value: unknown): value is ContextFileScope { return CONTEXT_FILE_SCOPES.some((scope) => scope === value); }
 function validateContextFileScopes(value: unknown, rolePath: string): readonly ContextFileScope[] | undefined {
   if (value === undefined) return undefined;
-  if (!Array.isArray(value) || value.some((scope) => !isContextFileScope(scope))) fail("INVALID_METADATA", `${rolePath}.contextFiles must be an array containing only global, project, or cwd`);
-  return value.map((scope) => {
-    if (!isContextFileScope(scope)) fail("INVALID_METADATA", `${rolePath}.contextFiles must be an array containing only global, project, or cwd`);
-    return scope;
-  });
+  if (!Array.isArray(value) || !value.every(isContextFileScope)) fail("INVALID_METADATA", `${rolePath}.contextFiles must be an array containing only global, project, or cwd`);
+  return [...value];
 }
 function validateWorkflowExtensions(value: unknown, settingsPath: string, errorCode: "INVALID_SETTINGS" | "INVALID_METADATA" = "INVALID_SETTINGS"): WorkflowExtensionSettings | undefined {
   if (value === undefined) return undefined;
@@ -161,8 +156,7 @@ export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, gl
     ...(globalSelectors.tools === undefined && projectSelectors.tools === undefined ? {} : { tools: [...(globalSelectors.tools ?? []), ...(projectSelectors.tools ?? [])] }),
   });
   const hasExtensionSelectors = global.extensions !== undefined || project.extensions !== undefined;
-  const configuredExtensionSettings = projectHas("extensionSettings") ? project.extensionSettings : global.extensionSettings;
-  const extensionSettings = configuredExtensionSettings;
+  const extensionSettings = projectHas("extensionSettings") ? project.extensionSettings : global.extensionSettings;
   const sources: WorkflowSettingsSources = {
     concurrency: projectHas("concurrency") ? projectSettingsPath : globalSettingsPath,
     modelAliases: projectHas("modelAliases") ? projectSettingsPath : globalSettingsPath,
@@ -342,6 +336,7 @@ function readRoleDefinitions(dirs: readonly WorkflowRoleDirectoryInput[], extens
   }));
   return extension ? { ...read(starterFiles), ...read(regularFiles) } : read(files);
 }
+export function loadProjectAgentDefinitions(cwd: string): Readonly<Record<string, AgentDefinition>> { return readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))); }
 export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), projectTrusted = true, extensionRoleDirectories: readonly WorkflowRoleDirectoryInput[] = registeredWorkflowRoleDirectoryRegistrations()): Readonly<Record<string, AgentDefinition>> {
   return deepFreeze({ ...readRoleDefinitions(extensionRoleDirectories, true), ...readRoleDefinitions(workflowRoleDirectories(agentDir)), ...(projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(cwd, ".pi"))) : {}) });
 }
@@ -394,6 +389,10 @@ type WorkflowCall = acorn.CallExpression & { callee: acorn.Identifier & { name: 
 function isAcornNode(value: unknown): value is acorn.AnyNode {
   return typeof value === "object" && value !== null && "type" in value && typeof value.type === "string";
 }
+/** The static name of an object property or record key; computed keys and non-literal expressions have none. */
+function propertyKeyName(property: acorn.Property | acorn.AssignmentProperty): string | undefined {
+  return property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+}
 function astChildren(node: acorn.AnyNode): acorn.AnyNode[] {
   const children: acorn.AnyNode[] = [];
   for (const value of Object.values(node)) {
@@ -428,7 +427,7 @@ function workflowCallsWithStructure(program: acorn.Program): Array<{ call: Workf
     let current = context;
     if (node.type === "Property" && current.structure.length) {
       const scope = current.structure.at(-1);
-      const key = node.key.type === "Identifier" ? node.key.name : node.key.type === "Literal" ? String(node.key.value) : undefined;
+      const key = propertyKeyName(node);
       if (scope?.key === null && key) current = { ...current, structure: [...current.structure.slice(0, -1), { ...scope, key }] };
     }
     if (isWorkflowCall(node)) {
@@ -523,6 +522,11 @@ type StaticWorkflowContext = { execution: StaticWorkflowExecution; structure: re
 const INTERNAL_AGENT_NAME = "__pi_extensible_workflows_agent";
 const INTERNAL_WORKTREE_NAME = "__pi_extensible_workflows_withWorktree";
 const INTERNAL_SHELL_NAME = "__pi_extensible_workflows_shell";
+const RESERVED_IDENTIFIERS = [[INTERNAL_AGENT_NAME, "agent"], [INTERNAL_WORKTREE_NAME, "withWorktree"], [INTERNAL_SHELL_NAME, "shell"]] as const;
+/** Workflow source must not mention the identifiers instrumentation rewrites primitive calls into. */
+function assertNoReservedIdentifiers(program: acorn.Program): void {
+  for (const [name, primitive] of RESERVED_IDENTIFIERS) if (hasIdentifier(program, name)) fail("INVALID_METADATA", `${name} is reserved for workflow ${primitive} instrumentation`);
+}
 
 function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
   let previous: acorn.Token | undefined;
@@ -538,9 +542,7 @@ export function instrumentWorkflow(script: string): string {
   const body = workflowBody(script);
   if (!body.trim()) return body;
   const program = parseWorkflow(body);
-  if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
-  if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
-  if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
+  assertNoReservedIdentifiers(program);
   validateRemovedWorkflowPrimitives(program, "INVALID_METADATA");
   const calls = workflowCalls(program).filter((call) => ["agent", "withWorktree", "shell"].includes(call.callee.name));
   const edits = calls.flatMap((call) => {
@@ -564,7 +566,7 @@ function propertyNode(node: acorn.AnyNode | undefined, name: string): acorn.AnyN
   for (let index = node.properties.length - 1; index >= 0; index -= 1) {
     const property = node.properties[index];
     if (!property || property.type === "SpreadElement" || property.computed) return undefined;
-    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    const key = propertyKeyName(property);
     if (key === name) return property.value;
   }
   return undefined;
@@ -579,7 +581,7 @@ function stableName(node: acorn.AnyNode | undefined): boolean | undefined {
   let result: boolean | undefined = false;
   for (const property of node.properties) {
     if (property.type === "SpreadElement" || property.computed) { result = undefined; continue; }
-    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    const key = propertyKeyName(property);
     if (key !== "name") continue;
     const value = literalString(property.value);
     result = value === undefined ? property.value.type === "Literal" ? false : undefined : value.trim() !== "";
@@ -692,7 +694,7 @@ function staticValue(node: acorn.AnyNode | undefined): StaticValue {
     const value: Record<string, unknown> = {};
     for (const property of node.properties) {
       if (property.type === "SpreadElement" || property.computed) return { known: false };
-      const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+      const key = propertyKeyName(property);
       const child = staticValue(property.value);
       if (!key || !child.known) return { known: false };
       value[key] = child.value;
@@ -714,10 +716,6 @@ function staticString(node: acorn.AnyNode | undefined): string | null {
   return value.known && typeof value.value === "string" ? value.value : null;
 }
 
-function staticRoleName(node: acorn.AnyNode | undefined): string | null {
-  const value = staticValue(node);
-  return value.known && typeof value.value === "string" ? value.value : null;
-}
 export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
   return workflowCallsWithStructure(parseWorkflow(script)).map(({ call, execution, structure }) => {
     const kind = call.callee.name;
@@ -730,7 +728,7 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
       const staticOutputSchema = outputSchema.known && jsonObject(outputSchema.value) ? outputSchema.value : undefined;
       const optionKeys = options?.type === "ObjectExpression" ? options.properties.flatMap((property) => {
         if (property.type === "SpreadElement" || property.computed) return [];
-        const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+        const key = propertyKeyName(property);
         return key ? [key] : [];
       }) : [];
       const knownOptionEntries: Array<[string, JsonValue]> = [];
@@ -739,7 +737,7 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
         if (value.known && jsonValue(value.value)) knownOptionEntries.push([key, value.value]);
       }
       const knownOptions: Record<string, JsonValue> = Object.fromEntries(knownOptionEntries);
-      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticRoleName(propertyNode(options, "role")) };
+      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticString(propertyNode(options, "role")) };
       return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(staticOutputSchema === undefined ? {} : { outputSchema: staticOutputSchema }), ...(optionKeys.length ? { options: knownOptions, optionKeys } : {}) };
     }
     if (kind === "checkpoint") return { ...placement, kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
@@ -761,7 +759,7 @@ function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
   for (let index = node.properties.length - 1; index >= 0; index -= 1) {
     const property = node.properties[index];
     if (!property || property.type === "SpreadElement" || property.computed) return true;
-    const key = property.key.type === "Identifier" ? property.key.name : property.key.type === "Literal" ? String(property.key.value) : undefined;
+    const key = propertyKeyName(property);
     if (key === "role") {
       const roleValue = staticValue(property.value);
       if (roleValue.known && typeof roleValue.value === "string") return false;
@@ -790,9 +788,7 @@ function validateStaticWithWorktree(call: WorkflowCall, compatibility: boolean):
 export function preflight(script: string, capabilities: PreflightCapabilities, schemas: readonly unknown[] = [], metadata: WorkflowMetadata = { name: "workflow" }, compatibility = false): PreflightResult {
   const checkedMetadata = validateWorkflowMetadata(metadata);
   const program = parseWorkflow(script);
-  if (hasIdentifier(program, INTERNAL_AGENT_NAME)) fail("INVALID_METADATA", `${INTERNAL_AGENT_NAME} is reserved for workflow agent instrumentation`);
-  if (hasIdentifier(program, INTERNAL_WORKTREE_NAME)) fail("INVALID_METADATA", `${INTERNAL_WORKTREE_NAME} is reserved for workflow withWorktree instrumentation`);
-  if (hasIdentifier(program, INTERNAL_SHELL_NAME)) fail("INVALID_METADATA", `${INTERNAL_SHELL_NAME} is reserved for workflow shell instrumentation`);
+  assertNoReservedIdentifiers(program);
   validateDirectPrimitiveReferences(program, "withWorktree");
   validateRemovedWorkflowPrimitives(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
   validateDirectPrimitiveReferences(program, "shell");
@@ -838,7 +834,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     const value = propertyNode(options, "tools");
     return value?.type === "ArrayExpression" ? value.elements.flatMap((element) => { const tool = element && element.type !== "SpreadElement" ? literalString(element) : undefined; return tool === undefined ? [] : [tool]; }) : [];
   });
-  const agentTypes = agentOptions.flatMap((options) => { const value = staticRoleName(propertyNode(options, "role")); return value === null ? [] : [value]; });
+  const agentTypes = agentOptions.flatMap((options) => { const value = staticString(propertyNode(options, "role")); return value === null ? [] : [value]; });
   for (const pattern of tools) {
     const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
     if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !capabilities.tools.has(body)) fail("UNKNOWN_TOOL", `Unknown tool: ${body}`);
@@ -875,7 +871,7 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   if (!script) fail("INVALID_SYNTAX", "Provide script or scriptPath");
   const metadata = validateWorkflowMetadata({ name: explicitName, ...(typeof params.description === "string" ? { description: params.description } : {}) });
   const globalAgentDefinitions = loadAgentDefinitions(context.cwd, context.agentDir, false, registry && typeof registry.roleDirectoryRegistrations === "function" ? registry.roleDirectoryRegistrations() : registry && typeof registry.roleDirectories === "function" ? registry.roleDirectories() : undefined);
-  const projectAgentDefinitions = context.projectTrusted ? readRoleDefinitions(projectRoleDirectories(join(context.cwd, ".pi"))) : {};
+  const projectAgentDefinitions = context.projectTrusted ? loadProjectAgentDefinitions(context.cwd) : {};
   const agentDefinitions = deepFreeze({ ...globalAgentDefinitions, ...projectAgentDefinitions });
   const aliases = context.modelAliases ?? {};
   const knownModels = context.knownModels ?? context.availableModels;

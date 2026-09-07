@@ -5,6 +5,19 @@
 
 - Optionally run a trusted workflow-settings command after newly created worktrees are checked out; failures roll back the worktree and report `WORKTREE_FAILED`.
 
+## [5.13.2] - 2026-09-07
+
+### Fixes
+
+- A pending pause can be cancelled: resuming a `pausing` run (the `/workflow` picker offers "Cancel pause", Trajectory offers the same, and the resume path accepts the state) returns it to `running` before the active operation finishes. The picker now reports "Pausing workflow ..." while the pause is pending instead of "Paused workflow ...". (#283)
+- Cold resume and paused-run alias refresh keep the snapshot's role definitions but fall back to the current role files for roles a registered function uses for the first time after the restart, capturing them into the snapshot as at launch; previously such runs failed with `UNKNOWN_AGENT_TYPE`. (#284)
+- Concurrent `agent(...)` calls issued by one workflow are admitted to the scheduler in call order, so a run concurrency limit starts the first-called agent first instead of whichever call finished its journal lookup first.
+- Replaying one journaled operation no longer clones every completed operation of the run and its retry lineage; the cost of an `agent()`/`shell()` replay lookup is now proportional to the single operation it resolves.
+
+### Internal
+
+- Run-state, budget, context-file-scope, and thinking-level vocabularies are declared once in the core (`types.ts`/`utils.ts`) and reused by the decoders, host, widget, subagents extension, and `@piewf/cli`; structure tests keep local copies from coming back.
+
 ## [5.13.1] - 2026-09-05
 
 ### Fixes

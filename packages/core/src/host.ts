@@ -5,24 +5,24 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
 import { copyToClipboard, getAgentDir, ModelSelectorComponent, type ExtensionAPI, type ExtensionContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
-import { RunLifecycle, WorkflowEventPublisher, nextNamedOccurrence, withWorkflowFunctions, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
-import { createWorkflowRecovery, persistedFailure } from "./host-recovery.js";
+import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
+import { RunLifecycle, WorkflowEventPublisher, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
+import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
 import { registerWorkflowNavigator, uiHostCapabilities } from "./host-navigator.js";
 import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
 import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
 import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, sanitizeDisplayText, validateModelAliases } from "./utils.js";
-import { loadAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
+import { loadAgentDefinitions, loadProjectAgentDefinitions, loadSettings, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath } from "./validation.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath } from "./execution.js";
 import backgroundWidget, { type BackgroundWidgetAPI } from "./background-widget.js";
 import { showChangelogNotice } from "./changelog.js";
-import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult } from "./trajectory.js";
+import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, WORKFLOW_BLOCKED_EVENT, WorkflowError, roleNameOf, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, roleNameOf, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import {
   SETTLED_AGENT_STATES,
@@ -133,6 +133,26 @@ function completionControlContent(result: unknown, controlRunId?: string): strin
   delete record.run;
   return JSON.stringify({ ...record, value });
 }
+type RoleCapture = { readonly snapshot: Readonly<LaunchSnapshot>; capture(role: string, model: ModelSpec): Promise<void> };
+/** Persists a role definition (and its model) into the launch snapshot the first time an agent uses it, so later replays and retries see the definition the run actually ran with. */
+function roleCapture(store: RunStore, initial: Readonly<LaunchSnapshot>, definitions: Readonly<Record<string, AgentDefinition>>, projectDefinitions: Readonly<Record<string, AgentDefinition>>): RoleCapture {
+  let persisted = initial;
+  return {
+    get snapshot() { return persisted; },
+    async capture(role, model) {
+      const definition = definitions[role];
+      if (!definition) return;
+      const modelName = `${model.provider}/${model.model}`;
+      const hasProjectRole = projectDefinitions[role] !== undefined;
+      if (persisted.roles?.[role] !== undefined && (!hasProjectRole || persisted.projectRoles?.includes(role)) && persisted.models.includes(modelName)) return;
+      const roles = { ...(persisted.roles ?? {}), [role]: definition };
+      const projectRoles = hasProjectRole ? [...new Set([...(persisted.projectRoles ?? []), role])] : persisted.projectRoles ?? [];
+      const models = [...new Set([...persisted.models, modelName])];
+      persisted = createLaunchSnapshot({ ...persisted, models, roles, projectRoles });
+      await store.saveSnapshot(persisted);
+    },
+  };
+}
 export function formatWorkflowPreview(args: { script?: unknown; scriptPath?: unknown; name?: unknown; description?: unknown }): string {
   const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "workflow";
   if (typeof args.script !== "string" || !args.script.trim()) return `workflow ${name}`;
@@ -185,10 +205,6 @@ function deliverWarning(pi: WorkflowExtensionAPI, content: string): void {
   pi.appendEntry<WorkflowWarningEntry>(WORKFLOW_WARNING_ENTRY, { message: content });
 }
 
-type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
-
-
-
 function projectTrusted(ctx: unknown): boolean {
   const check = object(ctx) ? ctx.isProjectTrusted : undefined;
   return typeof check === "function" ? Boolean(Reflect.apply(check, ctx, [])) : true;
@@ -219,7 +235,6 @@ function piHostCapabilities(pi: unknown): PiHostCapabilities {
 }
 type ContextHostCapabilities = { modelRegistry?: ModelRegistryCapability };
 type ModelRegistryGetter = () => readonly Model<Api>[];
-type ModelRegistryCapability = { getAll?: ModelRegistryGetter; getAvailable?: ModelRegistryGetter; find?: (provider: string, model: string) => Model<Api> | undefined; refresh?: () => Promise<void>; getError?: () => string | undefined };
 function contextHostCapabilities(ctx: unknown): ContextHostCapabilities {
   if (!object(ctx) || !object(ctx.modelRegistry)) return {};
   const registry = ctx.modelRegistry;
@@ -357,10 +372,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const clearSubagentStatusObserver = (): void => { liveSubagents.clear(); registry.setSubagentStatusObserver(undefined); };
   registry.setSubagentStatusObserver((status, request) => { liveSubagents.set(status.id, { status, request }); });
   const trajectoryRuns = (context: unknown) => {
-    const host = object(context) ? context : undefined;
-    const cwd = typeof host?.cwd === "string" ? host.cwd : undefined;
-    const sessionManager = host && object(host.sessionManager) ? host.sessionManager : undefined;
-    const sessionId = typeof sessionManager?.getSessionId === "function" ? String(Reflect.apply(sessionManager.getSessionId, sessionManager, [])) : undefined;
+    const { cwd, sessionId } = hostSessionContext(context);
     if (!cwd || !sessionId) throw new WorkflowError("RUN_NOT_FOUND", "Trajectory requires the current project and Pi session");
     return { cwd, sessionId };
   };
@@ -404,35 +416,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const settings = resolveWorkflowSettings(cwd, trusted, workflowSettingsPath(extensionAgentDir)).effective.extensionSettings?.trajectory;
     const port = settings?.port;
     const themes = settings?.themes ?? false;
-    const loadRuns = createTrajectoryRunLoader(cwd, sessionId, home, (run) => {
-      const active = runs.get(run.id);
-      const live = withLiveActivities(run);
-      return active ? { ...live, state: active.lifecycle.state, usage: active.budget.usage } : live;
-    });
-    const loadSubagents = createTrajectorySubagentLoader(cwd, sessionId, extensionAgentDir, (subagent) => {
-      const live = liveSubagents.get(subagent.id);
-      if (!live) return subagent;
-      if (live.status.sessionId !== subagent.sessionId) return subagent;
-      if (live.status.state !== "running" && live.status.finishedAt === subagent.finishedAt) { liveSubagents.delete(subagent.id); return subagent; }
-      const attempt = live.status.attemptDetails?.at(-1) ?? subagent.attempt;
-      const tools = live.status.progress?.state?.tools ?? attempt?.setup.tools ?? subagent.tools;
-      const model = live.status.progress?.state?.model ?? attempt?.setup.model ?? subagent.model;
-      return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
-    });
-    const loadRunsMetadata = createTrajectoryRunMetadataLoader(cwd, sessionId, home, (run) => {
-      const active = runs.get(run.id);
-      const live = withLiveActivities(run);
-      return active ? { ...live, state: active.lifecycle.state, usage: active.budget.usage } : live;
-    });
-    const loadSubagentsMetadata = createTrajectorySubagentMetadataLoader(cwd, sessionId, extensionAgentDir, (subagent) => {
-      const live = liveSubagents.get(subagent.id);
-      if (!live || live.status.sessionId !== subagent.sessionId) return subagent;
-      if (live.status.state !== "running" && live.status.finishedAt === subagent.finishedAt) { liveSubagents.delete(subagent.id); return subagent; }
-      const attempt = live.status.attemptDetails?.at(-1) ?? subagent.attempt;
-      const tools = live.status.progress?.state?.tools ?? attempt?.setup.tools ?? subagent.tools;
-      const model = live.status.progress?.state?.model ?? attempt?.setup.model ?? subagent.model;
-      return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
-    });
+    const loadRuns = createTrajectoryRunLoader(cwd, sessionId, home, overlayLiveRun);
+    const loadSubagents = createTrajectorySubagentLoader(cwd, sessionId, extensionAgentDir, overlayLiveSubagent);
+    const loadRunsMetadata = createTrajectoryRunMetadataLoader(cwd, sessionId, home, overlayLiveRun);
+    const loadSubagentsMetadata = createTrajectorySubagentMetadataLoader(cwd, sessionId, extensionAgentDir, overlayLiveSubagent);
     const loadTranscript = createTrajectoryTranscriptLoader(cwd, sessionId, home, extensionAgentDir, (subagentId) => {
       const live = liveSubagents.get(subagentId);
       return live?.status.sessionId === sessionId ? live.status.attemptDetails?.at(-1)?.session : undefined;
@@ -440,7 +427,23 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     return { cwd, sessionId, ...(port === undefined ? {} : { port }), themes, loadRuns, loadSubagents, loadMetadata: async () => ({ runs: await loadRunsMetadata(), subagents: await loadSubagentsMetadata() }), loadTranscript, handleAction: (request: Readonly<TrajectoryActionRequest>) => trajectoryAction(request, context) };
   };
   const withLiveActivities = (run: PersistedRun): PersistedRun => liveAgents.overlay(run);
-  const terminalRunStates = new Map<string, "completed" | "failed" | "stopped">();
+  /** Overlays the in-memory lifecycle state and budget usage of an active run onto its persisted record. */
+  const overlayLiveRun = (run: PersistedRun): PersistedRun => {
+    const active = runs.get(run.id);
+    const live = withLiveActivities(run);
+    return active ? { ...live, state: active.lifecycle.state, usage: active.budget.usage } : live;
+  };
+  /** Overlays the freshest observed status of a live subagent onto its persisted summary; a settled status that already matches is dropped from the live map. */
+  const overlayLiveSubagent = (subagent: TrajectorySubagent): TrajectorySubagent => {
+    const live = liveSubagents.get(subagent.id);
+    if (!live || live.status.sessionId !== subagent.sessionId) return subagent;
+    if (live.status.state !== "running" && live.status.finishedAt === subagent.finishedAt) { liveSubagents.delete(subagent.id); return subagent; }
+    const attempt = live.status.attemptDetails?.at(-1) ?? subagent.attempt;
+    const tools = live.status.progress?.state?.tools ?? attempt?.setup.tools ?? subagent.tools;
+    const model = live.status.progress?.state?.model ?? attempt?.setup.model ?? subagent.model;
+    return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
+  };
+  const terminalRunStates = new Map<string, HardTerminalRunState>();
   let sessionLease: SessionLease | undefined;
   let sessionLeasePromise: Promise<SessionLease> | undefined;
   const ensureSessionLease = async (cwd: string, sessionId: string) => {
@@ -454,6 +457,18 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     sessionLease = undefined;
     sessionLeasePromise = undefined;
     await lease?.release();
+  };
+  /** Releases what session_start acquired: subagent observer, session lease, registry retention. */
+  const releaseSessionResources = async () => {
+    clearSubagentStatusObserver();
+    try { await releaseSessionLease(); } finally {
+      if (releaseWorkflowRegistry) {
+        releaseWorkflowRegistry();
+        releaseWorkflowRegistry = undefined;
+      } else {
+        resetWorkflowRegistryIfIdle();
+      }
+    }
   };
   const persistRunState = async (store: RunStore, metadata: WorkflowMetadata, update: (run: PersistedRun) => PersistedRun | Promise<PersistedRun>): Promise<PersistedRun> => {
     const persisted = await store.updateState(update);
@@ -549,11 +564,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             if (nextPhaseActivities.length) next.activeShellsByPhase = nextPhaseActivities; else delete next.activeShellsByPhase;
             return next;
           }
-          const next = { ...current };
-          delete next.activeShells;
-          delete next.activeShellStartedAt;
-          delete next.activeShellsByPhase;
-          return next;
+          return withoutActiveShells(current);
         });
         runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(stopped)));
       }
@@ -659,12 +670,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   });
   const cleanupTerminalRun = async (runId: string): Promise<void> => {
     const run = runs.get(runId);
-    if (!run || !HARD_TERMINAL_RUN_STATES.has(run.lifecycle.state)) return;
+    if (!run) return;
+    const state = run.lifecycle.state;
+    if (!isHardTerminalRunState(state)) return;
     await scheduler.cancelRun(runId);
     await scheduler.flush(runId);
     if (runs.get(runId) !== run) return;
     scheduler.removeRun(runId);
-    terminalRunStates.set(runId, run.lifecycle.state as "completed" | "failed" | "stopped");
+    terminalRunStates.set(runId, state);
     run.checkpointResolvers.clear();
     liveAgents.deleteRun(runId);
     eventPublisher.removeRun(runId);
@@ -676,7 +689,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const terminalState = terminalRunStates.get(runId);
     if (!run) return terminalState ? { runId, state: terminalState, stopped: false, reason: "already_terminal" } : { runId, state: "unknown", stopped: false, reason: "unknown_run" };
     const state = run.lifecycle.state;
-    if (state === "completed" || state === "failed" || state === "stopped") return { runId, state, stopped: false, reason: "already_terminal" };
+    if (isHardTerminalRunState(state)) return { runId, state, stopped: false, reason: "already_terminal" };
     await run.lifecycle.terminal("stopped");
     run.abortController.abort();
     run.execution?.cancel();
@@ -685,11 +698,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     await cleanupTerminalRun(runId);
     return { runId, state: "stopped", stopped: true };
   };
-  type WorkflowStatusAgent = { id: string; label?: string; path: string; state: AgentRecord["state"]; lastEventAt?: number; accounting?: NonNullable<AgentRecord["accounting"]> };
+  type WorkflowStatusAgent = { id: string; label?: string; path: string; state: AgentRecord["state"]; lastEventAt?: number; accounting?: AgentAccounting };
   type WorkflowStatusResult = { runId: string; workflowName: string; state: RunState; error?: { code: WorkflowErrorCode; message: string }; failedAt?: string; budget?: NonNullable<PersistedRun["budget"]>; usage?: NonNullable<PersistedRun["usage"]>; phase?: string; delivery?: Pick<NonNullable<PersistedRun["delivery"]>, "mode" | "state">; agents: readonly WorkflowStatusAgent[] };
   const workflowStatusRun = async (runId: string, context: unknown): Promise<WorkflowStatusResult> => {
-    const host = object(context) ? context : {};
-    const cwd = typeof host.cwd === "string" ? host.cwd : undefined;
+    const { cwd } = hostSessionContext(context);
     if (!cwd || !runId.trim()) throw new WorkflowError("RUN_NOT_FOUND", `Unknown workflow run ${runId} in the current project`);
     for (const sessionId of await listPersistedSessionIds(cwd, home)) {
       if (!(await listRunIds(cwd, sessionId, home, false)).includes(runId)) continue;
@@ -863,7 +875,20 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     });
     catalogRegistered = true;
   };
-  const createAgentExecutor = (root: Omit<import("./agent-execution.js").AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks(), onResourceWarning: (message) => { deliverWarning(pi, message); } }, transport);
+  const createAgentExecutor = (root: Omit<AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks(), onResourceWarning: (message) => { deliverWarning(pi, message); } }, transport);
+  // Resumed runs keep the role definitions frozen in their snapshot and fall back to the current definitions for roles a
+  // registered function reaches for the first time after the restart; those are captured into the snapshot like at launch.
+  const resumeRoles = (store: RunStore, snapshot: Readonly<LaunchSnapshot>, cwd: string, trustedProject: boolean) => {
+    let current: Readonly<Record<string, AgentDefinition>> = {};
+    let project: Readonly<Record<string, AgentDefinition>> = {};
+    try {
+      current = loadAgentDefinitions(cwd, extensionAgentDir, trustedProject, registry.roleDirectoryRegistrations());
+      project = trustedProject ? loadProjectAgentDefinitions(cwd) : {};
+    } catch { /* Unreadable current roles leave the resume with the snapshot roles, as before. */ }
+    const definitions = { ...current, ...(snapshot.roles ?? {}) };
+    const captured = roleCapture(store, snapshot, definitions, project);
+    return { definitions, capture: (role: string, model: ModelSpec) => captured.capture(role, model) };
+  };
   const activeSnapshotTools = (tools: readonly string[], active: ReadonlySet<string> | "session") => active === "session"
     ? new Set(tools.filter((tool) => pi.getActiveTools().includes(tool) && tool !== "workflow_catalog"))
     : new Set(tools.filter((tool) => active.has(tool) || tool === "workflow_catalog"));
@@ -902,41 +927,47 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const snapshot = createLaunchSnapshot({ ...input.snapshot, settingsPath, ...refreshed, modelAliases: currentAliases });
     return { active, settingsPath, resolution, currentPolicy, previousAliases, knownModels, availableModels, currentAliases, blockedAliases, blockedAliasTargets, snapshot, script };
   };
-  const workflowAgentHandler = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string, captureRole?: (role: string, model: ModelSpec) => Promise<void>) => async (prompt: string, options: Readonly<Record<string, JsonValue>>, agentSignal: AbortSignal, identity: import("./types.js").AgentIdentity) => {
-    await lifecycle.enter();
-    try {
-      const path = agentIdentityPath(identity);
-      const replayed = await store.replay(path);
-      if (replayed) {
-        return replayed.value;
-      }
-      const worktree = agentWorktree(identity);
-      const agentCwd = worktree.worktreeOwner ? (await persistWorktree(store, metadata, worktree.worktreeOwner)).cwd : cwd;
-      const role = typeof options.role === "string" ? options.role : undefined;
-      const model = typeof options.model === "string" ? options.model : undefined;
-      const requestedLabel = typeof options.label === "string" ? options.label : undefined;
-      const skills = Array.isArray(options.skills) ? options.skills as string[] : undefined;
-      const extensions = Array.isArray(options.extensions) ? options.extensions as string[] : undefined;
-      const contextFiles = Array.isArray(options.contextFiles) && options.contextFiles.every((scope) => scope === "global" || scope === "project" || scope === "cwd") ? options.contextFiles : undefined;
-      const resolved = executor.resolve({ label: requestedLabel ?? role ?? "agent", workflowName: metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}), ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}) });
-      if (role) await captureRole?.(role, resolved.model);
-      const label = displayAgentName(requestedLabel, role, resolved.model);
-      const tools = resolved.tools;
-      const schema = object(options.outputSchema) ? options.outputSchema : undefined;
-      const sessionPath = identity.handle !== undefined && identity.turn !== undefined ? await handleTurnInput(store, identity.handle, identity.turn) : undefined;
-      const continuity = identity.handle === undefined ? undefined : sessionPath ? "continued" as const : "fresh" as const;
-      const spawned = scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(sessionPath ? { sessionPath } : {}), ...(continuity ? { continuity } : {}), agentOptions: options, agentIdentity: identity });
-      const cancel = () => { scheduler.cancel(spawned.id); };
-      if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
-      const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
-      if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
-      await store.complete(path, outcome.value);
-      scheduler.releaseResult(spawned.id);
-      return outcome.value;
-    } finally { await lifecycle.leave(); }
+  const workflowAgentHandler = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string, captureRole?: (role: string, model: ModelSpec) => Promise<void>) => {
+    // Replay lookup and spawn are serialised per run so concurrent agent(...) calls reach the scheduler in call order.
+    const admission = new SerialLane();
+    return async (prompt: string, options: Readonly<Record<string, JsonValue>>, agentSignal: AbortSignal, identity: AgentIdentity) => {
+      await lifecycle.enter();
+      try {
+        const path = agentIdentityPath(identity);
+        const admitted = await admission.run(async () => {
+          const replayed = await store.replay(path);
+          if (replayed) return { replayed };
+          const worktree = agentWorktree(identity);
+          const agentCwd = worktree.worktreeOwner ? (await persistWorktree(store, metadata, worktree.worktreeOwner)).cwd : cwd;
+          const role = typeof options.role === "string" ? options.role : undefined;
+          const model = typeof options.model === "string" ? options.model : undefined;
+          const requestedLabel = typeof options.label === "string" ? options.label : undefined;
+          const skills = Array.isArray(options.skills) ? options.skills as string[] : undefined;
+          const extensions = Array.isArray(options.extensions) ? options.extensions as string[] : undefined;
+          const contextFiles = Array.isArray(options.contextFiles) && options.contextFiles.every(isContextFileScope) ? options.contextFiles : undefined;
+          const resolved = executor.resolve({ label: requestedLabel ?? role ?? "agent", workflowName: metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}), ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}) });
+          if (role) await captureRole?.(role, resolved.model);
+          const label = displayAgentName(requestedLabel, role, resolved.model);
+          const tools = resolved.tools;
+          const schema = object(options.outputSchema) ? options.outputSchema : undefined;
+          const sessionPath = identity.handle !== undefined && identity.turn !== undefined ? await handleTurnInput(store, identity.handle, identity.turn) : undefined;
+          const continuity = identity.handle === undefined ? undefined : sessionPath ? "continued" as const : "fresh" as const;
+          return { spawned: scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(sessionPath ? { sessionPath } : {}), ...(continuity ? { continuity } : {}), agentOptions: options, agentIdentity: identity }) };
+        });
+        if ("replayed" in admitted) return admitted.replayed.value;
+        const { spawned } = admitted;
+        const cancel = () => { scheduler.cancel(spawned.id); };
+        if (agentSignal.aborted) cancel(); else agentSignal.addEventListener("abort", cancel, { once: true });
+        const outcome = await spawned.result.finally(() => { agentSignal.removeEventListener("abort", cancel); });
+        if (!outcome.ok) throw new WorkflowError(outcome.error.code as WorkflowErrorCode, outcome.error.message);
+        await store.complete(path, outcome.value);
+        scheduler.releaseResult(spawned.id);
+        return outcome.value;
+      } finally { await lifecycle.leave(); }
+    };
   };
   const recovery = createWorkflowRecovery({
-    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
+    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, resumeRoles, workflowAgentHandler, shellForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
   });
   const resumeSelectedWorkflow = async (runId: string, foreground: boolean, context: unknown, budgetPatch?: unknown): Promise<{ workflowName: string; state: "running" | "completed" | "awaiting_approval"; attached: boolean; value?: JsonValue }> => {
     const run = runs.get(runId);
@@ -946,6 +977,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const capabilities = uiHostCapabilities(host.ui);
     const ui = capabilities?.select ? { select: capabilities.select } : {};
     const recoveryContext = { ...resumeHostContext(context) };
+    if (run.lifecycle.state === "pausing") {
+      await run.lifecycle.resume();
+      return { workflowName: run.metadata.name, state: "running", attached: deliveryController.isForegroundAttached(runId) };
+    }
     if (run.lifecycle.state === "paused") {
       const wasAttached = deliveryController.isForegroundAttached(runId);
       if (!foreground && wasAttached) await deliveryController.moveForegroundToBackground(runId);
@@ -963,12 +998,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       await run.lifecycle.resume();
       if (!foreground) return { workflowName: run.metadata.name, state: "running", attached: false };
       if (!completion) { if (claimedForegroundResume) deliveryController.foregroundResumeClaims.delete(run.store); return { workflowName: run.metadata.name, state: "running", attached: false }; }
+      const markDelivered = async () => { if (!wasAttached) await run.store.updateState((current) => current.delivery?.mode === "foreground" && current.delivery.state === "attached" ? { ...current, delivery: { ...current.delivery, state: "delivered" } } : current); };
       try {
         const completed = await completion as { value?: JsonValue };
-        if (!wasAttached) await run.store.updateState((current) => current.delivery?.mode === "foreground" && current.delivery.state === "attached" ? { ...current, delivery: { ...current.delivery, state: "delivered" } } : current);
+        await markDelivered();
         return { workflowName: run.metadata.name, state: "completed", attached: wasAttached, ...(!wasAttached && completed.value !== undefined ? { value: completed.value } : {}) };
       } catch (error) {
-        if (!wasAttached) await run.store.updateState((current) => current.delivery?.mode === "foreground" && current.delivery.state === "attached" ? { ...current, delivery: { ...current.delivery, state: "delivered" } } : current);
+        await markDelivered();
         if (wasAttached && error && typeof error === "object") Object.defineProperty(error, "workflowResumeAttached", { value: true });
         throw error;
       }
@@ -1033,16 +1069,12 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       let loaded: { run: PersistedRun; snapshot: Readonly<LaunchSnapshot> };
       try { loaded = await store.load(); } catch { if (!await store.isComplete()) await store.delete(true).catch(() => undefined); continue; }
       // Stale terminal delivery is best effort; a corrupt run must not block session recovery.
-      if (loaded.run.state === "completed" || loaded.run.state === "failed" || loaded.run.state === "stopped") { terminalRunStates.set(runId, loaded.run.state); await deliverStaleTerminal(store, loaded.run).catch(() => undefined); continue; }
+      if (isHardTerminalRunState(loaded.run.state)) { terminalRunStates.set(runId, loaded.run.state); await deliverStaleTerminal(store, loaded.run).catch(() => undefined); continue; }
       if (loaded.run.state !== "interrupted" && loaded.run.state !== "budget_exhausted") {
         const previousState = loaded.run.state;
         await store.updateState((current) => {
           if (["completed", "failed", "stopped", "interrupted", "budget_exhausted"].includes(current.state)) return current;
-          const next = { ...current, state: "interrupted" as const };
-          delete next.activeShells;
-          delete next.activeShellStartedAt;
-          delete next.activeShellsByPhase;
-          return next;
+          return withoutActiveShells({ ...current, state: "interrupted" });
         });
         loaded = { ...loaded, run: (await store.load()).run };
         await eventPublisher.runState(store, loaded.snapshot.metadata, previousState, "interrupted", "session_shutdown");
@@ -1050,11 +1082,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       } else if (loaded.run.activeShells !== undefined || loaded.run.activeShellStartedAt !== undefined || loaded.run.activeShellsByPhase !== undefined) {
         await store.updateState((current) => {
           if (HARD_TERMINAL_RUN_STATES.has(current.state)) return current;
-          const next = { ...current };
-          delete next.activeShells;
-          delete next.activeShellStartedAt;
-          delete next.activeShellsByPhase;
-          return next;
+          return withoutActiveShells(current);
         });
         loaded = { ...loaded, run: (await store.load()).run };
       }
@@ -1086,19 +1114,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           const toResume = choice === "Resume all" ? interrupted : interrupted.filter((_, i) => labels[i] === choice);
           await Promise.all(toResume.map(async (run) => {
             try { await recovery.coldResumeRun(run, true, ctx.ui, projectTrusted(ctx), resumeHostContext(ctx), undefined, false); ctx.ui.notify(`Resumed workflow ${run.metadata.name}.`, "info"); }
-            catch (err) { ctx.ui.notify(`Cannot resume ${run.metadata.name}: ${err instanceof Error ? err.message : String(err)}`, "warning"); }
+            catch (error) { ctx.ui.notify(`Cannot resume ${run.metadata.name}: ${errorText(error)}`, "warning"); }
           }));
         }
       }
     }
     } catch (error) {
-      clearSubagentStatusObserver();
-      try { await releaseSessionLease(); } finally {
-        if (releaseWorkflowRegistry) {
-          releaseWorkflowRegistry();
-          releaseWorkflowRegistry = undefined;
-        }
-      }
+      await releaseSessionResources();
       throw error;
     }
   });
@@ -1160,19 +1182,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model, modelAliases, knownModels, settingsPath)] : []; });
       const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models, ...roleModels])];
       const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, launchMode: params.foreground ? "foreground" : "background", settings, settingsPath, settingsSources: { ...launch.resolution.sources, concurrency: params.concurrency === undefined ? launch.resolution.sources.concurrency : "per-run options" }, ...(Object.keys(modelAliases).length ? { modelAliases } : {}), ...(budget ? { budget } : {}), ...(checked.referenced.phases.length ? { phases: checked.referenced.phases } : {}), models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, schemas: checked.schemas });
-      let persistedSnapshot = snapshot;
-      const captureRole = async (role: string, model: ModelSpec): Promise<void> => {
-        const definition = agentDefinitions[role];
-        if (!definition) return;
-        const modelName = `${model.provider}/${model.model}`;
-        const hasProjectRole = projectAgentDefinitions[role] !== undefined;
-        if (persistedSnapshot.roles?.[role] !== undefined && (!hasProjectRole || persistedSnapshot.projectRoles?.includes(role)) && persistedSnapshot.models.includes(modelName)) return;
-        const roles = { ...(persistedSnapshot.roles ?? {}), [role]: definition };
-        const projectRoles = hasProjectRole ? [...new Set([...(persistedSnapshot.projectRoles ?? []), role])] : persistedSnapshot.projectRoles ?? [];
-        const models = [...new Set([...persistedSnapshot.models, modelName])];
-        persistedSnapshot = createLaunchSnapshot({ ...persistedSnapshot, models, roles, projectRoles });
-        await store.saveSnapshot(persistedSnapshot);
-      };
+      const capturedRoles = roleCapture(store, snapshot, agentDefinitions, projectAgentDefinitions);
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       const createRun = () => store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
@@ -1196,7 +1206,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             delivery.detached = true;
             const activeRun = runs.get(runId);
             if (activeRun) { activeRun.foreground = false; delete activeRun.update; }
-            await store.saveSnapshot(createLaunchSnapshot({ ...persistedSnapshot, launchMode: "background" }));
+            await store.saveSnapshot(createLaunchSnapshot({ ...capturedRoles.snapshot, launchMode: "background" }));
             for (const checkpoint of await store.awaitingCheckpoints()) deliverBackgroundCheckpoint(checked.metadata.name, runId, checkpoint);
             signal?.removeEventListener("abort", onForegroundAbort);
             const run = (await store.load()).run;
@@ -1216,7 +1226,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch());
-      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, captureRole), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry), runController.signal);
+      const execution = runWorkflow(script, args, withWorkflowFunctions({ shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, (role, model) => capturedRoles.capture(role, model)), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {
@@ -1230,9 +1240,10 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       }).catch(async (error: unknown) => {
         await scheduler.flush(runId);
         const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error));
-        if (!["stopped", "interrupted", "budget_exhausted"].includes(lifecycle.state)) await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
+        if (!isExternallyEndedRunState(lifecycle.state)) await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
         const persisted = await persistRunState(store, checked.metadata, (current) => persistedFailure({ ...current, ...budgetRuntime.snapshot() }, typed));
-        const state = lifecycle.state === "stopped" || lifecycle.state === "interrupted" || lifecycle.state === "budget_exhausted" ? lifecycle.state : "failed";
+        const ended = lifecycle.state;
+        const state = isExternallyEndedRunState(ended) ? ended : "failed";
         await eventPublisher.runFailed(store, checked.metadata, typed, state);
         const diagnostic = await createWorkflowFailureDiagnostics(store, checked.metadata, typed, persisted);
         markWorkflowFailureDiagnostics(typed, diagnostic);
@@ -1375,15 +1386,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       }));
       await scheduler.flush();
     } finally {
-      clearSubagentStatusObserver();
-      try { await releaseSessionLease(); } finally {
-        if (releaseWorkflowRegistry) {
-          releaseWorkflowRegistry();
-          releaseWorkflowRegistry = undefined;
-        } else {
-          resetWorkflowRegistryIfIdle();
-        }
-      }
+      await releaseSessionResources();
     }
   });
 }
@@ -1394,11 +1397,11 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
  * five parallel maps that previously had to stay consistent by hand; deleteRun() is the single
  * cleanup point when a run reaches a hard-terminal state.
  */
-type LiveAgentState = { session?: import("./types.js").WorkflowAgentSession; prepared?: Readonly<import("./types.js").PreparedAgentSession>; handoff?: import("./types.js").LiveSessionHandoff; activity?: AgentActivity; lastEventAt?: number };
+type LiveAgentState = { session?: WorkflowAgentSession; prepared?: Readonly<PreparedAgentSession>; handoff?: LiveSessionHandoff; activity?: AgentActivity; lastEventAt?: number };
 class LiveAgentRegistry {
   readonly #byRun = new Map<string, Map<string, LiveAgentState>>();
   get(runId: string, agentId: string): Readonly<LiveAgentState> | undefined { return this.#byRun.get(runId)?.get(agentId); }
-  setSession(runId: string, agentId: string, session?: import("./types.js").WorkflowAgentSession): void {
+  setSession(runId: string, agentId: string, session?: WorkflowAgentSession): void {
     if (session) this.#state(runId, agentId).session = session;
     else this.#clear(runId, agentId, (state) => { delete state.session; });
   }

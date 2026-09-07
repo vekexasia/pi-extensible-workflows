@@ -1,6 +1,5 @@
-import { WorkflowError, type BudgetDimension, type BudgetEvent, type BudgetLimits, type WorkflowBudget, type WorkflowBudgetPatch, type WorkflowBudgetUsage, type AgentAccounting, type RunState } from "./types.js";
+import { BUDGET_DIMENSIONS, WorkflowError, type BudgetDimension, type BudgetEvent, type BudgetLimits, type WorkflowBudget, type WorkflowBudgetPatch, type WorkflowBudgetUsage, type AgentAccounting, type RunState } from "./types.js";
 import { fail, object } from "./utils.js";
-const BUDGET_DIMENSIONS = ["tokens", "costUsd", "durationMs", "agentLaunches"] as const;
 const BUDGET_LIMITS = ["soft", "hard"] as const;
 type BudgetLimit = (typeof BUDGET_LIMITS)[number];
 type BudgetPatchLimits = { soft?: number | null; hard?: number | null };

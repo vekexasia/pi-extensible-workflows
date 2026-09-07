@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { isTurnActivityStart, isTurnBoundaryEnd } from "../src/pi-runtime-adapter.js";
 import { createLiveSessionHandoff } from "../src/session-handoff.js";
 
 void test("live session handoff waits for turn_end and releases ownership once", async () => {
@@ -84,4 +88,14 @@ void test("duplicate handoff requests share one launch and settle together", asy
   await Promise.all([first, second]);
   assert.equal(launches, 1);
   assert.equal(handoff.state, "completed");
+});
+
+void test("handoff turn boundaries come from the shared Pi event vocabulary", () => {
+  for (const type of ["turn_start", "turn_started", "turnStarted", "agent_start"]) assert.equal(isTurnActivityStart(type), true, type);
+  assert.equal(isTurnActivityStart("turn_end"), false);
+  for (const type of ["turn_end", "turnEnded", "agent_end", "agent_settled"]) assert.equal(isTurnBoundaryEnd(type), true, type);
+  const source = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "../../src/session-handoff.ts"), "utf8");
+  assert.doesNotMatch(source, /"turn_start"/, "session-handoff must not restate the turn-start event list");
+  assert.doesNotMatch(source, /"turn_end"/, "session-handoff must not restate the turn-end event list");
+  assert.match(source, /import \{[^}]*\bisTurnActivityStart\b[^}]*\} from "\.\/pi-runtime-adapter\.js";/);
 });

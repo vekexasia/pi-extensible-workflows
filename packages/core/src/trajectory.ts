@@ -297,32 +297,31 @@ export async function loadTrajectoryRuns(cwd: string, sessionId: string, home = 
   return loaded;
 }
 
-type CachedTrajectoryRun = { value: TrajectoryRun; stateMtimeMs: number; journalMtimeMs: number; transcriptMtimes: ReadonlyMap<string, number | undefined> };
 async function fileMtime(path: string): Promise<number | undefined> { return stat(path).then((value) => value.mtimeMs).catch(() => undefined); }
-async function cacheEntryChanged(store: RunStore, entry: CachedTrajectoryRun): Promise<boolean> {
-  const stateMtimeMs = await fileMtime(join(store.directory, "state.json"));
-  const journalMtimeMs = await fileMtime(join(store.directory, "journal.json"));
-  if (stateMtimeMs !== entry.stateMtimeMs || journalMtimeMs !== entry.journalMtimeMs) return true;
-  for (const [agentId, path] of transcriptPaths(entry.value.run)) if (await fileMtime(path) !== entry.transcriptMtimes.get(agentId)) return true;
-  return false;
-}
-
-export function createTrajectoryRunLoader(cwd: string, sessionId: string, home = homedir(), overlay?: (run: PersistedRun) => PersistedRun): TrajectoryRunLoader {
-  const cache = new Map<string, CachedTrajectoryRun>();
+type CachedRunEntry<Value extends { run: PersistedRun }, Signature> = { value: Value; stateMtimeMs: number; journalMtimeMs: number; transcripts: ReadonlyMap<string, Signature> };
+/** Lists the session's runs, reloading one only when its state, journal, or a transcript (per `transcriptSignature`) changed. */
+function createCachedRunLoader<Value extends { run: PersistedRun }, Signature>(cwd: string, sessionId: string, home: string, load: (store: RunStore) => Promise<Value>, transcriptSignature: (path: string) => Promise<Signature>, overlay: ((run: PersistedRun) => PersistedRun) | undefined): () => Promise<readonly Value[]> {
+  const cache = new Map<string, CachedRunEntry<Value, Signature>>();
+  const changed = async (store: RunStore, entry: CachedRunEntry<Value, Signature>): Promise<boolean> => {
+    if (await fileMtime(join(store.directory, "state.json")) !== entry.stateMtimeMs) return true;
+    if (await fileMtime(join(store.directory, "journal.json")) !== entry.journalMtimeMs) return true;
+    for (const [agentId, path] of transcriptPaths(entry.value.run)) if (await transcriptSignature(path) !== entry.transcripts.get(agentId)) return true;
+    return false;
+  };
   return async () => {
     const ids = await listRunIds(cwd, sessionId, home, false);
     const current = new Set(ids);
     for (const runId of cache.keys()) if (!current.has(runId)) cache.delete(runId);
-    const loaded: TrajectoryRun[] = [];
+    const loaded: Value[] = [];
     for (const runId of ids) {
       const store = new RunStore(cwd, sessionId, runId, home);
       try {
         let entry = cache.get(runId);
-        if (!entry || await cacheEntryChanged(store, entry)) {
-          const value = await loadTrajectoryRun(store);
-          const transcriptMtimes = new Map<string, number | undefined>();
-          for (const [agentId, path] of transcriptPaths(value.run)) transcriptMtimes.set(agentId, await fileMtime(path));
-          entry = { value, stateMtimeMs: (await fileMtime(join(store.directory, "state.json"))) ?? 0, journalMtimeMs: (await fileMtime(join(store.directory, "journal.json"))) ?? 0, transcriptMtimes };
+        if (!entry || await changed(store, entry)) {
+          const value = await load(store);
+          const transcripts = new Map<string, Signature>();
+          for (const [agentId, path] of transcriptPaths(value.run)) transcripts.set(agentId, await transcriptSignature(path));
+          entry = { value, stateMtimeMs: (await fileMtime(join(store.directory, "state.json"))) ?? 0, journalMtimeMs: (await fileMtime(join(store.directory, "journal.json"))) ?? 0, transcripts };
           cache.set(runId, entry);
         }
         loaded.push(overlay ? { ...entry.value, run: overlay(entry.value.run) } : entry.value);
@@ -330,6 +329,10 @@ export function createTrajectoryRunLoader(cwd: string, sessionId: string, home =
     }
     return loaded;
   };
+}
+
+export function createTrajectoryRunLoader(cwd: string, sessionId: string, home = homedir(), overlay?: (run: PersistedRun) => PersistedRun): TrajectoryRunLoader {
+  return createCachedRunLoader(cwd, sessionId, home, (store) => loadTrajectoryRun(store), fileMtime, overlay);
 }
 function transcriptRevision(info: { mtimeNs: bigint; size: bigint }): number {
   const digest = createHash("sha256").update(`${String(info.mtimeNs)}:${String(info.size)}`).digest();
@@ -360,12 +363,6 @@ async function metadataForRun(value: TrajectoryRun): Promise<TrajectoryRunMetada
   for (const [agentId, path] of transcriptPaths(value.run)) transcripts[agentId] = await transcriptMetadata(path);
   return { ...value, transcripts };
 }
-type CachedTrajectoryRunMetadata = {
-  value: TrajectoryRunMetadata;
-  stateMtimeMs: number;
-  journalMtimeMs: number;
-  transcriptSignatures: ReadonlyMap<string, string | undefined>;
-};
 async function fileSignature(path: string): Promise<string | undefined> {
   try {
     const info = await stat(path, { bigint: true });
@@ -374,35 +371,8 @@ async function fileSignature(path: string): Promise<string | undefined> {
     return undefined;
   }
 }
-async function metadataCacheEntryChanged(store: RunStore, entry: CachedTrajectoryRunMetadata): Promise<boolean> {
-  if (await fileMtime(join(store.directory, "state.json")) !== entry.stateMtimeMs) return true;
-  if (await fileMtime(join(store.directory, "journal.json")) !== entry.journalMtimeMs) return true;
-  for (const [agentId, path] of transcriptPaths(entry.value.run)) if (await fileSignature(path) !== entry.transcriptSignatures.get(agentId)) return true;
-  return false;
-}
 export function createTrajectoryRunMetadataLoader(cwd: string, sessionId: string, home = homedir(), overlay?: (run: PersistedRun) => PersistedRun): TrajectoryRunMetadataLoader {
-  const cache = new Map<string, CachedTrajectoryRunMetadata>();
-  return async () => {
-    const ids = await listRunIds(cwd, sessionId, home, false);
-    const current = new Set(ids);
-    for (const runId of cache.keys()) if (!current.has(runId)) cache.delete(runId);
-    const loaded: TrajectoryRunMetadata[] = [];
-    for (const runId of ids) {
-      const store = new RunStore(cwd, sessionId, runId, home);
-      try {
-        let entry = cache.get(runId);
-        if (!entry || await metadataCacheEntryChanged(store, entry)) {
-          const value = await metadataForRun(await loadTrajectoryRun(store, false));
-          const transcriptSignatures = new Map<string, string | undefined>();
-          for (const [agentId, path] of transcriptPaths(value.run)) transcriptSignatures.set(agentId, await fileSignature(path));
-          entry = { value, stateMtimeMs: (await fileMtime(join(store.directory, "state.json"))) ?? 0, journalMtimeMs: (await fileMtime(join(store.directory, "journal.json"))) ?? 0, transcriptSignatures };
-          cache.set(runId, entry);
-        }
-        loaded.push(overlay ? { ...entry.value, run: overlay(entry.value.run) } : entry.value);
-      } catch { cache.delete(runId); /* Ignore corrupt or concurrently removed runs. */ }
-    }
-    return loaded;
-  };
+  return createCachedRunLoader(cwd, sessionId, home, async (store) => metadataForRun(await loadTrajectoryRun(store, false)), fileSignature, overlay);
 }
 type CachedTrajectoryTranscriptMetadata = { path: string | undefined; signature: string | undefined; value: TrajectoryTranscriptMetadata };
 export function createTrajectorySubagentMetadataLoader(cwd: string, sessionId: string, agentDir: string, overlay?: (subagent: TrajectorySubagent) => TrajectorySubagent): TrajectorySubagentMetadataLoader {

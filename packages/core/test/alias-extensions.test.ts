@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import { testExtensionApi } from "./support.js";
+import { testExtensionApi, waitForIssue105 } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, loadAgentDefinitions, registerWorkflowExtension, RunStore, runWorkflow, structuralPath, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowFunctionContext } from "../src/index.js";
 import { loadingRegistry } from "../src/registry.js";
 import { withWorkflowFunctions, workflowRunContext } from "../src/host-runtime.js";
@@ -69,6 +69,57 @@ void test("registered globals preserve role definitions for agent calls across r
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for ${childId} to complete`);
+});
+void test("cold resume launches a registered function's role that the snapshot never captured (#284)", async () => {
+  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resume-function-role-"));
+  const agentDir = mkdtempSync(join(home, "agent-"));
+  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "developer.md"), "Developer role");
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Reviewer role");
+  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
+  const roles: string[] = [];
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const session = (prompt: () => Promise<void>) => async (input: SessionInput): Promise<TestPiSession> => {
+    roles.push(input.systemPromptAppend ?? "");
+    return { sessionId: `resume-role-${String(roles.length)}`, sessionFile: `/sessions/resume-role-${String(roles.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt, steer: async () => {}, abort: async () => { release(); }, dispose() {} };
+  };
+  const firstTools: Tool[] = [];
+  let firstShutdown: (() => Promise<void>) | undefined;
+  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { firstTools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") firstShutdown = handler as typeof firstShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(session(async () => { await held; })), agentDir);
+  // A new Pi process loads extensions again; mirror that by registering the function for each host instance.
+  const registerFunction = () => { registerWorkflowExtension({ version: "1.0.0", headline: "Developer then reviewer", functions: { developThenReview: { description: "Two roles", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: async (_input, context) => { await context.agent("build", { role: "developer", retries: 0 }); await context.agent("review", { role: "reviewer", retries: 0 }); return "reviewed"; } } } }); };
+  registerFunction();
+  const firstWorkflow = firstTools.find(({ name }) => name === "workflow");
+  assert.ok(firstWorkflow);
+  const started = await firstWorkflow.execute("first", { name: "function-roles", script: "return await developThenReview({});" }, undefined, undefined, context) as { content: Array<{ text: string }> };
+  const runId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
+  const store = new RunStore(home, "session", runId, home);
+  await waitForIssue105(() => roles.length > 0);
+  assert.deepEqual(roles, ["Developer role"]);
+  await firstShutdown?.();
+  assert.equal((await store.load()).run.state, "interrupted");
+  assert.deepEqual(Object.keys((await store.load()).snapshot.roles ?? {}), ["developer"], "the snapshot captured only the role that launched before the interruption");
+  const secondTools: Tool[] = [];
+  let secondStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+  let secondCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+  let secondShutdown: (() => Promise<void>) | undefined;
+  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { secondTools.push(tool); }, registerCommand(_name: string, value: { handler: NonNullable<typeof secondCommand> }) { secondCommand = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") secondStart = handler as typeof secondStart; if (name === "session_shutdown") secondShutdown = handler as typeof secondShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(session(async () => {})), agentDir);
+  registerFunction();
+  try {
+    assert.ok(secondStart && secondCommand);
+    await secondStart({}, context);
+    await contextualWorkflowAction(secondCommand, context, runId, "Resume");
+    await waitForIssue105(async () => ["completed", "failed"].includes((await store.load()).run.state));
+    const resumed = await store.load();
+    assert.equal(resumed.run.state, "completed", JSON.stringify(resumed.run.error));
+    assert.deepEqual(roles, ["Developer role", "Developer role", "Reviewer role"]);
+    assert.deepEqual(Object.keys(resumed.snapshot.roles ?? {}).sort(), ["developer", "reviewer"], "the resumed run captures the newly used role for later retries");
+  } finally {
+    release();
+    await secondShutdown?.();
+  }
 });
 void test("attributes dynamic alias availability failures to the exact extension", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-alias-provenance-"));

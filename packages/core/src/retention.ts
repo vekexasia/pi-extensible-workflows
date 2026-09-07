@@ -2,7 +2,7 @@ import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type LaunchSnapshot, type WorkflowRetentionSettings } from "./types.js";
-import { acquireSessionLease, listPersistedSessionIds, listRunIds, RunStore, type PersistedRun, type SessionLease } from "./persistence.js";
+import { acquireSessionLease, listPersistedSessionIds, listRunIds, RunStore, type BorrowedWorktreeBinding, type PersistedRun, type SessionLease } from "./persistence.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_FILES = new Set(["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"]);
@@ -46,6 +46,18 @@ async function validateInventory(store: RunStore, loaded: { run: PersistedRun; s
   if (await readFile(join(store.directory, "workflow.js"), "utf8") !== loaded.snapshot.script) throw new Error("Persisted workflow source does not match its launch snapshot");
 }
 
+/** The runs this run cannot outlive: its parent, its retry lineage, and every run it borrows a named worktree from. */
+export function runDependencyIds(run: Pick<PersistedRun, "parentRunId" | "retry">, borrowed: readonly BorrowedWorktreeBinding[]): string[] {
+  const dependencies = new Set<string>();
+  if (run.parentRunId !== undefined) dependencies.add(run.parentRunId);
+  if (run.retry) {
+    dependencies.add(run.retry.sourceRunId);
+    dependencies.add(run.retry.lineageRootRunId);
+  }
+  for (const binding of borrowed) dependencies.add(binding.sourceRunId);
+  return [...dependencies];
+}
+
 async function scanRun(cwd: string, sessionId: string, runId: string, home: string): Promise<StoredRun> {
   const store = new RunStore(cwd, sessionId, runId, home);
   const loaded = await store.load();
@@ -57,15 +69,9 @@ async function scanRun(cwd: string, sessionId: string, runId: string, home: stri
   await store.validateBorrowedWorktrees();
   if (loaded.run.retry) await store.validateRetrySource();
   const stateMtimeMs = (await stat(join(store.directory, "state.json"))).mtimeMs;
-  const dependencies = new Set<string>();
-  if (loaded.run.parentRunId !== undefined) dependencies.add(loaded.run.parentRunId);
-  if (loaded.run.retry) {
-    dependencies.add(loaded.run.retry.sourceRunId);
-    dependencies.add(loaded.run.retry.lineageRootRunId);
-  }
-  for (const binding of await store.borrowedWorktrees()) dependencies.add(binding.sourceRunId);
-  if (dependencies.has(runId)) throw new Error(`Run ${runId} depends on itself`);
-  return { sessionId, runId, store, run: loaded.run, stateMtimeMs, dependencies: [...dependencies] };
+  const dependencies = runDependencyIds(loaded.run, await store.borrowedWorktrees());
+  if (dependencies.includes(runId)) throw new Error(`Run ${runId} depends on itself`);
+  return { sessionId, runId, store, run: loaded.run, stateMtimeMs, dependencies };
 }
 
 async function scanSession(cwd: string, sessionId: string, home: string): Promise<StoredRun[]> {

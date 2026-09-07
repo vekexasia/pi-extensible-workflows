@@ -9,10 +9,11 @@ import { openWorkflowArtifact, workflowPromptArtifact, workflowResultArtifact, w
 import { agentActionLabels, agentBreadcrumb, formatCheckpointReview, formatNavigatorRun, formatWorkflowPhaseDashboard, navigatorAttentionSort, navigatorRunLabels, SETTLED_AGENT_STATES, themeWorkflowProgressStyles, visibleAgentAttemptActions as visibleRegisteredAgentAttemptActions } from "./host-view.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, navigateWorkflowPhaseTree, preserveWorkflowPhaseTreeSelection, workflowPhaseTreeInitialExpanded } from "./host-phases.js";
 import { type WorkflowRecoveryContext, type createWorkflowRecovery } from "./host-recovery.js";
+import { runDependencyIds } from "./retention.js";
 import { failureDiagnosticsFrom, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback } from "./host-delivery.js";
 import { type WorkflowRunRecord } from "./host-runtime.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
-import { type AgentAttemptActionContext, type AgentAttemptSummary, type AgentRecord, type JsonValue, type LaunchSnapshot } from "./types.js";
+import { type AgentAttemptAction, type AgentAttemptActionContext, type AgentAttemptSummary, type AgentRecord, type HardTerminalRunState, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type PreparedAgentSession, type WorkflowAgentSession } from "./types.js";
 
 type UiSelect = (title: string, options: string[]) => Promise<string | undefined>;
 type UiInput = (title: string, placeholder?: string) => Promise<string | undefined>;
@@ -37,17 +38,7 @@ function dependencyClosure(runId: string, dependencies: NavigatorRunDependencies
 }
 async function navigatorRunDependencies(entries: readonly NavigatorStoredRun[]): Promise<NavigatorRunDependencies> {
   const dependencies = new Map<string, readonly string[]>();
-  for (const entry of entries) {
-    const run = entry.loaded.run;
-    const direct = new Set<string>();
-    if (run.parentRunId !== undefined) direct.add(run.parentRunId);
-    if (run.retry) {
-      direct.add(run.retry.sourceRunId);
-      direct.add(run.retry.lineageRootRunId);
-    }
-    for (const binding of await entry.store.borrowedWorktrees()) direct.add(binding.sourceRunId);
-    dependencies.set(run.id, [...direct]);
-  }
+  for (const entry of entries) dependencies.set(entry.loaded.run.id, runDependencyIds(entry.loaded.run, await entry.store.borrowedWorktrees()));
   return dependencies;
 }
 function dependentRunId(targetRunId: string, entries: readonly NavigatorStoredRun[], dependencies: NavigatorRunDependencies): string | undefined {
@@ -138,7 +129,7 @@ export type WorkflowNavigatorDependencies = {
   clipboard: (value: string) => Promise<void>;
   extensionAgentDir: string;
   runs: Map<string, WorkflowRunRecord>;
-  terminalRunStates: Map<string, "completed" | "failed" | "stopped">;
+  terminalRunStates: Map<string, HardTerminalRunState>;
   hardTerminalRunStates: ReadonlySet<string>;
   ensureSessionLease: (cwd: string, sessionId: string) => Promise<void>;
   answerCheckpoint: (runId: string, name: string, approved: boolean, silent?: boolean) => Promise<boolean>;
@@ -147,7 +138,7 @@ export type WorkflowNavigatorDependencies = {
   moveForegroundToBackground: (runId: string) => Promise<{ runId: string; state: "running"; detached: true }>;
   isForegroundAttached: (runId: string) => boolean;
   liveAgents: {
-    get(runId: string, agentId: string): Readonly<{ session?: import("./types.js").WorkflowAgentSession; prepared?: Readonly<import("./types.js").PreparedAgentSession>; handoff?: import("./types.js").LiveSessionHandoff }> | undefined;
+    get(runId: string, agentId: string): Readonly<{ session?: WorkflowAgentSession; prepared?: Readonly<PreparedAgentSession>; handoff?: LiveSessionHandoff }> | undefined;
     overlay(run: PersistedRun): PersistedRun;
   };
   registry: WorkflowRegistryApi;
@@ -242,7 +233,12 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             });
             return deleted ? "picker" : "dashboard";
           }
-          if (action === "pause" && run) { await run.lifecycle.pause(); ctx.ui.notify(`Paused workflow ${run.store.runId}.`, "info"); return "dashboard"; }
+          if (action === "pause" && run) {
+            await run.lifecycle.pause();
+            ctx.ui.notify(run.lifecycle.state === "pausing" ? `Pausing workflow ${run.store.runId}; it pauses once the active operation finishes.` : `Paused workflow ${run.store.runId}.`, "info");
+            return "dashboard";
+          }
+          if (action === "cancel-pause" && run?.lifecycle.state === "pausing") { await run.lifecycle.resume(); ctx.ui.notify(`Cancelled the pending pause of workflow ${run.store.runId}.`, "info"); return "dashboard"; }
           if (action === "resume" && run) {
             if (run.lifecycle.state === "budget_exhausted") {
               const patch: unknown = rest.length ? JSON.parse(rest.join(" ")) as unknown : undefined;
@@ -426,6 +422,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             const add = (label: string, value: string) => { actions.set(label, `${value} ${store.runId}`); };
             const addCopy = (label: string, value: string, artifact: string) => { actions.set(label, "copy"); copies.set(label, { value, artifact }); };
             if (liveRun.state === "running") add("Pause", "pause");
+            if (liveRun.state === "pausing") add("Cancel pause", "cancel-pause");
             if (["paused", "interrupted"].includes(liveRun.state)) add("Resume", "resume");
             if (liveRun.state === "budget_exhausted") { actions.set("Resume unchanged", `resume ${store.runId}`); actions.set("Adjust budget", `adjust ${store.runId}`); }
             for (const decision of await store.pendingWorkflowDecisions()) {
@@ -469,7 +466,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
             const handoff = live ? liveAgent?.handoff : undefined;
             return { run: deepFreeze(structuredClone(dashboard.run)), agent: deepFreeze(structuredClone(agent)), attempt: attemptSnapshot, ...(attemptSnapshot.session ? { session: attemptSnapshot.session } : {}), ...(live ? { liveSession: live } : {}), ...(prepared ? { prepared } : {}), ...(handoff ? { handoff } : {}), signal: run?.abortController.signal ?? new AbortController().signal, ui: Object.freeze(ui) };
           };
-          const visibleAgentAttemptActions = (dashboard: Awaited<ReturnType<typeof loadDashboard>>, agent: AgentRecord): readonly [string, import("./types.js").AgentAttemptAction][] => {
+          const visibleAgentAttemptActions = (dashboard: Awaited<ReturnType<typeof loadDashboard>>, agent: AgentRecord): readonly [string, AgentAttemptAction][] => {
             const context = agentAttemptActionContext(dashboard, agent);
             return context ? visibleRegisteredAgentAttemptActions(registry.agentAttemptActions(), context) : [];
           };

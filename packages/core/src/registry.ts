@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
 import type { SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
-import { deepFreeze, errorCode, errorText, fail, jsonValue, object } from "./utils.js";
+import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, MODEL_ALIAS_NAME, object } from "./utils.js";
 import { loadSettings, resolveWorkflowSettings, validateSchema } from "./validation.js";
 
 const RESERVED_GLOBALS = new Set(["agent", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
@@ -92,7 +92,7 @@ export class WorkflowRegistry {
       if (fn.input.type !== "object") fail("INVALID_SCHEMA", `${name} input must describe one object`);
     }
     for (const [name, alias] of Object.entries(modelAliases)) {
-      if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) fail("INVALID_METADATA", `Invalid model alias name: ${name}`);
+      if (!MODEL_ALIAS_NAME.test(name)) fail("INVALID_METADATA", `Invalid model alias name: ${name}`);
       if (!object(alias) || Object.keys(alias).some((key) => key !== "resolve") || typeof alias.resolve !== "function") fail("INVALID_METADATA", `Invalid model alias resolver: ${name}`);
       if (this.#modelAliases.has(name)) fail("DUPLICATE_NAME", `Model alias already registered: ${name}`);
     }
@@ -126,7 +126,7 @@ export class WorkflowRegistry {
     return Object.freeze(Object.fromEntries([...this.#extensions].flatMap((extension) => Object.entries(extension.functions ?? {}))));
   }
   functionSources(): Readonly<Record<string, WorkflowFunctionSource>> {
-    return Object.freeze(Object.fromEntries([...this.#functionSources].map(([name, source]) => [name, source])));
+    return Object.freeze(Object.fromEntries(this.#functionSources));
   }
 
   catalog(context?: WorkflowCatalogContext): WorkflowCatalog {
@@ -199,7 +199,7 @@ export class WorkflowRegistry {
   }
 
   agentSetupHooks(): readonly RegisteredAgentSetupHook[] {
-    return [...this.#hooks.values()].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    return [...this.#hooks.values()].sort(byPriorityThenName);
   }
   agentAttemptActions(): Readonly<Record<string, AgentAttemptAction>> { return Object.freeze(Object.fromEntries(this.#agentAttemptActions.entries())); }
   roleDirectories(): readonly string[] {

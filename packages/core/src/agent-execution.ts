@@ -46,12 +46,11 @@ export interface PiResourceInspection {
   readonly systemPromptSource?: string;
 }
 import type { AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowRunContext } from "./types.js";
-import { SerialLane, assertModelThinking, deepFreeze, errorText, jsonObject, jsonValue, object, modelAliasName, modelCapability, resolveModelReference, resourcePatternHasMagic, selectResourcesByLayers, unmatchedResourcePatterns } from "./utils.js";
-import { type AgentState, type ThinkingLevel } from "./types.js";
-import { WorkflowError } from "./types.js";
+import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorText, jsonObject, jsonValue, object, modelAliasName, modelCapability, resolveModelReference, resourcePatternHasMagic, selectResourcesByLayers, unmatchedResourcePatterns } from "./utils.js";
+import { SETTLED_AGENT_STATES, WorkflowError, isContextFileScope, zeroAccounting, type AgentDefinition, type AgentState } from "./types.js";
 import { createLiveSessionHandoff } from "./session-handoff.js";
 import { createToolTimingExtension } from "./tool-timing.js";
-import { normalizePiMessage, normalizePiSessionEvent, runtimeProgressToAgentProgress } from "./pi-runtime-adapter.js";
+import { isEmptyAbortedAssistant, normalizePiMessage, normalizePiSessionEvent, runtimeProgressToAgentProgress } from "./pi-runtime-adapter.js";
 import { createPiRuntimeAgentRunner, isRuntimeAgentProviderError, normalizePiRuntimeError } from "./pi-runtime-runner.js";
 import type { RuntimeAgentProgress, RuntimeUsage } from "./runtime/agent-runner.js";
 import { defaultWorkflowResultSchema } from "./runtime/workflow-result.js";
@@ -66,7 +65,7 @@ export interface AgentBudgetHooks {
   afterTurn(accounting: AgentAccounting, final: boolean): void;
   instruction(): string | undefined;
 }
-export interface AgentDefinition { prompt?: string; description?: string; model?: string; thinking?: ThinkingLevel; tools?: readonly string[]; skills?: readonly string[]; extensions?: readonly string[]; overrideSystemPrompt?: boolean; contextFiles?: readonly ContextFileScope[] }
+export type { AgentDefinition } from "./types.js";
 export interface AgentProviderFailure { label: string; provider: string; model: string; error: string }
 export type AgentProviderRecovery = "retry" | "abort" | { model: string };
 export interface AgentExecutionOptions {
@@ -129,8 +128,6 @@ function parseModel(value: string | undefined, fallback: ModelSpec, aliases: Rea
   assertModelThinking(value);
   return resolveModelReference(value, aliases, knownModels, settingsPath);
 }
-
-function isEmptyAbortedAssistant(message: WorkflowAgentMessage | undefined): boolean { return message?.stopReason === "aborted" && Array.isArray(message.content) && message.content.length === 0; }
 
 function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
@@ -661,7 +658,7 @@ function isChildAgentToolParams(value: unknown): value is ChildAgentToolParams &
   if (value.extensions !== undefined && (!Array.isArray(value.extensions) || value.extensions.some((extension) => typeof extension !== "string"))) return false;
   if (value.model !== undefined && typeof value.model !== "string") return false;
   if (value.role !== undefined && (typeof value.role !== "string" || !value.role.trim())) return false;
-  if (value.contextFiles !== undefined && (!Array.isArray(value.contextFiles) || value.contextFiles.some((scope) => scope !== "global" && scope !== "project" && scope !== "cwd"))) return false;
+  if (value.contextFiles !== undefined && (!Array.isArray(value.contextFiles) || !value.contextFiles.every(isContextFileScope))) return false;
   if (value.outputSchema !== undefined && !jsonObject(value.outputSchema)) return false;
   if (value.retries !== undefined && (typeof value.retries !== "number" || !Number.isInteger(value.retries) || value.retries < 0)) return false;
   if (value.timeoutMs !== undefined && (value.timeoutMs !== null && (typeof value.timeoutMs !== "number" || !Number.isInteger(value.timeoutMs) || value.timeoutMs < 1))) return false;
@@ -855,7 +852,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
   const base = fallbackSetupContext(root, options, setupSignal);
   const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal, ...(base.tuiIndex === undefined ? {} : { tuiIndex: base.tuiIndex }), ...(base.tuiLabel === undefined ? {} : { tuiLabel: base.tuiLabel }), ...(inspection ? { mode: "inspection" as const } : {}) });
   const hookNames: string[] = [];
-  for (const hook of [...(root.agentSetupHooks ?? [])].sort((left, right) => left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))) {
+  for (const hook of [...(root.agentSetupHooks ?? [])].sort(byPriorityThenName)) {
     if (setupSignal.aborted) return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error: new WorkflowError("CANCELLED", "Agent cancelled") } };
     try { await hook.setup(setup, context); } catch (error) {
       setup.prepared = await preparedAgentSession(setup.sessionInput, task);
@@ -1007,7 +1004,7 @@ export class WorkflowAgentExecutor {
           return { content: [{ type: "text" as const, text: "Result accepted." }], details: {} };
         },
       });
-      let lastKnownAccounting: AgentAccounting = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+      let lastKnownAccounting: AgentAccounting = zeroAccounting();
       const accountingFromRuntime = (usage: RuntimeUsage, active: WorkflowAgentSession): AgentAccounting => {
         const input = usage.input;
         const output = usage.output;
@@ -1036,7 +1033,7 @@ export class WorkflowAgentExecutor {
         if (prepared.failure) throw prepared.failure.error;
         setupFailed = false;
         if (attemptSignal.aborted) throw new WorkflowError("CANCELLED", "Agent cancelled");
-        await options.onAttempt?.({ attempt, transport: attemptSetup.transport.id, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: setupSummary });
+        await options.onAttempt?.({ attempt, transport: attemptSetup.transport.id, accounting: zeroAccounting(), setup: setupSummary });
 
         const transportBase = fallbackSetupContext(this.root, options, attemptSignal);
         const transportContext = Object.freeze({ run: transportBase.run, identity: transportBase.identity, attempt, signal: attemptSignal, ...(transportBase.tuiIndex === undefined ? {} : { tuiIndex: transportBase.tuiIndex }), ...(transportBase.tuiLabel === undefined ? {} : { tuiLabel: transportBase.tuiLabel }) });
@@ -1055,7 +1052,7 @@ export class WorkflowAgentExecutor {
             onSession: async (createdSession, createdHandoff, createdPrepared) => {
               session = createdSession;
               releaseIfAttemptCancelled();
-              const activeAttempt: AgentAttempt = { attempt, transport: attemptSetup.transport.id, session: createdSession.reference, liveSession: createdSession, prepared: createdPrepared, handoff: createdHandoff, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: setupSummary };
+              const activeAttempt: AgentAttempt = { attempt, transport: attemptSetup.transport.id, session: createdSession.reference, liveSession: createdSession, prepared: createdPrepared, handoff: createdHandoff, accounting: zeroAccounting(), setup: setupSummary };
               await options.onAttempt?.(activeAttempt);
             },
             onSessionReady: async () => {
@@ -1132,7 +1129,7 @@ export class WorkflowAgentExecutor {
         const typed = normalizePiRuntimeError(error, attemptSignal, setupFailed);
         releaseHandoff("attempt failed");
         if (!session) {
-          const failedAttempt: AgentAttempt = { attempt, transport: setup?.transport.id ?? this.transport.id, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, error: { code: typed.code, message: typed.message }, setup: setupSummary };
+          const failedAttempt: AgentAttempt = { attempt, transport: setup?.transport.id ?? this.transport.id, accounting: zeroAccounting(), error: { code: typed.code, message: typed.message }, setup: setupSummary };
           attempts.push(failedAttempt);
           try { await options.onAttempt?.(failedAttempt); }
           catch (persistenceError) { throw errorWithAttempts(persistenceError, attempts); }
@@ -1328,7 +1325,7 @@ export class FairAgentScheduler {
   releaseResult(id: string): void {
     const node = this.#nodes.get(id);
     if (!node || !node.promise) return;
-    if (!["completed", "failed", "cancelled"].includes(node.state)) throw new WorkflowError("INTERNAL_ERROR", `Cannot release active agent result: ${id}`);
+    if (!SETTLED_AGENT_STATES.has(node.state)) throw new WorkflowError("INTERNAL_ERROR", `Cannot release active agent result: ${id}`);
     node.promise = undefined;
     node.task = async () => undefined;
   }
@@ -1358,7 +1355,7 @@ export class FairAgentScheduler {
     const run = this.#runs.get(runId);
     if (!run) return;
     const nodes = [...this.#nodes.values()].filter((node) => node.runId === runId);
-    if (run.active > 0 || nodes.some(({ state }) => !["completed", "failed", "cancelled"].includes(state))) throw new WorkflowError("INTERNAL_ERROR", `Cannot remove active scheduler run: ${runId}`);
+    if (run.active > 0 || nodes.some(({ state }) => !SETTLED_AGENT_STATES.has(state))) throw new WorkflowError("INTERNAL_ERROR", `Cannot remove active scheduler run: ${runId}`);
     for (const { id } of nodes) this.#nodes.delete(id);
     this.#runs.delete(runId);
     const index = this.#runOrder.indexOf(runId);
@@ -1476,7 +1473,7 @@ export class FairAgentScheduler {
   }
 
   #settle(node: ScheduledNode, result: ScheduledAgentResult): void {
-    if (["completed", "failed", "cancelled"].includes(node.state)) return;
+    if (SETTLED_AGENT_STATES.has(node.state)) return;
     const heldPermit = node.state === "running" || node.state === "retrying";
     node.state = result.ok ? "completed" : result.error.code === "CANCELLED" ? "cancelled" : "failed";
     Reflect.deleteProperty(node, "steer");
@@ -1490,13 +1487,13 @@ export class FairAgentScheduler {
   }
 
   #cancelTree(node: ScheduledNode): void {
-    if (["completed", "failed", "cancelled"].includes(node.state)) return;
+    if (SETTLED_AGENT_STATES.has(node.state)) return;
     node.controller.abort();
     for (const childId of node.children) { const child = this.#nodes.get(childId); if (child) this.#cancelTree(child); }
     if (node.state === "queued" || node.restored) this.#settle(node, { id: node.id, ok: false, error: { code: "CANCELLED", message: "Agent cancelled" } });
   }
 
-  #cancelledOrSettled(node: ScheduledNode): boolean { return node.controller.signal.aborted || ["completed", "failed", "cancelled"].includes(node.state); }
+  #cancelledOrSettled(node: ScheduledNode): boolean { return node.controller.signal.aborted || SETTLED_AGENT_STATES.has(node.state); }
 
   #node(id: string): ScheduledNode {
     const node = this.#nodes.get(id);

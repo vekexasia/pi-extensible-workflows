@@ -2,23 +2,23 @@ import { keyHint, truncateToVisualLines, type Theme } from "@earendil-works/pi-c
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { type AwaitingCheckpoint, type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
 import { budgetUsage } from "./budget.js";
-import { formatCost } from "./background-widget.js";
-import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, type AgentAttemptAction, type AgentAttemptActionContext, type AgentRecord, type LaunchSnapshot, type StandaloneAgentAttemptActionContext, type WorkflowCatalogFunction, type WorkflowCatalogIndex, type WorkflowPhaseShellActivity } from "./types.js";
+import { formatCost, formatTokens } from "./background-widget.js";
+import { BUDGET_DIMENSIONS, HARD_TERMINAL_RUN_STATES, SETTLED_AGENT_STATES, WORKFLOW_AGENT_STALL_THRESHOLD_MS, sumAccounting, type AgentAccounting, type AgentAttemptAction, type AgentAttemptActionContext, type AgentRecord, type LaunchSnapshot, type StandaloneAgentAttemptActionContext, type WorkflowCatalogFunction, type WorkflowCatalogIndex } from "./types.js";
 import { object, sanitizeDisplayText } from "./utils.js";
 import {
+  WORKFLOW_PHASE_STATES,
   buildWorkflowPhaseModel,
   buildWorkflowPhaseTree,
   phaseAgentCounts,
+  shellActivityFor,
   workflowPhaseTreeInitialExpanded,
   workflowPhaseTreePath,
   workflowPhaseTreeVisibleNodes,
   type WorkflowPhaseSelection,
-  type WorkflowPhaseState,
   type WorkflowPhaseTreeNode,
 } from "./host-phases.js";
 
 export { SETTLED_AGENT_STATES } from "./types.js";
-import { SETTLED_AGENT_STATES } from "./types.js";
 export interface WorkflowProgressStyles {
   accent(text: string): string;
   success(text: string): string;
@@ -83,21 +83,12 @@ function formatWorkflowRuntime(durationMs: number): string {
   const remainingMinutes = minutes % 60;
   return `${String(hours)}h${remainingMinutes ? ` ${String(remainingMinutes)}m` : ""}`;
 }
-function formatWorkflowTokens(tokens: number): string {
-  if (!tokens) return "";
-  if (tokens < 1000) return `${String(tokens)}t`;
-  const thousands = tokens / 1000;
-  return `${thousands < 10 ? thousands.toFixed(1) : String(Math.round(thousands))}kt`;
-}
 function formatShellActivity(activeShells: number | undefined, startedAt: number | undefined, spinner: string, styles: WorkflowProgressStyles, now: number): string | undefined {
   const count = activeShells ?? 0;
   if (count <= 0) return undefined;
   const started = startedAt !== undefined && Number.isFinite(startedAt) ? new Date(startedAt) : undefined;
   const timing = started && startedAt !== undefined && !Number.isNaN(started.getTime()) ? ` ${styles.dim(`started=${started.toISOString()} elapsed=${formatWorkflowRuntime(Math.max(0, now - startedAt))}`)}` : "";
   return `${styles.accent(spinner)} shell ${styles.accent("[running]")} ${styles.dim(`(${String(count)} active)`)}${timing}`;
-}
-function phaseShellActivity(run: Pick<PersistedRun, "activeShellsByPhase">, phaseIndex: number): WorkflowPhaseShellActivity | undefined {
-  return run.activeShellsByPhase?.find((activity) => activity.phaseIndex === phaseIndex && activity.active > 0);
 }
 function formatLogTimestamp(timestamp: number | undefined): string {
   if (timestamp === undefined || !Number.isFinite(timestamp)) return "--:--:--";
@@ -126,7 +117,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", style
   const iconStyle = workflowIconStyle(run.state, styles);
   const header = styles.bold(styles.accent(`Workflow: ${run.workflowName} (${String(done)}/${String(run.agents.length)} done)`));
   const state = progressStyleForState(run.state, styles)(`[${run.state}]`);
-  const usageStats = run.usage ? [formatWorkflowTokens(run.usage.tokens), formatCost(run.usage.costUsd)].filter(Boolean).join(" · ") : "";
+  const usageStats = run.usage ? [formatTokens(run.usage.tokens), formatCost(run.usage.costUsd)].filter(Boolean).join(" · ") : "";
   const runtime = run.usage ? ` runtime=${formatWorkflowRuntime(run.usage.durationMs)}` : "";
   const lines = [`${iconStyle(workflowIcon)} ${header} ${state}${usageStats ? ` ${usageStats}` : ""}${runtime}`];
   const budgetWarning = run.state === "budget_exhausted" || (run.budgetEvents ?? []).some((event) => event.type === "hard_exhausted");
@@ -146,7 +137,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", style
   }, run.agents, (label) => styles.muted(label)).map((line) => nested ? `  ${line}` : line);
   const phases = run.phaseHistory?.length ? run.phaseHistory : run.phase ? [{ phase: run.phase, afterAgent: 0 }] : [];
   if (scopedShells) {
-    const preflight = phaseShellActivity(run, -1);
+    const preflight = shellActivityFor(run, -1);
     if (preflight) {
       lines.push(`  ${styles.muted("[Preflight]")}`);
       const rendered = formatShellActivity(preflight.active, preflight.startedAt, spinner, styles, now);
@@ -159,7 +150,7 @@ export function formatWorkflowProgress(run: PersistedRun, spinner = "◇", style
     const boundary = Math.max(renderedAgents, Math.min(run.agents.length, phase.afterAgent));
     lines.push(...renderAgents(run.agents.slice(renderedAgents, boundary), renderedAgents, nested));
     lines.push(`  ${styles.muted(`[Phase: ${phase.phase}]`)}`);
-    const phaseShell = scopedShells ? phaseShellActivity(run, phaseIndex) : undefined;
+    const phaseShell = scopedShells ? shellActivityFor(run, phaseIndex) : undefined;
     if (phaseShell) {
       const rendered = formatShellActivity(phaseShell.active, phaseShell.startedAt, spinner, styles, now);
       if (rendered) lines.push(`    ${rendered}`);
@@ -202,7 +193,6 @@ export function workflowCatalogBlock(text: string, expanded: boolean) {
   };
 }
 
-type WorkflowControlResult = { details?: unknown; content?: readonly { type: string; text?: string }[] };
 function controlString(value: unknown): string | undefined { return typeof value === "string" && value.trim() ? value : undefined; }
 function controlValue(value: unknown): string {
   if (value === null) return "removed";
@@ -236,7 +226,6 @@ function budgetPatchDetails(value: unknown, theme: Theme): string[] {
   const entries = budgetPatchEntries(value);
   return entries.length ? [theme.fg("accent", theme.bold("Budget patch")), ...entries.map((entry) => `  ${theme.fg("toolOutput", entry)}`)] : [];
 }
-function workflowControlValue(result: WorkflowControlResult): unknown { return catalogResultValue(result); }
 export function workflowControlCall(name: string, args: Record<string, unknown>, theme: Theme): string {
   const runId = controlString(args.runId) ?? "(missing run ID)";
   if (name === "workflow_respond") {
@@ -250,12 +239,12 @@ export function workflowControlCall(name: string, args: Record<string, unknown>,
   if (name === "workflow_retry") return `${controlTitle(name, theme)} ${theme.fg("accent", runId)} ${theme.fg("muted", "failed run")}`;
   return `${controlTitle(name, theme)} ${theme.fg("accent", runId)}`;
 }
-export function workflowControlResult(name: string, args: Record<string, unknown>, result: WorkflowControlResult, expanded: boolean, theme: Theme, isError: boolean): string {
+export function workflowControlResult(name: string, args: Record<string, unknown>, result: CatalogToolResult, expanded: boolean, theme: Theme, isError: boolean): string {
   if (isError) {
     const text = result.content?.filter(({ type }) => type === "text").map(({ text }) => text ?? "").join("\n").trim();
     return theme.fg("error", text || `The ${name} tool failed.`);
   }
-  const value = workflowControlValue(result);
+  const value = catalogResultValue(result);
   if (!object(value)) return theme.fg("error", `The ${name} tool returned an invalid result.`);
   const runId = controlString(args.runId) ?? controlString(value.runId) ?? "(unknown)";
   const title = controlTitle(name, theme);
@@ -395,7 +384,6 @@ export function themeWorkflowProgressStyles(theme: Theme): WorkflowProgressStyle
 }
 export type WorkflowProgressRefreshState = { runId: string; inputRun: PersistedRun; run: PersistedRun; lastRefreshAt: number; runtimeStartedAt: number; runtimeBaseMs: number; refresh?: Promise<void> };
 export type WorkflowProgressRenderState = { workflowSpinner?: ReturnType<typeof setInterval>; workflowProgress?: WorkflowProgressRefreshState; workflowProgressComponent?: ReturnType<typeof workflowProgressBlock>; workflowProgressFrozenAt?: number };
-function isTerminalWorkflowState(state: PersistedRun["state"]): boolean { return state === "completed" || state === "failed" || state === "stopped"; }
 export function workflowProgressBlock(run: PersistedRun, theme: Theme, progress?: WorkflowProgressRefreshState, refresh?: () => Promise<PersistedRun | undefined>, invalidate?: () => void, prefix?: string, freezeAt?: number) {
   const styles = themeWorkflowProgressStyles(theme);
   let expanded = false;
@@ -410,10 +398,10 @@ export function workflowProgressBlock(run: PersistedRun, theme: Theme, progress?
   return {
     render(width: number) {
       const displayed = currentRun();
-      const terminal = isTerminalWorkflowState(displayed.state);
+      const terminal = HARD_TERMINAL_RUN_STATES.has(displayed.state);
       let now = Date.now();
       if (freezeAt !== undefined || terminal) {
-        if (previousState !== displayed.state && !isTerminalWorkflowState(previousState)) frozenAt = now;
+        if (previousState !== displayed.state && !HARD_TERMINAL_RUN_STATES.has(previousState)) frozenAt = now;
         now = frozenAt;
       } else {
         frozenAt = now;
@@ -448,7 +436,7 @@ export function formatBudgetStatus(run: Pick<PersistedRun, "budget" | "budgetVer
   const usage = budgetUsage(run.usage);
   if (!run.budget || !Object.keys(run.budget).length) return ["Budget: unlimited"];
   const lines = [`Budget version ${String(run.budgetVersion ?? 1)}`];
-  for (const dimension of ["tokens", "costUsd", "durationMs", "agentLaunches"] as const) {
+  for (const dimension of BUDGET_DIMENSIONS) {
     const limits = run.budget[dimension];
     if (!limits || (limits.soft === undefined && limits.hard === undefined)) continue;
     const limit = limits.hard ?? limits.soft;
@@ -531,10 +519,15 @@ export function formatStalledDuration(durationMs: number): string {
   const remainingMinutes = minutes % 60;
   return `${String(hours)}h${remainingMinutes ? ` ${String(remainingMinutes)}m` : ""}`;
 }
-function stalledDuration(agent: AgentRecord, now: number): number | undefined {
+function stalledDuration(agent: Pick<AgentDetailPresentation, "state" | "lastEventAt">, now: number): number | undefined {
   if (agent.state !== "running" || agent.lastEventAt === undefined || !Number.isFinite(agent.lastEventAt)) return undefined;
   const duration = now - agent.lastEventAt;
   return duration >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? duration : undefined;
+}
+/** A recorded duration wins; otherwise the elapsed time since start up to `end`, when both are finite. */
+function elapsedDurationMs(agent: Pick<AgentDetailPresentation, "durationMs" | "startedAt">, end: number): number | undefined {
+  if (agent.durationMs !== undefined && Number.isFinite(agent.durationMs)) return Math.max(0, agent.durationMs);
+  return agent.startedAt === undefined || !Number.isFinite(agent.startedAt) ? undefined : Math.max(0, end - agent.startedAt);
 }
 function agentActivityLabel(agent: { readonly activity?: AgentRecord["activity"]; readonly toolCalls?: AgentRecord["toolCalls"] }): string {
   const activity = agent.activity;
@@ -555,15 +548,11 @@ function formatAgentActivity(agent: AgentRecord, spinner: string, styles: Workfl
   return activity ? `${activity} ${styles.warning(`- ${warning}`)}` : styles.warning(warning);
 }
 function formatWorkflowAgentDetail(agent: AgentRecord, now: number): string {
-  const durationMs = agent.durationMs !== undefined && Number.isFinite(agent.durationMs)
-    ? Math.max(0, agent.durationMs)
-    : agent.startedAt === undefined || !Number.isFinite(agent.startedAt)
-      ? undefined
-      : Math.max(0, now - agent.startedAt);
+  const durationMs = elapsedDurationMs(agent, now);
   const accounting = agent.accounting;
   return [
     `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
-    accounting ? formatWorkflowTokens(accounting.input + accounting.output) : "",
+    accounting ? formatTokens(accounting.input + accounting.output) : "",
     accounting ? formatCost(accounting.cost) : "",
     durationMs === undefined ? "" : formatWorkflowRuntime(durationMs),
     agent.attempts > 1 ? `attempt ${String(agent.attempts)}` : "",
@@ -574,7 +563,7 @@ function formatAccountingValue(value: number): string {
   return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(value).toLowerCase();
 }
 
-function formatAccounting(accounting: NonNullable<AgentRecord["accounting"]>): string {
+function formatAccounting(accounting: AgentAccounting): string {
   const total = accounting.input + accounting.output + accounting.cacheRead + accounting.cacheWrite;
   return `${formatAccountingValue(total)} tok`;
 }
@@ -590,7 +579,7 @@ export interface AgentDetailPresentation {
   readonly startedAt?: number;
   readonly finishedAt?: number;
   readonly durationMs?: number;
-  readonly accounting?: NonNullable<AgentRecord["accounting"]>;
+  readonly accounting?: AgentAccounting;
   readonly error?: { readonly code: string; readonly message: string };
 }
 function formatAgentError(error: NonNullable<AgentDetailPresentation["error"]>, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES): string {
@@ -598,14 +587,8 @@ function formatAgentError(error: NonNullable<AgentDetailPresentation["error"]>, 
 }
 
 export function formatAgentDetail(agent: Readonly<AgentDetailPresentation>, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now(), options: Readonly<{ includeError?: boolean }> = {}): string[] {
-  const duration = agent.durationMs !== undefined && Number.isFinite(agent.durationMs)
-    ? Math.max(0, agent.durationMs)
-    : agent.startedAt === undefined || !Number.isFinite(agent.startedAt)
-      ? undefined
-      : Math.max(0, (agent.finishedAt ?? now) - agent.startedAt);
-  const stalled = agent.state === "running" && agent.lastEventAt !== undefined && Number.isFinite(agent.lastEventAt) && now - agent.lastEventAt >= WORKFLOW_AGENT_STALL_THRESHOLD_MS
-    ? Math.max(0, now - agent.lastEventAt)
-    : undefined;
+  const duration = elapsedDurationMs(agent, agent.finishedAt ?? now);
+  const stalled = stalledDuration(agent, now);
   const state = phaseStyleForState(agent.state, styles);
   const model = agent.model === undefined ? undefined : `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
   const tools = agent.tools?.join(", ") || "(none)";
@@ -661,7 +644,7 @@ export function visibleStandaloneAgentAttemptActions(actions: Readonly<Record<st
 }
 
 
-function formatAgentAccounting(accounting: NonNullable<AgentRecord["accounting"]>): string[] {
+function formatAgentAccounting(accounting: AgentAccounting): string[] {
   const total = accounting.input + accounting.output + accounting.cacheRead + accounting.cacheWrite;
   return [`Tokens: ∑${formatAccountingValue(total)} ↑${formatAccountingValue(accounting.input)} ↓${formatAccountingValue(accounting.output)} ⇢${formatAccountingValue(accounting.cacheRead)} ⇠${formatAccountingValue(accounting.cacheWrite)}`, `Cost: ${formatCost(accounting.cost) || "$0.00"}`];
 }
@@ -669,7 +652,7 @@ function formatAgentAccounting(accounting: NonNullable<AgentRecord["accounting"]
 export function formatNavigatorDashboard(run: PersistedRun, checkpoints: readonly AwaitingCheckpoint[], worktrees: readonly WorktreeReference[], now = Date.now()): string {
   void worktrees;
   const done = run.agents.filter((a) => SETTLED_AGENT_STATES.has(a.state)).length;
-  const totalAccounting = run.agents.reduce((sum, a) => ({ input: sum.input + (a.accounting?.input ?? 0), output: sum.output + (a.accounting?.output ?? 0), cacheRead: sum.cacheRead + (a.accounting?.cacheRead ?? 0), cacheWrite: sum.cacheWrite + (a.accounting?.cacheWrite ?? 0), cost: sum.cost + (a.accounting?.cost ?? 0) }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+  const totalAccounting = sumAccounting(run.agents.flatMap((a) => a.accounting ? [a.accounting] : []));
   const hasAccounting = run.agents.some((a) => a.accounting);
   const glyph = runStateGlyph(run.state, "⠦");
   const header = `${glyph} ${run.workflowName}`;
@@ -806,8 +789,7 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
     const errorLine = attemptError === undefined ? undefined : formatAgentError(attemptError, styles);
     return [...detail, ...(selection.actions ? [] : [styles.muted("enter agent actions")]), ...(errorLine === undefined ? [] : [errorLine])];
   };
-  const stateNames: readonly WorkflowPhaseState[] = ["not started", "running", "completed", "failed", "cancelled", "interrupted", "budget_exhausted"];
-  const statusSummary = stateNames.filter((state) => (model.counts[state] ?? 0) > 0).map((state) => `${String(model.counts[state])} ${state}`).join(" · ") || "0 phases";
+  const statusSummary = WORKFLOW_PHASE_STATES.filter((state) => (model.counts[state] ?? 0) > 0).map((state) => `${String(model.counts[state])} ${state}`).join(" · ") || "0 phases";
   const lines: string[] = [styles.bold(styles.accent(`Workflow: ${run.workflowName}`))];
   if (run.error) lines.push(styles.error(`ERROR ${run.error.code}: ${run.error.message}`));
   const runtime = run.usage ? ` runtime=${formatWorkflowRuntime(run.usage.durationMs)}` : "";
