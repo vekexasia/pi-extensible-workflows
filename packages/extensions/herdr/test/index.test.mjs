@@ -79,6 +79,7 @@ void test("registers session and live actions when enabled", () => {
   const fullyInspectable = createHerdrExtension({ agentDir: join(root, "agent"), env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", HERDR_PANE_ID: "pane" } });
   assert.equal(fullyInspectable.agentAttemptActions.openLiveSession.visible(context), false);
   assert.equal(fullyInspectable.agentAttemptActions.openSession.visible({ ...context, liveSession: undefined }), true);
+  assert.equal(fullyInspectable.agentAttemptActions.openLiveSession.visible({ ...context, prepared: { settings: { herdr: { enableFullyInspectableMode: false } } } }), true);
 });
 void test("runs Herdr session action from a standalone attempt context", async () => {
   const calls = [];
@@ -308,11 +309,14 @@ void test("opens a terminal live session without inventing a continuation", asyn
   const ownership = [];
   let processReports = 0;
   let runCommand;
+  let externalSettings;
   const runner = async (args) => {
     calls.push([...args]);
     if (args[0] === "pane" && args[1] === "run") {
       const script = /sh '([^']+)'$/.exec(args[3]);
       runCommand = script ? readFileSync(script[1], "utf8") : args[3];
+      const settingsPath = /PI_EXTENSIBLE_WORKFLOWS_SETTINGS_FILE='([^']+)'/.exec(runCommand)?.[1];
+      externalSettings = settingsPath ? JSON.parse(readFileSync(settingsPath, "utf8")) : undefined;
     }
     if (args[1] === "layout") return JSON.stringify({ result: { layout: { panes: [{ pane_id: "pane", rect: { width: 80, height: 20 } }] } } });
     if (args[1] === "split") return JSON.stringify({ result: { pane: { pane_id: "new-pane" } } });
@@ -326,7 +330,7 @@ void test("opens a terminal live session without inventing a continuation", asyn
   const handoff = createLiveSessionHandoff();
   handoff.observe({ type: "turn_started" });
   const session = { reference: { transport: "local", sessionId: "session", locator: { sessionFile: "/tmp/session.jsonl" } }, getLastAssistant: () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "completed report" }] }), suspendForHandoff: async () => ownership.push("suspend"), resumeFromHandoff: async () => ownership.push("resume") };
-  const opening = extension.agentAttemptActions.openLiveSession.run({ liveSession: session, prepared: { cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: [], piRuntime }, handoff, attempt: { attempt: 1 }, agent: {}, run: {}, signal: new AbortController().signal, ui: {} });
+  const opening = extension.agentAttemptActions.openLiveSession.run({ liveSession: session, prepared: { cwd: "/repo", model: { provider: "openai", model: "gpt" }, tools: [], settings: { acme: { enabled: true } }, piRuntime }, handoff, attempt: { attempt: 1 }, agent: {}, run: {}, signal: new AbortController().signal, ui: {} });
   handoff.observe({ type: "turn_end" });
   await opening;
   const runCall = calls.find(([command, subcommand]) => command === "pane" && subcommand === "run");
@@ -334,6 +338,7 @@ void test("opens a terminal live session without inventing a continuation", asyn
   assert.ok(runCommand);
   assert.match(runCommand, /--session '\/tmp\/session\.jsonl'/);
   assert.doesNotMatch(runCommand, /--session-id/);
+  assert.deepEqual(externalSettings, { acme: { enabled: true } });
   assert.deepEqual(ownership, ["suspend", "resume"]);
 });
 void test("reports terminal turns as idle", async () => {

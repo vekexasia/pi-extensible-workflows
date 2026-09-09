@@ -72,7 +72,7 @@ void test("records real parallel tool execution timing in the workflow session J
   } satisfies ToolDefinition;
   const controller = new AbortController();
   const prepared = { cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], customTools: [tool], sessionLabel: "tool-timing" } satisfies PreparedAgentSession;
-  const context = { run: { cwd, sessionId: "run-session", runId: "run", workflow: { name: "timing" }, args: null, signal: controller.signal }, identity: { structuralPath: [], callSite: "test", occurrence: 1 }, attempt: 1, signal: controller.signal } satisfies AgentTransportContext;
+  const context = { run: { cwd, sessionId: "run-session", runId: "run", workflow: { name: "timing" }, args: null, signal: controller.signal }, identity: { structuralPath: [], callSite: "test", occurrence: 1 }, attempt: 1, signal: controller.signal, settings: {} } satisfies AgentTransportContext;
   let session: Awaited<ReturnType<typeof localAgentTransport.createSession>> | undefined;
   try {
     session = await localAgentTransport.createSession(prepared, context);

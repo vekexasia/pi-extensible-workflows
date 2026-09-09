@@ -36,6 +36,17 @@ void test("public agent execution result types remain exported", () => {
 });
 
 const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, availableModels: new Set(["openai/gpt", "anthropic/opus", "google/gemini"]), tools: new Set(["read", "grep", "find", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", model: "anthropic/opus", thinking: "high", tools: ["!*", "read"] }, scout: { prompt: "Inspect broadly", model: "google/gemini", thinking: "low", tools: ["!*", "read", "grep"] } } };
+void test("passes effective extension settings to setup hooks and transports", async () => {
+  let setupSettings: unknown;
+  let transportSettings: unknown;
+  const base = testTransport(async () => ({ sessionId: "settings", messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} }));
+  const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession(prepared, context) { transportSettings = context.settings; return base.createSession(prepared, context); } };
+  const executor = new WorkflowAgentExecutor({ ...root, extensionSettings: { acme: { global: true } }, agentDefinitions: { reviewer: { extensionSettings: { acme: { role: true } } } }, agentSetupHooks: [{ name: "capture", priority: 10, setup(agent, context) { setupSettings = context.settings; agent.transport = transport; } }] }, localAgentTransport);
+  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", role: "reviewer" })).value, "done");
+  assert.deepEqual(setupSettings, { acme: { global: true, role: true } });
+  assert.deepEqual(transportSettings, setupSettings);
+  assert.equal(Object.isFrozen(setupSettings), true);
+});
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: { total: 0.25 } };
 function assistant(text: string) { return { role: "assistant", content: [{ type: "text", text }], usage }; }
 function terminalAssistant(errorMessage: string) { return { ...assistant(""), stopReason: "error", errorMessage }; }

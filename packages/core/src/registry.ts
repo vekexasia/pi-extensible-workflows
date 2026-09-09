@@ -2,9 +2,9 @@ import { readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
-import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
+import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
 import type { SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
-import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, MODEL_ALIAS_NAME, object } from "./utils.js";
+import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, MODEL_ALIAS_NAME, object, validWorkflowExtensionNamespace } from "./utils.js";
 import { loadSettings, resolveWorkflowSettings, validateSchema } from "./validation.js";
 
 const RESERVED_GLOBALS = new Set(["agent", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
@@ -53,6 +53,7 @@ export class WorkflowRegistry {
   readonly #agentAttemptActions = new Map<string, AgentAttemptAction>();
   readonly #roleDirectories = new Map<string, WorkflowRoleDirectoryRegistration>();
   readonly #modelAliases = new Map<string, { name: string; version: string; headline: string; resolve: WorkflowModelAlias["resolve"] }>();
+  readonly #settingsValidators = new Set<{ headline: string; validate: NonNullable<WorkflowExtension["validateSettings"]> }>();
   #frozen = false;
   #subagentStatusObserver: SubagentStatusObserver | undefined;
 
@@ -64,7 +65,7 @@ export class WorkflowRegistry {
   register(extension: WorkflowExtension): void {
     if (this.#frozen) fail("REGISTRY_FROZEN", "Workflow extension registration is closed after session_start");
     if (object(extension) && Object.prototype.hasOwnProperty.call(extension, "workflows")) fail("INVALID_METADATA", "Separate registered workflow definitions were removed; register a function with input and output schemas instead");
-    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "source", "dependencies", "functions", "modelAliases", "agentSetupHooks", "agentAttemptActions", "roleDirectories"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version and non-empty headline");
+    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "source", "dependencies", "validateSettings", "functions", "modelAliases", "agentSetupHooks", "agentAttemptActions", "roleDirectories"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version and non-empty headline");
     const functions = extension.functions ?? {};
     const modelAliases = extension.modelAliases ?? {};
     const agentSetupHooks = extension.agentSetupHooks ?? {};
@@ -72,12 +73,14 @@ export class WorkflowRegistry {
     const source = extension.source;
     const dependencyValues = extension.dependencies;
     const dependencies: readonly string[] = dependencyValues ?? [];
+    const validateSettings = extension.validateSettings;
+    if (validateSettings !== undefined && typeof validateSettings !== "function") fail("INVALID_METADATA", "Workflow extension validateSettings must be a function");
     if (source !== undefined && (typeof source !== "string" || !source.trim())) fail("INVALID_METADATA", "Workflow extension source must be a non-empty module URL");
     if (dependencyValues !== undefined && (!Array.isArray(dependencyValues) || dependencyValues.some((dependency) => typeof dependency !== "string" || dependency.trim() !== dependency || !PACKAGE_NAME.test(dependency)) || new Set(dependencyValues).size !== dependencyValues.length)) fail("INVALID_METADATA", "Workflow extension dependencies must be unique, non-empty package names");
     const roleDirectoryValues = extension.roleDirectories === undefined ? [] : extension.roleDirectories;
     if (!Array.isArray(roleDirectoryValues)) fail("INVALID_METADATA", "Workflow extension roleDirectories must be an array");
     const roleDirectories = [...new Set(Array.from(roleDirectoryValues, (value) => normalizeRoleDirectory(value)))];
-    if (!object(functions) || !object(modelAliases) || !object(agentSetupHooks) || !object(agentAttemptActions) || (Object.keys(functions).length === 0 && Object.keys(modelAliases).length === 0 && Object.keys(agentSetupHooks).length === 0 && Object.keys(agentAttemptActions).length === 0 && roleDirectories.length === 0)) fail("INVALID_METADATA", "Workflow extensions require functions, model aliases, agent setup hooks, agent attempt actions, or role directories");
+    if (!object(functions) || !object(modelAliases) || !object(agentSetupHooks) || !object(agentAttemptActions) || (Object.keys(functions).length === 0 && Object.keys(modelAliases).length === 0 && Object.keys(agentSetupHooks).length === 0 && Object.keys(agentAttemptActions).length === 0 && roleDirectories.length === 0 && validateSettings === undefined)) fail("INVALID_METADATA", "Workflow extensions require functions, model aliases, agent setup hooks, agent attempt actions, role directories, or a settings validator");
     const names = Object.keys(functions);
     if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", "Global name collision inside extension");
     for (const name of names) {
@@ -113,6 +116,7 @@ export class WorkflowRegistry {
     for (const [name, alias] of Object.entries(modelAliases)) this.#modelAliases.set(name, { name, version: extension.version, headline: extension.headline, resolve: alias.resolve });
     for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });
     for (const [name, action] of Object.entries(agentAttemptActions)) this.#agentAttemptActions.set(name, action);
+    if (validateSettings !== undefined) this.#settingsValidators.add({ headline: extension.headline, validate: validateSettings });
   }
 
   function(name: string): WorkflowFunction {
@@ -140,7 +144,7 @@ export class WorkflowRegistry {
     try {
       const resolved = context ? resolveWorkflowSettings(context.cwd, context.projectTrusted, context.globalSettingsPath) : undefined;
       aliases = resolved?.effective.modelAliases ?? loadSettings().modelAliases;
-      if (resolved) { source = resolved.projectTrusted && [resolved.sources.modelAliases, resolved.sources.skills, resolved.sources.extensions, resolved.sources.tools, resolved.sources.extensionSettings].some((path) => path === resolved.projectSettingsPath) ? "trusted project settings" : "global settings"; settings = { concurrency: resolved.effective.concurrency, backgroundWidget: resolved.effective.backgroundWidget ?? true, modelAliases: resolved.effective.modelAliases ?? {}, skills: resolved.effective.skills ?? [], extensions: Array.isArray(resolved.effective.extensions) ? resolved.effective.extensions : [], ...(resolved.effective.extensionSettings === undefined ? {} : { extensionSettings: resolved.effective.extensionSettings }), tools: resolved.effective.tools ?? [], globalSettingsPath: resolved.globalSettingsPath, projectSettingsPath: resolved.projectSettingsPath, projectTrusted: resolved.projectTrusted, sources: resolved.sources }; }
+      if (resolved) { source = resolved.projectTrusted && [resolved.sources.modelAliases, resolved.sources.skills, resolved.sources.extensions, resolved.sources.tools].some((path) => path === resolved.projectSettingsPath) ? "trusted project settings" : "global settings"; settings = { concurrency: resolved.effective.concurrency, backgroundWidget: resolved.effective.backgroundWidget ?? true, modelAliases: resolved.effective.modelAliases ?? {}, skills: resolved.effective.skills ?? [], extensions: Array.isArray(resolved.effective.extensions) ? resolved.effective.extensions : [], tools: resolved.effective.tools ?? [], ...(resolved.effective.extensionSettings === undefined ? {} : { extensionSettings: resolved.effective.extensionSettings }), globalSettingsPath: resolved.globalSettingsPath, projectSettingsPath: resolved.projectSettingsPath, projectTrusted: resolved.projectTrusted, sources: resolved.sources }; }
     } catch { aliases = undefined; }
     const staticEntries: WorkflowCatalogModelAlias[] = Object.keys(aliases ?? {}).map((name) => ({ name, kind: "static", provenance: source }));
     const dynamicEntries: WorkflowCatalogModelAlias[] = [...this.#modelAliases.values()].map(({ name, version, headline }) => ({ name, kind: "dynamic", provenance: `extension: ${headline}`, version, headline }));
@@ -182,7 +186,20 @@ export class WorkflowRegistry {
   globals(): Readonly<Record<string, { name: string }>> {
     return Object.freeze(Object.fromEntries([...this.#extensions].flatMap((extension) => Object.keys(extension.functions ?? {}).map((name) => [name, { name }]))));
   }
-
+  validateExtensionSettings(settings: Readonly<WorkflowExtensionSettings> | undefined, context: WorkflowExtensionSettingsValidatorContext): void {
+    const effectiveSettings = settings ?? Object.freeze({});
+    if (!jsonValue(effectiveSettings) || !object(effectiveSettings)) fail("INVALID_SETTINGS", "Workflow extension settings must be a JSON object");
+    const unsafeNamespace = Object.keys(effectiveSettings).find((namespace) => !validWorkflowExtensionNamespace(namespace));
+    if (unsafeNamespace !== undefined) fail("INVALID_SETTINGS", `Workflow extension settings contains an invalid namespace: ${unsafeNamespace}`);
+    const frozenSettings = deepFreeze(structuredClone(effectiveSettings));
+    for (const { headline, validate } of this.#settingsValidators) {
+      try { validate(frozenSettings, Object.freeze({ ...context })); }
+      catch (error) {
+        const location = context.source === "role" && context.role ? `role ${context.role}` : context.source;
+        fail("INVALID_SETTINGS", `Invalid extension settings (${headline}; ${location}): ${errorText(error)}`);
+      }
+    }
+  }
   async invokeFunction(name: string, input: unknown, context: Readonly<WorkflowFunctionContext>, path: string, journal: WorkflowJournal): Promise<JsonValue> {
     const fn = this.function(name);
     if (!object(input) || !jsonValue(input) || !Value.Check(fn.input, input)) fail("RESULT_INVALID", `Invalid input for ${name}`);
@@ -191,7 +208,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, invoke: context.invoke, agent: context.agent, shell: context.shell, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, settings: deepFreeze(structuredClone(context.settings)), invoke: context.invoke, agent: context.agent, shell: context.shell, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);
@@ -228,7 +245,7 @@ export class WorkflowRegistry {
     return Object.freeze(resolved);
   }
 }
-export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "modelAliases" | "resolveModelAliases" | "agentSetupHooks" | "agentAttemptActions" | "roleDirectories" | "roleDirectoryRegistrations" | "setSubagentStatusObserver" | "observeSubagentStatus">;
+export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "validateExtensionSettings" | "modelAliases" | "resolveModelAliases" | "agentSetupHooks" | "agentAttemptActions" | "roleDirectories" | "roleDirectoryRegistrations" | "setSubagentStatusObserver" | "observeSubagentStatus">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi; activeHosts: number }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -247,6 +264,7 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     catalogDetail: (name, context) => registry.catalogDetail(name, context),
     globals: () => registry.globals(),
     invokeFunction: (...args) => registry.invokeFunction(...args),
+    validateExtensionSettings: (...args) => { registry.validateExtensionSettings(...args); },
     modelAliases: () => registry.modelAliases(),
     resolveModelAliases: (...args) => registry.resolveModelAliases(...args),
     roleDirectories: () => registry.roleDirectories(),

@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatNavigatorDashboard, formatNavigatorRun, loadAgentDefinitions, loadSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, resourcePatternMatches, resolveAgentResourcePolicy, resolveModelReference, resolveWorkflowSettings, RunStore, runWorkflow, saveModelAliases, selectResourcesByLayers, structuralPath, validateModelAliases, WorkflowAgentExecutor, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WorkflowError, WorkflowRegistry } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatNavigatorDashboard, formatNavigatorRun, loadAgentDefinitions, loadSettings, mergeWorkflowExtensionSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, resourcePatternMatches, resolveAgentResourcePolicy, resolveModelReference, resolveWorkflowSettings, RunStore, runWorkflow, saveModelAliases, selectResourcesByLayers, structuralPath, validateModelAliases, WorkflowAgentExecutor, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WorkflowError, WorkflowRegistry } from "../src/index.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
@@ -232,6 +232,32 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   writeFileSync(path, JSON.stringify({ surprise: true }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
 });
+void test("preserves extension-defined settings through project and role inheritance", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-settings-"));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(settingsPath, JSON.stringify({ extensionSettings: { acme: { global: true, nested: { global: true } } } }));
+  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { acme: { project: true, nested: { project: true } } } }));
+  const resolution = resolveWorkflowSettings(cwd, true, settingsPath);
+  assert.deepEqual(resolution.effective.extensionSettings, { acme: { global: true, project: true, nested: { global: true, project: true } } });
+  const role = parseRoleMarkdown("---\nextensionSettings:\n  acme:\n    role: true\n    nested:\n      role: true\n---\nRole", true, join(cwd, "role.md"));
+  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { acme: { global: true, project: true, role: true, nested: { global: true, project: true, role: true } } });
+  const registry = new WorkflowRegistry();
+  const seen: Array<{ value: unknown; source: string; role?: string }> = [];
+  registry.register({ version: "1.0.0", headline: "Acme settings", validateSettings: (value, context) => { seen.push({ value, source: context.source, ...(context.role === undefined ? {} : { role: context.role }) }); } });
+  registry.validateExtensionSettings(resolution.global.extensionSettings, { source: "global", cwd, projectTrusted: true, settingsPath });
+  registry.validateExtensionSettings(resolution.project.extensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: join(cwd, ".pi", "pi-extensible-workflows", "settings.json") });
+  registry.validateExtensionSettings(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { source: "role", role: "reviewer", cwd, projectTrusted: true, settingsPath });
+  assert.deepEqual(seen, [
+    { value: { acme: { global: true, nested: { global: true } } }, source: "global" },
+    { value: { acme: { project: true, nested: { project: true } } }, source: "project" },
+    { value: { acme: { global: true, project: true, role: true, nested: { global: true, project: true, role: true } } }, source: "role", role: "reviewer" },
+  ]);
+  assert.doesNotThrow(() => { registry.register({ version: "1.0.0", headline: "Collision", validateSettings: () => {}, functions: { other: { description: "Other", input: { type: "object" }, output: { type: "null" }, run: () => null } } }); });
+});
 
 void test("workflow extension wires the background widget from global settings", () => {
   const install = (settings: string | undefined) => {
@@ -437,16 +463,16 @@ void test("resume reloads aliases for pending and retried calls while replaying 
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   const oldAliases = { reviewer: "old/model" };
   const newAliases = { reviewer: "new/model" };
-  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: oldAliases, skills: ["old-skill"], extensions: [join(agentDir, "old.ts")] }));
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 2, modelAliases: oldAliases, skills: ["old-skill"], extensions: [join(agentDir, "old.ts")], extensionSettings: { acme: { value: "old" } } }));
   const script = `const replayed = await agent("replayed", { model: "reviewer" }); const pending = await agent("pending", { model: "reviewer", label: "pending", retries: 1 }); const fresh = await agent("fresh", { model: "reviewer" }); return { replayed, pending, fresh };`;
   const replayPaths: string[] = [];
   await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPaths.push(structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`)); return "original"; } }).result;
   const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "alias-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "alias-resume" }, settings: { concurrency: 2, modelAliases: oldAliases }, modelAliases: oldAliases, models: ["root/model", "old/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "alias-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "alias-resume" }, settings: { concurrency: 2, modelAliases: oldAliases, extensionSettings: { acme: { value: "old" } } }, modelAliases: oldAliases, models: ["root/model", "old/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
   await store.complete(replayPaths[0] as string, "replayed");
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  writeFileSync(settingsPath, JSON.stringify({ concurrency: 6, modelAliases: newAliases, skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }));
+  writeFileSync(settingsPath, JSON.stringify({ concurrency: 6, modelAliases: newAliases, skills: ["new-skill"], extensions: [join(agentDir, "new.ts")], extensionSettings: { acme: { value: "new" } } }));
   const inputs: SessionInput[] = [];
   let failedPending = false;
   const createSession = async (input: SessionInput): Promise<TestPiSession> => {
@@ -489,6 +515,8 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     assert.equal(loaded.snapshot.settingsSources, undefined);
     assert.equal(inputs.length, 3);
     assert.deepEqual(inputs.map(({ model }) => ({ provider: model.provider, model: model.model })), [{ provider: "new", model: "model" }, { provider: "new", model: "model" }, { provider: "new", model: "model" }]);
+    assert.deepEqual(inputs.map(({ settings }) => settings), [{ acme: { value: "old" } }, { acme: { value: "old" } }, { acme: { value: "old" } }]);
+    assert.deepEqual(loaded.snapshot.settings.extensionSettings, { acme: { value: "old" } });
     assert.deepEqual(inputs.map(({ resourcePolicy }) => resourcePolicy?.effective), [{ skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }]);
     assert.deepEqual(loaded.snapshot.modelAliases, newAliases);
     assert.deepEqual(loaded.run.events, [{ type: "warning", message: "Model alias mappings changed on resume: reviewer: old/model -> new/model" }]);
@@ -590,7 +618,7 @@ void test("workflow_catalog reports effective project settings without registere
   const projectPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(globalPath, JSON.stringify({ concurrency: 6 }));
+  writeFileSync(globalPath, JSON.stringify({ concurrency: 6, extensionSettings: { acme: { enabled: true } } }));
   writeFileSync(projectPath, JSON.stringify({ concurrency: 2 }));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -603,9 +631,10 @@ void test("workflow_catalog reports effective project settings without registere
     await start({}, { cwd, isProjectTrusted: () => true, sessionManager: { getSessionId: () => "catalog" } });
     const catalogTool = tools.find(({ name }) => name === "workflow_catalog");
     assert.ok(catalogTool?.execute);
-    const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { settings: { concurrency: number; sources: { concurrency: string } } };
+    const catalog = JSON.parse((await catalogTool.execute()).content[0]?.text ?? "null") as { settings: { concurrency: number; extensionSettings: { acme: { enabled: boolean } }; sources: { concurrency: string } } };
     assert.equal(catalog.settings.concurrency, 2);
     assert.equal(catalog.settings.sources.concurrency, projectPath);
+    assert.deepEqual(catalog.settings.extensionSettings, { acme: { enabled: true } });
   } finally {
     await shutdown?.();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

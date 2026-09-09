@@ -1,6 +1,6 @@
-import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
-import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger } from "./utils.js";
+import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
 
 export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
 export type PersistedRun = RunRecord;
@@ -85,12 +85,13 @@ function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
   const extensions = value.extensions === undefined ? undefined : decodeStringArray(value.extensions);
   const overrideSystemPrompt = optionalBoolean(value.overrideSystemPrompt);
   const contextFiles = value.contextFiles === undefined ? undefined : decodeContextFileScopes(value.contextFiles);
+  const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
   if (prompt === INVALID_PERSISTED_VALUE || description === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || overrideSystemPrompt === INVALID_PERSISTED_VALUE) return undefined;
-  if (thinking !== undefined && !isThinkingLevel(thinking) || value.tools !== undefined && !tools || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.contextFiles !== undefined && !contextFiles) return undefined;
+  if (thinking !== undefined && !isThinkingLevel(thinking) || value.tools !== undefined && !tools || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.contextFiles !== undefined && !contextFiles || value.extensionSettings !== undefined && !extensionSettings) return undefined;
   const foldedModel = typeof model === "string" && thinking !== undefined && !model.includes(":") ? `${model}:${thinking}` : model;
   return {
     ...(prompt === undefined ? {} : { prompt }), ...(description === undefined ? {} : { description }), ...(foldedModel === undefined ? {} : { model: foldedModel }),
-    ...(tools === undefined ? {} : { tools }), ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(overrideSystemPrompt === undefined ? {} : { overrideSystemPrompt }), ...(contextFiles === undefined ? {} : { contextFiles }),
+    ...(tools === undefined ? {} : { tools }), ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(overrideSystemPrompt === undefined ? {} : { overrideSystemPrompt }), ...(contextFiles === undefined ? {} : { contextFiles }), ...(extensionSettings === undefined ? {} : { extensionSettings }),
   };
 }
 function decodeWorkflowMetadata(value: unknown): LaunchSnapshot["metadata"] | undefined {
@@ -99,25 +100,10 @@ function decodeWorkflowMetadata(value: unknown): LaunchSnapshot["metadata"] | un
   if (description === INVALID_PERSISTED_VALUE) return undefined;
   return { name: value.name, ...(description === undefined ? {} : { description }) };
 }
-function decodeWorkflowExtensions(value: unknown): { herdr?: { enableFullyInspectableMode?: boolean }; trajectory?: { port?: number; themes: boolean } } | undefined {
-  if (!object(value) || Object.keys(value).some((key) => key !== "herdr" && key !== "trajectory")) return undefined;
-  const herdr = value.herdr === undefined ? undefined : (() => {
-    if (!object(value.herdr) || Object.keys(value.herdr).some((key) => key !== "enableFullyInspectableMode")) return undefined;
-    const enableFullyInspectableMode = optionalBoolean(value.herdr.enableFullyInspectableMode);
-    if (enableFullyInspectableMode === INVALID_PERSISTED_VALUE) return undefined;
-    return { enableFullyInspectableMode };
-  })();
-  if (value.herdr !== undefined && herdr === undefined) return undefined;
-  const trajectory = value.trajectory === undefined ? undefined : (() => {
-    if (!object(value.trajectory) || Object.keys(value.trajectory).some((key) => key !== "port" && key !== "themes")) return undefined;
-    const port = value.trajectory.port;
-    if (port !== undefined && (!safePositiveInteger(port) || port > 65535)) return undefined;
-    const themes = optionalBoolean(value.trajectory.themes);
-    if (themes === INVALID_PERSISTED_VALUE) return undefined;
-    return { ...(port === undefined ? {} : { port }), themes: themes ?? false };
-  })();
-  if (value.trajectory !== undefined && trajectory === undefined) return undefined;
-  return { ...(herdr === undefined ? {} : { herdr: { ...(herdr.enableFullyInspectableMode === undefined ? {} : { enableFullyInspectableMode: herdr.enableFullyInspectableMode }) } }), ...(trajectory === undefined ? {} : { trajectory }) };
+function decodeWorkflowExtensions(value: unknown): WorkflowExtensionSettings | undefined {
+  if (!object(value) || !jsonValue(value)) return undefined;
+  if (Object.keys(value).some((key) => !validWorkflowExtensionNamespace(key))) return undefined;
+  return { ...value };
 }
 function decodeBudgetLimits(value: unknown): NonNullable<NonNullable<RunRecord["budget"]>[BudgetDimension]> | undefined {
   if (!object(value)) return undefined;
@@ -201,7 +187,8 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
   const agentIdentity = value.agentIdentity === undefined ? undefined : decodeIdentity(value.agentIdentity);
   const sessionPath = optionalString(value.sessionPath);
   const continuity = value.continuity === undefined ? undefined : isAgentContinuity(value.continuity) ? value.continuity : INVALID_PERSISTED_VALUE;
-  if (sessionPath === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.role !== undefined && typeof value.role !== "string") || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity)) return undefined;
+  const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
+  if (sessionPath === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.role !== undefined && typeof value.role !== "string") || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity) || (value.extensionSettings !== undefined && !extensionSettings)) return undefined;
   return {
     label: value.label,
     ...(requestedLabel === undefined ? {} : { requestedLabel }),
@@ -220,6 +207,7 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
     ...(continuity === undefined ? {} : { continuity }),
     ...(agentOptions === undefined ? {} : { agentOptions }),
     ...(agentIdentity === undefined ? {} : { agentIdentity }),
+    ...(extensionSettings === undefined ? {} : { extensionSettings }),
   };
 }
 function decodeAgentSession(value: unknown): PersistedAgentSession | undefined {

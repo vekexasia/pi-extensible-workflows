@@ -43,7 +43,7 @@ function preparedWithResultTool(parameters: RuntimeJsonSchema = defaultWorkflowR
 }
 function runnerFor(session: WorkflowAgentSession, prepared: Readonly<PreparedAgentSession> = preparedWithResultTool(), transport?: AgentTransport, callbacks?: Parameters<typeof createPiRuntimeAgentRunner>[0]["callbacks"], autoResult = true) {
   const controller = new AbortController();
-  const context: AgentTransportContext = { run: { cwd: "/repo", sessionId: "host", runId: "run", workflow: { name: "flow" }, args: null, signal: controller.signal }, identity: { structuralPath: ["worker"], callSite: "worker", occurrence: 1 }, attempt: 1, signal: controller.signal };
+  const context: AgentTransportContext = { run: { cwd: "/repo", sessionId: "host", runId: "run", workflow: { name: "flow" }, args: null, signal: controller.signal }, identity: { structuralPath: ["worker"], callSite: "worker", occurrence: 1 }, attempt: 1, signal: controller.signal, settings: {} };
   const baseTransport = transport ?? { id: "local", async createSession() { return session; } };
   const effectiveTransport = !autoResult ? baseTransport : { id: baseTransport.id, async createSession(preparedForSession: Readonly<PreparedAgentSession>, transportContext: AgentTransportContext) {
     const current = await baseTransport.createSession(preparedForSession, transportContext);

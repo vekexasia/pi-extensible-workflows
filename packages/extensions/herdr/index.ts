@@ -60,7 +60,7 @@ type LifecycleState = "idle" | "working" | "blocked";
 type LifecycleReport = { state: LifecycleState; message: string | undefined };
 type HerdrBlockedEvent = { active: boolean; label?: string };
 type ExtensionBridge = { extensionPath: string; settled?: Promise<void>; close(): Promise<void> };
-type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; command(value: string): string; close(): Promise<void> };
+type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; settingsFile: string; command(value: string): string; close(): Promise<void> };
 type HerdrToolDefinition = NonNullable<PreparedAgentSession["customTools"]>[number];
 type HerdrCommandResult = Awaited<ReturnType<typeof openHerdrLivePane>>;
 type ToolBridgeRequest = { toolCallId: string; name: string; params: unknown };
@@ -124,6 +124,7 @@ function createCommandFiles(prepared: Readonly<PreparedAgentSession>, prompt: st
     appendPrompt: prepared.systemPromptAppend ? create("append-prompt", prepared.systemPromptAppend) : undefined,
     contextPrompt: contextFiles && formatContextFiles(contextFiles) ? create("context-prompt", formatContextFiles(contextFiles)) : undefined,
     prompt: prompt === undefined || directPrompt ? undefined : create("prompt", prompt),
+    settingsFile: create("settings", JSON.stringify(prepared.settings ?? {})),
   };
   return { ...files, command(value: string): string { return `sh ${quote(create("command", `${value}\n`))}`; }, async close(): Promise<void> { for (const path of paths) { try { unlinkSync(path); } catch { /* Cleanup is best effort after the child exits. */ } } } };
 }
@@ -296,7 +297,7 @@ function sessionCommand(session: HerdrSession, prepared: Readonly<PreparedAgentS
   const bridgeExtensions = bridges.filter(Boolean).map(({ extensionPath }) => ` --extension ${quote(extensionPath)}`).join("");
   const extensions = prepared.resourcePolicy ? ` --no-extensions${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}` : bridgeExtensions;
   const trust = prepared.resourcePolicy?.projectTrusted === false ? " --no-approve" : prepared.resourcePolicy?.projectTrusted === true ? " --approve" : "";
-  const environment = [prepared.agentDir ? `PI_CODING_AGENT_DIR=${quote(prepared.agentDir)}` : "", "PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER=1"].filter(Boolean).join(" ");
+  const environment = [prepared.agentDir ? `PI_CODING_AGENT_DIR=${quote(prepared.agentDir)}` : "", `PI_EXTENSIBLE_WORKFLOWS_SETTINGS_FILE=${quote(files.settingsFile)}`, "PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER=1"].filter(Boolean).join(" ");
   const message = prompt === undefined ? "" : directPrompt ? ` ${quote(prompt)}` : ` @${quote(files.prompt ?? "")}`;
   return `${environment} ${quote(runtime.executable)}${entrypoint ? ` ${quote(entrypoint)}` : ""} ${sessionArg} --model ${quote(model)}${tools}${systemPrompt}${appendPrompt}${contextPrompt}${contextFiles}${skills}${extensions}${trust}${message}`;
 }
@@ -603,6 +604,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
   const runner = options.runner ?? herdrCommandRunner;
   const workspaces = options.workspaces ?? createWorkflowWorkspaces(runner);
   const fullyInspectable = isFullyInspectableMode(options.agentDir);
+  const fullyInspectableFor = (settings: Readonly<WorkflowSettings["extensionSettings"]> | undefined): boolean => settings?.herdr === undefined ? fullyInspectable : settings.herdr.enableFullyInspectableMode === true;
   type ActionContext = HerdrAttemptActionContext;
   const sessionCwd = (context: ActionContext): string | undefined => completedSessionCwd("run" in context ? context : { attempt: context.attempt });
   const actionIdentity = (context: ActionContext): AgentIdentity => {
@@ -616,7 +618,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
     if (!session || context.liveSession || !cwd) return;
     await openHerdrLivePane({ action: "live", cwd, command: inspectSessionCommand(session), ...(env.HERDR_PANE_ID ? { paneId: env.HERDR_PANE_ID } : {}) }, runner);
   };
-  const openLiveVisible = (context: ActionContext): boolean => herdrAvailable(env) && !fullyInspectable && Boolean(context.liveSession && sessionPath(context.liveSession.reference) && context.prepared && context.handoff);
+  const openLiveVisible = (context: ActionContext): boolean => herdrAvailable(env) && !fullyInspectableFor(context.prepared?.settings) && Boolean(context.liveSession && sessionPath(context.liveSession.reference) && context.prepared && context.handoff);
   const openLive = async (context: ActionContext): Promise<void> => {
     const session = context.liveSession;
     const prepared = context.prepared;
@@ -671,9 +673,18 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
       }
     }).finally(() => { setWorkingMessage(); });
   };
+  const validateSettings = (settings: Readonly<WorkflowSettings["extensionSettings"]> | undefined): void => {
+    const value: unknown = settings?.herdr;
+    if (value === undefined) return;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("herdr settings must be an object");
+    const keys = Object.keys(value);
+    if (keys.some((key) => key !== "enableFullyInspectableMode")) throw new Error("unsupported herdr setting");
+    if ("enableFullyInspectableMode" in value && typeof (value as Record<string, unknown>).enableFullyInspectableMode !== "boolean") throw new Error("enableFullyInspectableMode must be a boolean");
+  };
   return {
     version: "1.0.0",
     headline: "Herdr workflow integration",
+    validateSettings,
     agentAttemptActions: {
       openSession: {
         label: "Open session in Herdr pane",
@@ -693,7 +704,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
     agentSetupHooks: {
       fullyInspectable: {
         setup(agent, context) {
-          if (context.mode === "inspection" || !fullyInspectable || !herdrAvailable(env)) return;
+          if (context.mode === "inspection" || !fullyInspectableFor(context.settings) || !herdrAvailable(env)) return;
           agent.transport = herdrTransport(agent, context, runner, true, env, workspaces);
         },
       },

@@ -9,7 +9,7 @@ import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition, AgentResourceSelectors, AgentResourceSelectorSet, AgentResourcePolicy, CheckpointInput, ContextFileScope, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowExtensionMetadata, WorkflowExtensionSettings, WorkflowMetadata, WorkflowRetentionSettings, WorkflowRoleDirectoryRegistration, WorkflowSettings, WorkflowSettingsOverrides, WorkflowSettingsResolution, WorkflowSettingsSources, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
 import type { WorkflowRegistryApi } from "./registry.js";
 import { registeredWorkflowRoleDirectoryRegistrations } from "./registry.js";
-import { annotateModelAliasError, assertModelThinking, deepFreeze, errorText, fail, isNodeError, jsonObject, jsonValue, modelAliasName, modelCapability, object, positiveInteger, resolveModelReference, resourcePatternHasMagic, unknownModel, validateModelAliases, validateResourcePattern } from "./utils.js";
+import { annotateModelAliasError, assertModelThinking, deepFreeze, errorText, fail, isNodeError, jsonObject, jsonValue, mergeWorkflowExtensionSettings, modelAliasName, modelCapability, object, positiveInteger, resolveModelReference, resourcePatternHasMagic, unknownModel, validateModelAliases, validateResourcePattern, validWorkflowExtensionNamespace } from "./utils.js";
 import { WORKFLOW_CALL_KINDS, isContextFileScope } from "./types.js";
 
 export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, backgroundWidget: true });
@@ -69,25 +69,32 @@ function validateContextFileScopes(value: unknown, rolePath: string): readonly C
   if (!Array.isArray(value) || !value.every(isContextFileScope)) fail("INVALID_METADATA", `${rolePath}.contextFiles must be an array containing only global, project, or cwd`);
   return [...value];
 }
-function validateWorkflowExtensions(value: unknown, settingsPath: string, errorCode: "INVALID_SETTINGS" | "INVALID_METADATA" = "INVALID_SETTINGS"): WorkflowExtensionSettings | undefined {
+export function validateWorkflowExtensionSettings(value: unknown, settingsPath: string, errorCode: "INVALID_SETTINGS" | "INVALID_METADATA" = "INVALID_SETTINGS", applyDefaults = true): WorkflowExtensionSettings | undefined {
   if (value === undefined) return undefined;
   const base = `${settingsPath}.extensionSettings`;
   if (!object(value)) fail(errorCode, `${base} must be an object`);
-  if (Object.keys(value).some((key) => key !== "herdr" && key !== "trajectory")) fail(errorCode, `${base} contains an unsupported extension setting`);
-  const herdr = value.herdr === undefined ? undefined : (() => {
-    if (!object(value.herdr)) fail(errorCode, `${base}.herdr must be an object`);
-    if (Object.keys(value.herdr).some((key) => key !== "enableFullyInspectableMode")) fail(errorCode, `${base}.herdr contains an unsupported setting`);
-    if (value.herdr.enableFullyInspectableMode !== undefined && typeof value.herdr.enableFullyInspectableMode !== "boolean") fail(errorCode, `${base}.herdr.enableFullyInspectableMode must be a boolean`);
-    return Object.freeze({ ...(value.herdr.enableFullyInspectableMode === undefined ? {} : { enableFullyInspectableMode: value.herdr.enableFullyInspectableMode }) });
-  })();
-  const trajectory = value.trajectory === undefined ? undefined : (() => {
-    if (!object(value.trajectory)) fail(errorCode, `${base}.trajectory must be an object`);
-    if (Object.keys(value.trajectory).some((key) => key !== "port" && key !== "themes")) fail(errorCode, `${base}.trajectory contains an unsupported setting`);
-    if (value.trajectory.port !== undefined && (!positiveInteger(value.trajectory.port) || value.trajectory.port > 65535)) fail(errorCode, `${base}.trajectory.port must be an integer from 1 to 65535`);
-    if (value.trajectory.themes !== undefined && typeof value.trajectory.themes !== "boolean") fail(errorCode, `${base}.trajectory.themes must be a boolean`);
-    return Object.freeze({ ...(value.trajectory.port === undefined ? {} : { port: value.trajectory.port }), themes: value.trajectory.themes ?? false });
-  })();
-  return Object.freeze({ ...(herdr === undefined ? {} : { herdr }), ...(trajectory === undefined ? {} : { trajectory }) });
+  const normalized: Record<string, JsonValue> = {};
+  for (const [namespace, raw] of Object.entries(value)) {
+    if (!validWorkflowExtensionNamespace(namespace)) fail(errorCode, `${base} contains an invalid namespace: ${namespace}`);
+    if (namespace === "herdr") {
+      if (!object(raw)) fail(errorCode, `${base}.herdr must be an object`);
+      if (Object.keys(raw).some((key) => key !== "enableFullyInspectableMode")) fail(errorCode, `${base}.herdr contains an unsupported setting`);
+      if (raw.enableFullyInspectableMode !== undefined && typeof raw.enableFullyInspectableMode !== "boolean") fail(errorCode, `${base}.herdr.enableFullyInspectableMode must be a boolean`);
+      normalized.herdr = Object.freeze({ ...(raw.enableFullyInspectableMode === undefined ? {} : { enableFullyInspectableMode: raw.enableFullyInspectableMode }) });
+      continue;
+    }
+    if (namespace === "trajectory") {
+      if (!object(raw)) fail(errorCode, `${base}.trajectory must be an object`);
+      if (Object.keys(raw).some((key) => key !== "port" && key !== "themes")) fail(errorCode, `${base}.trajectory contains an unsupported setting`);
+      if (raw.port !== undefined && (!positiveInteger(raw.port) || raw.port > 65535)) fail(errorCode, `${base}.trajectory.port must be an integer from 1 to 65535`);
+      if (raw.themes !== undefined && typeof raw.themes !== "boolean") fail(errorCode, `${base}.trajectory.themes must be a boolean`);
+      normalized.trajectory = Object.freeze({ ...(raw.port === undefined ? {} : { port: raw.port }), ...(raw.themes === undefined ? (applyDefaults ? { themes: false } : {}) : { themes: raw.themes }) });
+      continue;
+    }
+    if (!jsonValue(raw)) fail(errorCode, `${base}.${namespace} must be JSON-compatible`);
+    normalized[namespace] = structuredClone(raw);
+  }
+  return deepFreeze(normalized as WorkflowExtensionSettings);
 }
 function positiveRetentionInteger(value: unknown): value is number { return positiveInteger(value) && Number.isSafeInteger(value); }
 function validateRetention(value: unknown, settingsPath: string): Readonly<WorkflowRetentionSettings> | undefined {
@@ -122,7 +129,7 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   const skills = validateSelectorList(parsed.skills, path, "skills");
   const tools = validateSelectorList(parsed.tools, path, "tools");
   const extensions = validateSelectorList(parsed.extensions, path, "extensions");
-  const extensionSettings = parsed.extensionSettings === undefined ? undefined : validateWorkflowExtensions(parsed.extensionSettings, path);
+  const extensionSettings = parsed.extensionSettings === undefined ? undefined : validateWorkflowExtensionSettings(parsed.extensionSettings, path, "INVALID_SETTINGS", !partial);
   const retention = validateRetention(parsed.retention, path);
   return Object.freeze({
     ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(modelAliases === undefined ? {} : { modelAliases }),
@@ -146,7 +153,7 @@ export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, gl
     ...(globalSelectors.tools === undefined && projectSelectors.tools === undefined ? {} : { tools: [...(globalSelectors.tools ?? []), ...(projectSelectors.tools ?? [])] }),
   });
   const hasExtensionSelectors = global.extensions !== undefined || project.extensions !== undefined;
-  const extensionSettings = projectHas("extensionSettings") ? project.extensionSettings : global.extensionSettings;
+  const extensionSettings = mergeWorkflowExtensionSettings(global.extensionSettings, project.extensionSettings);
   const sources: WorkflowSettingsSources = {
     concurrency: projectHas("concurrency") ? projectSettingsPath : globalSettingsPath,
     modelAliases: projectHas("modelAliases") ? projectSettingsPath : globalSettingsPath,
@@ -202,7 +209,7 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
     if (end < 0) return { prompt: content };
     const meta: Record<string, string> = {};
     for (const line of content.slice(4, end).split("\n")) {
-      const match = /^(model|tools|skills|extensions|description|overrideSystemPrompt|override_system_prompt|is_system_prompt|contextFiles|disabledAgentResources|thinking)\s*:\s*(.+)$/.exec(line.trim());
+      const match = /^(model|tools|skills|extensions|description|overrideSystemPrompt|override_system_prompt|is_system_prompt|contextFiles|extensionSettings|disabledAgentResources|thinking)\s*:\s*(.+)$/.exec(line.trim());
       if (match?.[1] === "disabledAgentResources") fail("INVALID_METADATA", "disabledAgentResources is no longer supported; use skills, extensions, and tools selectors");
       if (match?.[1] === "thinking") fail("INVALID_METADATA", "Role thinking is not supported; put it on model as provider/model:thinking");
       if (match?.[1] && match[2]) meta[match[1]] = match[2].trim();
@@ -212,6 +219,13 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
     const tools = parseList(meta.tools);
     const skills = parseList(meta.skills);
     const extensions = parseList(meta.extensions);
+    let extensionSettings: unknown;
+    if (meta.extensionSettings !== undefined) {
+      try { extensionSettings = JSON.parse(meta.extensionSettings) as unknown; }
+      catch (error) { fail("INVALID_METADATA", `Invalid role extensionSettings: ${errorText(error)}`); }
+    }
+    const rolePathValue = rolePath ?? "<role>";
+    const normalizedExtensionSettings = validateWorkflowExtensionSettings(extensionSettings, rolePathValue, "INVALID_METADATA", false);
     const definition: AgentDefinition = { prompt: content.slice(end + 4).replace(/^\n/, "") };
     if (meta.model) {
       const model = unquote(meta.model);
@@ -222,6 +236,7 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
     if (tools) definition.tools = tools;
     if (skills) definition.skills = skills;
     if (extensions) definition.extensions = extensions;
+    if (normalizedExtensionSettings !== undefined) definition.extensionSettings = normalizedExtensionSettings;
     const overrideSystemPrompt = meta.overrideSystemPrompt ?? meta.override_system_prompt ?? meta.is_system_prompt;
     const contextFiles = meta.contextFiles ? meta.contextFiles.replace(/^\[|\]$/g, "").split(",").map((scope) => unquote(scope.trim())).filter(Boolean) : undefined;
     const normalizedContextFiles = validateContextFileScopes(contextFiles, "role");
@@ -235,7 +250,7 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
   try { parsed = parseFrontmatter(content); }
   catch (error) { fail("INVALID_METADATA", `Invalid role frontmatter: ${errorText(error)}`); }
   if (!object(parsed.frontmatter)) fail("INVALID_METADATA", "Role frontmatter must be an object");
-  const { model, tools, skills, extensions, description, contextFiles } = parsed.frontmatter;
+  const { model, tools, skills, extensions, extensionSettings, description, contextFiles } = parsed.frontmatter;
   if (Object.prototype.hasOwnProperty.call(parsed.frontmatter, "disabledAgentResources")) fail("INVALID_METADATA", "disabledAgentResources is no longer supported; use skills, extensions, and tools selectors");
   if (Object.prototype.hasOwnProperty.call(parsed.frontmatter, "thinking")) fail("INVALID_METADATA", "Role thinking is not supported; put it on model as provider/model:thinking");
   const overrideSystemPrompt = parsed.frontmatter.overrideSystemPrompt ?? parsed.frontmatter.override_system_prompt ?? parsed.frontmatter.is_system_prompt;
@@ -247,6 +262,7 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
   const normalizedTools = validateSelectorList(tools, rolePathValue, "tools", "INVALID_METADATA");
   const normalizedSkills = validateSelectorList(skills, rolePathValue, "skills", "INVALID_METADATA");
   const normalizedExtensions = validateSelectorList(extensions, rolePathValue, "extensions", "INVALID_METADATA");
+  const normalizedExtensionSettings = validateWorkflowExtensionSettings(extensionSettings, rolePathValue, "INVALID_METADATA", false);
   const normalizedDescription = typeof description === "string" ? description.trim() : undefined;
   const normalizedModel = typeof model === "string" ? model.trim() : undefined;
   if (normalizedModel !== undefined) assertModelThinking(normalizedModel, "Role model");
@@ -256,6 +272,7 @@ export function parseRoleMarkdown(content: string, strict = false, rolePath?: st
   if (normalizedTools !== undefined) definition.tools = normalizedTools;
   if (normalizedSkills !== undefined) definition.skills = normalizedSkills;
   if (normalizedExtensions !== undefined) definition.extensions = normalizedExtensions;
+  if (normalizedExtensionSettings !== undefined) definition.extensionSettings = normalizedExtensionSettings;
   if (typeof overrideSystemPrompt === "boolean") definition.overrideSystemPrompt = overrideSystemPrompt;
   if (normalizedContextFiles !== undefined) definition.contextFiles = normalizedContextFiles;
   return definition;
@@ -866,6 +883,14 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)), modelAliases: aliases, knownModels, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) }, [], metadata);
   const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
   validateRolePolicies(agentDefinitions, roleNames, context.availableModels, aliases, knownModels, context.settingsPath);
+  if (registry?.validateExtensionSettings) {
+    const validate = registry.validateExtensionSettings.bind(registry);
+    const validatorContext = (source: "effective" | "role", role?: string) => ({ source, cwd: context.cwd, projectTrusted: context.projectTrusted, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}), ...(role === undefined ? {} : { role }) });
+    validate(context.extensionSettings, validatorContext("effective"));
+    for (const role of roleNames) {
+      validate(mergeWorkflowExtensionSettings(context.extensionSettings, agentDefinitions[role]?.extensionSettings), validatorContext("role", role));
+    }
+  }
   return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames };
 }
 

@@ -94,6 +94,7 @@ export const testTransportContext = {
   identity: { structuralPath: [], callSite: "test", occurrence: 1 },
   attempt: 1,
   signal: testTransportSignal,
+  settings: {},
 } satisfies AgentTransportContext;
 export function testExtensionContextFor(overrides: object = {}): ExtensionCommandContext {
   const context = testExtensionRunner.createCommandContext();

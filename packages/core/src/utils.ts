@@ -1,4 +1,4 @@
-import { ERROR_CODES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WorkflowError, type JsonValue, type ModelSpec, type ThinkingLevel, type WorkflowErrorCode } from "./types.js";
+import { ERROR_CODES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WorkflowError, type JsonValue, type ModelSpec, type ThinkingLevel, type WorkflowErrorCode, type WorkflowExtensionSettings } from "./types.js";
 import { Minimatch } from "minimatch";
 export class SerialLane {
   #tail: Promise<void> = Promise.resolve();
@@ -32,6 +32,22 @@ export function jsonValue(value: unknown, seen = new Set<object>()): value is Js
   return valid;
 }
 export function jsonObject(value: unknown): value is Record<string, JsonValue> { return jsonValue(value) && object(value); }
+export function mergeWorkflowExtensionSettings(...layers: readonly (Readonly<WorkflowExtensionSettings> | undefined)[]): Readonly<WorkflowExtensionSettings> | undefined {
+  const merge = (left: JsonValue, right: JsonValue): JsonValue => {
+    if (!jsonObject(left) || !jsonObject(right)) return structuredClone(right);
+    const result: Record<string, JsonValue> = { ...left };
+    for (const [key, value] of Object.entries(right)) Object.defineProperty(result, key, { value: Object.prototype.hasOwnProperty.call(left, key) ? merge(left[key] as JsonValue, value) : structuredClone(value), enumerable: true, configurable: true, writable: true });
+    return result;
+  };
+  const merged: Record<string, JsonValue> = {};
+  let present = false;
+  for (const layer of layers) {
+    if (!layer) continue;
+    present = true;
+    for (const [namespace, value] of Object.entries(layer)) Object.defineProperty(merged, namespace, { value: Object.prototype.hasOwnProperty.call(merged, namespace) ? merge(merged[namespace] as JsonValue, value) : structuredClone(value), enumerable: true, configurable: true, writable: true });
+  }
+  return present ? deepFreeze(merged as WorkflowExtensionSettings) : undefined;
+}
 export function positiveInteger(value: unknown): value is number { return typeof value === "number" && Number.isInteger(value) && value > 0; }
 export function finiteNumber(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
 export function deepFreeze<T>(value: T): T {
@@ -68,6 +84,8 @@ export function byPriorityThenName(left: { priority: number; name: string }, rig
 
 export function isThinkingLevel(value: unknown): value is ThinkingLevel { return THINKING_LEVELS.some((level) => level === value); }
 export const MODEL_ALIAS_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export const WORKFLOW_EXTENSION_NAMESPACE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export function validWorkflowExtensionNamespace(value: string): boolean { return WORKFLOW_EXTENSION_NAMESPACE.test(value) && value !== "__proto__" && value !== "constructor" && value !== "prototype"; }
 export function parseThinking(value: unknown): ModelSpec["thinking"] | undefined { return isThinkingLevel(value) ? value : undefined; }
 export function parseModelReference(value: string): ModelSpec {
   const match = /^([^/:\s]+)\/([^:\s]+)(?::([^:\s]+))?$/.exec(value);

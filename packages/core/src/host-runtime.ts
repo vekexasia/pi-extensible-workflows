@@ -5,7 +5,7 @@ import { type PersistedRun, type RunStore, type WorktreeReference } from "./pers
 import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonValue, object } from "./utils.js";
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
-import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentOptions, type AgentRecord, type BudgetEvent, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentOptions, type AgentRecord, type BudgetEvent, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
 export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -286,7 +286,7 @@ export function nextNamedOccurrence(counters: Map<string, number>, label: string
 
 function functionBreadcrumb(name: string, occurrence: number): string { return occurrence === 1 ? name : `${name} #${String(occurrence)}`; }
 
-export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, registry: WorkflowRegistryApi): WorkflowBridge {
+export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, runContext: Readonly<WorkflowRunContext>, registry: WorkflowRegistryApi, settings: Readonly<WorkflowExtensionSettings> = Object.freeze({})): WorkflowBridge {
   const functionAgentOccurrences = new Map<string, number>();
   const functionShellOccurrences = new Map<string, number>();
   const functionInvokeOccurrences = new Map<string, number>();
@@ -311,6 +311,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
     };
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
+      settings: deepFreeze(structuredClone(settings)),
       run: runContext,
       invoke: async (targetName, targetInput, label) => {
         if (label !== undefined && (typeof label !== "string" || !label.trim())) fail("INVALID_METADATA", "invoke label must be a non-empty string");

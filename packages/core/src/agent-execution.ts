@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { Compile } from "typebox/compile";
 import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
-import type { ExtensionContext, ModelRegistry, SessionStartEvent, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 type HerdrModelContext = { readonly model: ExtensionContext["model"]; readonly modelRegistry: ModelRegistry | undefined };
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
 type LocalSessionShutdownReason = "quit" | "resume";
@@ -45,8 +45,8 @@ export interface PiResourceInspection {
   readonly diagnostics: readonly { type: "warning" | "error" | "collision"; message: string; source?: string }[];
   readonly systemPromptSource?: string;
 }
-import type { AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowRunContext } from "./types.js";
-import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorText, jsonObject, jsonValue, object, modelAliasName, modelCapability, resolveModelReference, resourcePatternHasMagic, selectResourcesByLayers, unmatchedResourcePatterns } from "./utils.js";
+import type { AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowRunContext, WorkflowSessionStartEvent } from "./types.js";
+import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorText, jsonObject, jsonValue, mergeWorkflowExtensionSettings, object, modelAliasName, modelCapability, resolveModelReference, resourcePatternHasMagic, selectResourcesByLayers, unmatchedResourcePatterns } from "./utils.js";
 import { SETTLED_AGENT_STATES, WorkflowError, isContextFileScope, zeroAccounting, type AgentDefinition, type AgentState } from "./types.js";
 import { createLiveSessionHandoff } from "./session-handoff.js";
 import { createToolTimingExtension } from "./tool-timing.js";
@@ -96,11 +96,16 @@ export interface AgentExecutionOptions {
   budget?: AgentBudgetHooks;
   agentOptions?: Readonly<Record<string, JsonValue>>;
   agentIdentity?: AgentIdentity;
+  inheritedExtensionSettings?: Readonly<WorkflowExtensionSettings>;
+  agentNodeId?: string;
 }
 export interface AgentExecutionRoot {
   cwd: string;
   model: ModelSpec;
   tools: ReadonlySet<string>;
+  extensionSettings?: Readonly<WorkflowExtensionSettings> | undefined;
+  validateExtensionSettings?: (settings: Readonly<WorkflowExtensionSettings> | undefined, context: WorkflowExtensionSettingsValidatorContext) => void;
+  onAgentSettings?: (agentNodeId: string, settings: Readonly<WorkflowExtensionSettings>) => void;
   resourceSelectors?: AgentResourceSelectors;
   agentDefinitions?: Readonly<Record<string, AgentDefinition>>;
   agentDir?: string;
@@ -282,7 +287,7 @@ export function flushExtensionProviders(resourceLoader: DefaultResourceLoader, m
   return failures;
 }
 
-async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: SessionStartEvent): Promise<LocalPiSessionHandle> {
+async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
   const systemPromptOptions = input.systemPrompt !== undefined ? { systemPromptOverride: () => input.systemPrompt } : systemPromptSource !== undefined ? { systemPrompt: systemPromptSource } : {};
@@ -355,7 +360,8 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     const because = providerFailures.length > 0 ? ` (provider registration failed — ${providerFailures.join("; ")})` : "";
     throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}${because}`);
   }
-  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(sessionStartEvent ? { sessionStartEvent } : {}), sessionManager: manager });
+  const effectiveSessionStartEvent = input.settings === undefined && sessionStartEvent === undefined ? undefined : { ...(sessionStartEvent ?? { type: "session_start" as const, reason: "startup" as const }), settings: input.settings ?? Object.freeze({}) };
+  const { session } = await createAgentSession({ ...(input.options ?? {}), cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(effectiveSessionStartEvent ? { sessionStartEvent: effectiveSessionStartEvent } : {}), sessionManager: manager });
   const nativeDispose = session.dispose.bind(session);
   let disposal: Promise<void> | undefined;
   const shutdown = (reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> => {
@@ -409,13 +415,12 @@ function notifyPiSessionEvent(notify: (event: WorkflowAgentSessionEvent) => Prom
   return notify(normalized);
 }
 export async function createLocalWorkflowAgentSession(prepared: Readonly<PreparedAgentSession>, context: Readonly<AgentTransportContext>): Promise<WorkflowAgentSession> {
-  void context;
   const input: SessionInput = {
     cwd: prepared.cwd, model: { ...prepared.model }, tools: [...prepared.tools] as SessionInput["tools"], sessionLabel: prepared.sessionLabel, ...(prepared.sessionPath ? { sessionPath: prepared.sessionPath } : {}),
     ...(prepared.agentDir ? { agentDir: prepared.agentDir } : {}), ...(prepared.customTools?.length ? { customTools: [...prepared.customTools] as NonNullable<SessionInput["customTools"]> } : {}),
     ...(prepared.resultTool ? { resultTool: prepared.resultTool } : {}), ...(prepared.systemPrompt === undefined ? {} : { systemPrompt: prepared.systemPrompt }),
     ...(prepared.systemPromptAppend ? { systemPromptAppend: prepared.systemPromptAppend } : {}), extensionFactories: [...(prepared.extensionFactories ?? []), ...(prepared.extensionFactories?.includes(localToolTimingExtension) ? [] : [localToolTimingExtension])],
-    ...(prepared.additionalSkillPaths?.length ? { additionalSkillPaths: [...prepared.additionalSkillPaths] } : {}), ...(prepared.contextFiles === undefined ? {} : { contextFiles: [...prepared.contextFiles] }), ...(prepared.resourcePolicy ? { resourcePolicy: structuredClone(prepared.resourcePolicy) } : {}), ...(prepared.options ? { options: { ...prepared.options } } : {}),
+    ...(prepared.additionalSkillPaths?.length ? { additionalSkillPaths: [...prepared.additionalSkillPaths] } : {}), ...(prepared.contextFiles === undefined ? {} : { contextFiles: [...prepared.contextFiles] }), ...(prepared.resourcePolicy ? { resourcePolicy: structuredClone(prepared.resourcePolicy) } : {}), settings: context.settings, ...(prepared.options ? { options: { ...prepared.options } } : {}),
   };
   let nativeHandle = await createLocalPiSessionHandle(input);
   let native = nativeHandle.session;
@@ -544,7 +549,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
           await shutdownNative("resume", sessionFile);
         }
         if (isClosing()) return;
-        const nextHandle = await createLocalPiSessionHandle({ ...input, sessionPath: sessionFile }, { type: "session_start", reason: "resume", previousSessionFile: sessionFile });
+        const nextHandle = await createLocalPiSessionHandle({ ...input, sessionPath: sessionFile }, { type: "session_start", reason: "resume", previousSessionFile: sessionFile, settings: input.settings ?? Object.freeze({}) });
         nativeHandle = nextHandle;
         native = nextHandle.session;
         nativeShutdownReason = undefined;
@@ -572,7 +577,7 @@ export async function createLocalWorkflowAgentSession(prepared: Readonly<Prepare
         if (nativeShutdownReason === "resume") {
           const sessionFile = native.sessionFile;
           if (sessionFile) {
-            const nextHandle = await createLocalPiSessionHandle({ ...input, sessionPath: sessionFile }, { type: "session_start", reason: "resume", previousSessionFile: sessionFile });
+            const nextHandle = await createLocalPiSessionHandle({ ...input, sessionPath: sessionFile }, { type: "session_start", reason: "resume", previousSessionFile: sessionFile, settings: input.settings ?? Object.freeze({}) });
             nativeHandle = nextHandle;
             native = nextHandle.session;
             nativeShutdownReason = undefined;
@@ -796,8 +801,7 @@ async function preparedAgentSession(input: SessionInput, initialPrompt?: string)
     cwd: input.cwd, model: Object.freeze({ ...input.model }), tools: Object.freeze([...input.tools]), sessionLabel: input.sessionLabel, ...(input.sessionPath ? { sessionPath: input.sessionPath } : {}), ...(initialPrompt === undefined ? {} : { initialPrompt }),
     ...(input.agentDir ? { agentDir: input.agentDir } : {}), ...(input.customTools?.length ? { customTools: Object.freeze([...input.customTools]) } : {}), ...(input.resultTool ? { resultTool: input.resultTool } : {}), ...(input.options ? { options: Object.freeze(structuredClone(input.options)) } : {}),
     ...(piRuntime ? { piRuntime } : {}), ...(piRuntimeError ? { piRuntimeError } : {}),
-    ...(input.systemPrompt === undefined ? {} : { systemPrompt: input.systemPrompt }), ...(systemPromptPath ? { systemPromptPath } : {}), ...(input.systemPromptAppend ? { systemPromptAppend: input.systemPromptAppend } : {}), ...(input.extensionFactories?.length ? { extensionFactories: Object.freeze([...input.extensionFactories]) } : {}), ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: Object.freeze([...input.additionalSkillPaths]) } : {}), ...(input.contextFiles === undefined ? {} : { contextFiles: Object.freeze([...input.contextFiles]) }),
-    ...(input.resourcePolicy ? { resourcePolicy: Object.freeze(structuredClone(input.resourcePolicy)) } : {}),
+    ...(input.systemPrompt === undefined ? {} : { systemPrompt: input.systemPrompt }), ...(systemPromptPath ? { systemPromptPath } : {}), ...(input.systemPromptAppend ? { systemPromptAppend: input.systemPromptAppend } : {}), ...(input.extensionFactories?.length ? { extensionFactories: Object.freeze([...input.extensionFactories]) } : {}), ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: Object.freeze([...input.additionalSkillPaths]) } : {}), ...(input.contextFiles === undefined ? {} : { contextFiles: Object.freeze([...input.contextFiles]) }), ...(input.resourcePolicy ? { resourcePolicy: Object.freeze(structuredClone(input.resourcePolicy)) } : {}), ...(input.settings === undefined ? {} : { settings: Object.freeze(structuredClone(input.settings)) }),
   };
   return deepFreeze(prepared);
 }
@@ -847,10 +851,13 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
   }
   const resourcePolicyCeiling = resourcePolicy ? structuredClone(resourcePolicy) : undefined;
   const sessionPath = options.sessionPath === undefined || inspection ? options.sessionPath : await attemptSessionInput(options.sessionPath, attempt);
-  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(sessionPath ? { sessionPath } : {}), ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), options: structuredClone(baselineOptions) };
+  const extensionSettings = mergeWorkflowExtensionSettings(options.inheritedExtensionSettings ?? root.extensionSettings, roleDefinition?.extensionSettings) ?? Object.freeze({});
+  root.validateExtensionSettings?.(extensionSettings, { source: roleName === undefined ? "effective" : "role", cwd, projectTrusted: resourcePolicy?.projectTrusted ?? true, ...(root.settingsPath ? { settingsPath: root.settingsPath } : {}), ...(roleName === undefined ? {} : { role: roleName }) });
+  if (options.agentNodeId !== undefined) root.onAgentSettings?.(options.agentNodeId, extensionSettings);
+  const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(sessionPath ? { sessionPath } : {}), ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), settings: extensionSettings, options: structuredClone(baselineOptions) };
   const setup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, prepared: await preparedAgentSession(sessionInput, task), transport };
   const base = fallbackSetupContext(root, options, setupSignal);
-  const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal, ...(base.tuiIndex === undefined ? {} : { tuiIndex: base.tuiIndex }), ...(base.tuiLabel === undefined ? {} : { tuiLabel: base.tuiLabel }), ...(inspection ? { mode: "inspection" as const } : {}) });
+  const context = Object.freeze({ run: base.run, identity: base.identity, attempt, signal: setupSignal, settings: extensionSettings, ...(base.tuiIndex === undefined ? {} : { tuiIndex: base.tuiIndex }), ...(base.tuiLabel === undefined ? {} : { tuiLabel: base.tuiLabel }), ...(inspection ? { mode: "inspection" as const } : {}) });
   const hookNames: string[] = [];
   for (const hook of [...(root.agentSetupHooks ?? [])].sort(byPriorityThenName)) {
     if (setupSignal.aborted) return { setup, summary: agentSetupSummary(setup, hookNames), failure: { error: new WorkflowError("CANCELLED", "Agent cancelled") } };
@@ -1036,7 +1043,7 @@ export class WorkflowAgentExecutor {
         await options.onAttempt?.({ attempt, transport: attemptSetup.transport.id, accounting: zeroAccounting(), setup: setupSummary });
 
         const transportBase = fallbackSetupContext(this.root, options, attemptSignal);
-        const transportContext = Object.freeze({ run: transportBase.run, identity: transportBase.identity, attempt, signal: attemptSignal, ...(transportBase.tuiIndex === undefined ? {} : { tuiIndex: transportBase.tuiIndex }), ...(transportBase.tuiLabel === undefined ? {} : { tuiLabel: transportBase.tuiLabel }) });
+        const transportContext = Object.freeze({ run: transportBase.run, identity: transportBase.identity, attempt, signal: attemptSignal, settings: setup.prepared.settings ?? Object.freeze({}), ...(transportBase.tuiIndex === undefined ? {} : { tuiIndex: transportBase.tuiIndex }), ...(transportBase.tuiLabel === undefined ? {} : { tuiLabel: transportBase.tuiLabel }) });
         handoff = createLiveSessionHandoff();
         handoffAbort = () => { releaseHandoff("attempt cancelled"); };
         attemptSignal.addEventListener("abort", handoffAbort, { once: true });
@@ -1174,6 +1181,7 @@ export interface ScheduledAgentOptions {
   continuity?: AgentContinuity;
   agentOptions?: Readonly<Record<string, JsonValue>>;
   agentIdentity?: AgentIdentity;
+  extensionSettings?: Readonly<WorkflowExtensionSettings>;
 }
 
 export type ScheduledAgentResult =
@@ -1214,7 +1222,7 @@ type ScheduledNode = {
   steer?: (message: string) => void | Promise<void>;
 };
 
-type ScheduledRun = { limit: number; beforeLaunch?: () => void; logical: number; active: number; nextIndex: number; queue: Array<{ node?: ScheduledNode; start: () => void }> };
+type ScheduledRun = { limit: number; beforeLaunch?: () => void; extensionSettings?: Readonly<WorkflowExtensionSettings> | undefined; logical: number; active: number; nextIndex: number; queue: Array<{ node?: ScheduledNode; start: () => void }> };
 export type OwnershipRecord = { id: string; parentId?: string; prompt?: string; label: string; state: ScheduledNode["state"]; options: Readonly<ScheduledAgentOptions> };
 type OwnershipWriter = (runId: string, ownership: readonly OwnershipRecord[]) => void | Promise<void>;
 
@@ -1232,10 +1240,10 @@ export class FairAgentScheduler {
     if (!Number.isInteger(sessionLimit) || sessionLimit < 1 || sessionLimit > 16) throw new WorkflowError("INVALID_SETTINGS", "Session concurrency must be an integer from 1 to 16");
   }
 
-  addRun(runId: string, limit = 8, beforeLaunch?: () => void): void {
+  addRun(runId: string, limit = 8, beforeLaunch?: () => void, extensionSettings?: Readonly<WorkflowExtensionSettings>): void {
     if (this.#runs.has(runId)) throw new WorkflowError("DUPLICATE_NAME", `Scheduler run already exists: ${runId}`);
     if (!Number.isInteger(limit) || limit < 1 || limit > this.sessionLimit) throw new WorkflowError("INVALID_SETTINGS", "Invalid run concurrency");
-    this.#runs.set(runId, { limit, ...(beforeLaunch ? { beforeLaunch } : {}), logical: 0, active: 0, nextIndex: 0, queue: [] });
+    this.#runs.set(runId, { limit, ...(beforeLaunch ? { beforeLaunch } : {}), ...(extensionSettings === undefined ? {} : { extensionSettings: deepFreeze(structuredClone(extensionSettings)) }), logical: 0, active: 0, nextIndex: 0, queue: [] });
     this.#runOrder.push(runId);
   }
   updateRunLimit(runId: string, limit: number): void {
@@ -1245,13 +1253,23 @@ export class FairAgentScheduler {
     run.limit = limit;
     this.#dispatch();
   }
+  setRunExtensionSettings(runId: string, settings: Readonly<WorkflowExtensionSettings> | undefined): void {
+    const run = this.#runs.get(runId);
+    if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown scheduler run: ${runId}`);
+    run.extensionSettings = settings === undefined ? undefined : deepFreeze(structuredClone(settings));
+  }
+  setExtensionSettings(agentId: string, settings: Readonly<WorkflowExtensionSettings>): void {
+    const node = this.#node(agentId);
+    node.options = Object.freeze({ ...node.options, extensionSettings: deepFreeze(structuredClone(settings)) });
+    this.#persist(node.runId);
+  }
 
   spawn(runId: string, prompt: string, options: ScheduledAgentOptions, parentId?: string): { id: string; result: Promise<ScheduledAgentResult> } {
     const run = this.#runs.get(runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown scheduler run: ${runId}`);
     const parent = parentId ? this.#nodes.get(parentId) : undefined;
     if (parentId && (!parent || parent.runId !== runId)) throw new WorkflowError("UNKNOWN_AGENT_TYPE", "Parent agent is not owned by this run");
-    const effective = this.#inherit(parent, options);
+    const effective = this.#inherit(run, parent, options);
     const id = `${runId}:${String(++this.#nextId)}`;
     const tuiIndex = ++run.nextIndex;
     let resolveResult: (result: ScheduledAgentResult) => void = () => undefined;
@@ -1403,8 +1421,8 @@ export class FairAgentScheduler {
     return [...this.#nodes.values()].map(({ id, parentId, prompt, options, state }) => ({ id, ...(parentId ? { parentId } : {}), ...(prompt === undefined ? {} : { prompt }), label: options.label, state, options }));
   }
 
-  restoreRun(runId: string, limit: number, ownership: readonly OwnershipRecord[], beforeLaunch?: () => void): void {
-    this.addRun(runId, limit, beforeLaunch);
+  restoreRun(runId: string, limit: number, ownership: readonly OwnershipRecord[], beforeLaunch?: () => void, extensionSettings?: Readonly<WorkflowExtensionSettings>): void {
+    this.addRun(runId, limit, beforeLaunch, extensionSettings);
     const run = this.#runs.get(runId) as ScheduledRun;
     for (const record of ownership) {
       if (record.id.split(":").slice(0, -1).join(":") !== runId) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted agent belongs to another run: ${record.id}`);
@@ -1412,7 +1430,7 @@ export class FairAgentScheduler {
       const promise = new Promise<ScheduledAgentResult>((resolve) => { resolveResult = resolve; });
       let resolveCompletion: () => void = () => undefined;
       const completion = new Promise<void>((resolve) => { resolveCompletion = resolve; });
-      const node: ScheduledNode = { id: record.id, runId, ...(record.parentId ? { parentId: record.parentId } : {}), ...(record.prompt === undefined ? {} : { prompt: record.prompt }), options: this.#inherit(undefined, record.options), children: new Set(), collected: false, collecting: false, resultQueue: Promise.resolve(), state: record.state, controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: true };
+      const node: ScheduledNode = { id: record.id, runId, ...(record.parentId ? { parentId: record.parentId } : {}), ...(record.prompt === undefined ? {} : { prompt: record.prompt }), options: this.#inherit(run, undefined, record.options), children: new Set(), collected: false, collecting: false, resultQueue: Promise.resolve(), state: record.state, controller: new AbortController(), promise, resolve: resolveResult, completion, resolveCompletion, task: async () => undefined, restored: true };
       this.#nodes.set(node.id, node);
       run.logical += 1;
       this.#nextId = Math.max(this.#nextId, Number(node.id.slice(node.id.lastIndexOf(":") + 1)) || 0);
@@ -1433,16 +1451,16 @@ export class FairAgentScheduler {
     this.#persistenceErrors.delete(key);
     throw error;
   }
-
-  #inherit(parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
+  #inherit(run: ScheduledRun, parent: ScheduledNode | undefined, options: ScheduledAgentOptions): Readonly<ScheduledAgentOptions> {
     if (!options.label.trim() || !options.cwd || !Array.isArray(options.tools)) throw new WorkflowError("INVALID_METADATA", "Agents require label, cwd, and tools");
     const inheritedTools: readonly string[] = options.tools;
-    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...inheritedTools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(options.agentIdentity ? { agentIdentity: Object.freeze({ ...options.agentIdentity, structuralPath: Object.freeze([...options.agentIdentity.structuralPath]) }) } : {}) });
+    const extensionSettings = options.extensionSettings ?? parent?.options.extensionSettings ?? run.extensionSettings;
+    if (!parent) return Object.freeze({ ...options, tools: Object.freeze([...inheritedTools]), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(options.agentIdentity ? { agentIdentity: Object.freeze({ ...options.agentIdentity, structuralPath: Object.freeze([...options.agentIdentity.structuralPath]) }) } : {}) });
     if (options.cwd !== parent.options.cwd) throw new WorkflowError("UNKNOWN_TOOL", "Child cwd cannot differ from its parent");
     const forbidden = inheritedTools.find((tool: string) => !parent.options.tools.includes(tool));
     if (forbidden) throw new WorkflowError("UNKNOWN_TOOL", `Child tool escalates parent boundary: ${forbidden}`);
     const identity = options.agentIdentity ?? parent.options.agentIdentity;
-    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...inheritedTools]), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(parent.options.parentBreadcrumb && !options.parentBreadcrumb ? { parentBreadcrumb: parent.options.parentBreadcrumb } : {}), ...(identity ? { agentIdentity: Object.freeze({ ...identity, structuralPath: Object.freeze([...identity.structuralPath]) }) } : {}), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
+    return Object.freeze({ ...options, cwd: parent.options.cwd, tools: Object.freeze([...inheritedTools]), ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(options.agentOptions ? { agentOptions: structuredClone(options.agentOptions) } : {}), ...(parent.options.parentBreadcrumb && !options.parentBreadcrumb ? { parentBreadcrumb: parent.options.parentBreadcrumb } : {}), ...(identity ? { agentIdentity: Object.freeze({ ...identity, structuralPath: Object.freeze([...identity.structuralPath]) }) } : {}), ...(parent.options.worktreeOwner ? { worktreeOwner: parent.options.worktreeOwner } : {}) });
   }
 
   #enqueue(runId: string, node: ScheduledNode | undefined, start: () => void): void { this.#runs.get(runId)?.queue.push({ ...(node ? { node } : {}), start }); this.#dispatch(); }

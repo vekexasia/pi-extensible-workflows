@@ -42,8 +42,7 @@ import {
 } from "pi-extensible-workflows";
 import type { AgentDefinition } from "pi-extensible-workflows";
 import { loadingRegistry, type WorkflowRegistryApi } from "pi-extensible-workflows";
-import { selectResourcesByLayers, unmatchedResourcePatterns } from "pi-extensible-workflows";
-
+import { selectResourcesByLayers, unmatchedResourcePatterns, mergeWorkflowExtensionSettings } from "pi-extensible-workflows";
 export type DoctorSeverity = "error" | "warning";
 export interface DoctorDiagnostic { severity: DoctorSeverity; code: string; message: string; source?: string; hint?: string }
 export interface DoctorRole { name: string; path: string; scope: "extension" | "global" | "project"; active: boolean; overrides?: string; overriddenBy?: string; extension?: WorkflowExtensionMetadata }
@@ -300,12 +299,12 @@ function matchResourcePolicy(policy: AgentResourcePolicy, pi: DoctorPiState): Ag
   const selectedTools = selectResourcesByLayers([layers.global.tools, layers.project.tools], tools);
   return { ...policy, selectedSkills, selectedExtensions, selectedTools, unmatchedSkills: unmatchedResourcePatterns(policy.effective.skills, skills), unmatchedExtensions: unmatchedResourcePatterns(policy.effective.extensions, extensions), unmatchedTools: unmatchedResourcePatterns(policy.effective.tools ?? [], tools) };
 }
-async function inspectRoleSession(cwd: string, agentDir: string, roleName: string, definition: AgentDefinition, rolePath: string, basePolicy: AgentResourcePolicy, rootModel: { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }, activeTools: readonly string[], aliases: Readonly<Record<string, string>>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, settingsPath: string, prompt: string, hooks: NonNullable<AgentExecutionRoot["agentSetupHooks"]>, diagnostics: DoctorDiagnostic[]): Promise<DoctorRoleInspection | undefined> {
+async function inspectRoleSession(cwd: string, agentDir: string, roleName: string, definition: AgentDefinition, rolePath: string, basePolicy: AgentResourcePolicy, rootModel: { provider: string; model: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" }, activeTools: readonly string[], aliases: Readonly<Record<string, string>>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, settingsPath: string, extensionSettings: Readonly<WorkflowSettings["extensionSettings"]> | undefined, prompt: string, hooks: NonNullable<AgentExecutionRoot["agentSetupHooks"]>, diagnostics: DoctorDiagnostic[]): Promise<DoctorRoleInspection | undefined> {
   const setupDiagnostics: DoctorDiagnostic[] = [];
   const signal = new AbortController().signal;
   const transport: AgentTransport = { id: "doctor-local", createSession: async () => { throw new Error("Doctor inspection does not create transport sessions"); } };
   const run = { cwd, sessionId: "doctor", runId: "doctor", workflow: { name: "doctor" }, args: null, signal };
-  const root: AgentExecutionRoot = { cwd, model: { ...rootModel }, tools: new Set(activeTools), agentDefinitions: { [roleName]: definition }, agentDir, modelAliases: aliases, knownModels, availableModels, settingsPath, agentSetupHooks: hooks, agentResourcePolicy: () => structuredClone(basePolicy), runContext: run };
+  const root: AgentExecutionRoot = { cwd, model: { ...rootModel }, tools: new Set(activeTools), agentDefinitions: { [roleName]: definition }, agentDir, extensionSettings, modelAliases: aliases, knownModels, availableModels, settingsPath, agentSetupHooks: hooks, agentResourcePolicy: () => structuredClone(basePolicy), runContext: run };
   const options: AgentExecutionOptions = { label: roleName, workflowName: "doctor", role: roleName };
   let prepared: Awaited<ReturnType<typeof prepareAgentSetupForInspection>>;
   try { prepared = await prepareAgentSetupForInspection(root, prompt, options, transport); }
@@ -332,6 +331,10 @@ async function inspectRoleSession(cwd: string, agentDir: string, roleName: strin
   finally { await session.dispose(); }
 }
 function resourcePolicySource(settingsSource: string): string { return settingsSource; }
+function validateDoctorExtensionSettings(registry: WorkflowRegistryApi, value: Readonly<WorkflowSettings["extensionSettings"]>, source: "global" | "project" | "effective" | "role", cwd: string, projectTrusted: boolean, settingsPath: string, diagnostics: DoctorDiagnostic[], role?: string): void {
+  try { registry.validateExtensionSettings(value, { source, cwd, projectTrusted, settingsPath, ...(role === undefined ? {} : { role }) }); }
+  catch (error) { diagnostics.push(diagnostic("error", "SETTINGS_INVALID", errorText(error), `${settingsPath}.extensionSettings`, "Fix the extension-owned settings reported in this error.")); }
+}
 export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport> {
   const cwd = canonical(options.cwd ?? process.cwd());
   const agentDir = canonical(options.agentDir ?? getAgentDir());
@@ -339,6 +342,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const projectSettingsPath = workflowProjectSettingsPath(cwd);
   const legacyGlobalSettings = usesLegacySettings(settingsPath);
   const diagnostics: DoctorDiagnostic[] = [];
+  const registry = options.registry ?? loadingRegistry();
   let settings = DEFAULT_SETTINGS;
   try { settings = loadSettings(settingsPath); }
   catch (error) { diagnostics.push(diagnostic("error", "SETTINGS_INVALID", errorText(error), settingsPath, "Fix or remove the invalid workflow settings file.")); }
@@ -360,6 +364,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     const resolved = resolveWorkflowSettings(cwd, pi.trust.trusted, settingsPath);
     settings = resolved.effective;
     settingsSources = resolved.sources;
+    if (resolved.global.extensionSettings !== undefined) validateDoctorExtensionSettings(registry, resolved.global.extensionSettings, "global", cwd, pi.trust.trusted, resolved.globalSettingsPath, diagnostics);
+    if (pi.trust.trusted && resolved.project.extensionSettings !== undefined) validateDoctorExtensionSettings(registry, resolved.project.extensionSettings, "project", cwd, true, resolved.projectSettingsPath, diagnostics);
+    validateDoctorExtensionSettings(registry, resolved.effective.extensionSettings, "effective", cwd, pi.trust.trusted, settingsSources.extensionSettings ?? settingsPath, diagnostics);
   } catch (error) {
     const message = errorText(error);
     const source = message.includes(projectSettingsPath) ? projectSettingsPath : settingsPath;
@@ -386,7 +393,6 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const knownModels = new Set(pi.knownModels);
   const availableModels = new Set(pi.availableModels);
   const aliases = settings.modelAliases ?? {};
-  const registry = options.registry ?? loadingRegistry();
   const registeredModelAliases = registry.modelAliases();
   const dynamicAliases = new Set(registeredModelAliases.map(({ name }) => name).filter((name) => !Object.prototype.hasOwnProperty.call(aliases, name)));
   const modelAliases: WorkflowCatalogModelAlias[] = [
@@ -429,6 +435,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     const overriddenBy = starterOverriddenBy.get(file.path);
     roles.push({ name: file.name, path: file.path, scope: "extension", active: overriddenBy === undefined, extension: file.extension, ...(starterPath ? { overrides: starterPath } : {}), ...(overriddenBy ? { overriddenBy } : {}) });
     const definition = inspectRole(file.path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath, { directory: file.directory, extension: file.extension });
+    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, file.path, diagnostics, file.name);
     if (duplicateExtensionNames.has(file.name)) continue;
     if (extensionPaths.get(file.name) !== file.path) continue;
     if (definition) definitions.set(file.name, definition);
@@ -445,6 +452,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
       if (extension) { extension.active = false; extension.overriddenBy = path; }
     }
     const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
+    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, path, diagnostics, name);
     if (definition) definitions.set(name, definition); else definitions.delete(name);
   }
   for (const path of roleFilesFrom([join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
@@ -463,6 +471,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
       if (extension) { extension.active = false; extension.overriddenBy = path; }
     }
     const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
+    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, path, diagnostics, name);
     if (definition) definitions.set(name, definition); else definitions.delete(name);
   }
   const rolePaths = new Set(roles.map(({ path }) => path));
@@ -484,7 +493,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
             const dynamic = await registry.resolveModelAliases({ cwd, projectTrusted: pi.trust.trusted, rootModel, knownModels, availableModels, signal: new AbortController().signal });
             roleAliases = { ...aliases, ...dynamic };
           }
-          roleInspection = await inspectRoleSession(cwd, agentDir, options.role, definition, activeRole.path, resourcePolicy, rootModel, [...activeTools], roleAliases, knownModels, availableModels, settingsPath, options.prompt ?? "", registry.agentSetupHooks(), diagnostics);
+          roleInspection = await inspectRoleSession(cwd, agentDir, options.role, definition, activeRole.path, resourcePolicy, rootModel, [...activeTools], roleAliases, knownModels, availableModels, settingsPath, settings.extensionSettings, options.prompt ?? "", registry.agentSetupHooks(), diagnostics);
           if (roleInspection) diagnostics.push(...roleInspection.setup.diagnostics);
         } catch (error) { diagnostics.push(diagnostic("error", "ROLE_INSPECTION_MODEL", errorText(error), activeRole.path)); }
       }
@@ -579,7 +588,7 @@ export function formatDoctorReport(report: DoctorReport): string {
     `- Agent dir: \`${report.agentDir}\``,
     `- Global workflow settings: \`${report.settingsPath}\``,
     `- Project workflow settings: \`${report.resourcePolicy.projectSettingsPath}\` (${report.resourcePolicy.projectTrusted ? "trusted" : "ignored: project untrusted"})`,
-    `- Effective setting sources: concurrency=\`${report.settingsSources.concurrency}\`, modelAliases=\`${report.settingsSources.modelAliases}\`, skills=\`${report.settingsSources.skills ?? "(none)"}\`, extensions=\`${report.settingsSources.extensions ?? "(none)"}\`, tools=\`${report.settingsSources.tools ?? "(none)"}\``,
+    `- Effective setting sources: concurrency=\`${report.settingsSources.concurrency}\`, modelAliases=\`${report.settingsSources.modelAliases}\`, skills=\`${report.settingsSources.skills ?? "(none)"}\`, extensions=\`${report.settingsSources.extensions ?? "(none)"}\`, extensionSettings=\`${report.settingsSources.extensionSettings ?? "(none)"}\`, tools=\`${report.settingsSources.tools ?? "(none)"}\``,
     `- Limits: concurrency=${String(report.settings.concurrency)}`,
     "",
     "## Trust/resources",
