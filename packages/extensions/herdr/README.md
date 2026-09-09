@@ -43,7 +43,7 @@ Set the global workflow settings file, normally `~/.pi/agent/pi-extensible-workf
 
 `extensionSettings.herdr` is the only valid location for Herdr configuration. The obsolete `extensions.herdr` object is rejected with `INVALID_SETTINGS`; migrate it before launching.
 
-The effective value inherits global settings and trusted project settings, with project fields refining global fields. Untrusted project settings are ignored. When enabled, every workflow agent launches in a dedicated labeled Herdr workspace and the manual live-session action is hidden. Completed-session inspection remains available.
+The effective value uses the global map unless a trusted project declares `extensionSettings`, in which case the project's complete map replaces it, including `{}`. Role settings are then applied by top-level-key replacement; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled, every workflow agent launches in a dedicated labeled Herdr workspace and the manual live-session action is hidden. Completed-session inspection remains available.
 
 ## Live handoff and ownership
 

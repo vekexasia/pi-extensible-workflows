@@ -153,7 +153,7 @@ export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, gl
     ...(globalSelectors.tools === undefined && projectSelectors.tools === undefined ? {} : { tools: [...(globalSelectors.tools ?? []), ...(projectSelectors.tools ?? [])] }),
   });
   const hasExtensionSelectors = global.extensions !== undefined || project.extensions !== undefined;
-  const extensionSettings = mergeWorkflowExtensionSettings(global.extensionSettings, project.extensionSettings);
+  const extensionSettings = projectHas("extensionSettings") ? project.extensionSettings : global.extensionSettings;
   const sources: WorkflowSettingsSources = {
     concurrency: projectHas("concurrency") ? projectSettingsPath : globalSettingsPath,
     modelAliases: projectHas("modelAliases") ? projectSettingsPath : globalSettingsPath,

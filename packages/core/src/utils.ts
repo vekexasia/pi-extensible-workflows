@@ -33,18 +33,12 @@ export function jsonValue(value: unknown, seen = new Set<object>()): value is Js
 }
 export function jsonObject(value: unknown): value is Record<string, JsonValue> { return jsonValue(value) && object(value); }
 export function mergeWorkflowExtensionSettings(...layers: readonly (Readonly<WorkflowExtensionSettings> | undefined)[]): Readonly<WorkflowExtensionSettings> | undefined {
-  const merge = (left: JsonValue, right: JsonValue): JsonValue => {
-    if (!jsonObject(left) || !jsonObject(right)) return structuredClone(right);
-    const result: Record<string, JsonValue> = { ...left };
-    for (const [key, value] of Object.entries(right)) Object.defineProperty(result, key, { value: Object.prototype.hasOwnProperty.call(left, key) ? merge(left[key] as JsonValue, value) : structuredClone(value), enumerable: true, configurable: true, writable: true });
-    return result;
-  };
   const merged: Record<string, JsonValue> = {};
   let present = false;
   for (const layer of layers) {
-    if (!layer) continue;
+    if (layer === undefined) continue;
     present = true;
-    for (const [namespace, value] of Object.entries(layer)) Object.defineProperty(merged, namespace, { value: Object.prototype.hasOwnProperty.call(merged, namespace) ? merge(merged[namespace] as JsonValue, value) : structuredClone(value), enumerable: true, configurable: true, writable: true });
+    for (const [namespace, value] of Object.entries(layer)) Object.defineProperty(merged, namespace, { value: structuredClone(value), enumerable: true, configurable: true, writable: true });
   }
   return present ? deepFreeze(merged as WorkflowExtensionSettings) : undefined;
 }

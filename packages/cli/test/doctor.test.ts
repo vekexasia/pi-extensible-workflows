@@ -72,6 +72,20 @@ void test("doctor reports malformed settings and Pi discovery rejection diagnost
   assert.match(discovery.hint ?? "", /rerun doctor/);
   assert.equal(doctorExitCode(report), 1);
 });
+void test("doctor reports extension validator diagnostics", async () => {
+  const paths = fixture();
+  writeFileSync(paths.settingsPath, JSON.stringify({ extensionSettings: { acme: { enabled: "yes" } } }));
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Acme settings", validateSettings: (_settings, context) => { if (context.source === "global") throw new Error("acme.enabled must be a boolean"); } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, discoverPi: async () => pi() }));
+  const invalid = report.diagnostics.find(({ code }) => code === "SETTINGS_INVALID");
+  assert.ok(invalid);
+  assert.equal(invalid.source, `${paths.settingsPath}.extensionSettings`);
+  assert.match(invalid.message, /Acme settings/);
+  assert.match(invalid.message, /global/);
+  assert.match(invalid.message, /acme\.enabled/);
+  assert.equal(doctorExitCode(report), 1);
+});
 void test("doctor discovers per-file symlinked role files", async () => {
   const paths = fixture();
   const target = join(paths.root, "source-role.md");

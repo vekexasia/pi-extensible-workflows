@@ -43,7 +43,7 @@ void test("passes effective extension settings to setup hooks and transports", a
   const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession(prepared, context) { transportSettings = context.settings; return base.createSession(prepared, context); } };
   const executor = new WorkflowAgentExecutor({ ...root, extensionSettings: { acme: { global: true } }, agentDefinitions: { reviewer: { extensionSettings: { acme: { role: true } } } }, agentSetupHooks: [{ name: "capture", priority: 10, setup(agent, context) { setupSettings = context.settings; agent.transport = transport; } }] }, localAgentTransport);
   assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", role: "reviewer" })).value, "done");
-  assert.deepEqual(setupSettings, { acme: { global: true, role: true } });
+  assert.deepEqual(setupSettings, { acme: { role: true } });
   assert.deepEqual(transportSettings, setupSettings);
   assert.equal(Object.isFrozen(setupSettings), true);
 });
@@ -1662,6 +1662,68 @@ void test("executor registers the production native steering handler", async () 
   assert.deepEqual(steered, ["redirect"]);
 });
 
+void test("scheduler inherits effective extension settings into nested agents", async () => {
+  const seen = new Map<string, unknown>();
+  // eslint-disable-next-line prefer-const
+  let scheduler!: FairAgentScheduler;
+  const executor = new WorkflowAgentExecutor({
+    ...root,
+    extensionSettings: { acme: { root: true } },
+    agentDefinitions: { nested: { extensionSettings: { acme: { nested: true } } } },
+    onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); },
+  }, testTransport(async (input) => {
+    seen.set(input.sessionLabel, input.settings);
+    return { sessionId: input.sessionLabel, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} };
+  }));
+  scheduler = new FairAgentScheduler(async ({ id, options, prompt }) => {
+    const result = await executor.execute(prompt, { label: options.label, workflowName: "flow", agentNodeId: id, ...(options.role === undefined ? {} : { role: options.role }), ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }) });
+    if (prompt === "parent") {
+      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: [], role: "nested" }, id);
+      const childResult = await scheduler.result(id, child.id);
+      if (!childResult.ok) throw new Error(childResult.error.message);
+    }
+    return result.value;
+  }, 2);
+  scheduler.addRun("run", 2, undefined, { acme: { root: true } });
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
+  assert.equal((await parent.result).ok, true);
+  assert.deepEqual(seen.get("flow:parent:attempt-1"), { acme: { root: true } });
+  assert.deepEqual(seen.get("flow:child:attempt-1"), { acme: { nested: true } });
+});
+void test("concurrent scheduler agents receive isolated extension settings", async () => {
+  const seen = new Map<string, unknown>();
+  let started = 0;
+  let markStarted!: () => void;
+  let release!: () => void;
+  const bothStarted = new Promise<void>((resolve) => { markStarted = resolve; });
+  const continueSessions = new Promise<void>((resolve) => { release = resolve; });
+  // eslint-disable-next-line prefer-const
+  let scheduler!: FairAgentScheduler;
+  const executor = new WorkflowAgentExecutor({
+    ...root,
+    extensionSettings: { acme: { root: true } },
+    agentDefinitions: { alpha: { extensionSettings: { acme: { agent: "alpha" } } }, beta: { extensionSettings: { acme: { agent: "beta" } } } },
+    onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); },
+  }, testTransport(async (input) => {
+    seen.set(input.sessionLabel, input.settings);
+    started += 1;
+    if (started === 2) markStarted();
+    await continueSessions;
+    return { sessionId: input.sessionLabel, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} };
+  }));
+  scheduler = new FairAgentScheduler(async ({ id, options, prompt }) => (await executor.execute(prompt, { label: options.label, workflowName: "flow", agentNodeId: id, ...(options.role === undefined ? {} : { role: options.role }), ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }) })).value, 2);
+  scheduler.addRun("run", 2, undefined, { acme: { root: true } });
+  const alpha = scheduler.spawn("run", "alpha", { label: "alpha", cwd: "/repo", tools: [], role: "alpha" });
+  const beta = scheduler.spawn("run", "beta", { label: "beta", cwd: "/repo", tools: [], role: "beta" });
+  await bothStarted;
+  release();
+  assert.deepEqual(await Promise.all([alpha.result, beta.result]), [
+    { id: alpha.id, ok: true, value: "done" },
+    { id: beta.id, ok: true, value: "done" },
+  ]);
+  assert.deepEqual(seen.get("flow:alpha:attempt-1"), { acme: { agent: "alpha" } });
+  assert.deepEqual(seen.get("flow:beta:attempt-1"), { acme: { agent: "beta" } });
+});
 void test("fair scheduler enforces session/run ceilings and round-robins runs", async () => {
   const order: string[] = [];
   const releases: Array<() => void> = [];

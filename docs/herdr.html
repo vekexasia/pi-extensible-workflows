@@ -76,7 +76,7 @@
     <span class="tok-punctuation">}</span>
   <span class="tok-punctuation">}</span>
 <span class="tok-punctuation">}</span></code></pre>
-        <p><code>extensionSettings.herdr</code> is the only valid location for Herdr configuration. The obsolete <code>extensions.herdr</code> object is rejected with <code>INVALID_SETTINGS</code>; migrate it before launching. This setting is global-only: a project-scope value is accepted by the generic workflow settings parser but ignored by Herdr. When enabled globally, every workflow agent launches in a dedicated labeled Herdr workspace and uses the Herdr transport. The manual live-session action is hidden because the session is already in Herdr. Completed-session inspection remains available.</p>
+        <p><code>extensionSettings.herdr</code> is the only valid location for Herdr configuration. The obsolete <code>extensions.herdr</code> object is rejected with <code>INVALID_SETTINGS</code>; migrate it before launching. The effective setting uses the global map unless a trusted project declares <code>extensionSettings</code>, in which case the project's complete map replaces it, including <code>{}</code>. Role settings then replace declared top-level keys in full; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled for an effective agent, it launches in a dedicated labeled Herdr workspace and uses the Herdr transport. The manual live-session action is hidden because the session is already in Herdr. Completed-session inspection remains available.</p>
       </section>
       <section id="handoff">
         <h2>Live handoff and ownership</h2>

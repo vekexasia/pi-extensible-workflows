@@ -232,31 +232,36 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   writeFileSync(path, JSON.stringify({ surprise: true }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
 });
-void test("preserves extension-defined settings through project and role inheritance", () => {
+void test("replaces extension settings by source and role key", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-settings-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify({ extensionSettings: { acme: { global: true, nested: { global: true } } } }));
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { acme: { project: true, nested: { project: true } } } }));
+  writeFileSync(settingsPath, JSON.stringify({ extensionSettings: { acme: { global: true, nested: { global: true }, rules: ["global"] }, globalOnly: true } }));
+  writeFileSync(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true } }));
   const resolution = resolveWorkflowSettings(cwd, true, settingsPath);
-  assert.deepEqual(resolution.effective.extensionSettings, { acme: { global: true, project: true, nested: { global: true, project: true } } });
-  const role = parseRoleMarkdown("---\nextensionSettings:\n  acme:\n    role: true\n    nested:\n      role: true\n---\nRole", true, join(cwd, "role.md"));
-  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { acme: { global: true, project: true, role: true, nested: { global: true, project: true, role: true } } });
+  assert.deepEqual(resolution.effective.extensionSettings, { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true });
+  assert.equal(resolution.sources.extensionSettings, projectSettingsPath);
+  const role = parseRoleMarkdown("---\nextensionSettings:\n  acme:\n    role: true\n    nested:\n      role: true\n    rules: [role]\n  roleOnly: true\n---\nRole", true, join(cwd, "role.md"));
+  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { acme: { role: true, nested: { role: true }, rules: ["role"] }, projectOnly: true, roleOnly: true });
+  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, {}), resolution.effective.extensionSettings);
+  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, { acme: {} }), { acme: {}, projectOnly: true });
   const registry = new WorkflowRegistry();
   const seen: Array<{ value: unknown; source: string; role?: string }> = [];
   registry.register({ version: "1.0.0", headline: "Acme settings", validateSettings: (value, context) => { seen.push({ value, source: context.source, ...(context.role === undefined ? {} : { role: context.role }) }); } });
   registry.validateExtensionSettings(resolution.global.extensionSettings, { source: "global", cwd, projectTrusted: true, settingsPath });
-  registry.validateExtensionSettings(resolution.project.extensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: join(cwd, ".pi", "pi-extensible-workflows", "settings.json") });
+  registry.validateExtensionSettings(resolution.project.extensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: projectSettingsPath });
   registry.validateExtensionSettings(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { source: "role", role: "reviewer", cwd, projectTrusted: true, settingsPath });
   assert.deepEqual(seen, [
-    { value: { acme: { global: true, nested: { global: true } } }, source: "global" },
-    { value: { acme: { project: true, nested: { project: true } } }, source: "project" },
-    { value: { acme: { global: true, project: true, role: true, nested: { global: true, project: true, role: true } } }, source: "role", role: "reviewer" },
+    { value: { acme: { global: true, nested: { global: true }, rules: ["global"] }, globalOnly: true }, source: "global" },
+    { value: { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true }, source: "project" },
+    { value: { acme: { role: true, nested: { role: true }, rules: ["role"] }, projectOnly: true, roleOnly: true }, source: "role", role: "reviewer" },
   ]);
-  assert.doesNotThrow(() => { registry.register({ version: "1.0.0", headline: "Collision", validateSettings: () => {}, functions: { other: { description: "Other", input: { type: "object" }, output: { type: "null" }, run: () => null } } }); });
+  writeFileSync(projectSettingsPath, JSON.stringify({ extensionSettings: {} }));
+  assert.deepEqual(resolveWorkflowSettings(cwd, true, settingsPath).effective.extensionSettings, {});
 });
 
 void test("workflow extension wires the background widget from global settings", () => {
