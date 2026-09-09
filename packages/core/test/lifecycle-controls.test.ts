@@ -864,6 +864,7 @@ void test("detaching a checkpointed foreground workflow switches future prompts 
   releaseSelect();
   await respond.execute("respond", { runId, name: "ship", approved: true }, undefined, undefined, context);
   await waitForIssue105(async () => (await store.load()).run.delivery?.state === "delivered");
+  await waitForIssue105(() => messages.some((message) => message.startsWith("Workflow background-checkpoint completed:")));
   assert.equal(messages.filter((message) => message.startsWith("Workflow background-checkpoint completed:")).length, 1);
 });
 void test("interrupted lifecycle can cold-resume while completed and failed cannot", async () => {
