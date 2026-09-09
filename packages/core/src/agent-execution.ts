@@ -117,6 +117,7 @@ export interface AgentExecutionRoot {
   blockedAliases?: ReadonlySet<string>;
   blockedAliasTargets?: Readonly<Record<string, string>>;
   settingsPath?: string;
+  extensionSettingsPath?: string;
   runStore?: AgentExecutionRunStore;
   providerPause?: () => Promise<void>;
   agentSetupHooks?: readonly RegisteredAgentSetupHook[];
@@ -852,7 +853,7 @@ async function prepareAgentSetup(root: AgentExecutionRoot, transport: AgentTrans
   const resourcePolicyCeiling = resourcePolicy ? structuredClone(resourcePolicy) : undefined;
   const sessionPath = options.sessionPath === undefined || inspection ? options.sessionPath : await attemptSessionInput(options.sessionPath, attempt);
   const extensionSettings = mergeWorkflowExtensionSettings(options.inheritedExtensionSettings ?? root.extensionSettings, roleDefinition?.extensionSettings) ?? Object.freeze({});
-  root.validateExtensionSettings?.(extensionSettings, { source: roleName === undefined ? "effective" : "role", cwd, projectTrusted: resourcePolicy?.projectTrusted ?? true, ...(root.settingsPath ? { settingsPath: root.settingsPath } : {}), ...(roleName === undefined ? {} : { role: roleName }) });
+  root.validateExtensionSettings?.(extensionSettings, { source: roleName === undefined ? "effective" : "role", cwd, projectTrusted: resourcePolicy?.projectTrusted ?? true, ...((root.extensionSettingsPath ?? root.settingsPath) ? { settingsPath: root.extensionSettingsPath ?? root.settingsPath } : {}), ...(roleName === undefined ? {} : { role: roleName }) });
   if (options.agentNodeId !== undefined) root.onAgentSettings?.(options.agentNodeId, extensionSettings);
   const sessionInput: SessionInput = { cwd, model: { ...resolved.model }, tools: [...resolved.tools], sessionLabel: `${options.workflowName}:${options.label}:attempt-${String(attempt)}`, ...(sessionPath ? { sessionPath } : {}), ...(root.agentDir ? { agentDir: root.agentDir } : {}), ...(root.additionalSkillPaths?.length ? { additionalSkillPaths: [...root.additionalSkillPaths] } : {}), ...(resolved.contextFiles === undefined ? {} : { contextFiles: [...resolved.contextFiles] }), ...(customTools.length ? { customTools: [...customTools] } : {}), ...(resultTool ? { resultTool } : {}), ...(resolved.systemPrompt !== undefined ? { systemPrompt: resolved.systemPrompt } : {}), systemPromptAppend: resolved.systemPromptAppend, ...(resourcePolicy ? { resourcePolicy } : {}), settings: extensionSettings, options: structuredClone(baselineOptions) };
   const setup = { prompt: task, options: sessionInput.options ?? {}, sessionInput, prepared: await preparedAgentSession(sessionInput, task), transport };

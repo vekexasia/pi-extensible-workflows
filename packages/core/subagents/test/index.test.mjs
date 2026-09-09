@@ -1,4 +1,4 @@
-/* global setTimeout, setImmediate */
+/* global setTimeout, setImmediate, structuredClone */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, WorkflowError, registerWorkflowExtension, resetWorkflowRegistry } from "pi-extensible-workflows";
+import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, WorkflowError, prepareAgentSetupForInspection, registerWorkflowExtension, resetWorkflowRegistry } from "pi-extensible-workflows";
 import extension, {
   createSubagentManager,
   createSubagentTools,
@@ -2286,10 +2286,7 @@ test("retries an interrupted persisted subagent as a new run", async () => {
   try {
     assert.equal((await manager.inspect({ id }, context)).state, "failed");
     assert.deepEqual(cleanupCalls, [{ cwd, sessionId: "session-1", runId: id, name: "scope", owner: "worktree/named/scope" }]);
-    const retried = await manager.retry({ id }, context);
-    assert.notEqual(retried.id, id);
-    await waitFor(async () => (await manager.inspect({ id: retried.id }, context)).state === "completed");
-    assert.equal((await manager.inspect({ id: retried.id }, context)).value, "recovered");
+    await assert.rejects(manager.retry({ id }, context), (error) => error instanceof WorkflowError && error.code === "RESUME_INCOMPATIBLE");
   } finally {
     await manager.dispose();
     await rm(cwd, { recursive: true, force: true });
@@ -2832,6 +2829,113 @@ test("rejects malformed persisted attempt metadata at the manager boundary", asy
   } finally {
     await manager.dispose();
     await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("freezes standalone extension settings and role definitions across live and cold retries", async () => {
+  resetWorkflowRegistry();
+  const root = await mkdtemp(join(tmpdir(), "subagents-frozen-settings-retry-"));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  const storageDir = join(root, "storage");
+  const globalSettingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
+  const rolePath = join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
+  const observed = [];
+  const received = [];
+  const writeConfiguration = async (value) => {
+    await mkdir(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+    await writeFile(globalSettingsPath, JSON.stringify({ extensionSettings: { acme: { global: value } } }));
+    await writeFile(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: value } } }));
+    await writeFile(rolePath, `---\nextensionSettings: {"acme":{"role":"${value}"}}\n---\nReview`);
+  };
+  const context = await managerContext(cwd);
+  registerWorkflowExtension({ version: "1.0.0", headline: "Frozen settings fixture", validateSettings(settings, source) { observed.push({ source: source.source, role: source.role, settings: structuredClone(settings) }); } });
+  const dependencies = {
+    agentDir,
+    storageDir,
+    createExecutor(rootValue) {
+      received.push({ settings: structuredClone(rootValue.extensionSettings), role: structuredClone(rootValue.agentDefinitions.reviewer.extensionSettings) });
+      return { async execute() { if (received.length === 1) throw new Error("first retry fixture failure"); return { value: "retried", attempts: [], cwd }; } };
+    },
+  };
+  let manager;
+  try {
+    await writeConfiguration("old");
+    manager = createSubagentManager(dependencies);
+    const liveSource = await manager.run({ prompt: "live", role: "reviewer" }, context);
+    await waitFor(async () => (await manager.inspect({ id: liveSource.id }, context)).state === "failed");
+    await writeConfiguration("new");
+    const liveRetry = await manager.retry({ id: liveSource.id }, context);
+    await waitFor(async () => (await manager.inspect({ id: liveRetry.id }, context)).state === "completed");
+    assert.deepEqual(received, [
+      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+    ]);
+    assert.deepEqual(observed.filter(({ source }) => source === "global" || source === "project").map(({ source, settings }) => ({ source, settings })), [
+      { source: "global", settings: { acme: { global: "old" } } },
+      { source: "project", settings: { acme: { project: "old" } } },
+      { source: "global", settings: { acme: { global: "old" } } },
+      { source: "project", settings: { acme: { project: "old" } } },
+    ]);
+    await manager.dispose();
+    manager = undefined;
+    received.length = 0;
+    await writeConfiguration("old");
+    manager = createSubagentManager(dependencies);
+    const coldSource = await manager.run({ prompt: "cold", role: "reviewer" }, context);
+    await waitFor(async () => (await manager.inspect({ id: coldSource.id }, context)).state === "failed");
+    await manager.dispose();
+    manager = undefined;
+    await writeConfiguration("new");
+    manager = createSubagentManager(dependencies);
+    const coldRetry = await manager.retry({ id: coldSource.id }, context);
+    await waitFor(async () => (await manager.inspect({ id: coldRetry.id }, context)).state === "completed");
+    assert.deepEqual(received, [
+      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+    ]);
+  } finally {
+    await manager?.dispose();
+    resetWorkflowRegistry();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+test("validates standalone global, project, role, and effective settings before session creation", async () => {
+  resetWorkflowRegistry();
+  const root = await mkdtemp(join(tmpdir(), "subagents-settings-validation-"));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+  const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
+  const rolePath = join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
+  const seen = [];
+  const context = await managerContext(cwd);
+  let manager;
+  const writeConfiguration = async () => {
+    await mkdir(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
+    await writeFile(settingsPath, JSON.stringify({ modelAliases: { cheap: "fixture/cheap" }, extensionSettings: { acme: { global: true } } }));
+    await writeFile(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: true } } }));
+    await writeFile(rolePath, "---\nextensionSettings: {\"acme\":{\"role\":true}}\n---\nReview");
+  };
+  registerWorkflowExtension({ version: "1.0.0", headline: "Settings validation fixture", validateSettings(settings, context) { seen.push({ source: context.source, role: context.role, path: context.settingsPath, settings: structuredClone(settings) }); } });
+  try {
+    await writeConfiguration();
+    const transportValue = { id: "inspection", async createSession() { throw new Error("inspection must not create a session"); } };
+    manager = createSubagentManager({ agentDir, storageDir: join(root, "storage"), transport: transportValue, createExecutor(rootValue, nextTransport) { return { async execute(task, options) { const prepared = await prepareAgentSetupForInspection(rootValue, task, options, nextTransport); return { value: prepared.setup.prepared.settings ?? {}, attempts: [], cwd }; } }; } });
+    const result = await manager.run({ prompt: "validate", mode: "foreground", role: "reviewer" }, context);
+    assert.equal(result.state, "completed");
+    assert.deepEqual(seen.map(({ source }) => source), ["global", "project", "role"]);
+    assert.equal(seen[0].path, settingsPath);
+    assert.equal(seen[1].path, projectSettingsPath);
+    assert.equal(seen[2].role, "reviewer");
+    assert.equal(seen[2].path, projectSettingsPath);
+    await manager.dispose();
+  } finally {
+    await manager?.dispose();
+    resetWorkflowRegistry();
+    await rm(root, { recursive: true, force: true });
   }
 });
 function deferred() {

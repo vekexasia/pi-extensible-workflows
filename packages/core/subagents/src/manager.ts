@@ -4,12 +4,14 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
   addAccounting,
+  deepFreeze,
   errorCode,
   errorText,
   finiteNumber,
   isNodeError,
   isThinkingLevel,
   jsonValue,
+  object,
   loadAgentDefinitions,
   loadingRegistry,
   localAgentTransport,
@@ -22,10 +24,12 @@ import {
   validateModelAliasAvailability,
   WorkflowAgentExecutor,
   WorkflowError,
+  workflowProjectSettingsPath,
   workflowSettingsPath,
   type AgentAccounting,
   type AgentAttempt,
   type AgentAttemptSummary,
+  type AgentDefinition,
   type AgentExecutionOptions,
   type AgentExecutionRoot,
   type AgentProgress,
@@ -34,9 +38,11 @@ import {
   type JsonValue,
   type ModelSpec,
   type WorkflowAgentSessionState,
+  type WorkflowExtensionSettings,
   type WorkflowRunContext,
   SerialLane,
 } from "../../src/index.js";
+import { decodeAgentDefinition, decodeWorkflowExtensions } from "../../src/decoders.js";
 import { atomicJson, json as readJson, processAlive } from "../../src/persistence.js";
 import { accountingValue, activityValue, legacyAccountingValue, worktreeValue } from "./decode.js";
 import {
@@ -62,6 +68,7 @@ import { createRunStoreWorktreeAdapter, defaultWorktreeHome, type SubagentWorktr
 const WORKFLOW_NAME = "subagents";
 const STORAGE_DIRECTORY = "subagents";
 const OWNER_FILE = "owner.json";
+const CONFIGURATION_FILE = "configuration.json";
 const OWNER_WRITE_GRACE_MS = 30_000;
 const MAX_STORAGE_OWNER_ATTEMPTS = 8;
 const MAX_TERMINAL_SUMMARIES = 128;
@@ -70,6 +77,12 @@ const MAX_PERSISTED_ATTEMPT_ARRAY_ITEMS = SUBAGENT_MAX_RETRIES + 1;
 const MAX_PERSISTED_ATTEMPT_STRING_CHARS = 4096;
 const MAX_PERSISTED_ATTEMPT_LOCATOR_CHARS = 16 * 1024;
 const SUBAGENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+type StandaloneExternalConfiguration = Readonly<{
+  projectTrusted: boolean;
+  globalExtensionSettings?: Readonly<WorkflowExtensionSettings>;
+  projectExtensionSettings?: Readonly<WorkflowExtensionSettings>;
+  agentDefinitions: Readonly<Record<string, AgentDefinition>>;
+}>;
 class InvalidPersistedSubagentStatusError extends WorkflowError {
   constructor() { super("INTERNAL_ERROR", "Persisted subagent status is invalid"); }
 }
@@ -156,11 +169,23 @@ function rootModel(context: Readonly<SubagentManagerContext>): ModelSpec {
   const thinking = context.extensionContext.thinkingLevel;
   return { provider: model.provider, model: model.id, ...(thinking === undefined ? {} : { thinking }) };
 }
-function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>, signal: AbortSignal, runId: string, worktree: SubagentWorktreeHandle | undefined): AgentExecutionRoot {
+function standaloneExtensionSettingsPath(cwd: string, agentDir: string, trustedProject: boolean, external: StandaloneExternalConfiguration): string {
+  return trustedProject && external.projectExtensionSettings !== undefined ? workflowProjectSettingsPath(cwd) : workflowSettingsPath(agentDir);
+}
+function validateStandaloneExtensionSources(context: Readonly<SubagentManagerContext>, external: StandaloneExternalConfiguration, registry: ReturnType<typeof loadingRegistry>, agentDir: string): void {
+  const cwd = context.extensionContext.cwd;
+  const globalSettingsPath = workflowSettingsPath(agentDir);
+  const trustedProject = context.extensionContext.isProjectTrusted();
+  if (external.globalExtensionSettings !== undefined) registry.validateExtensionSettings(external.globalExtensionSettings, { source: "global", cwd, projectTrusted: trustedProject, settingsPath: globalSettingsPath });
+  if (trustedProject && external.projectExtensionSettings !== undefined) registry.validateExtensionSettings(external.projectExtensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: workflowProjectSettingsPath(cwd) });
+}
+function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>, signal: AbortSignal, runId: string, worktree: SubagentWorktreeHandle | undefined, external: StandaloneExternalConfiguration): AgentExecutionRoot {
   const extensionContext = context.extensionContext;
   const model = rootModel(context);
   const agentDir = dependencies.agentDir ?? getAgentDir();
-  const trustedProject = extensionContext.isProjectTrusted();
+  const currentTrustedProject = extensionContext.isProjectTrusted();
+  if (external.projectTrusted && !currentTrustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot retry standalone configuration from an untrusted project");
+  const trustedProject = currentTrustedProject;
   const settingsPath = workflowSettingsPath(agentDir);
   const settings = resolveWorkflowSettings(extensionContext.cwd, trustedProject, settingsPath);
   const resourcePolicy = resolveAgentResourcePolicy(extensionContext.cwd, trustedProject, settingsPath);
@@ -182,6 +207,9 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     signal,
   };
   const registry = loadingRegistry();
+  validateStandaloneExtensionSources(context, external, registry, agentDir);
+  const extensionSettings = trustedProject && external.projectExtensionSettings !== undefined ? external.projectExtensionSettings : external.globalExtensionSettings;
+  const extensionSettingsPath = standaloneExtensionSettingsPath(extensionContext.cwd, agentDir, trustedProject, external);
   return {
     cwd: extensionContext.cwd,
     model,
@@ -189,12 +217,13 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     resourceSelectors: resourcePolicy.effective,
     ...(worktree === undefined ? {} : { runStore: worktree.runStore }),
     agentDir,
-    extensionSettings: settings.effective.extensionSettings,
+    extensionSettings,
     availableModels,
     knownModels,
     ...(Object.keys(staticAliases).length ? { modelAliases: staticAliases } : {}),
     settingsPath: settings.sources.modelAliases,
-    agentDefinitions: loadAgentDefinitions(extensionContext.cwd, agentDir, trustedProject),
+    extensionSettingsPath,
+    agentDefinitions: external.agentDefinitions,
     agentSetupHooks: registry.agentSetupHooks(),
     validateExtensionSettings: registry.validateExtensionSettings,
     agentResourcePolicy: () => structuredClone(resourcePolicy),
@@ -207,7 +236,9 @@ async function addDynamicAliases(context: Readonly<SubagentManagerContext>, sign
   const registry = loadingRegistry();
   if (registry.modelAliases().length === 0) return root;
   const staticAliases = root.modelAliases ?? {};
-  const dynamicAliases = await registry.resolveModelAliases({ cwd: context.extensionContext.cwd, projectTrusted: context.extensionContext.isProjectTrusted(), rootModel: root.model, knownModels: root.knownModels ?? new Set(), availableModels: root.availableModels ?? new Set(), signal }, new Set(Object.keys(staticAliases)));
+  const resourcePolicy = await root.agentResourcePolicy?.();
+  const trustedProject = resourcePolicy?.projectTrusted ?? context.extensionContext.isProjectTrusted();
+  const dynamicAliases = await registry.resolveModelAliases({ cwd: context.extensionContext.cwd, projectTrusted: trustedProject, rootModel: root.model, knownModels: root.knownModels ?? new Set(), availableModels: root.availableModels ?? new Set(), signal }, new Set(Object.keys(staticAliases)));
   validateModelAliasAvailability(dynamicAliases, Object.keys(dynamicAliases), root.availableModels ?? new Set(), root.knownModels ?? new Set(), root.settingsPath);
   return { ...root, modelAliases: { ...dynamicAliases, ...staticAliases } };
 }
@@ -243,6 +274,7 @@ function storageDirectory(dependencies: Readonly<SubagentManagerDependencies>): 
 
 function runDirectory(root: string, id: string): string { return join(root, id); }
 function requestPath(directory: string): string { return join(directory, "request.json"); }
+function configurationPath(directory: string): string { return join(directory, CONFIGURATION_FILE); }
 function statusPath(directory: string): string { return join(directory, "status.json"); }
 function resultPath(directory: string): string { return join(directory, "result.json"); }
 function failurePath(directory: string): string { return join(directory, "failure.json"); }
@@ -368,6 +400,34 @@ function validSubagentId(id: string): boolean { return SUBAGENT_ID_PATTERN.test(
 
 function checkedRequest(request: unknown): SubagentRunRequest {
   return normalizeSubagentRunRequest(request);
+}
+function decodePersistedStandaloneExternalConfiguration(value: unknown): StandaloneExternalConfiguration | undefined {
+  if (!object(value) || !jsonValue(value) || typeof value.projectTrusted !== "boolean") return undefined;
+  const globalExtensionSettings = value.globalExtensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.globalExtensionSettings);
+  const projectExtensionSettings = value.projectExtensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.projectExtensionSettings);
+  if (value.globalExtensionSettings !== undefined && globalExtensionSettings === undefined || value.projectExtensionSettings !== undefined && projectExtensionSettings === undefined) return undefined;
+  if (!object(value.agentDefinitions)) return undefined;
+  const agentDefinitions = Object.create(null) as Record<string, AgentDefinition>;
+  for (const [name, definition] of Object.entries(value.agentDefinitions)) {
+    const decoded = decodeAgentDefinition(definition);
+    if (decoded === undefined) return undefined;
+    agentDefinitions[name] = decoded;
+  }
+  return deepFreeze({ projectTrusted: value.projectTrusted, ...(globalExtensionSettings === undefined ? {} : { globalExtensionSettings }), ...(projectExtensionSettings === undefined ? {} : { projectExtensionSettings }), agentDefinitions });
+}
+function standaloneExternalConfiguration(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>): StandaloneExternalConfiguration {
+  const cwd = context.extensionContext.cwd;
+  const trustedProject = context.extensionContext.isProjectTrusted();
+  const agentDir = dependencies.agentDir ?? getAgentDir();
+  const resolution = resolveWorkflowSettings(cwd, trustedProject, workflowSettingsPath(agentDir));
+  const globalExtensionSettings = resolution.global.extensionSettings;
+  const projectExtensionSettings = resolution.project.extensionSettings;
+  return deepFreeze({
+    projectTrusted: trustedProject,
+    ...(globalExtensionSettings === undefined ? {} : { globalExtensionSettings: structuredClone(globalExtensionSettings) }),
+    ...(projectExtensionSettings === undefined ? {} : { projectExtensionSettings: structuredClone(projectExtensionSettings) }),
+    agentDefinitions: structuredClone(loadAgentDefinitions(cwd, agentDir, trustedProject)),
+  });
 }
 
 function checkedId(request: Readonly<{ id: string }>): string {
@@ -661,7 +721,7 @@ function emitUpdate(run: LiveRun): void {
   try { run.observe?.(publicStatus(live, true, true)); } catch { /* A widget failure is display-only. */ }
 }
 
-async function createRunStorage(root: string, id: string, request: Readonly<SubagentRunRequest>, status: PersistedSubagentStatus): Promise<string> {
+async function createRunStorage(root: string, id: string, request: Readonly<SubagentRunRequest>, status: PersistedSubagentStatus, external: StandaloneExternalConfiguration): Promise<string> {
   await secureDirectory(root);
   const directory = runDirectory(root, id);
   let created = false;
@@ -670,6 +730,7 @@ async function createRunStorage(root: string, id: string, request: Readonly<Suba
     created = true;
     await chmod(directory, 0o700);
     await atomicJson(requestPath(directory), request);
+    await atomicJson(configurationPath(directory), external);
     await atomicJson(statusPath(directory), status);
     return directory;
   } catch (error) {
@@ -729,6 +790,19 @@ async function loadOptionalJson(path: string): Promise<unknown> {
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return undefined;
     throw error;
+  }
+}
+async function loadPersistedStandaloneExternalConfiguration(root: string, id: string): Promise<StandaloneExternalConfiguration> {
+  try {
+    const value = await loadOptionalJson(configurationPath(runDirectory(root, id)));
+    if (value === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", `Subagent ${id} has no frozen external configuration; this historic run cannot be retried deterministically`);
+    const configuration = decodePersistedStandaloneExternalConfiguration(value);
+    if (configuration === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", `Subagent ${id} has invalid frozen external configuration`);
+    return configuration;
+  } catch (error) {
+    if (error instanceof WorkflowError) throw error;
+    if (error instanceof SyntaxError) throw new WorkflowError("RESUME_INCOMPATIBLE", `Subagent ${id} has invalid frozen external configuration`);
+    throw internalStorageError(error, `Unable to read subagent ${id} external configuration`);
   }
 }
 
@@ -892,10 +966,12 @@ class PersistentSubagentManager implements SubagentManager {
     return run.terminal;
   }
 
-  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>): Promise<LiveRun> {
+  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>, frozenExternal?: StandaloneExternalConfiguration): Promise<LiveRun> {
     await this.ensureInitialized();
     if (this.disposed) throw new WorkflowError("CANCELLED", "Subagent manager is disposed");
     if (context.signal?.aborted) throw new WorkflowError("CANCELLED", "Subagent cancelled");
+    const external = frozenExternal ?? standaloneExternalConfiguration(context, this.dependencies);
+    if (external.projectTrusted && !context.extensionContext.isProjectTrusted()) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot retry standalone configuration from an untrusted project");
     const id = randomUUID();
     const startedAt = Date.now();
     const sessionId = context.extensionContext.sessionManager.getSessionId();
@@ -909,7 +985,7 @@ class PersistentSubagentManager implements SubagentManager {
     const initialStatus: PersistedSubagentStatus = { id, sessionId, state: "running", startedAt, owner: { ...owner } };
     let directory: string;
     try {
-      directory = await createRunStorage(storageDirectory(this.dependencies), id, snapshot, initialStatus);
+      directory = await createRunStorage(storageDirectory(this.dependencies), id, snapshot, initialStatus, external);
     } catch (error) {
       this.activeRunCount -= 1;
       if (error instanceof WorkflowError) throw error;
@@ -942,7 +1018,7 @@ class PersistentSubagentManager implements SubagentManager {
           throw new WorkflowError("CANCELLED", "Subagent cancelled");
         }
       }
-      const baseRoot = executionRoot(context, this.dependencies, controller.signal, id, worktree);
+      const baseRoot = executionRoot(context, this.dependencies, controller.signal, id, worktree, external);
       const root = loadingRegistry().modelAliases().length === 0 ? baseRoot : await addDynamicAliases(context, controller.signal, baseRoot);
       const transport = this.dependencies.transport ?? localAgentTransport;
       const injectedExecutor = this.dependencies.createExecutor?.(root, transport);
@@ -1104,8 +1180,9 @@ class PersistentSubagentManager implements SubagentManager {
     const status = active ? persistedStatus(active) : this.terminalSummaries.get(id) ?? await loadPersistedStatus(storageDirectory(this.dependencies), id);
     if (status.state !== "failed" && status.state !== "stopped") throw new WorkflowError("AGENT_FAILED", `Subagent ${id} is not retryable`);
     const requestSnapshot = await loadPersistedRequest(storageDirectory(this.dependencies), id);
+    const frozenExternal = await loadPersistedStandaloneExternalConfiguration(storageDirectory(this.dependencies), id);
     const retryRequest = context.waitForForeground === false && requestSnapshot.mode === "foreground" ? { ...requestSnapshot, mode: "background" as const } : requestSnapshot;
-    const run = await this.start(retryRequest, context);
+    const run = await this.start(retryRequest, context, frozenExternal);
     emitUpdate(run);
     if (run.request.mode !== "foreground") return { id: run.id, state: "running" };
     return run.terminal;

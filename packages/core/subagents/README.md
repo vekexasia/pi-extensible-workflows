@@ -82,7 +82,7 @@ Each call owns an independent run, so calls can execute concurrently and settle 
 
 ## IDs, inspection, and terminal values
 
-Run records are stored below the agent directory's private `subagents/` directory, normally `~/.pi/agent/subagents/<id>/`. The record includes the normalized request, including its launch mode, and status. A shared storage owner marker uses the process ID, process start, session ID, and token; every running record carries the same manager identity so a live manager does not reconcile another manager's active run.
+Run records are stored below the agent directory's private `subagents/<id>/` directory, normally `~/.pi/agent/subagents/<id>/`. The record includes the normalized request, its frozen external settings and role definitions for deterministic retries, and status. A shared storage owner marker uses the process ID, process start, session ID, and token; every running record carries the same manager identity so a live manager does not reconcile another manager's active run.
 
 Inspection is repeatable. Use the list form for ordered summaries and the ID form for one detailed status plus its terminal value or failure information. Progress is retained in memory and is persisted when the executor marks a progress update for persistence. The result and failure files remain available after manager restart.
 
@@ -94,7 +94,7 @@ Inspection is repeatable. Use the list form for ordered summaries and the ID for
 
 ## Retries
 
-`subagents_retry` is available for `failed` and `stopped` runs. It reads the original normalized request and starts a fresh execution with a new UUID. The old record and ID remain available. Completed or currently running runs are not retryable. The retry preserves the original `background` or `foreground` launch mode, so retrying a foreground run returns its new terminal envelope inline.
+`subagents_retry` is available for `failed` and `stopped` runs. It reads the original normalized request and frozen external configuration, then starts a fresh execution with a new UUID. Historic records without that frozen configuration are reported as incompatible rather than retried with current settings. The old record and ID remain available. Completed or currently running runs are not retryable. The retry preserves the original `background` or `foreground` launch mode, so retrying a foreground run returns its new terminal envelope inline.
 
 ## Worktrees
 
