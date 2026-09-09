@@ -94,24 +94,30 @@ export class TestHarness {
   readonly cwd: string;
   readonly sessionId: string;
   private readonly model: string | undefined;
+  private readonly agentDir: string | undefined;
+  private readonly homeDir: string | undefined;
+  private readonly environment: Readonly<Record<string, string>>;
   private paneId: string | undefined;
   private agentCounter = 0;
   private runCounter = 0;
 
-  private constructor(cwd: string, sessionId: string, model?: string) {
+  private constructor(cwd: string, sessionId: string, model?: string, agentDir?: string, homeDir?: string, environment: Readonly<Record<string, string>> = {}) {
     this.cwd = cwd;
     this.sessionId = sessionId;
     this.model = model;
+    this.agentDir = agentDir;
+    this.homeDir = homeDir;
+    this.environment = environment;
   }
 
   /**
    * Create a harness with a fresh temp cwd and a fixed session ID.
    * Add fixtures with `addRun()`, then call `launch()`.
    */
-  static create(options: { prefix?: string; model?: string; sessionId?: string } = {}): TestHarness {
+  static create(options: { prefix?: string; model?: string; sessionId?: string; agentDir?: string; homeDir?: string; environment?: Readonly<Record<string, string>> } = {}): TestHarness {
     const cwd = mkdtempSync(join(tmpdir(), `pi-wf-${options.prefix ?? "test"}-`));
     const sessionId = options.sessionId ?? randomUUID();
-    return new TestHarness(cwd, sessionId, options.model);
+    return new TestHarness(cwd, sessionId, options.model, options.agentDir, options.homeDir, options.environment);
   }
 
   // ── Agent builder ──────────────────────────────────────────────────────
@@ -193,15 +199,15 @@ export class TestHarness {
   // ── Pi lifecycle ───────────────────────────────────────────────────────
 
   /**
-   * Launch Pi in a herdr pane with only this extension loaded and the
-   * harness session ID. Fixtures written before this call are visible
-   * immediately — interrupted runs are cold-recovered by session_start.
+   * Launch Pi with either the source extension or the only package installed
+   * in agentDir. Fixtures written before this call are visible immediately —
+   * interrupted runs are cold-recovered by session_start.
    */
-  async launch(): Promise<void> {
+  async launch(options: { installedExtensions?: boolean } = {}): Promise<void> {
     if (this.paneId) throw new Error("Already launched");
+    if (options.installedExtensions && !this.agentDir) throw new Error("agentDir is required for installed extensions");
 
     const extensionPath = resolve("dist/src/index.js");
-
     const tabResult = herdrJson(
       "tab", "create", "--workspace", testWorkspace(), "--cwd", this.cwd,
       "--label", `pi-wf-${this.sessionId.slice(0, 8)}`, "--no-focus",
@@ -209,7 +215,14 @@ export class TestHarness {
     this.paneId = tabResult.result.root_pane.pane_id;
 
     const modelFlag = this.model ? ` --model ${this.model}` : "";
-    const cmd = `pi --no-extensions -e ${extensionPath} --no-builtin-tools${modelFlag} --session-id ${this.sessionId}`;
+    const installedFlag = options.installedExtensions ? "" : ` --no-extensions -e ${extensionPath}`;
+    const environment = [
+      ...Object.entries(this.environment),
+      ...(this.homeDir ? [["HOME", this.homeDir] as const] : []),
+      ...(this.agentDir ? [["PI_CODING_AGENT_DIR", this.agentDir] as const] : []),
+    ];
+    const environmentPrefix = environment.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(" ");
+    const cmd = `${environmentPrefix}${environmentPrefix ? " " : ""}pi${installedFlag} --no-builtin-tools${modelFlag} --session-id ${this.sessionId}`;
     herdr("pane", "run", this.paneId, cmd);
 
     // Wait for Pi to be ready

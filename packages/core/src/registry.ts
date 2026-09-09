@@ -1,11 +1,12 @@
-import { readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "typebox/value";
 import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext, WorkflowRoleDirectoryRegistration } from "./types.js";
 import type { SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, MODEL_ALIAS_NAME, object } from "./utils.js";
 import { loadSettings, resolveWorkflowSettings, validateSchema } from "./validation.js";
+import { canonicalPath } from "./paths.js";
 
 const RESERVED_GLOBALS = new Set(["agent", "shell", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
@@ -28,9 +29,8 @@ function normalizeRoleDirectory(value: unknown): string {
   }
   fail("INVALID_METADATA", "Workflow role directories require file URLs or absolute filesystem paths");
 }
-function canonicalRoleDirectory(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
 function isBuiltinRoleDirectory(path: string): boolean {
-  const canonical = canonicalRoleDirectory(path);
+  const canonical = canonicalPath(path);
   const starterDirectory = dirname(canonical);
   if (basename(canonical) !== "roles" || basename(starterDirectory) !== "starter") return false;
   const distributionDirectory = dirname(starterDirectory);

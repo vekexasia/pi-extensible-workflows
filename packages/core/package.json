@@ -47,14 +47,14 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets && cp -R trajectory/src/assets dist/trajectory/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist",
+    "build": "rm -rf dist && tsc -p tsconfig.json && cp -R starter/roles dist/starter/roles && cp -R trajectory/src/assets dist/trajectory/src/assets && cp -R trajectory/src/assets dist/trajectory/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist && esbuild trajectory/src/server.ts --bundle --format=esm --platform=node --sourcemap --sources-content=false --outfile=dist/trajectory/src/server.js",
     "lint": "eslint .",
     "test": "npm run test:layout && npm run build && npm run test:widget && npm run test:run && npm run test:herdr && npm run test:subagents",
     "test:layout": "node --test --test-timeout=10000 --test-force-exit test/workspace-layout.test.mjs",
     "test:subagents": "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; PI_CODING_AGENT_DIR=\"$tmp\" node --test --test-timeout=30000 --test-force-exit subagents/test/index.test.mjs",
     "test:widget": "node --test --test-timeout=30000 --test-force-exit test/background-widget.test.mjs",
     "test:run": "files=${TEST_FILES:-$(find dist/test dist/trajectory/test -name '*.test.js' ! -name 'navigator.test.js')}; printf '%s\\n' $files | xargs -n1 -P20 sh -c 'tmp=$(mktemp -d); agent=$(mktemp -d); trap '\"'\"'rm -rf \"$tmp\" \"$agent\"'\"'\"' EXIT; TMPDIR=\"$tmp\" PI_CODING_AGENT_DIR=\"$agent\" env -u HERDR_ENV -u HERDR_PANE_ID -u HERDR_SOCKET_PATH -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID node --expose-gc --test --test-concurrency=1 --test-timeout=120000 --test-force-exit --test-reporter=dot \"$1\"' sh",
-    "test:herdr": "if [ \"${HERDR_ENV:-}\" != \"1\" ]; then echo 'Skipping navigator integration tests: HERDR_ENV=1 is required; run inside a Herdr pane to exercise them.'; exit 0; fi; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; TMPDIR=\"$tmp\" node --expose-gc --test --test-concurrency=1 --test-timeout=120000 --test-force-exit --test-reporter=dot dist/test/navigator.test.js",
+    "test:herdr": "if [ \"${HERDR_ENV:-}\" != \"1\" ]; then echo 'Skipping Herdr integration tests: HERDR_ENV=1 is required; run inside a Herdr pane to exercise them.'; exit 0; fi; tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT; TMPDIR=\"$tmp\" node --expose-gc --test --test-concurrency=1 --test-timeout=180000 --test-force-exit --test-reporter=dot dist/test/navigator.test.js dist/test/trajectory-e2e.test.js",
     "acceptance": "npm run build && TEST_FILES='dist/test/runtime-acceptance.test.js' npm run test:run",
     "evals": "npm run build && node dist/evals/src/workflow-evals.js",
     "evals:ambient": "node -e \"if (process.env.PI_WORKFLOW_EVAL_AMBIENT !== '1') { console.error('Ambient Tier D evals are opt-in. Set PI_WORKFLOW_EVAL_AMBIENT=1 to run them.'); process.exit(1); }\" && npm run build && node dist/evals/src/ambient-workflow-evals.js",
