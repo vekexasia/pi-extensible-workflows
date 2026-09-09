@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { open, readFile, readdir, stat } from "node:fs/promises";
-import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition, DefaultPackageManager, getAgentDir, SettingsManager, DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
@@ -11,6 +10,7 @@ import { normalizeSubagentRunRequest, type SubagentProgress, type SubagentRunReq
 import { statusValue, subagentErrorValue } from "../subagents/src/decode.js";
 import { isNodeError, jsonValue, object, resourcePatternHasMagic, selectResourcesByLayers } from "./utils.js";
 import type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
+import { canonicalPath, sameFilesystemPath } from "./paths.js";
 
 export const TRAJECTORY_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const TRAJECTORY_MAX_NON_TIMING_ENTRIES = 400;
@@ -207,14 +207,13 @@ export function withPiToolDescriptionsForTools(tools: readonly string[], cwd: st
   return toolDefinitionsFor(tools, piToolCatalog(cwd));
 }
 
-function canonicalSourcePath(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
 function canonicalExtensionSelector(selector: string, base: string): string {
   const negated = selector.startsWith("!");
   const body = negated ? selector.slice(1) : selector;
   if (body === "*" || body === "**" || body.startsWith("**/")) return selector;
   const resolved = resolve(base, body);
   if (resourcePatternHasMagic(body)) return `${negated ? "!" : ""}${resolved}`;
-  return `${negated ? "!" : ""}${canonicalSourcePath(resolved)}`;
+  return `${negated ? "!" : ""}${canonicalPath(resolved)}`;
 }
 function skillNameFromPath(path: string): string {
   const file = basename(path);
@@ -232,7 +231,7 @@ async function discoveredResources(cwd: string): Promise<DiscoveredResources> {
     const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
     const resolved = await packageManager.resolve();
     return {
-      extensions: [...new Set(resolved.extensions.filter((entry) => entry.enabled).map((entry) => canonicalSourcePath(entry.path)))],
+      extensions: [...new Set(resolved.extensions.filter((entry) => entry.enabled).map((entry) => canonicalPath(entry.path)))],
       skills: [...new Set(resolved.skills.filter((entry) => entry.enabled).map((entry) => skillNameFromPath(entry.path)))],
     };
   })();
@@ -409,7 +408,7 @@ export function createTrajectoryTranscriptLoader(cwd: string, sessionId: string,
         const status = statusValue(rawStatus);
         const statusRecord = object(rawStatus) ? rawStatus : undefined;
         const statusCwd = statusRecord === undefined ? undefined : statusRecord.cwd;
-        if (!status || status.sessionId !== sessionId || typeof statusCwd === "string" && resolve(statusCwd) !== resolve(cwd)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
+        if (!status || status.sessionId !== sessionId || typeof statusCwd === "string" && !sameFilesystemPath(statusCwd, cwd)) return { status: "missing", revision: 0, entries: [], error: "Transcript not found" };
         path = sessionFile(resolveSubagentSession?.(request.subagentId) ?? status.attemptDetails?.at(-1)?.session);
       }
     } catch (error) {

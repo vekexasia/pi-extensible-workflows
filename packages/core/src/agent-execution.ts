@@ -55,6 +55,7 @@ import { createPiRuntimeAgentRunner, isRuntimeAgentProviderError, normalizePiRun
 import type { RuntimeAgentProgress, RuntimeUsage } from "./runtime/agent-runner.js";
 import { defaultWorkflowResultSchema } from "./runtime/workflow-result.js";
 import { validateAgentOptions, validateSchema } from "./validation.js";
+import { canonicalPath } from "./paths.js";
 import type { RunStore } from "./persistence.js";
 type AgentExecutionRunStore = Pick<RunStore, "recordSystemPrompt" | "validateWorktree" | "worktree" | "snapshotWorktree">;
 const localToolTimingExtension = createToolTimingExtension();
@@ -133,16 +134,15 @@ function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 
-function canonicalSourcePath(path: string): string { try { return realpathSync(path); } catch { return resolve(path); } }
 const extensionDirectory = dirname(fileURLToPath(import.meta.url));
 const workflowPackageRoot = basename(dirname(extensionDirectory)) === "dist" ? resolve(extensionDirectory, "../..") : resolve(extensionDirectory, "..");
 const WORKFLOW_HOST_ENTRIES = new Set([
-  canonicalSourcePath(resolve(workflowPackageRoot, "src/index.ts")),
-  canonicalSourcePath(resolve(workflowPackageRoot, "dist/src/index.js")),
-  canonicalSourcePath(resolve(workflowPackageRoot, "starter/index.ts")),
-  canonicalSourcePath(resolve(workflowPackageRoot, "dist/starter/index.js")),
-  canonicalSourcePath(resolve(workflowPackageRoot, "subagents/index.ts")),
-  canonicalSourcePath(resolve(workflowPackageRoot, "dist/subagents/index.js")),
+  canonicalPath(resolve(workflowPackageRoot, "src/index.ts")),
+  canonicalPath(resolve(workflowPackageRoot, "dist/src/index.js")),
+  canonicalPath(resolve(workflowPackageRoot, "starter/index.ts")),
+  canonicalPath(resolve(workflowPackageRoot, "dist/starter/index.js")),
+  canonicalPath(resolve(workflowPackageRoot, "subagents/index.ts")),
+  canonicalPath(resolve(workflowPackageRoot, "dist/subagents/index.js")),
 ]);
 function canonicalExtensionSelector(selector: string, base = process.cwd()): string {
   const negated = selector.startsWith("!");
@@ -150,7 +150,7 @@ function canonicalExtensionSelector(selector: string, base = process.cwd()): str
   if (body === "*" || body === "**" || body.startsWith("**/")) return selector;
   const resolved = resolve(base, body);
   if (resourcePatternHasMagic(body)) return `${negated ? "!" : ""}${resolved}`;
-  return `${negated ? "!" : ""}${canonicalSourcePath(resolved)}`;
+  return `${negated ? "!" : ""}${canonicalPath(resolved)}`;
 }
 const WORKFLOW_DIRECTORY = "pi-extensible-workflows";
 function workflowSystemPromptPath(cwd: string, agentDir: string, projectTrusted: boolean): string | undefined {
@@ -160,10 +160,10 @@ function workflowSystemPromptPath(cwd: string, agentDir: string, projectTrusted:
   return globalPaths.find((path) => existsSync(path));
 }
 function filterContextFiles(base: readonly { path: string; content: string }[], scopes: readonly ContextFileScope[], cwd: string, agentDir: string): { path: string; content: string }[] {
-  const globalPath = resolve(agentDir);
-  const cwdPath = resolve(cwd);
+  const globalPath = canonicalPath(agentDir);
+  const cwdPath = canonicalPath(cwd);
   return base.filter(({ path }) => {
-    const resolvedPath = resolve(dirname(path));
+    const resolvedPath = canonicalPath(dirname(path));
     return scopes.some((scope) => scope === "global" ? resolvedPath === globalPath : scope === "cwd" ? resolvedPath === cwdPath : resolvedPath !== globalPath && resolvedPath !== cwdPath);
   });
 }
@@ -300,7 +300,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     settingsManager.setProjectTrusted(policy.projectTrusted);
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
     const resolved = await packageManager.resolve();
-    const discoveredExtensions = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalSourcePath(path)))];
+    const discoveredExtensions = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalPath(path)))];
     const selectorSources = policy.selectorSources;
     const extensionLayers = [selectorSources.global.extensions, selectorSources.project.extensions, selectorSources.role?.extensions, selectorSources.call?.extensions];
     const extensionSelectors = extensionLayers.flatMap((layer) => (layer ?? []).map((original) => ({ original, matching: canonicalExtensionSelector(original, input.cwd) })));
@@ -340,7 +340,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: true });
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
     const resolved = await packageManager.resolve();
-    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => canonicalSourcePath(path)).filter((path) => !WORKFLOW_HOST_ENTRIES.has(path)))];
+    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => canonicalPath(path)).filter((path) => !WORKFLOW_HOST_ENTRIES.has(path)))];
     resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
@@ -376,13 +376,13 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     await shutdown("quit").catch(() => undefined);
     throw error;
   }
-  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalSourcePath(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalSourcePath(filePath)) };
+  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalPath(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalPath(filePath)) };
   const resourceInspection = (): PiResourceInspection => {
     const extensions = resourceLoader.getExtensions();
     const skills = resourceLoader.getSkills();
     const diagnostics = [...extensions.errors.map(({ path, error }) => ({ type: "error" as const, message: error, source: path })), ...skills.diagnostics.map(({ type, path, message }) => ({ type, message, ...(path ? { source: path } : {}) }))];
     const systemSource = systemPromptSource;
-    return { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalSourcePath(resolvedPath)), skills: skills.skills.map(({ name }) => name), diagnostics, ...(systemSource ? { systemPromptSource: systemSource } : resourceLoader.getSystemPrompt() !== undefined ? { systemPromptSource: "Pi resource loader" } : {}) };
+    return { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalPath(resolvedPath)), skills: skills.skills.map(({ name }) => name), diagnostics, ...(systemSource ? { systemPromptSource: systemSource } : resourceLoader.getSystemPrompt() !== undefined ? { systemPromptSource: "Pi resource loader" } : {}) };
   };
   const managedSession = Object.assign(session, {
     getLeafId: () => manager.getLeafId(),
