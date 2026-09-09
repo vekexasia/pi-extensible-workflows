@@ -74,7 +74,7 @@ function decodeAgentResourceSelectors(value: unknown): AgentResourceSelectors | 
   return { ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }) };
 }
 function decodeContextFileScopes(value: unknown): ContextFileScope[] | undefined { return decodeArray(value, (scope) => isContextFileScope(scope) ? scope : undefined); }
-function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
+export function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
   if (!object(value)) return undefined;
   const prompt = optionalString(value.prompt);
   const description = optionalString(value.description);
@@ -100,10 +100,25 @@ function decodeWorkflowMetadata(value: unknown): LaunchSnapshot["metadata"] | un
   if (description === INVALID_PERSISTED_VALUE) return undefined;
   return { name: value.name, ...(description === undefined ? {} : { description }) };
 }
-function decodeWorkflowExtensions(value: unknown): WorkflowExtensionSettings | undefined {
+export function decodeWorkflowExtensions(value: unknown): WorkflowExtensionSettings | undefined {
   if (!object(value) || !jsonValue(value)) return undefined;
-  if (Object.keys(value).some((key) => !validWorkflowExtensionNamespace(key))) return undefined;
-  return { ...value };
+  const normalized: Record<string, JsonValue> = {};
+  for (const [namespace, raw] of Object.entries(value)) {
+    if (!validWorkflowExtensionNamespace(namespace)) return undefined;
+    if (namespace === "herdr") {
+      if (!object(raw) || Object.keys(raw).some((key) => key !== "enableFullyInspectableMode") || raw.enableFullyInspectableMode !== undefined && typeof raw.enableFullyInspectableMode !== "boolean") return undefined;
+      normalized.herdr = { ...(raw.enableFullyInspectableMode === undefined ? {} : { enableFullyInspectableMode: raw.enableFullyInspectableMode }) };
+      continue;
+    }
+    if (namespace === "trajectory") {
+      if (!object(raw) || Object.keys(raw).some((key) => key !== "port" && key !== "themes") || raw.port !== undefined && (typeof raw.port !== "number" || !Number.isSafeInteger(raw.port) || raw.port < 1 || raw.port > 65535) || raw.themes !== undefined && typeof raw.themes !== "boolean") return undefined;
+      normalized.trajectory = { ...(raw.port === undefined ? {} : { port: raw.port }), ...(raw.themes === undefined ? {} : { themes: raw.themes }) };
+      continue;
+    }
+    if (!jsonValue(raw)) return undefined;
+    normalized[namespace] = structuredClone(raw);
+  }
+  return normalized;
 }
 function decodeBudgetLimits(value: unknown): NonNullable<NonNullable<RunRecord["budget"]>[BudgetDimension]> | undefined {
   if (!object(value)) return undefined;

@@ -80,6 +80,11 @@ void test("registers session and live actions when enabled", () => {
   assert.equal(fullyInspectable.agentAttemptActions.openLiveSession.visible(context), false);
   assert.equal(fullyInspectable.agentAttemptActions.openSession.visible({ ...context, liveSession: undefined }), true);
   assert.equal(fullyInspectable.agentAttemptActions.openLiveSession.visible({ ...context, prepared: { settings: { herdr: { enableFullyInspectableMode: false } } } }), true);
+  const localTransport = { id: "local" };
+  const setupAgent = { transport: localTransport };
+  fullyInspectable.agentSetupHooks.fullyInspectable.setup(setupAgent, { mode: "execution", settings: {}, identity: { structuralPath: [], callSite: "test", occurrence: 1 }, run: { runId: "run", workflow: { name: "test" } }, signal: new AbortController().signal });
+  assert.equal(setupAgent.transport, localTransport);
+  assert.equal(fullyInspectable.agentAttemptActions.openLiveSession.visible({ ...context, prepared: { settings: {} } }), true);
 });
 void test("runs Herdr session action from a standalone attempt context", async () => {
   const calls = [];

@@ -604,7 +604,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
   const runner = options.runner ?? herdrCommandRunner;
   const workspaces = options.workspaces ?? createWorkflowWorkspaces(runner);
   const fullyInspectable = isFullyInspectableMode(options.agentDir);
-  const fullyInspectableFor = (settings: Readonly<WorkflowSettings["extensionSettings"]> | undefined): boolean => settings?.herdr === undefined ? fullyInspectable : settings.herdr.enableFullyInspectableMode === true;
+  const fullyInspectableFor = (settings: Readonly<WorkflowSettings["extensionSettings"]> | undefined): boolean => settings === undefined ? fullyInspectable : settings.herdr?.enableFullyInspectableMode === true;
   type ActionContext = HerdrAttemptActionContext;
   const sessionCwd = (context: ActionContext): string | undefined => completedSessionCwd("run" in context ? context : { attempt: context.attempt });
   const actionIdentity = (context: ActionContext): AgentIdentity => {

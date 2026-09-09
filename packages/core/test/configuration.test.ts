@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import { decodeLaunchSnapshot } from "../src/decoders.js";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
@@ -231,6 +232,18 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
   writeFileSync(path, JSON.stringify({ surprise: true }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
+});
+void test("decodes persisted built-in extension settings with value validation", () => {
+  const snapshot = (settings: unknown, roles?: unknown) => decodeLaunchSnapshot({ script: "return null;", args: null, metadata: { name: "decoded" }, settings, models: [], tools: [], agentTypes: [], ...(roles === undefined ? {} : { roles }), schemas: [] });
+  for (const extensionSettings of [{ trajectory: { port: 0 } }, { trajectory: { themes: "yes" } }, { herdr: { enableFullyInspectableMode: "yes" } }]) {
+    assert.equal(snapshot({ concurrency: 1, extensionSettings }), undefined);
+  }
+  assert.equal(snapshot({ concurrency: 1, extensions: { trajectory: { port: 0 } } }), undefined);
+  assert.equal(snapshot({ concurrency: 1 }, { reviewer: { extensionSettings: { herdr: { enableFullyInspectableMode: "yes" } } } }), undefined);
+  const valid = snapshot({ concurrency: 1, extensionSettings: { acme: { nested: [true, "value"] }, trajectory: { port: 7432 } } }, { reviewer: { prompt: "Review", extensionSettings: { acme: { role: true } } } });
+  assert.ok(valid);
+  assert.deepEqual(valid.settings.extensionSettings, { acme: { nested: [true, "value"] }, trajectory: { port: 7432 } });
+  assert.deepEqual(valid.roles?.reviewer?.extensionSettings, { acme: { role: true } });
 });
 void test("replaces extension settings by source and role key", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-settings-"));
