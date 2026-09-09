@@ -21,6 +21,7 @@ repository, not a hosted application.
 - Workflow JavaScript is sandboxed; registered functions, shell commands, extensions, and transports are trusted host code. Preserve project trust and parent tool ceilings.
 - Persisted snapshots and operation identities define recovery. Validate stored data and preserve replay compatibility; external effects before journaling are not guaranteed exactly once.
 - Own cancellation and session disposal. Do not declare completion before results and terminal state are persisted and delivered.
+- Use `packages/core/src/paths.ts` as the single source of truth for filesystem path identity; do not compare identity with direct `realpath`/`resolve` combinations or locally reimplemented helpers.
 - Preserve pre-existing edits. No merge, publish, deployment, or permission changes without authorization; release approvals remain in [RELEASING.md](RELEASING.md).
 
 ## Deliver and verify

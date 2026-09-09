@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -6,6 +7,18 @@ import { WorkflowError } from "./types.js";
 import { isNodeError } from "./utils.js";
 
 export function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
+
+/**
+ * Resolves a path to its filesystem spelling, including symlink and platform aliases.
+ * A missing path safely falls back to its absolute lexical spelling rather than
+ * guessing at the identity of an object that does not exist.
+ */
+export function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); } catch { return absolute; }
+}
+
+export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
 
 export function projectStorageKey(cwd: string): string {
   const exact = resolve(cwd);

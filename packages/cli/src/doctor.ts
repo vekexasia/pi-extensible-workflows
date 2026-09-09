@@ -1,5 +1,5 @@
-import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { basename, dirname, extname, join, resolve } from "node:path";
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import { basename, dirname, extname, join } from "node:path";
 import { InMemoryCredentialStore, InMemoryModelsStore, type Credential } from "@earendil-works/pi-ai";
 import {
   ModelRuntime,
@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_SETTINGS,
+  canonicalPath,
   createLocalPiSession,
   errorText,
   isNodeError,
@@ -112,10 +113,6 @@ function usesLegacyRoleSelectors(path: string): boolean {
   catch { return false; }
 }
 
-function canonical(path: string): string {
-  const absolute = resolve(path);
-  try { return realpathSync(absolute); } catch { return absolute; }
-}
 function isDynamicModelAlias(value: string, aliases: ReadonlySet<string>): boolean {
   const match = /^([^/\s:]+)(?::([^\s]+))?$/.exec(value);
   const name = match?.[1];
@@ -143,7 +140,7 @@ function savedTrust(cwd: string, agentDir: string): boolean | undefined {
   try { parsed = JSON.parse(readFileSync(join(agentDir, "trust.json"), "utf8")); }
   catch (error) { if (isNodeError(error, "ENOENT")) return undefined; throw error; }
   if (!isObject(parsed)) throw new Error("Pi trust.json must be an object");
-  let current = canonical(cwd);
+  let current = canonicalPath(cwd);
   while (current !== dirname(current)) {
     const value = parsed[current];
     if (value === true || value === false) return value;
@@ -290,7 +287,7 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
 }
 
 function matchResourcePolicy(policy: AgentResourcePolicy, pi: DoctorPiState): AgentResourcePolicy {
-  const extensions = [...new Set((pi.extensions ?? []).map(canonical))];
+  const extensions = [...new Set((pi.extensions ?? []).map(canonicalPath))];
   const skills = [...new Set(pi.skills ?? [])];
   const tools = [...new Set(pi.activeTools)];
   const layers = policy.selectorSources;
@@ -336,9 +333,9 @@ function validateDoctorExtensionSettings(registry: WorkflowRegistryApi, value: R
   catch (error) { diagnostics.push(diagnostic("error", "SETTINGS_INVALID", errorText(error), `${settingsPath}.extensionSettings`, "Fix the extension-owned settings reported in this error.")); }
 }
 export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport> {
-  const cwd = canonical(options.cwd ?? process.cwd());
-  const agentDir = canonical(options.agentDir ?? getAgentDir());
-  const settingsPath = canonical(options.settingsPath ?? workflowSettingsPath(agentDir));
+  const cwd = canonicalPath(options.cwd ?? process.cwd());
+  const agentDir = canonicalPath(options.agentDir ?? getAgentDir());
+  const settingsPath = canonicalPath(options.settingsPath ?? workflowSettingsPath(agentDir));
   const projectSettingsPath = workflowProjectSettingsPath(cwd);
   const legacyGlobalSettings = usesLegacySettings(settingsPath);
   const diagnostics: DoctorDiagnostic[] = [];
@@ -508,7 +505,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
   const severityOrder: Record<DoctorSeverity, number> = { error: 0, warning: 1 };
   diagnostics.sort((left, right) => severityOrder[left.severity] - severityOrder[right.severity] || (left.source ?? "").localeCompare(right.source ?? "") || left.code.localeCompare(right.code) || left.message.localeCompare(right.message));
   roles.sort((left, right) => left.name.localeCompare(right.name) || left.scope.localeCompare(right.scope));
-  return { cwd, agentDir, settingsPath, settings, settingsSources, trust: pi.trust, activeTools: [...activeTools].sort(), piExtensions: [...new Set((pi.extensions ?? []).map(canonical))].sort(), piSkills: [...new Set(pi.skills ?? [])].sort(), roles, functions, modelAliases, resourcePolicy, ...(options.role !== undefined ? { roleTarget: options.role } : {}), ...(roleInspection ? { roleInspection } : {}), diagnostics };
+  return { cwd, agentDir, settingsPath, settings, settingsSources, trust: pi.trust, activeTools: [...activeTools].sort(), piExtensions: [...new Set((pi.extensions ?? []).map(canonicalPath))].sort(), piSkills: [...new Set(pi.skills ?? [])].sort(), roles, functions, modelAliases, resourcePolicy, ...(options.role !== undefined ? { roleTarget: options.role } : {}), ...(roleInspection ? { roleInspection } : {}), diagnostics };
 }
 
 function count(report: DoctorReport, severity: DoctorSeverity): number { return report.diagnostics.filter((item) => item.severity === severity).length; }

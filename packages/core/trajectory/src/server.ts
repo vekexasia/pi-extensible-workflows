@@ -4,6 +4,7 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
+import { sameFilesystemPath } from "../../src/paths.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
 type Socket = import("node:stream").Duplex;
@@ -443,4 +444,4 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", () => { resolve(); }); });
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) void main().catch((error: unknown) => { console.error(error); process.exitCode = 1; });
+if (process.argv[1] && sameFilesystemPath(fileURLToPath(import.meta.url), process.argv[1])) void main().catch((error: unknown) => { console.error(error); process.exitCode = 1; });

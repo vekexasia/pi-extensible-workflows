@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, object, registeredWorkflowFunctionSources, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, loadAgentDefinitions, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
@@ -580,8 +580,8 @@ async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
     writeLauncher(destination, workflowName, force);
     if (!output) {
       const binDir = join(homedir(), ".local", "bin");
-      const pathEntries = (process.env.PATH ?? "").split(":").filter(Boolean).map((entry) => { try { return realpathSync(entry); } catch { return entry; } });
-      if (!pathEntries.includes(binDir)) options.stderr(`Warning: ${binDir} is not in PATH\n`);
+      const pathEntries = (process.env.PATH ?? "").split(":").filter(Boolean);
+      if (!pathEntries.some((entry) => sameFilesystemPath(entry, binDir))) options.stderr(`Warning: ${binDir} is not in PATH\n`);
     }
     options.write(`Exported ${destination}\n`);
     return 0;
@@ -711,7 +711,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
   return 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+if (process.argv[1] && sameFilesystemPath(fileURLToPath(import.meta.url), process.argv[1])) {
   const controller = new AbortController();
   const onSignal = () => { controller.abort(); };
   process.once("SIGINT", onSignal);

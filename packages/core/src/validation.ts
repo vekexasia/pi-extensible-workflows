@@ -1,5 +1,5 @@
 import { atomicWriteFile } from "./persistence.js";
-import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import type { WorkflowRegistryApi } from "./registry.js";
 import { registeredWorkflowRoleDirectoryRegistrations } from "./registry.js";
 import { annotateModelAliasError, assertModelThinking, deepFreeze, errorText, fail, isNodeError, jsonObject, jsonValue, mergeWorkflowExtensionSettings, modelAliasName, modelCapability, object, positiveInteger, resolveModelReference, resourcePatternHasMagic, unknownModel, validateModelAliases, validateResourcePattern, validWorkflowExtensionNamespace } from "./utils.js";
 import { WORKFLOW_CALL_KINDS, isContextFileScope } from "./types.js";
+import { canonicalPath } from "./paths.js";
 
 export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ concurrency: 8, backgroundWidget: true });
 export function validateCheckpoint(value: unknown): CheckpointInput {
@@ -34,9 +35,9 @@ function normalizedResourcePath(value: string, settingsPath: string): string {
     const rootBoundary = separatorIndex === 0 || (separatorIndex === 2 && /^[A-Za-z]:[\\/]/.test(resolved));
     const prefix = rootBoundary ? resolved.slice(0, separatorIndex + 1) : separatorIndex >= 0 ? resolved.slice(0, separatorIndex) : resolved;
     const suffix = rootBoundary ? resolved.slice(separatorIndex + 1) : separatorIndex >= 0 ? resolved.slice(separatorIndex) : "";
-    try { return `${realpathSync(prefix)}${suffix}`; } catch { return resolved; }
+    return `${canonicalPath(prefix)}${suffix}`;
   }
-  try { return realpathSync(resolved); } catch { return resolved; }
+  return canonicalPath(resolved);
 }
 function validateSelectorList(value: unknown, path: string, kind: "skills" | "extensions" | "tools", errorCode: "INVALID_SETTINGS" | "INVALID_METADATA" = "INVALID_SETTINGS", normalizeExtensions = true): readonly string[] | undefined {
   if (value === undefined) return undefined;
