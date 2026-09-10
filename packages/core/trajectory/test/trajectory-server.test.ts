@@ -154,7 +154,9 @@ void test("Trajectory HTTP and WebSocket boundaries require localhost and origin
     assert.equal((await fetch(`${base}/health`)).status, 200);
     assert.equal((await fetch(`${base}/health`, { headers: { host: `localhost:${String(port)}` } })).status, 200);
     assert.equal((await fetch(`${base}/health?token=ignored`)).status, 200);
-    for (const path of ["/", "/index.html", "/marked.min.js"]) assert.equal((await fetch(`${base}${path}`)).status, 200);
+    for (const path of ["/", "/index.html", "/marked.min.js", "/morphdom.min.js", "/favicon.png"]) assert.equal((await fetch(`${base}${path}`)).status, 200);
+    // Live topology is native DOM/CSS and does not add a separate runtime endpoint.
+    assert.notEqual((await fetch(`${base}/topology-runtime.js`)).status, 200);
     assert.equal((await fetch(`${base}/health`, { headers: { origin: "http://evil.test" } })).status, 403);
     const valid = await handshake(port, `http://127.0.0.1:${String(port)}`);
     assert.match(valid.response, /^HTTP\/1\.1 101 Switching Protocols/);
