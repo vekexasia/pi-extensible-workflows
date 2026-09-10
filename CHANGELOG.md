@@ -1,6 +1,22 @@
 # Changelog
 ## Unreleased
 
+## [5.14.0] - 2026-09-10
+
+### New capabilities
+
+- Extensions can declare namespaced `extensionSettings` and validate their own values. Settings are passed to workflow functions and agent transports, with explicit global, trusted-project, and role override semantics.
+
+### Fixes
+
+- Herdr detects agent settlement through a direct lifecycle bridge instead of waiting for pane status to become idle, preventing completed agents from becoming stale.
+- Canonical filesystem path handling is shared across the CLI, workflows, and Trajectory; the detached Trajectory server is bundled correctly for installed packages.
+- Explicit empty extension settings, including `extensionSettings: {}`, now replace inherited settings instead of silently falling back.
+
+### Compatibility
+
+- Standalone subagent retries persist launch-time roles and extension settings for deterministic replay. Historic runs without the frozen `configuration.json` remain inspectable but cannot be retried.
+
 ## [5.13.2] - 2026-09-07
 
 ### Fixes
