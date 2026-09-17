@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- New worktrees can copy explicitly selected Git-ignored local context from a tracked or ignored `.worktreeinclude` manifest and an ignored, untracked `.worktreeinclude.local` contributor overlay. The clean launch-tree invariant remains enforced; copying is limited to physical creation for `withWorktree()` and `subagents_run({ worktree })`, with deterministic precedence and rollback. (#291)
+
 ## [5.14.1] - 2026-09-17
 
 ### Fixes

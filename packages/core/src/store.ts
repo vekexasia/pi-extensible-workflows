@@ -15,6 +15,7 @@ import {
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { copyWorktreeIncludes, worktreeIncludePlan } from "./worktreeinclude.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -52,12 +53,14 @@ export class RunStore {
   private borrowedWorktreeLane = new SerialLane();
   private snapshotLane = new SerialLane();
   private launchSnapshotLane = new SerialLane();
+  private copyWorktreeIncludes = true;
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptLane = new SerialLane();
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
   }
+  disableWorktreeIncludes(): void { this.copyWorktreeIncludes = false; }
   #assertRunIdentity(run: PersistedRun, code: WorkflowErrorCode, message: string): void {
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
   }
@@ -632,7 +635,7 @@ export class RunStore {
     }
   }
 
-  async worktree(owner: string): Promise<WorktreeReference> {
+  async worktree(owner: string, options: Readonly<{ copyIncludes?: boolean }> = {}): Promise<WorktreeReference> {
     const write = this.worktreeLane.run(async () => {
       const loaded = await this.load();
       const recordsPath = resolve(this.directory, "worktrees.json");
@@ -668,6 +671,8 @@ export class RunStore {
           const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
           throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
         }
+        const copyIncludes = options.copyIncludes !== false && this.copyWorktreeIncludes && loaded.run.retry === undefined;
+        const includePlan = copyIncludes ? await worktreeIncludePlan(root) : [];
         let commit: string;
         try {
           commit = (await git(root, ["rev-parse", "--verify", "HEAD^{commit}"])).trim();
@@ -683,6 +688,7 @@ export class RunStore {
         await git(root, ["worktree", "add", "--no-checkout", path, branch]);
         worktreeCreated = true;
         await git(path, ["checkout", "--force", branch]);
+        if (copyIncludes) await copyWorktreeIncludes(root, path, includePlan);
         await atomicJson(recordsPath, [...records, record]);
         await rm(markerPath, { force: true });
         return record;

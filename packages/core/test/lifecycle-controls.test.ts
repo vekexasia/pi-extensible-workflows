@@ -92,6 +92,27 @@ void test("orchestration lifecycle events cover phase, worktree, retry, checkpoi
   assert.ok(channels.indexOf(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT) < channels.indexOf(WORKFLOW_RUN_COMPLETED_EVENT));
   assert.doesNotMatch(JSON.stringify(events), /PROMPT_SECRET|RESULT_SECRET|ARG_SECRET|CHECKPOINT_SECRET|CONTEXT_SECRET/);
 });
+void test("withWorktree provisions selected ignored context", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktreeinclude-workflow-"));
+  const cwd = join(home, "repo");
+  mkdirSync(cwd, { recursive: true });
+  execFileSync("git", ["init", "-q", cwd]);
+  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(cwd, "tracked.txt"), "tracked");
+  writeFileSync(join(cwd, ".gitignore"), "local-context/\n");
+  writeFileSync(join(cwd, ".worktreeinclude"), "local-context/\n");
+  execFileSync("git", ["-C", cwd, "add", "."]);
+  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  mkdirSync(join(cwd, "local-context"), { recursive: true });
+  writeFileSync(join(cwd, "local-context", "value.txt"), "workflow local context");
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getActiveTools: () => ["workflow"] }), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const result = await workflow.execute("worktreeinclude", { name: "worktreeinclude", script: "return await withWorktree('context', async () => shell('cat local-context/value.txt'));", foreground: true }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }) as { details?: { value?: { stdout?: string } } };
+  assert.equal(result.details?.value?.stdout, "workflow local context");
+});
 void test("TUI terminal provider recovery shows factual failure and retries without a recommendation", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-provider-recovery-retry-"));
   let sessions = 0;

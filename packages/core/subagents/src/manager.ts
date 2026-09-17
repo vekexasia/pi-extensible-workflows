@@ -966,7 +966,7 @@ class PersistentSubagentManager implements SubagentManager {
     return run.terminal;
   }
 
-  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>, frozenExternal?: StandaloneExternalConfiguration): Promise<LiveRun> {
+  private async start(snapshot: SubagentRunRequest, context: Readonly<SubagentManagerContext>, frozenExternal?: StandaloneExternalConfiguration, skipWorktreeIncludes = false): Promise<LiveRun> {
     await this.ensureInitialized();
     if (this.disposed) throw new WorkflowError("CANCELLED", "Subagent manager is disposed");
     if (context.signal?.aborted) throw new WorkflowError("CANCELLED", "Subagent cancelled");
@@ -1004,6 +1004,7 @@ class PersistentSubagentManager implements SubagentManager {
         runId: id,
         name: snapshot.worktree,
         owner: structuralPath("worktree", "named", snapshot.worktree),
+        ...(skipWorktreeIncludes ? { copyIncludes: false } : {}),
       };
       if (worktreeContext !== undefined) {
         live.worktreeContext = worktreeContext;
@@ -1182,7 +1183,7 @@ class PersistentSubagentManager implements SubagentManager {
     const requestSnapshot = await loadPersistedRequest(storageDirectory(this.dependencies), id);
     const frozenExternal = await loadPersistedStandaloneExternalConfiguration(storageDirectory(this.dependencies), id);
     const retryRequest = context.waitForForeground === false && requestSnapshot.mode === "foreground" ? { ...requestSnapshot, mode: "background" as const } : requestSnapshot;
-    const run = await this.start(retryRequest, context, frozenExternal);
+    const run = await this.start(retryRequest, context, frozenExternal, true);
     emitUpdate(run);
     if (run.request.mode !== "foreground") return { id: run.id, state: "running" };
     return run.terminal;

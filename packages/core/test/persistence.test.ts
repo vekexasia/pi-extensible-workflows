@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -7,6 +7,7 @@ import { join, relative } from "node:path";
 import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
 import { atomicWriteFile } from "../src/io.js";
+import { copyWorktreeIncludes, worktreeIncludePlan } from "../src/worktreeinclude.js";
 import { hasLiveSessionLease, listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
 import { decodeTestJsonRecord, isTestRecord } from "./support.js";
 
@@ -464,6 +465,145 @@ void test("persists awaiting checkpoints and atomically accepts only the first a
   assert.deepEqual(await store.awaitingCheckpoints(), []);
 });
 
+void test("copies selected ignored context from base and local worktree manifests", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktreeinclude-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".gitignore"), ".pi/local/\nprivate/\nnot-selected/\n.worktreeinclude.local\n\\#literal/\n\\!literal/\n");
+  writeFileSync(join(repo, ".worktreeinclude"), ".pi/local/\n\\#literal/\n\\!literal/\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  mkdirSync(join(repo, ".pi", "local"), { recursive: true });
+  mkdirSync(join(repo, "private"), { recursive: true });
+  mkdirSync(join(repo, "not-selected"), { recursive: true });
+  mkdirSync(join(repo, "#literal"), { recursive: true });
+  mkdirSync(join(repo, "!literal"), { recursive: true });
+  writeFileSync(join(repo, ".pi", "local", "skill.md"), "local skill");
+  writeFileSync(join(repo, ".pi", "local", "not-selected.md"), "not selected");
+  writeFileSync(join(repo, "private", "notes.md"), "private notes");
+  writeFileSync(join(repo, "not-selected", "notes.md"), "not selected");
+  writeFileSync(join(repo, "#literal", "value.txt"), "literal hash");
+  writeFileSync(join(repo, "!literal", "value.txt"), "literal bang");
+  writeFileSync(join(repo, ".worktreeinclude.local"), "private/\nprivate/\n!.pi/local/not-selected.md\n");
+  assert.equal(execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" }), "");
+
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("include");
+  assert.equal(execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" }), "");
+  await assert.rejects(copyWorktreeIncludes(repo, worktree.path, ["tracked.txt"]), /destination collides with existing content/);
+  assert.equal(readFileSync(join(worktree.path, "tracked.txt"), "utf8"), "initial");
+  assert.equal(readFileSync(join(worktree.path, ".pi", "local", "skill.md"), "utf8"), "local skill");
+  assert.equal(readFileSync(join(worktree.path, "private", "notes.md"), "utf8"), "private notes");
+  assert.equal(readFileSync(join(worktree.path, "#literal", "value.txt"), "utf8"), "literal hash");
+  assert.equal(readFileSync(join(worktree.path, "!literal", "value.txt"), "utf8"), "literal bang");
+  assert.equal(existsSync(join(worktree.path, ".pi", "local", "not-selected.md")), false);
+  assert.equal(existsSync(join(worktree.path, "not-selected", "notes.md")), false);
+  assert.equal(existsSync(join(worktree.path, ".worktreeinclude.local")), false);
+  writeFileSync(join(repo, ".pi", "local", "skill.md"), "updated launch value");
+  const reused = await store.worktree("include");
+  assert.equal(readFileSync(join(reused.path, ".pi", "local", "skill.md"), "utf8"), "local skill");
+  await store.delete(true);
+});
+
+void test("uses repository, info/exclude, and global ignore sources without copying unselected ignored files", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktreeinclude-ignore-sources-"));
+  const repo = join(home, "repo");
+  const globalExcludes = join(home, "global-excludes");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, ".gitignore"), "repository-context/\nunselected/\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "repository-context/\ninfo-context/\nglobal-context/\n");
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".git", "info", "exclude"), "info-context/\n");
+  writeFileSync(globalExcludes, "global-context/\n");
+  execFileSync("git", ["-C", repo, "config", "core.excludesFile", globalExcludes]);
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  for (const directory of ["repository-context", "info-context", "global-context", "unselected"]) mkdirSync(join(repo, directory), { recursive: true });
+  writeFileSync(join(repo, "repository-context", "value.txt"), "repository");
+  writeFileSync(join(repo, "info-context", "value.txt"), "info");
+  writeFileSync(join(repo, "global-context", "value.txt"), "global");
+  writeFileSync(join(repo, "unselected", "value.txt"), "unselected");
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  const worktree = await store.worktree("ignore-sources");
+  assert.equal(readFileSync(join(worktree.path, "repository-context", "value.txt"), "utf8"), "repository");
+  assert.equal(readFileSync(join(worktree.path, "info-context", "value.txt"), "utf8"), "info");
+  assert.equal(readFileSync(join(worktree.path, "global-context", "value.txt"), "utf8"), "global");
+  assert.equal(existsSync(join(worktree.path, "unselected")), false);
+  await store.delete(true);
+});
+
+void test("rejects selected tracked and non-ignored sources before creating a worktree", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktreeinclude-validation-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".worktreeinclude"), "tracked.txt\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const trackedStore = new RunStore(repo, "session-a", "tracked", home);
+  await trackedStore.create({ ...run(repo), id: "tracked" }, snapshot);
+  await assert.rejects(trackedStore.worktree("tracked"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("selected tracked path"));
+  assert.deepEqual(JSON.parse(readFileSync(join(trackedStore.directory, "worktrees.json"), "utf8")), []);
+
+  writeFileSync(join(repo, "tracked.txt"), "changed");
+  const dirtyStore = new RunStore(repo, "session-a", "dirty", home);
+  await dirtyStore.create({ ...run(repo), id: "dirty" }, snapshot);
+  await assert.rejects(dirtyStore.worktree("dirty"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes"));
+  execFileSync("git", ["-C", repo, "checkout", "--", "tracked.txt"]);
+
+  writeFileSync(join(repo, ".worktreeinclude.local"), "tracked.txt\n");
+  await assert.rejects(worktreeIncludePlan(repo), /\.worktreeinclude\.local must be ignored and untracked/);
+  const unignoredOverlayStore = new RunStore(repo, "session-a", "unignored-overlay", home);
+  await unignoredOverlayStore.create({ ...run(repo), id: "unignored-overlay" }, snapshot);
+  await assert.rejects(unignoredOverlayStore.worktree("unignored-overlay"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes"));
+  rmSync(join(repo, ".worktreeinclude.local"));
+
+  writeFileSync(join(repo, ".worktreeinclude"), "local.txt\n");
+  writeFileSync(join(repo, "local.txt"), "not ignored");
+  await assert.rejects(worktreeIncludePlan(repo), /selected path that is not ignored by Git: local.txt/);
+  const unignoredStore = new RunStore(repo, "session-a", "unignored", home);
+  await unignoredStore.create({ ...run(repo), id: "unignored" }, snapshot);
+  await assert.rejects(unignoredStore.worktree("unignored"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes"));
+  assert.deepEqual(JSON.parse(readFileSync(join(unignoredStore.directory, "worktrees.json"), "utf8")), []);
+});
+
+void test("rolls back a physical worktree when selected context copying fails", { skip: process.platform === "win32" }, async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktreeinclude-rollback-"));
+  const repo = join(home, "repo");
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".gitignore"), "broken-context\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "broken-context\n");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  writeFileSync(join(repo, "broken-context"), "unreadable");
+  chmodSync(join(repo, "broken-context"), 0o000);
+  const store = new RunStore(repo, "session-a", "run-a", home);
+  await store.create(run(repo), snapshot);
+  try {
+    await assert.rejects(store.worktree("broken"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+  } finally {
+    chmodSync(join(repo, "broken-context"), 0o600);
+  }
+  assert.deepEqual(JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")), []);
+  assert.equal(execFileSync("git", ["-C", repo, "branch", "--list", "pi-extensible-workflows/run-a/*"], { encoding: "utf8" }).trim(), "");
+});
+
 void test("creates worktrees from clean HEAD, preserves launch subdirectories, and cleans up only on confirmed deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-"));
   const repo = join(home, "repo");
@@ -656,20 +796,34 @@ void test("reuses named worktrees through durable follow-up bindings without del
   execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
   execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
   writeFileSync(join(repo, "tracked.txt"), "initial");
+  writeFileSync(join(repo, ".gitignore"), "local-context/\n");
+  writeFileSync(join(repo, ".worktreeinclude"), "local-context/\n");
   execFileSync("git", ["-C", repo, "add", "."]);
   execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  mkdirSync(join(repo, "local-context"), { recursive: true });
+  writeFileSync(join(repo, "local-context", "value.txt"), "original");
   const owner = structuralPath("worktree", "named", "banana");
   const source = new RunStore(repo, "session-a", "source", home);
   await source.create({ ...run(repo), id: "source", state: "completed" }, snapshot);
   const original = await source.worktree(owner);
+  assert.equal(readFileSync(join(original.path, "local-context", "value.txt"), "utf8"), "original");
+  writeFileSync(join(repo, "local-context", "value.txt"), "updated");
   const first = new RunStore(repo, "session-a", "follow-up", home);
   await first.create({ ...run(repo), id: "follow-up", parentRunId: "source", state: "completed" }, snapshot);
   const reused = await first.worktree(owner);
   assert.deepEqual(reused, original);
+  assert.equal(readFileSync(join(reused.path, "local-context", "value.txt"), "utf8"), "original");
   assert.equal(await first.ownsWorktree(owner), false);
   assert.deepEqual(await first.borrowedWorktrees(), [{ name: "banana", sourceRunId: "source", owner }]);
   const missing = await first.worktree(structuralPath("worktree", "named", "apple"));
   assert.notEqual(missing.path, original.path);
+  assert.equal(readFileSync(join(missing.path, "local-context", "value.txt"), "utf8"), "updated");
+  const resumed = new RunStore(repo, "session-a", "resumed", home);
+  await resumed.create({ ...run(repo), id: "resumed" }, snapshot);
+  resumed.disableWorktreeIncludes();
+  const resumedWorktree = await resumed.worktree(structuralPath("worktree", "named", "resume-only"));
+  assert.equal(existsSync(join(resumedWorktree.path, "local-context")), false);
+  await resumed.delete(true);
   assert.equal(await first.ownsWorktree(structuralPath("worktree", "named", "apple")), true);
   const second = new RunStore(repo, "session-a", "second-follow-up", home);
   await second.create({ ...run(repo), id: "second-follow-up", parentRunId: "follow-up", state: "completed" }, snapshot);
@@ -682,6 +836,8 @@ void test("reuses named worktrees through durable follow-up bindings without del
   await retryChild.create({ ...run(repo), id: "retry-child", state: "failed", parentRunId: "retry-source", retry: { sourceRunId: "retry-source", lineageRootRunId: "source", completedPaths: [], incompletePaths: [], namedWorktrees: ["banana"] } }, snapshot);
   assert.deepEqual(await retryChild.worktree(owner), original);
   assert.deepEqual(await retryChild.borrowedWorktrees(), [{ name: "banana", sourceRunId: "source", owner }]);
+  const retryWorktree = await retryChild.worktree(structuralPath("worktree", "named", "retry-only"));
+  assert.equal(existsSync(join(retryWorktree.path, "local-context")), false);
   await retryChild.delete(true);
   await retrySource.delete(true);
   const unrelated = new RunStore(repo, "session-a", "unrelated", home);

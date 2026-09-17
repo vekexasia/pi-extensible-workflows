@@ -7,12 +7,13 @@ export interface SubagentWorktreeContext {
   readonly runId: string;
   readonly name: string;
   readonly owner: string;
+  readonly copyIncludes?: boolean;
 }
 
 export interface SubagentWorktreeRunStore {
   recordSystemPrompt(entry: { sessionId: string; attempt: number; turn: number; prompt: string }): Promise<void>;
   validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference>;
-  worktree(owner: string): Promise<WorktreeReference>;
+  worktree(owner: string, options?: Readonly<{ copyIncludes?: boolean }>): Promise<WorktreeReference>;
   snapshotWorktree(owner: string): Promise<string>;
 }
 
@@ -63,7 +64,7 @@ export function createRunStoreWorktreeAdapter(home: string): SubagentWorktreeAda
         const store = new RunStore(context.cwd, context.sessionId, context.runId, home);
         await store.create(syntheticRun(context), syntheticSnapshot());
         try {
-          const reference = await store.worktree(context.owner);
+          const reference = await store.worktree(context.owner, { copyIncludes: context.copyIncludes !== false });
           let cleaned = false;
           return {
             path: reference.path,

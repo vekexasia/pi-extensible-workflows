@@ -132,7 +132,7 @@ const result = await withWorktree("issue", async ({ path, branch }) => {
 });
 ```
 
-Entering the scope materializes its worktree from the launch repository's current `HEAD`. The launch working tree must be clean. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
+Entering the scope materializes its worktree from the launch repository's current `HEAD`. The launch working tree must be clean. An optional root `.worktreeinclude` and ignored, untracked `.worktreeinclude.local` overlay can select additional Git-ignored local context; shared rules run first, overlay rules second, and the last matching rule wins. Copying happens only for physical creation, never for reuse, borrowing, retry, or resume. The callback receives a frozen reference containing only the real string `path` and `branch`; callbacks may ignore the argument, and their bare return value is preserved. Concurrent agents share mutable files, so assign non-conflicting work or coordinate explicitly.
 
 Branches may call any workflow function, not only `agent()`. Use separate named scopes when parallel branches need isolated worktrees:
 
