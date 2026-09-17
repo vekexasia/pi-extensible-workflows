@@ -130,12 +130,12 @@ void test("Trajectory preference storage failures preserve defaults", () => {
     setItem: () => { throw new Error("storage unavailable"); },
   };
   const helpers = runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; const state = { runLayout: defaultRunLayout(), sidebarCollapsed: new Set() }; return { loadRunLayout, loadSidebarCollapsed, saveRunLayout, saveSidebarCollapsed }; })()`, { localStorage: storage }) as {
-    loadRunLayout: () => { swimHeight: number; ganttCollapsed: boolean; agentsCollapsed: boolean; logsCollapsed: boolean };
+    loadRunLayout: () => { swimHeight: number; ganttCollapsed: boolean; agentsCollapsed: boolean; logsCollapsed: boolean; topologyCollapsed: boolean; agentTopologyCollapsed: boolean };
     loadSidebarCollapsed: () => Set<string>;
     saveRunLayout: () => void;
     saveSidebarCollapsed: () => void;
   };
-  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, logsCollapsed: false });
+  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, logsCollapsed: false, topologyCollapsed: true, agentTopologyCollapsed: true });
   assert.deepEqual([...helpers.loadSidebarCollapsed()], []);
   assert.doesNotThrow(() => { helpers.saveRunLayout(); });
   assert.doesNotThrow(() => { helpers.saveSidebarCollapsed(); });
@@ -1025,4 +1025,181 @@ void test("trajectory run loaders serve cached runs until state, journal, or tra
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+type TrajectoryNativeTopologyCall = {
+  callEventIndex?: number;
+  resultEventIndex?: number;
+  navigationEventIndex?: number;
+  interactive?: boolean;
+  status?: string;
+};
+type TrajectoryNativeTopologyNode = { id: string; label?: string; kind?: string; state?: string } & TrajectoryNativeTopologyCall;
+type TrajectoryNativeTopologyData = { nodes: readonly TrajectoryNativeTopologyNode[]; edges: readonly { from: string; to: string }[]; calls: readonly TrajectoryNativeTopologyCall[] };
+type TrajectoryNativeTopologyHelpers = {
+  topologyLabel: (value: unknown, fallback?: string) => string;
+  topologyToolInvocations: (entries: readonly Record<string, unknown>[], fallbackAgent?: Record<string, unknown>) => readonly TrajectoryNativeTopologyCall[];
+  buildAgentTopologyData: (entries: readonly Record<string, unknown>[], agent?: Record<string, unknown>) => TrajectoryNativeTopologyData;
+  buildTopologyData: (record: Record<string, unknown>, timingsByAgent?: Map<string, unknown[]>) => TrajectoryNativeTopologyData;
+  nativeTopologyOverview: (data: TrajectoryNativeTopologyData) => string;
+  nativeTopologyDetail: (data: TrajectoryNativeTopologyData) => string;
+};
+
+function loadTrajectoryNativeTopologyHelpers(source: string): TrajectoryNativeTopologyHelpers {
+  const helperStart = source.indexOf("    const topologyLabel");
+  const helperEnd = source.indexOf("    function renderTopologyUnavailable", helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  return runInNewContext(`(() => {
+    const esc = (value) => String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const toolCallsOf = (entry) => Array.isArray(entry?.message?.content) ? entry.message.content.filter((part) => part?.type === "toolCall") : [];
+    const toolCallIdOf = (entry) => entry?.toolCallId || entry?.message?.toolCallId || toolCallsOf(entry)[0]?.id;
+    const isToolResult = (entry) => entry?.type === "tool_result" || entry?.type === "message" && entry?.message?.role === "toolResult";
+    const timingData = (entry) => entry?.data?.toolCallId ? entry.data : undefined;
+    const toolResultIsError = (entry) => entry?.isError === true || entry?.message?.isError === true || Boolean(entry?.error || entry?.message?.error);
+    const transcriptSource = (_record, agent) => Array.isArray(agent?.transcript) ? agent.transcript : [];
+    const phases = (record) => Array.isArray(record?.phases) ? record.phases : [{ name: "workflow", agents: (record?.run?.agents || []).map((agent) => agent.id) }];
+    const state = { selectedEvent: null };
+    ${source.slice(helperStart, helperEnd)}
+    return { topologyLabel, topologyToolInvocations, buildAgentTopologyData, buildTopologyData, nativeTopologyOverview, nativeTopologyDetail };
+  })()`) as TrajectoryNativeTopologyHelpers;
+}
+
+void test("Trajectory native detail topology preserves transcript turns, fan-out, and deterministic edges", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryNativeTopologyHelpers(source);
+  const call = (id: string, name: string) => ({ type: "toolCall", id, name, arguments: { value: id } });
+  const entries: Record<string, unknown>[] = [
+    { type: "message", timestamp: "2099-01-01", message: { role: "assistant", content: [call("a", "read"), call("b", "bash")] } },
+    { type: "message", timestamp: "2000-01-01", message: { role: "toolResult", toolCallId: "b", content: [] } },
+    { type: "message", timestamp: "1999-01-01", message: { role: "toolResult", toolCallId: "a", content: [] } },
+    { type: "message", timestamp: "1900-01-01", message: { role: "assistant", content: [call("c", "write")] } },
+  ];
+  const data = helpers.buildAgentTopologyData(entries, { id: "agent", label: "agent", state: "completed" });
+  assert.equal(data.calls.length, 3);
+  assert.ok(data.nodes.some((node) => node.id === "turn-0-branch"));
+  assert.ok(data.nodes.some((node) => node.id === "turn-0-join"));
+  assert.ok(data.nodes.some((node) => node.id === "turn-1-branch"));
+  assert.equal(data.edges.some((edge) => edge.from.startsWith("operation-") && edge.to.startsWith("operation-")), false);
+  assert.equal(data.edges.filter((edge) => edge.from === "turn-0-branch").length, 2);
+  assert.equal(data.edges.filter((edge) => edge.to === "turn-0-join").length, 2);
+  const retimed = entries.map((entry, index) => ({ ...entry, timestamp: `190${String(index)}-01-01` }));
+  assert.deepEqual(helpers.buildAgentTopologyData(retimed, { id: "agent", label: "agent", state: "completed" }), data);
+  const html = helpers.nativeTopologyDetail(data);
+  assert.match(html, /TURN 1/);
+  assert.match(html, /TURN 2/);
+  assert.match(html, /<button type="button"/);
+});
+
+void test("Trajectory topology correlates only unique call and result IDs", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryNativeTopologyHelpers(source);
+  const call = (id: string | undefined, name = "read") => ({ type: "toolCall", ...(id === undefined ? {} : { id }), name, arguments: {} });
+  const assistant = (...calls: Record<string, unknown>[]) => ({ type: "message", message: { role: "assistant", content: calls } });
+  const result = (id: string) => ({ type: "message", message: { role: "toolResult", toolCallId: id, content: [] } });
+  const project = (entries: Record<string, unknown>[], agent: Record<string, unknown> = { id: "agent", state: "running" }) => Array.from(helpers.topologyToolInvocations(entries, agent), (value) => ({ call: value.callEventIndex, result: value.resultEventIndex, selected: value.navigationEventIndex, interactive: value.interactive }));
+
+  assert.deepEqual(project([assistant(call("unique")), result("unique")]), [{ call: 0, result: 1, selected: 1, interactive: true }]);
+  assert.deepEqual(project([assistant(call("duplicate", "grep"), call("duplicate", "write")), result("duplicate")]), [
+    { call: 0, result: undefined, selected: undefined, interactive: false },
+    { call: 0, result: undefined, selected: undefined, interactive: false },
+  ]);
+  assert.deepEqual(project([assistant(call("duplicate-result")), result("duplicate-result"), result("duplicate-result")]), [{ call: 0, result: undefined, selected: 0, interactive: true }]);
+  assert.deepEqual(project([assistant(call("known")), result("unknown")]), [{ call: 0, result: undefined, selected: 0, interactive: true }]);
+  assert.deepEqual(project([assistant(call(undefined, "bash"))]), [{ call: 0, result: undefined, selected: 0, interactive: true }]);
+  assert.deepEqual(project([assistant(call(undefined, "read"), call(undefined, "bash"))]), [
+    { call: 0, result: undefined, selected: undefined, interactive: false },
+    { call: 0, result: undefined, selected: undefined, interactive: false },
+  ]);
+  assert.deepEqual(project([], { id: "agent", state: "running", toolCalls: [{ toolCallId: "fallback", toolName: "read" }] }), [{ call: undefined, result: undefined, selected: undefined, interactive: false }]);
+});
+
+void test("Trajectory overview topology uses phase, scope, and valid parent evidence only", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryNativeTopologyHelpers(source);
+  const record = { phases: [
+    { name: "first", agents: ["parent", "child"] },
+    { name: "second", agents: ["other"] },
+    { name: "cycle", agents: ["cycle-a", "cycle-b"] },
+  ], run: { workflowName: "pipeline", agents: [
+    { id: "parent", name: "parent", state: "completed", structuralPath: ["pipeline", "parallel"] },
+    { id: "child", name: "child", state: "completed", parentId: "parent", structuralPath: ["pipeline", "parallel"] },
+    { id: "other", name: "other", state: "running", structuralPath: ["pipeline", "parallel"] },
+    { id: "cycle-a", name: "cycle-a", state: "running", parentId: "cycle-b" },
+    { id: "cycle-b", name: "cycle-b", state: "running", parentId: "cycle-a" },
+  ] } } as unknown as Record<string, unknown>;
+  const data = helpers.buildTopologyData(record, new Map());
+  assert.equal(data.nodes.filter((node) => node.label === "Scope pipeline parallel").length, 2, "phase-qualified scopes must not be merged");
+  const nodeId = (label: string) => data.nodes.find((node) => node.label?.startsWith(label))?.id;
+  const parent = nodeId("parent");
+  const child = nodeId("child");
+  const cycleA = nodeId("cycle-a");
+  const cycleB = nodeId("cycle-b");
+  assert.ok(parent && child && cycleA && cycleB);
+  assert.ok(data.edges.some((edge) => edge.from === parent && edge.to === child));
+  assert.equal(data.edges.some((edge) => (edge.from === cycleA && edge.to === cycleB) || (edge.from === cycleB && edge.to === cycleA)), false);
+  const html = helpers.nativeTopologyOverview(data);
+  assert.match(html, /role="treeitem"/);
+  assert.match(source, /validTopologyParent\(agent, byId\)/);
+});
+
+void test("Trajectory native topology sanitizes labels, aggregates failures, and stays bounded", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const helpers = loadTrajectoryNativeTopologyHelpers(source);
+  assert.equal(helpers.topologyLabel("%%init: <script> [quoted] --> value"), "init script quoted value");
+  const hostile = { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "hostile", name: `evil</script><img src=x onerror=alert(1)>`, arguments: { value: "secret" } }] } };
+  const failed = { type: "message", message: { role: "toolResult", toolCallId: "hostile", error: { message: "nested failure" }, content: [] } };
+  const rendered = helpers.nativeTopologyDetail(helpers.buildAgentTopologyData([hostile, failed], { id: "agent", state: "running" }));
+  const openingTags = rendered.match(/<[^>]*>/g) || [];
+  const executableMarkup = openingTags.map((tag) => tag.replace(/"[^"]*"|'[^']*'/g, "")).join(" ");
+  assert.doesNotMatch(executableMarkup, /<\s*(?:script|img)\b/i);
+  assert.doesNotMatch(executableMarkup, /\bon[a-z]+\s*=/i);
+  assert.match(rendered, /failed/);
+
+  const call = (id: string) => ({ type: "toolCall", id, name: "bash", arguments: { command: id } });
+  const record = { run: { workflowName: "mixed", agents: [{ id: "agent", name: "agent", state: "failed", transcript: [
+    { type: "message", message: { role: "assistant", content: [call("done")] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "done", content: [] } },
+    { type: "message", message: { role: "assistant", content: [call("bad")] } },
+    { type: "message", message: { role: "toolResult", toolCallId: "bad", isError: true, content: [] } },
+  ] }] } } as unknown as Record<string, unknown>;
+  const overview = helpers.buildTopologyData(record, new Map());
+  assert.match(overview.nodes.map((node) => node.label).join(" "), /bash .*failed .*2/);
+
+  const many = Array.from({ length: 250 }, (_, index) => ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: `call-${String(index)}`, name: "read", arguments: { path: `file-${String(index)}` } }] } }));
+  const bounded = helpers.buildAgentTopologyData(many, { id: "agent", state: "running" });
+  assert.equal(bounded.calls.length, 200);
+  assert.ok(bounded.edges.length <= 2000);
+  assert.deepEqual(helpers.buildAgentTopologyData(many, { id: "agent", state: "running" }), bounded);
+});
+
+void test("Trajectory topology interaction is native, accessible, isolated, and has no unrelated controls", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  assert.match(source, /function renderRunTopology\(record\)/);
+  assert.match(source, /function renderAgentTopology\(entries, agent\)/);
+  assert.match(source, /<button type="button" class="topology-operation/);
+  assert.match(source, /aria-label="\$\{esc\(label\)\}; activate to inspect transcript event/);
+  assert.match(source, /data-topology-event="\$\{eventIndex\}"/);
+  assert.match(source, /target\.dataset\.topologyEvent !== undefined/);
+  assert.match(source, /function revealEventRow\(events, row\)/);
+  assert.match(source, /events\.scrollTop/);
+  assert.match(source, /window\.__PIEWF_STATIC__/);
+  assert.match(source, /omitted from static reports/);
+  // A real button supplies mouse, Enter, and Space activation without a custom key handler.
+  assert.match(source, /<button type="button" class="topology-operation/);
+  assert.doesNotMatch(source, /data-column-resizer|traj-agent-columns|topologyZoom|topologyRender/);
+  assert.doesNotMatch(source, /\b(?:fetch|XMLHttpRequest)\s*\(/i);
+  const topologyStart = source.indexOf("    const topologyLabel");
+  const topologyEnd = source.indexOf("    function renderTopologyUnavailable", topologyStart);
+  assert.ok(topologyStart >= 0 && topologyEnd > topologyStart);
+  const topologySource = source.slice(topologyStart, topologyEnd);
+  assert.doesNotMatch(topologySource, /scrollIntoView|document\.documentElement\.scroll|document\.body\.scroll/);
+  assert.doesNotMatch(topologySource, /Promise|async\s/);
+  const revealStart = source.indexOf("    function revealEventRow");
+  const revealEnd = source.indexOf("    function ", revealStart + 10);
+  assert.ok(revealStart >= 0 && revealEnd > revealStart);
+  const events = { scrollTop: 40, clientHeight: 100 };
+  const row = { offsetTop: 220, offsetHeight: 20 };
+  const reveal = runInNewContext(`(() => { ${source.slice(revealStart, revealEnd)}; return revealEventRow; })()`) as (container: Record<string, number>, item: Record<string, number>) => void;
+  reveal(events, row);
+  assert.equal(events.scrollTop, 140);
 });

@@ -28,6 +28,17 @@ function strings(value) {
   return [];
 }
 function filePathHasTestDirectory(path) { return path.split(/[\\/]/).includes("test"); }
+const trajectoryAssetPaths = [
+  "dist/trajectory/src/assets/index.html", "dist/trajectory/src/assets/marked.min.js", "dist/trajectory/src/assets/morphdom.min.js", "dist/trajectory/src/assets/favicon.png",
+  "dist/trajectory/assets/index.html", "dist/trajectory/assets/marked.min.js", "dist/trajectory/assets/morphdom.min.js", "dist/trajectory/assets/favicon.png",
+];
+function checkTrajectoryAssets(packageFiles, packageRoot, packageName, errors) {
+  const relative = packageFiles.map((file) => file.slice(packageRoot.length + 1).replaceAll("\\", "/"));
+  const expected = new Set(trajectoryAssetPaths);
+  const actual = relative.filter((file) => file.startsWith("dist/trajectory/src/assets/") || file.startsWith("dist/trajectory/assets/"));
+  for (const asset of expected) if (!actual.includes(asset)) errors.push(`${packageName}: missing Trajectory asset ${asset}`);
+  for (const asset of actual) if (!expected.has(asset)) errors.push(`${packageName}: unexpected Trajectory asset ${asset}`);
+}
 function relativeImports(source) {
   const imports = [];
   const visit = (value) => {
@@ -57,6 +68,7 @@ try {
     execFileSync("tar", ["-xzf", tarball, "-C", extracted, "--strip-components=1"], { stdio: "pipe", timeout: 30_000 });
     const packed = json(resolve(extracted, "package.json"));
     const packedFiles = files(extracted);
+    if (manifest.name === "pi-extensible-workflows") checkTrajectoryAssets(packedFiles, extracted, manifest.name, errors);
     const entrypoints = [packed.main, ...strings(packed.bin), ...strings(packed.exports), ...strings(packed.pi?.extensions)].filter((path) => typeof path === "string" && path.startsWith("./"));
     for (const entrypoint of entrypoints) if (!existsSync(resolve(extracted, entrypoint))) errors.push(`${manifest.name}: missing entrypoint ${entrypoint}`);
     for (const file of packedFiles.filter((path) => path.startsWith(resolve(extracted, "dist")) && (filePathHasTestDirectory(path.slice(extracted.length + 1)) || path.includes(".test.")))) errors.push(`${manifest.name}: published test artifact ${file.slice(extracted.length + 1)}`);
@@ -74,6 +86,11 @@ try {
   if (cli.status !== 0 || !cliOutput.includes("Usage: piewf run")) throw new Error(`Standalone CLI smoke test failed (${String(cli.status)}):\n${cliOutput}`);
   execFileSync("npm", ["audit", "--prefix", installRoot, "--omit=dev"], { stdio: "pipe", timeout: 60_000 });
 
+  const installedCore = packagePath(installRoot, "pi-extensible-workflows");
+  const installedCoreFiles = files(installedCore);
+  const installedCoreAssetErrors = [];
+  checkTrajectoryAssets(installedCoreFiles, installedCore, "Installed core package", installedCoreAssetErrors);
+  if (installedCoreAssetErrors.length) throw new Error(installedCoreAssetErrors.join("\n"));
   const localPackages = ["pi-extensible-workflows", "@piewf/herdr"].map((name) => packagePath(installRoot, name));
   const extensionCount = localPackages.reduce((count, directory) => count + strings(json(resolve(directory, "package.json")).pi?.extensions).length, 0);
   const pi = resolve(root, "node_modules/.bin/pi");

@@ -91,6 +91,8 @@
         <h2>Trajectory browser</h2>
         <p>Open <code>/workflow trajectory</code> to inspect standalone subagents in Trajectory's local browser UI. Each publisher session shows a sibling <code>SUBAGENTS</code> section beside its workflow runs, scoped to the current Pi session and sorted attention-first: running, failed, stopped, then completed.</p>
         <p>The publisher home view includes a subagent Gantt with one lane per subagent and matching tool-timing bars. Select a subagent to open its own view with the transcript event timeline, searchable events, model, tools, accounting, result or failure, and worktree path and branch when available.</p>
+        <p>Live workflow views also provide a separate native overview topology: a bounded tree based only on recorded phases, scopes, parent relationships, and agent/tool status. The selected agent view provides a bounded ordered turn sequence with same-turn tool fan-out. Labels are sanitized, malformed relationships degrade conservatively, and invocation controls are keyboard-accessible. A uniquely correlated invocation can select its exact transcript row and inspector entry.</p>
+        <p>Static HTML reports preserve their native Gantt, events, and inspector content but explicitly omit topology. They are self-contained and do not need a topology runtime or network resource.</p>
         <p>While a subagent is running, its view exposes <code>Stop</code> and <code>Steer</code>. Failed or stopped subagents expose <code>Retry</code>; retry starts a fresh subagent with a new ID and follows that ID in the UI. Pause, resume, and checkpoint controls are not shown for subagents.</p>
       </section>
       <section id="execution">

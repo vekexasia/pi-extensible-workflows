@@ -35,6 +35,11 @@ void test("exportTrajectoryRunHtml renders a self-contained static run report", 
     assert.equal(html.includes('href="./'), false);
     assert.ok(html.includes('<script src="data:text/javascript;base64,'));
     assert.ok(html.includes('href="data:image/png;base64,'));
+    // Static reports omit live topology and contain no external runtime or network loader.
+    assert.match(html, /omitted from static reports/i);
+    assert.doesNotMatch(html, /\b(?:fetch|XMLHttpRequest)\s*\(/i);
+    assert.match(html, /if \(window\.__PIEWF_STATIC__\) \{ acceptState\(window\.__PIEWF_STATIC__\); \} else \{ connect\(\);/);
+    assert.doesNotMatch(html, /\b(?:src|href)=["'](?!data:|#)[^"']+["']/i);
     // The raw injected payload cannot terminate its script block early.
     assert.equal(html.includes("</script> world"), false);
     // $-sequences in transcripts must not trigger String.replace expansion and duplicate the document.
