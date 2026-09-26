@@ -164,9 +164,10 @@ function workflowProgressLines(run: PersistedRun, spinner: string, styles: Workf
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
   const position = new Map(run.agents.map((agent, index) => [agent, index]));
   const renderAgents = (agents: readonly AgentRecord[], nested: boolean) => renderGroupedAgents(agents, ({ agent, depth }, grouped) => {
-    const icon = agentStateGlyph(agent.state, spinner);
+    const icon = agentStateGlyph(agent.state, "●");
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
-    const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : formatAgentActivity(agent, spinner, styles, now);
+    const idleSpinner = agent.state === "running" && !agentActivityLabel(agent) ? styles.accent(spinner) : "";
+    const activity = SETTLED_AGENT_STATES.has(agent.state) ? "" : [idleSpinner, formatAgentActivity(agent, spinner, styles, now)].filter(Boolean).join(" ");
     const name = grouped ? agent.label ?? agent.name : styledAgentBreadcrumb(agent, byId, styles);
     const state = progressStyleForState(agent.state, styles);
     const detail = expanded ? formatWorkflowAgentDetail(agent, now) : "";

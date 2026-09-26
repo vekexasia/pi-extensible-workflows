@@ -39,7 +39,7 @@ void test("workflow progress warns after ten minutes of agent silence and resets
   const stalledAgent = stalled.agents[0];
   assert.ok(stalledAgent);
   const noActivity = makeRun({ ...stalled, agents: [{ ...stalledAgent, activity: undefined }] });
-  assert.match(formatWorkflowProgress(noActivity, "◇", undefined, now), /stalled\? 12m/);
+  assert.match(formatWorkflowProgress(noActivity, "◇", undefined, now), /#1 ● worker \[running\] ◇ stalled\? 12m/);
   assert.doesNotMatch(formatWorkflowProgress(noActivity, "◇", undefined, now), / - stalled\?/);
   const reset = makeRun({ ...stalled, agents: [{ ...stalledAgent, lastEventAt: now }] });
   assert.doesNotMatch(formatWorkflowProgress(reset, "◇", undefined, now), /stalled\?/);
@@ -502,11 +502,12 @@ void test("foreground workflow reports parallel agent activities together", { ti
 void test("workflow progress keeps each agent to one line with latest tool", () => {
   const run = makeRun({ workflowName: "live", phase: "work", agents: [makeAgent({ id: "run:1", name: "review", path: "run:1", model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "high" }, tools: ["read"], accounting: { input: 120, output: 30, cacheRead: 40, cacheWrite: 0, cost: 0.01 }, toolCalls: [{ id: "call-1", name: "ls", state: "completed" }, { id: "call-2", name: "read", state: "running" }] })] });
   const rendered = formatWorkflowProgress(run);
-  assert.match(rendered, /#1 ◇ review \[running\] ◇ read/);
+  assert.match(formatWorkflowProgress(makeRun({ agents: [makeAgent({ activity: undefined, toolCalls: [] })] })), /#1 ● worker \[running\] ◇/);
+  assert.match(rendered, /#1 ● review \[running\] ◇ read/);
   assert.doesNotMatch(rendered, /Model:/);
   assert.doesNotMatch(rendered, /Tokens:/);
   assert.doesNotMatch(rendered, /✓ ls/);
-  assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ⠙ review \[running\] ⠙ read/);
+  assert.match(formatWorkflowProgress(run, "⠙"), /⠙ Workflow:[\s\S]*#1 ● review \[running\] ⠙ read/);
   const agent = run.agents[0];
   assert.ok(agent);
   const reasoning = makeRun({ ...run, agents: [{ ...agent, activity: { kind: "reasoning", text: "checking cache" } }] });
@@ -537,7 +538,7 @@ void test("workflow progress applies semantic styles without coloring agent name
   assert.match(progress, /<bold><accent>Workflow: styled/);
   assert.match(progress, /<warning>!<\/warning>/);
   assert.match(progress, /<success>✓<\/success> done <success>\[completed\]<\/success>/);
-  assert.match(progress, /<accent>@<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding · answer<\/dim>/);
+  assert.match(progress, /<accent>●<\/accent> live <accent>\[running\]<\/accent> <accent>@<\/accent> <dim>responding · answer<\/dim>/);
   assert.match(progress, /<muted>○<\/muted> waiting <muted>\[queued\]<\/muted>/);
   assert.match(progress, /<error>✗<\/error> failed <error>\[failed\]<\/error>/);
   assert.match(progress, /<error>✗<\/error> cancelled <error>\[cancelled\]<\/error>/);
@@ -568,7 +569,7 @@ void test("workflow cards group structural scopes with stable creation order", (
   assert.ok(progress.indexOf("#1") < progress.indexOf("#3"));
   assert.ok(progress.indexOf("#3") < progress.indexOf("#4"));
   assert.ok(progress.indexOf("#3") < progress.indexOf("#2"));
-  assert.match(progress, /#4 ◇ child/);
+  assert.match(progress, /#4 ● child/);
 });
 void test("workflow cards separate repeated function invocations", () => {
   const run = makeRun({ workflowName: "repeated", agents: [
@@ -588,7 +589,7 @@ void test("workflow progress keeps top-level agents separate from review-loop gr
   ] });
   const progress = formatWorkflowProgress(run);
   assert.match(progress, / {2}Agents\n {4}#1 ✓ scout \[completed\]/);
-  assert.match(progress, / {2}reviewLoop\.developUntilApproved\n {4}#2 ◇ developer \[running\]/);
+  assert.match(progress, / {2}reviewLoop\.developUntilApproved\n {4}#2 ● developer \[running\]/);
 });
 
 void test("workflow progress compacts only past the line limit and keeps its header, failures, and active agents on screen", () => {
@@ -608,7 +609,7 @@ void test("workflow progress compacts only past the line limit and keeps its hea
   assert.equal(compact[0], full[0]);
   assert.match(compact.join("\n"), /\[Phase: inventory\] 11 done · 1 failed · 16s · 18kt · \$0\.12/);
   assert.match(compact.join("\n"), /#5 ✗ agent-4 \[failed\]/);
-  for (const index of [0, 1, 2]) assert.match(compact.join("\n"), new RegExp(`#${String(33 + index)} ◇ live-${String(index)} \\[running\\]`));
+  for (const index of [0, 1, 2]) assert.match(compact.join("\n"), new RegExp(`#${String(33 + index)} ● live-${String(index)} \\[running\\]`));
   assert.match(compact.join("\n"), /… \+8 queued · \+\d+ done/);
   assert.equal(compact.filter((line) => /^\s+\d\d:\d\d:\d\d log /.test(line) || /log \d$/.test(line)).length, 3);
   // Expanded view is the reader's explicit choice and is never compacted.

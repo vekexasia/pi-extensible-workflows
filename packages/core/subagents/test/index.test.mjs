@@ -182,7 +182,7 @@ test("renders subagent calls and background or foreground progress consistently"
     { args: { id: "inspected" }, state: {}, invalidate() {} },
   );
   const inspected = inspectComponent.render(80).join("\n");
-  assert.match(inspected, /^◇ Subagent: inspecte.*\[running\]/);
+  assert.match(inspected, /^● Subagent: inspecte.*\[running\]\n {2}◇$/);
   assert.equal(inspectComponent.render(80).join("\n"), inspected);
   assert.doesNotMatch(inspected, /role=/);
   const inspection = inspect.renderResult(

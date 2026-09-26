@@ -110,11 +110,11 @@ function formatSubagentProgress(status: SubagentStatus, args: SubagentRenderArgs
   const metadata = requestMetadata(args, args.id === undefined);
   const stats = usageStats(status);
   const lines = [
-    `${theme.fg(color, stateGlyph(status.state, spinner))} ${theme.bold(theme.fg("accent", `Subagent: ${label({ ...args, id: status.id })}`))} ${theme.fg(color, `[${status.state}]`)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}${stats ? ` ${stats}` : ""}${elapsed ? ` runtime=${elapsed}` : ""}`,
+    `${theme.fg(color, stateGlyph(status.state, "●"))} ${theme.bold(theme.fg("accent", `Subagent: ${label({ ...args, id: status.id })}`))} ${theme.fg(color, `[${status.state}]`)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}${stats ? ` ${stats}` : ""}${elapsed ? ` runtime=${elapsed}` : ""}`,
   ];
   const current = status.state === "running" ? agentActivityLabel(status.progress ?? {}) : undefined;
   const stalled = stalledDuration({ ...status.progress, state: status.state }, now);
-  if (current) lines.push(`  ${theme.fg("accent", spinner)} ${theme.fg("dim", current)}${stalled === undefined ? "" : ` ${theme.fg("warning", `- stalled? ${formatStalledDuration(stalled)}`)}`}`);
+  if (current || status.state === "running") lines.push(`  ${theme.fg("accent", spinner)}${current ? ` ${theme.fg("dim", current)}` : ""}${stalled === undefined ? "" : ` ${theme.fg("warning", `- stalled? ${formatStalledDuration(stalled)}`)}`}`);
   else if (stalled !== undefined) lines.push(`  ${theme.fg("warning", `stalled? ${formatStalledDuration(stalled)}`)}`);
   if (status.error) lines.push(`  ${theme.fg("error", `${status.error.code}: ${status.error.message}`)}`);
   if (expanded) {
