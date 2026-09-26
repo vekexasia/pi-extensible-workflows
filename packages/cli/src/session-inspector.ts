@@ -122,7 +122,8 @@ function transcript(manager: SessionManager): TranscriptSummary {
 
 function readTranscript(path: string): TranscriptSummary | undefined {
   try {
-    if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size === 0) return undefined;
+    const info = existsSync(path) ? statSync(path) : undefined;
+    if (!info?.isFile() || info.size === 0) return undefined;
     const manager = SessionManager.open(path);
     if (!manager.getHeader()) return undefined;
     const summary = transcript(manager);

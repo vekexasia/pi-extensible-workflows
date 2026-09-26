@@ -3,7 +3,7 @@ import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { AGENT_STATES as CORE_AGENT_STATES, BUDGET_DIMENSIONS as CORE_BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES as CORE_BUDGET_EVENT_TYPES, HARD_TERMINAL_RUN_STATES, RUN_STATES, errorText, isNodeError, isThinkingLevel, jsonValue, object, validateBudget, validateModelAliases, validateSchema, type AgentState, type ModelSpec, type RunState } from "pi-extensible-workflows";
-import { acquireSessionLease, hasLiveSessionLease, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "pi-extensible-workflows/persistence";
+import { acquireSessionLease, hasLiveSessionLease, json, projectSessionsDirectory, RunStore, type PersistedRun, type SessionLease } from "pi-extensible-workflows/persistence";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUIRED_RUN_FILES = ["workflow.js", "state.json", "snapshot.json", "journal.json", "ownership.json", "worktrees.json", "borrowed-worktrees.json", "system-prompts.json"] as const;
@@ -46,7 +46,6 @@ function isActivityKind(value: unknown): value is ActivityKind { return ["reason
 function positiveDays(value: number): number { if (!Number.isSafeInteger(value) || value < 1 || !Number.isFinite(value * DAY_MS)) throw new Error("older-than-days must be a positive integer"); return value; }
 function runItem(entry: StoredRun, action: CleanupRunResult["action"], reason?: string): CleanupRunResult { return { sessionId: entry.sessionId, runId: entry.runId, action, state: entry.run.state, stateMtimeMs: entry.stateMtimeMs, path: entry.store.directory, ...(reason ? { reason } : {}) }; }
 function sameNames(left: readonly string[], right: readonly string[]): boolean { return left.length === right.length && left.every((value, index) => value === right[index]); }
-async function jsonFile(path: string): Promise<unknown> { return JSON.parse(await readFile(path, "utf8")) as unknown; }
 async function requiredFile(path: string): Promise<void> { const info = await lstat(path); if (!info.isFile()) throw new Error(`Required artifact is not a regular file: ${path}`); }
 function stringList(value: unknown, label: string, nonEmpty = false): asserts value is string[] { if (!isList(value) || value.some((item) => typeof item !== "string" || (nonEmpty && !item))) throw new Error(`${label} is invalid`); }
 function optionalString(value: unknown, label: string): asserts value is string | undefined { if (value !== undefined && typeof value !== "string") throw new Error(`${label} is invalid`); }
@@ -165,7 +164,7 @@ function validateSnapshot(snapshot: unknown): void {
 }
 function validateJournal(value: unknown): void { if (!object(value) || !object(value.completed) || (value.awaiting !== undefined && !object(value.awaiting)) || (value.decisions !== undefined && !object(value.decisions))) throw new Error("Persisted workflow journal is invalid"); for (const operation of Object.values(value.completed)) if (!object(operation) || typeof operation.path !== "string" || !operation.path || !jsonValue(operation.value)) throw new Error("Persisted completed operation is invalid"); for (const checkpoint of Object.values(value.awaiting ?? {})) if (!object(checkpoint) || typeof checkpoint.path !== "string" || !checkpoint.path || typeof checkpoint.name !== "string" || !checkpoint.name || typeof checkpoint.prompt !== "string" || !jsonValue(checkpoint.context)) throw new Error("Persisted awaiting checkpoint is invalid"); for (const decision of Object.values(value.decisions ?? {})) { if (!object(decision) || decision.kind !== "budget" || typeof decision.proposalId !== "string" || !decision.proposalId || typeof decision.runId !== "string" || !decision.runId || !object(decision.previous) || !object(decision.proposed) || !Number.isSafeInteger(decision.budgetVersion) || Number(decision.budgetVersion) < 1) throw new Error("Persisted budget decision is invalid"); validateUsage(decision.consumed, "Persisted budget decision usage"); validateBudget(decision.previous); validateBudget(decision.proposed); } }
 async function validateSystemPrompts(store: RunStore): Promise<void> {
-  const value = await jsonFile(store.systemPromptPath());
+  const value = await json(store.systemPromptPath());
   if (object(value) && value.version === 2) { await store.systemPrompts(); return; }
   if (!object(value) || value.version !== 1 || !isList(value.entries)) throw new Error("Persisted system prompts are invalid");
   for (const [index, entry] of value.entries.entries()) {
@@ -192,11 +191,11 @@ async function validateRunArtifacts(store: RunStore, workflowScript: string, sta
   for (const name of REQUIRED_RUN_FILES) await requiredFile(join(store.directory, name));
   if (await readFile(join(store.directory, "workflow.js"), "utf8") !== workflowScript) throw new Error("Persisted workflow source does not match its launch snapshot");
   await validateSystemPrompts(store);
-  const result = await jsonFile(join(store.directory, "result.json")).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
+  const result = await json(join(store.directory, "result.json")).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
   if (result === undefined && state === "completed") throw new Error("Completed run result is missing");
   if (result !== undefined && !jsonValue(result)) throw new Error("Persisted workflow result is invalid");
-  validateJournal(await jsonFile(join(store.directory, "journal.json")));
-  const rawOwnership = await jsonFile(join(store.directory, "ownership.json"));
+  validateJournal(await json(join(store.directory, "journal.json")));
+  const rawOwnership = await json(join(store.directory, "ownership.json"));
   if (!isList(rawOwnership)) throw new Error("Persisted ownership records are invalid");
   const ownershipIds = new Set<string>();
   const ownership = rawOwnership.map((record, index) => {
@@ -232,7 +231,7 @@ async function scanSession(cwd: string, sessionId: string, home: string, expecte
   const ownerPath = join(runsPath, "owner.json");
   let liveLease = false;
   if (expectedLease && expectedLease.path === ownerPath) {
-    const owned = await jsonFile(ownerPath);
+    const owned = await json(ownerPath);
     if (!object(owned) || owned.token !== expectedLease.token) throw new Error("Session ownership lease changed before deletion");
   } else liveLease = await hasLiveSessionLease(cwd, sessionId, home);
   const runs: StoredRun[] = [];

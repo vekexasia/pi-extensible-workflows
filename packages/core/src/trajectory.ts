@@ -11,6 +11,7 @@ import { statusValue, subagentErrorValue } from "../subagents/src/decode.js";
 import { isNodeError, jsonValue, object, resourcePatternHasMagic, selectResourcesByLayers } from "./utils.js";
 import type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
 import { canonicalPath, sameFilesystemPath } from "./paths.js";
+import { TOOL_TIMING_ENTRY_TYPE } from "./tool-timing.js";
 
 export const TRAJECTORY_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const TRAJECTORY_MAX_NON_TIMING_ENTRIES = 400;
@@ -124,7 +125,7 @@ function transcriptToolCallId(value: unknown): string | undefined {
   for (const part of message.content) if (object(part) && typeof part.id === "string") return part.id;
   return undefined;
 }
-function isTimingTranscriptEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === "pi-workflows:tool-timing"; }
+export function isTimingTranscriptEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === TOOL_TIMING_ENTRY_TYPE; }
 function timingToolCallId(value: unknown): string | undefined {
   if (!object(value) || !isTimingTranscriptEntry(value) || !object(value.data)) return undefined;
   return typeof value.data.toolCallId === "string" ? value.data.toolCallId : undefined;

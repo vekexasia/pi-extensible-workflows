@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- `pi-extensible-workflows/runtime` no longer exports the unused `WorkflowNamespace`, `WorkflowLease`, and `WorkflowLeaseProvider` types. Nothing in the package consumed them.
+
 ## [5.17.0] - 2026-09-23
 
 ### New capabilities

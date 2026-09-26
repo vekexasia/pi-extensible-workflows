@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
 import { sameFilesystemPath } from "../../src/paths.js";
+import { TOOL_TIMING_ENTRY_TYPE } from "../../src/tool-timing.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
 type Socket = import("node:stream").Duplex;
@@ -17,9 +18,8 @@ const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 const MAX_PENDING_REQUESTS = 128;
 const TRANSCRIPT_REQUEST_TIMEOUT_MS = 10_000;
 const ACTION_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const TIMING_ENTRY_TYPE = "pi-workflows:tool-timing";
 function isTimingEntry(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "custom" && (value as { customType?: unknown }).customType === TIMING_ENTRY_TYPE);
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "custom" && (value as { customType?: unknown }).customType === TOOL_TIMING_ENTRY_TYPE);
 }
 function compactTranscript(value: unknown): unknown {
   if (Array.isArray(value)) return value.filter(isTimingEntry);

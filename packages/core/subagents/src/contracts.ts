@@ -60,14 +60,6 @@ export const SUBAGENTS_RETRY_PARAMETERS = Type.Object({
   id: Type.String({ description: "Failed or stopped subagent ID to retry" }),
 }, { additionalProperties: false });
 
-export const SUBAGENTS_TOOL_SCHEMAS = {
-  subagents_run: SUBAGENTS_RUN_PARAMETERS,
-  subagents_inspect: SUBAGENTS_INSPECT_PARAMETERS,
-  subagents_steer: SUBAGENTS_STEER_PARAMETERS,
-  subagents_stop: SUBAGENTS_STOP_PARAMETERS,
-  subagents_retry: SUBAGENTS_RETRY_PARAMETERS,
-} as const;
-
 export type SubagentRunRequest = Static<typeof SUBAGENTS_RUN_PARAMETERS>;
 export function normalizeSubagentRunRequest(value: unknown): SubagentRunRequest {
   if (!Value.Check(SUBAGENTS_RUN_PARAMETERS, value)) throw new WorkflowError("INVALID_METADATA", "Invalid subagents_run parameters");

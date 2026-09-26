@@ -1,7 +1,8 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatCost, formatStalledDuration, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
-import { drawFrame, formatElapsed, formatTokens, mark, QUIET_MS, type Paint } from "../../src/background-widget.js";
+import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
+import { agentActivityLabel, stalledDuration, textBlock } from "../../src/host-view.js";
+import { drawFrame, formatElapsed, formatTokens, mark, QUIET_MS, REPAINT_MS, type Paint } from "../../src/background-widget.js";
 import type { SubagentRunRequest, SubagentStatus } from "./contracts.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -18,13 +19,6 @@ export type SubagentRenderState = {
   subagentProgressComponent?: ProgressComponent;
   subagentProgressFrozenAt?: number;
 };
-
-function textBlock(text: string) {
-  return {
-    render(width: number): string[] { return text.split("\n").map((line) => truncateToWidth(line, Math.max(1, width), "…")); },
-    invalidate() {},
-  };
-}
 
 function roleName(value: unknown): string | undefined {
   if (typeof value === "string") return value.trim() || undefined;
@@ -73,18 +67,6 @@ function statusValue(value: unknown): SubagentStatus | undefined {
   return value as SubagentStatus;
 }
 
-function runtime(startedAt: number | undefined, finishedAt: number | undefined, now: number): string {
-  if (startedAt === undefined) return "";
-  const seconds = Math.max(0, Math.floor(((finishedAt ?? now) - startedAt) / 1000));
-  if (seconds < 60) return `${String(seconds)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (minutes < 60) return `${String(minutes)}m${remainingSeconds ? ` ${String(remainingSeconds)}s` : ""}`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return `${String(hours)}h${remainingMinutes ? ` ${String(remainingMinutes)}m` : ""}`;
-}
-
 function stateGlyph(state: SubagentStatus["state"], spinner: string): string {
   if (state === "running") return spinner;
   return state === "completed" ? "✓" : "✗";
@@ -93,25 +75,6 @@ function stateGlyph(state: SubagentStatus["state"], spinner: string): string {
 function stateColor(state: SubagentStatus["state"]): "accent" | "success" | "error" {
   if (state === "running") return "accent";
   return state === "completed" ? "success" : "error";
-}
-
-function activity(status: SubagentStatus): string | undefined {
-  if (status.state !== "running") return undefined;
-  const current = status.progress?.activity;
-  if (current?.kind === "reasoning" || current?.kind === "text") {
-    const name = current.kind === "reasoning" ? "reasoning" : "responding";
-    const text = sanitizeDisplayText(current.text);
-    return text && text !== name ? `${name} · ${text}` : name;
-  }
-  if (current?.kind === "tool") return sanitizeDisplayText(current.text);
-  return sanitizeDisplayText([...(status.progress?.toolCalls ?? [])].reverse().find(({ state }) => state === "running")?.name ?? "");
-}
-
-function stalledDuration(status: SubagentStatus, now: number): number | undefined {
-  const lastEventAt = status.progress?.lastEventAt;
-  if (status.state !== "running" || lastEventAt === undefined || !Number.isFinite(lastEventAt)) return undefined;
-  const duration = now - lastEventAt;
-  return duration >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? duration : undefined;
 }
 
 /** Tokens and cost as the workflow header shows them. */
@@ -143,14 +106,14 @@ function boundedValue(value: unknown): string {
 
 function formatSubagentProgress(status: SubagentStatus, args: SubagentRenderArgs, theme: Theme, spinner: string, now: number, expanded: boolean): string {
   const color = stateColor(status.state);
-  const elapsed = runtime(status.startedAt, status.finishedAt, now);
+  const elapsed = status.startedAt === undefined ? "" : formatWorkflowRuntime((status.finishedAt ?? now) - status.startedAt);
   const metadata = requestMetadata(args, args.id === undefined);
   const stats = usageStats(status);
   const lines = [
     `${theme.fg(color, stateGlyph(status.state, spinner))} ${theme.bold(theme.fg("accent", `Subagent: ${label({ ...args, id: status.id })}`))} ${theme.fg(color, `[${status.state}]`)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}${stats ? ` ${stats}` : ""}${elapsed ? ` runtime=${elapsed}` : ""}`,
   ];
-  const current = activity(status);
-  const stalled = stalledDuration(status, now);
+  const current = status.state === "running" ? agentActivityLabel(status.progress ?? {}) : undefined;
+  const stalled = stalledDuration({ ...status.progress, state: status.state }, now);
   if (current) lines.push(`  ${theme.fg("accent", spinner)} ${theme.fg("dim", current)}${stalled === undefined ? "" : ` ${theme.fg("warning", `- stalled? ${formatStalledDuration(stalled)}`)}`}`);
   else if (stalled !== undefined) lines.push(`  ${theme.fg("warning", `stalled? ${formatStalledDuration(stalled)}`)}`);
   if (status.error) lines.push(`  ${theme.fg("error", `${status.error.code}: ${status.error.message}`)}`);
@@ -218,7 +181,7 @@ export function subagentProgressBlock(status: SubagentStatus, args: SubagentRend
     render(width: number): string[] {
       const now = TERMINAL_STATES.has(current.state) ? frozenAt : Date.now();
       if (!TERMINAL_STATES.has(current.state)) frozenAt = now;
-      const frame = SPINNER[Math.floor(now / 80) % SPINNER.length] ?? "◇";
+      const frame = SPINNER[Math.floor(now / REPAINT_MS) % SPINNER.length] ?? "◇";
       return formatSubagentProgress(current, args, currentTheme, frame, now, expanded).split("\n").map((line) => truncateToWidth(line, Math.max(1, width), "…"));
     },
     invalidate() {},
@@ -236,7 +199,7 @@ export function renderSubagentResult(result: AgentToolResult<unknown>, options: 
   const status = state.subagentStatus;
 
   if (status?.state === "running" && options.isPartial && !state.subagentSpinner) {
-    state.subagentSpinner = setInterval(() => { context.invalidate(); }, 80);
+    state.subagentSpinner = setInterval(() => { context.invalidate(); }, REPAINT_MS);
     state.subagentSpinner.unref();
   } else if ((!options.isPartial || status?.state !== "running") && state.subagentSpinner) {
     clearInterval(state.subagentSpinner);
@@ -373,7 +336,7 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
         };
       }, { placement: "belowEditor" });
       showing = true;
-      timer = setInterval(() => { requestRender?.(); }, 80);
+      timer = setInterval(() => { requestRender?.(); }, REPAINT_MS);
       timer.unref();
     } catch {
       hide();

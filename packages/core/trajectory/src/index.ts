@@ -8,7 +8,7 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { clearTrajectoryHost, setTrajectoryHost, type TrajectoryHost, type TrajectoryPublisherProvider } from "../../src/trajectory-host-handle.js";
 import { processAlive } from "../../src/session-lease.js";
 import { errorText, isNodeError, object, positiveInteger } from "../../src/utils.js";
-import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
+import { isTimingTranscriptEntry, isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
 import { shareTrajectoryRun } from "./export.js";
 
 const DEFAULT_TRAJECTORY_PORT = 7432;
@@ -202,7 +202,6 @@ const RECONNECT_MAX_DELAY_MS = 5_000;
 type LiveStateRecord = Record<string, unknown>;
 type TranscriptRevision = { signature: string; revision: number };
 type PendingTranscript = { generation: number; timer: ReturnType<typeof setTimeout>; publisherId: string; runId?: string; agentId?: string; subagentId?: string; revision?: number };
-function isTimingEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === "pi-workflows:tool-timing"; }
 function boundedString(value: unknown, maxLength = 1024): unknown {
   if (typeof value !== "string") return value;
   const bytes = Buffer.from(value);
@@ -231,7 +230,7 @@ function liveValueWillBeBounded(value: unknown, key = "", depth = 0): boolean {
 const MAX_LIVE_TIMING_BYTES = 64 * 1024;
 /** Keeps the newest timing entries: dropping the oldest leaves a live agent's gantt growing instead of frozen. */
 function boundedTiming(value: unknown): unknown[] {
-  const entries = Array.isArray(value) ? value.filter(isTimingEntry) : [];
+  const entries = Array.isArray(value) ? value.filter(isTimingTranscriptEntry) : [];
   const retained: unknown[] = [];
   let bytes = 2;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
@@ -446,11 +445,9 @@ export function createTrajectoryController(agentDir: string): TrajectoryControll
     }
   };
   const transcriptFromFallback = async (input: TrajectoryPublisherInput, request: TrajectoryTranscriptRequest): Promise<TrajectoryTranscriptResult> => {
-    const boundedTranscriptResult = (result: TrajectoryTranscriptResult): TrajectoryTranscriptResult => {
-      try { if (result.status === "available" && Buffer.byteLength(JSON.stringify(result.entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) return { status: "oversized", revision: result.revision, entries: [], error: "Transcript is too large" }; } catch { return { status: "failed", revision: result.revision, entries: [], error: "Transcript failed" }; }
-      return result;
-    };
-    const boundedResult = (entries: readonly unknown[], revision: number): TrajectoryTranscriptResult => { try { if (Buffer.byteLength(JSON.stringify(entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES) return { status: "oversized", revision, entries: [], error: "Transcript is too large" }; } catch { return { status: "failed", revision, entries: [], error: "Transcript failed" }; } return { status: entries.length ? "available" : "empty", revision, entries }; };
+    const oversized = (entries: readonly unknown[], revision: number): TrajectoryTranscriptResult | undefined => { try { return Buffer.byteLength(JSON.stringify(entries)) > TRAJECTORY_MAX_TRANSCRIPT_BYTES ? { status: "oversized", revision, entries: [], error: "Transcript is too large" } : undefined; } catch { return { status: "failed", revision, entries: [], error: "Transcript failed" }; } };
+    const boundedTranscriptResult = (result: TrajectoryTranscriptResult): TrajectoryTranscriptResult => (result.status === "available" ? oversized(result.entries, result.revision) : undefined) ?? result;
+    const boundedResult = (entries: readonly unknown[], revision: number): TrajectoryTranscriptResult => oversized(entries, revision) ?? { status: entries.length ? "available" : "empty", revision, entries };
     if (input.loadTranscript) {
       const result = await input.loadTranscript(request);
       const revisionChanged = request.revision !== undefined && result.revision !== request.revision && result.status !== "missing" && result.status !== "failed" && result.status !== "oversized" && result.status !== "disconnected";

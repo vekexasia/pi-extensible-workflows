@@ -573,7 +573,7 @@ export function formatStalledDuration(durationMs: number): string {
   const remainingMinutes = minutes % 60;
   return `${String(hours)}h${remainingMinutes ? ` ${String(remainingMinutes)}m` : ""}`;
 }
-function stalledDuration(agent: Pick<AgentDetailPresentation, "state" | "lastEventAt">, now: number): number | undefined {
+export function stalledDuration(agent: Pick<AgentDetailPresentation, "state" | "lastEventAt">, now: number): number | undefined {
   if (agent.state !== "running" || agent.lastEventAt === undefined || !Number.isFinite(agent.lastEventAt)) return undefined;
   const duration = now - agent.lastEventAt;
   return duration >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? duration : undefined;
@@ -583,7 +583,7 @@ function elapsedDurationMs(agent: Pick<AgentDetailPresentation, "durationMs" | "
   if (agent.durationMs !== undefined && Number.isFinite(agent.durationMs)) return Math.max(0, agent.durationMs);
   return agent.startedAt === undefined || !Number.isFinite(agent.startedAt) ? undefined : Math.max(0, end - agent.startedAt);
 }
-function agentActivityLabel(agent: { readonly activity?: AgentRecord["activity"]; readonly toolCalls?: AgentRecord["toolCalls"] }): string {
+export function agentActivityLabel(agent: { readonly activity?: AgentRecord["activity"]; readonly toolCalls?: AgentRecord["toolCalls"] }): string {
   const activity = agent.activity;
   if (activity?.kind === "reasoning" || activity?.kind === "text") {
     const name = activity.kind === "reasoning" ? "reasoning" : "responding";
