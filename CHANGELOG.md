@@ -1,9 +1,15 @@
 # Changelog
 ## Unreleased
 
-### Breaking changes
+## [5.17.1] - 2026-09-26
 
-- `pi-extensible-workflows/runtime` no longer exports the unused `WorkflowNamespace`, `WorkflowLease`, and `WorkflowLeaseProvider` types. Nothing in the package consumed them.
+### Fixes
+
+- Running workflow agents and standalone subagents show a fixed status glyph before their names and keep the activity spinner visible after `[running]`, even without a current activity label.
+
+### Internal
+
+- Remove duplicated view and trajectory helpers, unused internal code, and tracked generated images. Preserve the public `pi-extensible-workflows/runtime` type exports.
 
 ## [5.17.0] - 2026-09-23
 
