@@ -235,8 +235,10 @@ function parseInspectArgs(rawArgs: readonly string[]): { sessionId?: string; mod
   }
   return { ...(sessionId ? { sessionId } : {}), mode: failedOnly && mode === "tui" ? "summary" : mode, failedOnly };
 }
-export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; prompt?: string; json?: boolean } {
+function isDoctorRolePath(value: string): boolean { return value.includes("/") || value.includes("\\"); }
+export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; rolePath?: string; prompt?: string; json?: boolean } {
   let role: string | undefined;
+  let rolePath: string | undefined;
   let prompt: string | undefined;
   let json = false;
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -247,17 +249,18 @@ export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; pr
     if (option === "--role" || option === "--prompt") {
       const value = equals >= 0 ? token.slice(equals + 1) : rawArgs[++index];
       if (!value) throw new Error(`Missing value for ${option}`);
-      if (option === "--role") { if (role !== undefined) throw new Error("--role may only be provided once"); role = value; }
+      if (option === "--role") { if (role !== undefined || rolePath !== undefined) throw new Error("--role may only be provided once"); role = value; }
       else { if (prompt !== undefined) throw new Error("--prompt may only be provided once"); prompt = value; }
       continue;
     }
     if (token === "--help" || token === "-h") throw new Error("help");
     if (token.startsWith("--")) throw new Error(`Unknown doctor option: ${token}`);
-    if (role !== undefined) throw new Error(`Unexpected argument: ${token}`);
-    role = token;
+    if (role !== undefined || rolePath !== undefined) throw new Error(`Unexpected argument: ${token}`);
+    if (isDoctorRolePath(token)) rolePath = token;
+    else role = token;
   }
-  if (prompt !== undefined && role === undefined) throw new Error("--prompt requires --role");
-  return { ...(role === undefined ? {} : { role }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
+  if (prompt !== undefined && role === undefined && rolePath === undefined) throw new Error("--prompt requires --role or a role file");
+  return { ...(role === undefined ? {} : { role }), ...(rolePath === undefined ? {} : { rolePath }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
 }
 
 export function parseDoctorCleanupArgs(rawArgs: readonly string[]): Required<Pick<DoctorCleanupOptions, "olderThanDays" | "yes">> {
@@ -648,7 +651,7 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
 export async function runCli(args: readonly string[], options: CliOptions = {}, write: (text: string) => void = (text) => { process.stdout.write(text); }): Promise<number> {
   const stderr = options.stderr ?? ((text: string) => { process.stderr.write(text); });
   if (args[0] === "doctor" && args[1] !== "cleanup") {
-    if (args.slice(1).some((arg) => arg === "--help" || arg === "-h")) { write("Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json]\n"); return 0; }
+    if (args.slice(1).some((arg) => arg === "--help" || arg === "-h")) { write("Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json]\n"); return 0; }
     try {
       const { json, ...parsed } = parseDoctorArgs(args.slice(1));
       const report = await doctor({ ...options, ...parsed });
@@ -708,7 +711,7 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${errorText(error)}\n`); return 1; }
   }
-  write("Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  write("Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   return 1;
 }
 

@@ -25,6 +25,13 @@ function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   };
 }
 
+function configureRoleInspection(paths: ReturnType<typeof fixture>): (cwd: string, agentDir: string) => Promise<DoctorPiState> {
+  writeFileSync(join(paths.agentDir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "local-fixture" } }));
+  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
+  writeFileSync(join(paths.agentDir, "trust.json"), JSON.stringify({ [realpathSync(paths.cwd)]: true }));
+  return async () => pi({ knownModels: ["fixture/fixture-model"], availableModels: ["fixture/fixture-model"], model: { provider: "fixture", model: "fixture-model" } });
+}
+
 function fixture(): { root: string; cwd: string; agentDir: string; settingsPath: string } {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-doctor-")));
   const cwd = join(root, "project");
@@ -295,15 +302,117 @@ void test("role-targeted doctor inspects effective resources and prepares hooks 
   assert.equal(jsonReport.roleTarget, "reviewer");
   assert.equal(jsonReport.roleInspection.role, "reviewer");
   assert.equal(jsonReport.roleInspection.model.model, "override-model");
+  let positionalOutput = "";
+  assert.equal(await withHomeAndCwd(paths.root, paths.cwd, () => runCli(["doctor", "reviewer", "--json"], { ...paths, registry, discoverPi: async () => pi({ activeTools: ["read", "grep"], knownModels: ["fixture/fixture-model", "fixture/override-model"], availableModels: ["fixture/fixture-model", "fixture/override-model"], model: { provider: "fixture", model: "fixture-model", thinking: "medium" } }) }, (text) => { positionalOutput += text; })), 0);
+  const positionalReport = JSON.parse(positionalOutput) as { roleTarget: string; roleInspection: { path: string } };
+  assert.equal(positionalReport.roleTarget, "reviewer");
+  assert.equal(positionalReport.roleInspection.path, join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"));
+});
+void test("doctor reuses diagnostics when inspecting a discovered role by path", async () => {
+  const paths = fixture();
+  const roleName = "dedupe-path-regression-unique";
+  const rolePath = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", `${roleName}.md`);
+  writeFileSync(rolePath, "---\ntools: [cat]\n---\n");
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Role settings", validateSettings: (_settings, context) => { if (context.source === "role" && context.role === roleName) throw new Error("role settings invalid"); } });
+  let output = "";
+  await withHome(paths.root, () => runCli(["doctor", rolePath, "--json"], { ...paths, registry, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; }));
+  const report = JSON.parse(output) as { diagnostics: readonly { code: string; source?: string }[] };
+  for (const code of ["ROLE_TOOL_INACTIVE", "ROLE_BODY_EMPTY"]) {
+    assert.equal(report.diagnostics.filter((item) => item.code === code && item.source === rolePath).length, 1, code);
+  }
+  assert.equal(report.diagnostics.filter(({ code, source }) => code === "SETTINGS_INVALID" && source === `${rolePath}.extensionSettings`).length, 1);
+});
+void test("doctor inspects an external absolute role file before installation", async () => {
+  const paths = fixture();
+  const discoverPi = configureRoleInspection(paths);
+  const rolePath = join(paths.root, "pre-install.md");
+  writeFileSync(rolePath, "---\ndescription: Local role\n---\nInspect this local role");
+  let output = "";
+  let errors = "";
+  const status = await withHome(paths.root, () => runCli(["doctor", rolePath, "--json"], { ...paths, discoverPi, stderr: (text) => { errors += text; } }, (text) => { output += text; }));
+  assert.equal(status, 0, errors);
+  assert.equal(errors, "");
+  const report = JSON.parse(output) as { roleTarget: string; roleInspection: { role: string; path: string; systemPrompt: { text: string } }; diagnostics: readonly { code: string }[] };
+  assert.equal(report.roleTarget, rolePath);
+  assert.equal(report.roleInspection.role, "pre-install");
+  assert.equal(report.roleInspection.path, rolePath);
+  assert.match(report.roleInspection.systemPrompt.text, /Inspect this local role/);
+  assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_NOT_FOUND"), false);
+});
+void test("doctor resolves relative external role files from the selected cwd", async () => {
+  const paths = fixture();
+  const discoverPi = configureRoleInspection(paths);
+  writeFileSync(join(paths.cwd, "pre-install.md"), "---\ndescription: Local role\n---\nRelative local role");
+  let output = "";
+  const status = await withHome(paths.root, () => runCli(["doctor", "./pre-install.md"], { ...paths, discoverPi }, (text) => { output += text; }));
+  assert.equal(status, 0);
+  assert.ok(output.includes(`Role: \`pre-install\` - \`${join(paths.cwd, "pre-install.md")}\``));
+  assert.match(output, /Relative local role/);
+});
+void test("doctor names a symlinked role by its requested file", async () => {
+  const paths = fixture();
+  const discoverPi = configureRoleInspection(paths);
+  const target = join(paths.root, "source.txt");
+  const link = join(paths.root, "reviewer.md");
+  writeFileSync(target, "---\ndescription: Linked role\n---\nLinked body");
+  symlinkSync(target, link);
+  let output = "";
+  const status = await withHome(paths.root, () => runCli(["doctor", link, "--json"], { ...paths, discoverPi }, (text) => { output += text; }));
+  const report = JSON.parse(output) as { roleInspection: { role: string }; diagnostics: readonly { code: string }[] };
+  assert.equal(status, 0);
+  assert.equal(report.roleInspection.role, "reviewer");
+  assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_FILE_EXTENSION"), false);
+});
+void test("doctor warns when a role file does not use the installable .md extension", async () => {
+  const paths = fixture();
+  const discoverPi = configureRoleInspection(paths);
+  const rolePath = join(paths.root, "reviewer.txt");
+  writeFileSync(rolePath, "---\ndescription: Local role\n---\nRole body");
+  let output = "";
+  const status = await withHome(paths.root, () => runCli(["doctor", rolePath, "--json"], { ...paths, discoverPi }, (text) => { output += text; }));
+  const report = JSON.parse(output) as { diagnostics: readonly { severity: string; code: string; source?: string; message: string }[] };
+  assert.equal(status, 0);
+  assert.ok(report.diagnostics.some(({ severity, code, source, message }) => severity === "warning" && code === "ROLE_FILE_EXTENSION" && source === rolePath && /\.md/.test(message)));
+});
+void test("doctor reports missing, non-file, and invalid external role paths", async () => {
+  const paths = fixture();
+  const discoverPi = configureRoleInspection(paths);
+  const directory = join(paths.root, "role-directory");
+  mkdirSync(directory);
+  const invalid = join(paths.root, "invalid.md");
+  writeFileSync(invalid, "---\ndescription: [broken\n---\nInvalid role");
+  let missingOutput = "";
+  const missingStatus = await withHome(paths.root, () => runCli(["doctor", "./missing.md", "--json"], { ...paths, discoverPi }, (text) => { missingOutput += text; }));
+  const missingReport = JSON.parse(missingOutput) as { roleTarget: string; diagnostics: readonly { code: string; source?: string; message: string }[] };
+  assert.equal(missingStatus, 1);
+  assert.equal(missingReport.roleTarget, join(paths.cwd, "missing.md"));
+  assert.ok(missingReport.diagnostics.some(({ code, source, message }) => code === "ROLE_FILE_NOT_FOUND" && source === join(paths.cwd, "missing.md") && /does not exist/.test(message)));
+  let directoryOutput = "";
+  const directoryStatus = await withHome(paths.root, () => runCli(["doctor", directory, "--json"], { ...paths, discoverPi }, (text) => { directoryOutput += text; }));
+  const directoryReport = JSON.parse(directoryOutput) as { diagnostics: readonly { code: string }[] };
+  assert.equal(directoryStatus, 1);
+  assert.ok(directoryReport.diagnostics.some(({ code }) => code === "ROLE_FILE_NOT_REGULAR"));
+  let invalidOutput = "";
+  const invalidStatus = await withHome(paths.root, () => runCli(["doctor", invalid, "--json"], { ...paths, discoverPi }, (text) => { invalidOutput += text; }));
+  const invalidReport = JSON.parse(invalidOutput) as { diagnostics: readonly { code: string; source?: string }[] };
+  assert.equal(invalidStatus, 1);
+  assert.ok(invalidReport.diagnostics.some(({ code, source }) => code === "ROLE_FRONTMATTER" && source === invalid));
 });
 void test("role-targeted doctor preserves role-not-found diagnostics in focused output", async () => {
   const paths = fixture();
-  const report = await withHome(paths.root, () => doctor({ ...paths, role: "missing", discoverPi: async () => pi() }));
+  let output = "";
+  const status = await withHome(paths.root, () => runCli(["doctor", "missing.md", "--json"], { ...paths, discoverPi: async () => pi() }, (text) => { output += text; }));
+  const report = JSON.parse(output) as Awaited<ReturnType<typeof doctor>>;
+  const notFound = report.diagnostics.find(({ code }) => code === "ROLE_NOT_FOUND");
   const formatted = formatDoctorReport(report);
+  assert.equal(status, 1);
+  assert.equal(report.roleTarget, "missing.md");
   assert.equal(report.roleInspection, undefined);
   assert.match(formatted, /## Role inspection/);
-  assert.match(formatted, /Role: `missing`/);
+  assert.match(formatted, /Role: `missing.md`/);
   assert.match(formatted, /ROLE_NOT_FOUND/);
+  assert.ok(notFound?.hint?.includes("./reviewer.md"));
   assert.match(formatted, /1 error\(s\), 0 warning\(s\)/);
   for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Model aliases", "## Reusable functions"]) assert.doesNotMatch(formatted, new RegExp(heading));
 });
@@ -436,7 +545,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(inspected, "session-a");
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: piewf doctor [role] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  assert.equal(output, "Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   const bin = join(paths.root, "bin", "piewf");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
@@ -448,6 +557,8 @@ void test("doctor parser accepts role and prompt probes", () => {
   assert.deepEqual(parseDoctorArgs(["--role", "reviewer", "--prompt=check this", "--json"]), { role: "reviewer", prompt: "check this", json: true });
   assert.deepEqual(parseDoctorArgs(["--json"]), { json: true });
   assert.deepEqual(parseDoctorArgs(["reviewer"]), { role: "reviewer" });
+  assert.deepEqual(parseDoctorArgs(["./roles/reviewer.md", "--prompt", "check this"]), { rolePath: "./roles/reviewer.md", prompt: "check this" });
+  assert.deepEqual(parseDoctorArgs(["--role", "./roles/reviewer.md"]), { role: "./roles/reviewer.md" });
   assert.throws(() => parseDoctorArgs(["--role", "reviewer", "other"]), /Unexpected argument/);
   assert.throws(() => parseDoctorArgs(["--prompt", "check this"]), /--prompt requires --role/);
 });
