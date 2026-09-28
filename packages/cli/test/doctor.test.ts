@@ -162,6 +162,7 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   const report = await withHome(paths.root, () => doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) }));
   const codes = report.diagnostics.map(({ code }) => code);
   assert.ok(codes.includes("ROLE_TOOL_INACTIVE"));
+  assert.equal(report.diagnostics.find(({ code }) => code === "ROLE_TOOL_INACTIVE")?.severity, "warning");
   assert.ok(codes.includes("ROLE_FRONTMATTER"));
   assert.ok(codes.includes("MODEL_INVALID"));
   assert.ok(codes.includes("MODEL_UNAVAILABLE"));
@@ -178,14 +179,36 @@ void test("doctor reports role errors, warnings, overrides, and extension failur
   assert.equal(global.overriddenBy, join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"));
   assert.equal(global.active, false);
   assert.equal(doctorExitCode(report), 1);
-  assert.match(formatDoctorReport(report), /Fix: Use a tool listed under Pi active tools/);
+  assert.match(formatDoctorReport(report), /Fix: Doctor cannot see tools that extensions add when a session starts/);
 });
 
 void test("doctor validates role tool selectors like runtime", async () => {
   const paths = fixture();
   writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "selectors.md"), "---\ntools: [\"!*\", \"r*\", read, cat]\n---\nInspect selectors");
   const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ activeTools: ["read"] }) }));
-  assert.deepEqual(report.diagnostics.filter(({ code }) => code === "ROLE_TOOL_INACTIVE").map(({ message }) => message), ["Tool is unknown or inactive: cat"]);
+  assert.deepEqual(report.diagnostics.filter(({ code }) => code === "ROLE_TOOL_INACTIVE").map(({ severity, message }) => `${severity}: ${message}`), ["warning: Tool is not in Pi's headless active tool list: cat"]);
+  assert.equal(doctorExitCode(report), 0);
+});
+
+void test("doctor checks usage only for effective roles but parses overridden files", async () => {
+  const paths = fixture();
+  const overriddenReviewer = join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
+  const effectiveReviewer = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md");
+  const overriddenScout = join(paths.agentDir, "pi-extensible-workflows", "roles", "scout.md");
+  const effectiveScout = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "scout.md");
+  writeFileSync(overriddenReviewer, "---\nmodel: gpt-5\ntools: [missing-tool]\nextensionSettings:\n  acme:\n    invalid: true\n---\n");
+  writeFileSync(effectiveReviewer, "---\ntools: [missing-effective-tool]\nextensionSettings:\n  acme:\n    invalid: true\n---\nReview");
+  writeFileSync(overriddenScout, "---\nmodel: [broken\n---\nInvalid overridden frontmatter");
+  writeFileSync(effectiveScout, "Valid effective scout");
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Role settings", validateSettings: (_settings, context) => { if (context.source === "role" && context.settingsPath !== undefined && [overriddenReviewer, effectiveReviewer].includes(context.settingsPath)) throw new Error("role settings invalid"); } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, discoverPi: async () => pi({ activeTools: ["read"] }) }));
+  assert.equal(report.diagnostics.some(({ code, source }) => source === overriddenReviewer && ["ROLE_TOOL_INACTIVE", "MODEL_INVALID", "MODEL_UNAVAILABLE", "ROLE_BODY_EMPTY"].includes(code)), false);
+  assert.equal(report.diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === `${overriddenReviewer}.extensionSettings`), false);
+  assert.ok(report.diagnostics.some(({ code, source }) => code === "ROLE_TOOL_INACTIVE" && source === effectiveReviewer));
+  assert.ok(report.diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === `${effectiveReviewer}.extensionSettings`));
+  assert.ok(report.diagnostics.some(({ code, source }) => code === "ROLE_FRONTMATTER" && source === overriddenScout));
+  assert.ok(report.diagnostics.some(({ code }) => code === "ROLE_LOAD_BLOCKED"));
 });
 
 void test("doctor rejects invalid role descriptions", async () => {

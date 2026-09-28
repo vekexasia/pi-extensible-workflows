@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
@@ -2365,6 +2365,33 @@ void test("composes role resource selectors and reapplies them on retries", asyn
   ]);
   assert.deepEqual(basePolicy.effective, { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] });
 });
+void test("excludes workflow host entries from another installed package copy", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-host-copy-"));
+  const agentDir = join(rootDir, "agent");
+  const cwd = join(rootDir, "project");
+  const packageRoot = join(rootDir, "install", "node_modules", "pi-extensible-workflows");
+  const hostEntry = join(packageRoot, "dist", "starter", "index.js");
+  const marker = join(rootDir, "host-extension-loaded");
+  mkdirSync(dirname(hostEntry), { recursive: true });
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-extensible-workflows" }));
+  writeFileSync(hostEntry, `import { writeFileSync } from "node:fs"; export default function() { writeFileSync(${JSON.stringify(marker)}, "loaded"); }`);
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [hostEntry] }));
+  const resourcePolicy: AgentResourcePolicy = { globalSettingsPath: "/workflow/settings.json", projectSettingsPath: "/project/.pi/pi-extensible-workflows/settings.json", projectTrusted: false, global: { skills: [], extensions: ["**/*"] }, project: { skills: [], extensions: [] }, effective: { skills: [], extensions: ["**/*"] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { extensions: ["**/*"] }, project: {} } };
+  let session: Awaited<ReturnType<typeof createLocalPiSession>> | undefined;
+  try {
+    session = await createLocalPiSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "host-copy", resourcePolicy });
+    assert.equal(existsSync(marker), false);
+    assert.ok(!session.herdrResourcePaths?.extensions.includes(realpathSync(hostEntry)));
+  } finally {
+    await session?.dispose();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 void test("filters excluded native extensions before factories and skills before session registration", async () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-loader-"));
   const physicalRoot = join(fixtureRoot, "physical");

@@ -5,6 +5,10 @@
 
 - `piewf doctor` inspects a role file before it is installed: a role ending in `.md`, such as `piewf doctor ./roles/reviewer.md`, is read as a file relative to the current working directory, while other values still name an installed role. A missing file reports `ROLE_FILE_NOT_FOUND` ([#303](https://github.com/vekexasia/pi-extensible-workflows/issues/303)).
 
+### Fixes
+
+- `piewf doctor` no longer fails because of roles that another role overrides: it still reports their invalid frontmatter, but checks tools, models, and settings only for the roles that apply. A role tool missing from doctor's headless tool list is now a `ROLE_TOOL_INACTIVE` warning, because doctor cannot see tools that extensions add when a session starts and the runtime skips unavailable role tools. Role inspection and workflow agent sessions now skip the workflow host extensions of every installed copy of the package, so a Pi package installed next to `@piewf/cli` no longer fails with `Global name is already registered: reviewLoop` ([#302](https://github.com/vekexasia/pi-extensible-workflows/issues/302)).
+
 ## [5.17.1] - 2026-09-26
 
 ### Fixes

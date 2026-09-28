@@ -259,9 +259,8 @@ function validateModel(value: string, known: ReadonlySet<string>, available: Rea
   }
 }
 
-function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, dynamicAliases: ReadonlySet<string>, settingsPath: string, source?: { directory: string; extension: WorkflowExtensionMetadata }): AgentDefinition | undefined {
-  let definition: AgentDefinition;
-  try { definition = parseRoleMarkdown(readFileSync(path, "utf8"), true, path); }
+function parseRole(path: string, diagnostics: DoctorDiagnostic[], source?: { directory: string; extension: WorkflowExtensionMetadata }): AgentDefinition | undefined {
+  try { return parseRoleMarkdown(readFileSync(path, "utf8"), true, path); }
   catch (error) {
     if (usesLegacyRoleSelectors(path)) {
       diagnostics.push(legacyAgentResourceSelectorDiagnostic(path));
@@ -271,6 +270,8 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
     diagnostics.push(diagnostic("error", "ROLE_FRONTMATTER", source ? `${roleProvenance(source)} contains invalid role at "${path}": ${message}` : message, path, "Fix the role YAML frontmatter."));
     return undefined;
   }
+}
+function inspectRoleUsage(path: string, definition: AgentDefinition, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, dynamicAliases: ReadonlySet<string>, settingsPath: string): void {
   const toolSelectorDiagnostic = positiveOnlyToolSelectorDiagnostic(path, definition.tools);
   if (toolSelectorDiagnostic) diagnostics.push(toolSelectorDiagnostic);
   const body = definition.prompt ?? "";
@@ -280,8 +281,12 @@ function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels
   if (definition.model) validateModel(definition.model, knownModels, availableModels, path, diagnostics, aliases, dynamicAliases, settingsPath);
   for (const selector of definition.tools ?? []) {
     const tool = selector.startsWith("!") ? selector.slice(1) : selector;
-    if (!selector.startsWith("!") && !resourcePatternHasMagic(selector) && !activeTools.has(tool)) diagnostics.push(diagnostic("error", "ROLE_TOOL_INACTIVE", `Tool is unknown or inactive: ${tool}`, path, "Use a tool listed under Pi active tools or enable its Pi extension."));
+    if (!selector.startsWith("!") && !resourcePatternHasMagic(selector) && !activeTools.has(tool)) diagnostics.push(diagnostic("warning", "ROLE_TOOL_INACTIVE", `Tool is not in Pi's headless active tool list: ${tool}`, path, "Doctor cannot see tools that extensions add when a session starts; otherwise use a tool listed under Pi active tools or enable its Pi extension."));
   }
+}
+function inspectRole(path: string, activeTools: ReadonlySet<string>, knownModels: ReadonlySet<string>, availableModels: ReadonlySet<string>, diagnostics: DoctorDiagnostic[], aliases: Readonly<Record<string, string>>, dynamicAliases: ReadonlySet<string>, settingsPath: string, source?: { directory: string; extension: WorkflowExtensionMetadata }): AgentDefinition | undefined {
+  const definition = parseRole(path, diagnostics, source);
+  if (definition) inspectRoleUsage(path, definition, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
   return definition;
 }
 
@@ -396,7 +401,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     ...registeredModelAliases.map(({ name, version, headline }) => ({ name, kind: "dynamic" as const, provenance: `extension: ${headline}`, version, headline })),
   ].sort((left, right) => left.name.localeCompare(right.name) || left.kind.localeCompare(right.kind));
   const roles: DoctorRole[] = [];
-  const definitions = new Map<string, AgentDefinition>();
+  const definitions = new Map<string, { path: string; definition: AgentDefinition }>();
   // Keep this scan local because doctor reports every invalid and duplicate file; discoverRoles intentionally fails closed on the complete set.
 
   const extensionScan = scanExtensionRoleFiles(registeredWorkflowRoleDirectoryRegistrations());
@@ -432,11 +437,10 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
     const starterPath = starterOverrides.get(file.path);
     const overriddenBy = starterOverriddenBy.get(file.path);
     roles.push({ name: file.name, path: file.path, scope: "extension", active: overriddenBy === undefined, extension: file.extension, ...(starterPath ? { overrides: starterPath } : {}), ...(overriddenBy ? { overriddenBy } : {}) });
-    const definition = inspectRole(file.path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath, { directory: file.directory, extension: file.extension });
-    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, file.path, diagnostics, file.name);
+    const definition = parseRole(file.path, diagnostics, { directory: file.directory, extension: file.extension });
     if (duplicateExtensionNames.has(file.name)) continue;
     if (extensionPaths.get(file.name) !== file.path) continue;
-    if (definition) definitions.set(file.name, definition);
+    if (definition) definitions.set(file.name, { path: file.path, definition });
   }
   const globalPaths = new Map<string, string>();
   const globalRoleDirs = workflowRoleDirectories(agentDir);
@@ -449,9 +453,8 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
       const extension = roles.find((role) => role.path === extensionPath);
       if (extension) { extension.active = false; extension.overriddenBy = path; }
     }
-    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
-    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, path, diagnostics, name);
-    if (definition) definitions.set(name, definition); else definitions.delete(name);
+    const definition = parseRole(path, diagnostics);
+    if (definition) definitions.set(name, { path, definition }); else definitions.delete(name);
   }
   for (const path of roleFilesFrom([join(cwd, ".pi", "pi-extensible-workflows", "roles")])) {
     const name = basename(path, ".md");
@@ -468,9 +471,12 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
       const extension = roles.find((role) => role.path === extensionPath);
       if (extension) { extension.active = false; extension.overriddenBy = path; }
     }
-    const definition = inspectRole(path, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
-    if (definition) validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, path, diagnostics, name);
-    if (definition) definitions.set(name, definition); else definitions.delete(name);
+    const definition = parseRole(path, diagnostics);
+    if (definition) definitions.set(name, { path, definition }); else definitions.delete(name);
+  }
+  for (const [name, { path, definition }] of definitions) {
+    inspectRoleUsage(path, definition, activeTools, knownModels, availableModels, diagnostics, aliases, dynamicAliases, settingsPath);
+    validateDoctorExtensionSettings(registry, mergeWorkflowExtensionSettings(settings.extensionSettings, definition.extensionSettings), "role", cwd, pi.trust.trusted, path, diagnostics, name);
   }
   const rolePaths = new Set(roles.map(({ path }) => path));
   if (diagnostics.some(({ code, source }) => source !== undefined && rolePaths.has(source) && (code === "ROLE_FRONTMATTER" || code === "AGENT_RESOURCE_SELECTOR_MIGRATION"))) diagnostics.push(diagnostic("error", "ROLE_LOAD_BLOCKED", "Workflow role loading is blocked because the runtime rejects the complete role set when any active role file is invalid.", undefined, "Fix the reported role file before launching workflows."));
@@ -492,10 +498,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<DoctorReport>
         if (definition) target = { name, path, definition };
       }
     } else {
-      const activeRole = roles.find(({ name, active }) => name === options.role && active);
-      const definition = activeRole ? definitions.get(options.role) : undefined;
-      if (!activeRole || !definition) diagnostics.push(diagnostic("error", "ROLE_NOT_FOUND", `Active role not found: ${options.role}`, options.role));
-      else target = { name: options.role, path: activeRole.path, definition };
+      const effective = definitions.get(options.role);
+      if (!effective) diagnostics.push(diagnostic("error", "ROLE_NOT_FOUND", `Active role not found: ${options.role}`, options.role));
+      else target = { name: options.role, ...effective };
     }
     if (target) {
       const { name, path, definition } = target;

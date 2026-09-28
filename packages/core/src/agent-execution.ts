@@ -141,16 +141,23 @@ function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 
-const extensionDirectory = dirname(fileURLToPath(import.meta.url));
-const workflowPackageRoot = basename(dirname(extensionDirectory)) === "dist" ? resolve(extensionDirectory, "../..") : resolve(extensionDirectory, "..");
-const WORKFLOW_HOST_ENTRIES = new Set([
-  canonicalPath(resolve(workflowPackageRoot, "src/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/src/index.js")),
-  canonicalPath(resolve(workflowPackageRoot, "starter/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/starter/index.js")),
-  canonicalPath(resolve(workflowPackageRoot, "subagents/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/subagents/index.js")),
-]);
+const WORKFLOW_HOST_ENTRY_PATHS = ["src/index.ts", "dist/src/index.js", "starter/index.ts", "dist/starter/index.js", "subagents/index.ts", "dist/subagents/index.js"];
+function isWorkflowHostEntry(path: string): boolean {
+  const entryPath = canonicalPath(path);
+  let packageRoot = dirname(entryPath);
+  while (packageRoot !== dirname(packageRoot)) {
+    const packageMetadataPath = join(packageRoot, "package.json");
+    if (existsSync(packageMetadataPath)) {
+      try {
+        const metadata: unknown = JSON.parse(readFileSync(packageMetadataPath, "utf8"));
+        if (typeof metadata !== "object" || metadata === null || !("name" in metadata) || metadata.name !== "pi-extensible-workflows") return false;
+        return WORKFLOW_HOST_ENTRY_PATHS.some((entry) => canonicalPath(join(packageRoot, entry)) === entryPath);
+      } catch { return false; }
+    }
+    packageRoot = dirname(packageRoot);
+  }
+  return false;
+}
 const WORKFLOW_DIRECTORY = "pi-extensible-workflows";
 function workflowSystemPromptPath(cwd: string, agentDir: string, projectTrusted: boolean): string | undefined {
   const projectPath = join(cwd, ".pi", WORKFLOW_DIRECTORY, "SYSTEM.md");
@@ -307,7 +314,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
       resources: { extensions: discoveredExtensions },
     });
     const selectedExtensions = selection.selectedExtensions ?? [];
-    const extensionPaths = selectedExtensions.filter((path) => !WORKFLOW_HOST_ENTRIES.has(path));
+    const extensionPaths = selectedExtensions.filter((path) => !isWorkflowHostEntry(path));
     policy.selectedExtensions = selectedExtensions;
     policy.unmatchedExtensions = selection.unmatchedExtensions ?? [];
     const skillPaths = [...new Set(resolved.skills.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => path))];
@@ -341,7 +348,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: true });
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
     const resolved = await packageManager.resolve();
-    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => canonicalPath(path)).filter((path) => !WORKFLOW_HOST_ENTRIES.has(path)))];
+    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => canonicalPath(path)).filter((path) => !isWorkflowHostEntry(path)))];
     resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
