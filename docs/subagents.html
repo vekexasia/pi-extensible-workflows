@@ -66,7 +66,7 @@
           <thead><tr><th>Tool</th><th>Use</th></tr></thead>
           <tbody>
             <tr><td><code>subagents_run</code></td><td>Start a durable background or foreground run. <code>prompt</code> is the only required field.</td></tr>
-            <tr><td><code>subagents_inspect</code></td><td>Omit <code>id</code> for ordered summaries, or provide it for progress, activity, accounting, tools, timestamps, worktree metadata, and terminal output.</td></tr>
+            <tr><td><code>subagents_inspect</code></td><td>Omit <code>id</code> for ordered summaries of the current session (<code>scope: "all"</code> for every session), or provide it for progress, activity, accounting, tools, timestamps, worktree metadata, and terminal output.</td></tr>
             <tr><td><code>subagents_steer</code></td><td>Send a message to one running agent. Early messages are queued in order, up to 16 pending messages.</td></tr>
             <tr><td><code>subagents_stop</code></td><td>Abort one run, persist <code>stopped</code>, clear queued steering, and clean its worktree without affecting siblings.</td></tr>
             <tr><td><code>subagents_retry</code></td><td>Start a fresh run from a failed or stopped request. The new run gets a new ID and preserves the original launch mode.</td></tr>

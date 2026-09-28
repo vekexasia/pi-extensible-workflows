@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- `subagents_inspect({})` lists only the runs of the current Pi session, matching `/subagents` and Trajectory. Pass `scope: "all"` to list every stored run as before. Lookup by `id` still resolves runs from any session ([#305](https://github.com/vekexasia/pi-extensible-workflows/pull/305)).
+
 ### New capabilities
 
 - `piewf doctor` inspects a role file before it is installed: a role ending in `.md`, such as `piewf doctor ./roles/reviewer.md`, is read as a file relative to the current working directory, while other values still name an installed role. A missing file reports `ROLE_FILE_NOT_FOUND` ([#303](https://github.com/vekexasia/pi-extensible-workflows/issues/303)).

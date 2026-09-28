@@ -135,7 +135,7 @@ The model-facing surface is exactly:
 | Tool | Contract |
 | --- | --- |
 | `subagents_run` | Start one run. `prompt` is required; `mode` defaults to `background` and may be `foreground`. |
-| `subagents_inspect` | Omit `id` for summaries or provide it for detailed progress and terminal output. |
+| `subagents_inspect` | Omit `id` for current-session summaries (`scope: "all"` for every session) or provide it for detailed progress and terminal output. |
 | `subagents_steer` | Send one message to a running ID. |
 | `subagents_stop` | Stop one run and clean its worktree. |
 | `subagents_retry` | Start a fresh run from a failed or stopped request, with a new ID and the original mode. |

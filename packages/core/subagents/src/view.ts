@@ -371,9 +371,9 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
 }
 
 
-export function renderSubagentInspectCall(args: { id?: string }, theme: Theme) {
+export function renderSubagentInspectCall(args: { id?: string; scope?: string }, theme: Theme) {
   const title = theme.fg("toolTitle", theme.bold("subagents_inspect"));
-  return textBlock(args.id ? `${title} ${theme.fg("accent", args.id)}` : `${title} ${theme.fg("muted", "all")}`);
+  return textBlock(args.id ? `${title} ${theme.fg("accent", args.id)}` : `${title} ${theme.fg("muted", args.scope === "all" ? "all" : "session")}`);
 }
 
 export function renderSubagentInspectResult(result: AgentToolResult<unknown>, options: { expanded: boolean }, theme: Theme, args: { id?: string }) {

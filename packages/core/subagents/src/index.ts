@@ -87,7 +87,7 @@ export function createSubagentTools(manager: SubagentManager): readonly ToolDefi
     defineTool({
       name: "subagents_inspect",
       label: "Subagents Inspect",
-      description: "Inspect durable subagent runs. Omit id for ordered run summaries, or provide id for detailed status, progress, activity, accounting, tool calls, timestamps, worktree metadata, and a terminal value or error when available.",
+      description: "Inspect durable subagent runs. Omit id for ordered run summaries of the current session (scope all for every session), or provide id for detailed status, progress, activity, accounting, tool calls, timestamps, worktree metadata, and a terminal value or error when available.",
       parameters: SUBAGENTS_INSPECT_PARAMETERS,
       async execute(toolCallId, params, signal, onUpdate, context) {
         return toolResult(await manager.inspect(validateSubagentInspectRequest(params), managerContext(toolCallId, signal, onUpdate, context)));

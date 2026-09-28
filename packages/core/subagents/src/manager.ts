@@ -1112,9 +1112,9 @@ class PersistentSubagentManager implements SubagentManager {
       }
       return inspection;
     }
-    return this.inspectList();
+    return this.inspectList(request.scope === "all" ? undefined : context.extensionContext.sessionManager.getSessionId());
   }
-  private async inspectList(): Promise<unknown> {
+  private async inspectList(sessionId: string | undefined): Promise<unknown> {
     const root = storageDirectory(this.dependencies);
     await secureDirectory(root);
     const entries = await readdir(root, { withFileTypes: true });
@@ -1126,7 +1126,7 @@ class PersistentSubagentManager implements SubagentManager {
       try {
         const active = this.activeRuns.get(entry.name);
         const status = publicStatus(active ? persistedStatus(active) : this.terminalSummaries.get(entry.name) ?? await loadPersistedStatus(root, entry.name, false));
-        if (status.startedAt === undefined) continue;
+        if (status.startedAt === undefined || (sessionId !== undefined && status.sessionId !== sessionId)) continue;
         statuses.push({ status, startedAt: status.startedAt });
       } catch (error) {
         if (error instanceof WorkflowError && (error.code === "RUN_NOT_FOUND" || error instanceof InvalidPersistedSubagentStatusError)) continue;
