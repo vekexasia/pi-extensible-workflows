@@ -235,10 +235,8 @@ function parseInspectArgs(rawArgs: readonly string[]): { sessionId?: string; mod
   }
   return { ...(sessionId ? { sessionId } : {}), mode: failedOnly && mode === "tui" ? "summary" : mode, failedOnly };
 }
-function isDoctorRolePath(value: string): boolean { return value.includes("/") || value.includes("\\"); }
-export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; rolePath?: string; prompt?: string; json?: boolean } {
+export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; prompt?: string; json?: boolean } {
   let role: string | undefined;
-  let rolePath: string | undefined;
   let prompt: string | undefined;
   let json = false;
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -249,18 +247,17 @@ export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; ro
     if (option === "--role" || option === "--prompt") {
       const value = equals >= 0 ? token.slice(equals + 1) : rawArgs[++index];
       if (!value) throw new Error(`Missing value for ${option}`);
-      if (option === "--role") { if (role !== undefined || rolePath !== undefined) throw new Error("--role may only be provided once"); role = value; }
+      if (option === "--role") { if (role !== undefined) throw new Error("--role may only be provided once"); role = value; }
       else { if (prompt !== undefined) throw new Error("--prompt may only be provided once"); prompt = value; }
       continue;
     }
     if (token === "--help" || token === "-h") throw new Error("help");
     if (token.startsWith("--")) throw new Error(`Unknown doctor option: ${token}`);
-    if (role !== undefined || rolePath !== undefined) throw new Error(`Unexpected argument: ${token}`);
-    if (isDoctorRolePath(token)) rolePath = token;
-    else role = token;
+    if (role !== undefined) throw new Error(`Unexpected argument: ${token}`);
+    role = token;
   }
-  if (prompt !== undefined && role === undefined && rolePath === undefined) throw new Error("--prompt requires --role or a role file");
-  return { ...(role === undefined ? {} : { role }), ...(rolePath === undefined ? {} : { rolePath }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
+  if (prompt !== undefined && role === undefined) throw new Error("--prompt requires --role");
+  return { ...(role === undefined ? {} : { role }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
 }
 
 export function parseDoctorCleanupArgs(rawArgs: readonly string[]): Required<Pick<DoctorCleanupOptions, "olderThanDays" | "yes">> {

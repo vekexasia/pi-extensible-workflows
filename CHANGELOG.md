@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- `piewf doctor` inspects a role file before it is installed: a role ending in `.md`, such as `piewf doctor ./roles/reviewer.md`, is read as a file relative to the current working directory, while other values still name an installed role. A missing file reports `ROLE_FILE_NOT_FOUND` ([#303](https://github.com/vekexasia/pi-extensible-workflows/issues/303)).
+
 ## [5.17.1] - 2026-09-26
 
 ### Fixes
