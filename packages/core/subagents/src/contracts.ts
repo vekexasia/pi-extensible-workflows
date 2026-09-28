@@ -41,6 +41,7 @@ export const SUBAGENTS_RUN_PARAMETERS = Type.Object({
 
 export const SUBAGENTS_INSPECT_PARAMETERS = Type.Object({
   id: Type.Optional(Type.String({ description: "Subagent ID; omit to list ordered run summaries" })),
+  scope: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("all")], { description: "List scope when id is omitted: session (default) lists runs from the current Pi session; all lists every stored run" })),
 }, { additionalProperties: false });
 
 export const SUBAGENTS_ID_PARAMETERS = Type.Object({

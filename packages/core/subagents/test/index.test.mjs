@@ -1421,7 +1421,7 @@ test("exposes closed tool schemas and minimal prompt guidance", () => {
   assert.equal(SUBAGENTS_RUN_PARAMETERS.additionalProperties, false);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.properties.mode.anyOf.map(({ const: value }) => value), ["background", "foreground"]);
 
-  assert.deepEqual(Object.keys(SUBAGENTS_INSPECT_PARAMETERS.properties), ["id"]);
+  assert.deepEqual(Object.keys(SUBAGENTS_INSPECT_PARAMETERS.properties), ["id", "scope"]);
   assert.equal(SUBAGENTS_INSPECT_PARAMETERS.additionalProperties, false);
   assert.equal(SUBAGENTS_INSPECT_PARAMETERS.required, undefined);
   for (const schema of [SUBAGENTS_ID_PARAMETERS, SUBAGENTS_STOP_PARAMETERS, SUBAGENTS_RETRY_PARAMETERS]) {
@@ -1804,6 +1804,10 @@ test("runs simultaneous background subagents and settles them independently", as
     const expected = await Promise.all([first, second].map(async ({ id }) => ({ id, state: "completed", startedAt: JSON.parse(await readFile(join(storageDir, id, "status.json"), "utf8")).startedAt })));
     expected.sort((left, right) => left.startedAt - right.startedAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
     assert.deepEqual(listed, expected.map(({ id, state }) => ({ id, state })));
+    const otherSession = { ...context, extensionContext: { ...context.extensionContext, sessionManager: { getSessionId: () => "session-2" } } };
+    assert.deepEqual(await manager.inspect({}, otherSession), []);
+    assert.deepEqual((await manager.inspect({ scope: "all" }, otherSession)).map(({ id }) => id), expected.map(({ id }) => id));
+    assert.equal((await manager.inspect({ id: first.id }, otherSession)).state, "completed");
     const restarted = createSubagentManager({ storageDir });
     assert.equal((await restarted.inspect({ id: first.id }, context)).state, "completed");
     assert.deepEqual((await restarted.inspect({ id: first.id }, context)).value, { answer: "one" });
@@ -2082,7 +2086,7 @@ test("reconciles orphaned running records after a manager restart", async () => 
     assert.equal(status.state, "failed");
     assert.deepEqual(status.error, { code: "INTERNAL_ERROR", message: "Subagent run was interrupted before completion" });
     assert.deepEqual((await manager.inspect({ id }, context)).error, { code: "INTERNAL_ERROR", message: "Subagent run was interrupted before completion" });
-    assert.deepEqual((await manager.inspect({}, context)).map(({ id: listedId, state }) => ({ id: listedId, state })), [{ id, state: "failed" }]);
+    assert.deepEqual((await manager.inspect({ scope: "all" }, context)).map(({ id: listedId, state }) => ({ id: listedId, state })), [{ id, state: "failed" }]);
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -2778,7 +2782,7 @@ test("isolates failures while reconciling interrupted runs", async () => {
     assert.equal(cleanupCalls.filter((id) => id === malformedId).length, 1);
     assert.equal(cleanupCalls.filter((id) => id === cleanupId).length, 1);
     await restarted.dispose();
-    assert.deepEqual((await manager.inspect({}, context)).map(({ id, state }) => ({ id, state })), [
+    assert.deepEqual((await manager.inspect({ scope: "all" }, context)).map(({ id, state }) => ({ id, state })), [
       { id: malformedId, state: "failed" },
       { id: cleanupId, state: "failed" },
       { id: healthyId, state: "failed" },
@@ -2800,7 +2804,7 @@ test("keeps healthy persisted rows available when another status has an I/O erro
   const manager = createSubagentManager({ storageDir });
   const context = await managerContext(cwd);
   try {
-    assert.deepEqual((await manager.inspect({}, context)).map(({ id }) => id), [healthyId]);
+    assert.deepEqual((await manager.inspect({ scope: "all" }, context)).map(({ id }) => id), [healthyId]);
     assert.equal((await manager.inspect({ id: healthyId }, context)).state, "stopped");
     await assert.rejects(manager.inspect({ id: unreadableId }, context), (error) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR" && /Unable to read subagent/.test(error.message));
   } finally {
@@ -2852,7 +2856,7 @@ test("deletes settled subagent records and refuses running ones", async () => {
     assert.deepEqual(await manager.delete({ id: done.id }, context), { id: done.id, deleted: true });
     await assert.rejects(stat(join(storageDir, done.id)));
     await assert.rejects(manager.inspect({ id: done.id }, context), (error) => error.code === "RUN_NOT_FOUND");
-    assert.deepEqual((await manager.inspect({}, context)).map(({ id }) => id), [running.id]);
+    assert.deepEqual((await manager.inspect({ scope: "all" }, context)).map(({ id }) => id), [running.id]);
   } finally {
     pending.resolve({ value: "cleanup", attempts: [], cwd });
     await manager.dispose();
@@ -3217,7 +3221,7 @@ test("loads legacy oversized progress metadata without breaking the picker list"
   const manager = createSubagentManager({ storageDir });
   const context = await managerContext(cwd);
   try {
-    const statuses = await manager.inspect({}, context);
+    const statuses = await manager.inspect({ scope: "all" }, context);
     assert.deepEqual(statuses.map(({ id }) => id), [goodId, legacyId, legacyTopLevelId]);
     const legacy = statuses.find(({ id }) => id === legacyId);
     assert.equal(legacy?.progress?.state?.systemPrompt, undefined);
