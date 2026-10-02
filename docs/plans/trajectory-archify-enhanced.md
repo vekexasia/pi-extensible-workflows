@@ -436,6 +436,26 @@ Richiesta: poter nascondere o abilitare elementi e funzioni della mappa, per ese
 - **Architettura:** i filtri di presentazione restano nel viewer (come espandi/comprimi); quelli che riducono il carico (tipi di evento, agenti) si applicano nella proiezione del parent per mantenere i limiti di payload/nodi. Il bridge continua a non trasportare contenuti; nessuna nuova dipendenza.
 - **Gate:** test unitari su proiezione/layout filtrati (identità stabili, ricollegamento della sequenza, conteggi), test browser su attiva/disattiva e persistenza locale, nessuna regressione di apertura (<200 ms), dei test V0-D e del ciclo apri/chiudi 50 volte; screenshot paper chiaro/scuro con preset «Solo agenti» ed «Errori».
 
+### H9 — Grafici, statistiche di consumo e analisi dei fail (TODO, richiesto dall'owner, non avviato)
+
+Richiesta: grafici e statistiche su come crescono contesto, token e cache, per agente oppure aggregati per tool, role, ecc., più un'analisi dei fail. Da eseguire dopo H8 (i filtri e i preset si riusano); nessun codice scritto finora.
+
+- **Solo dati registrati.** Per turno: `usage` dei messaggi assistant nelle trascrizioni (input, output, cacheRead, cacheWrite, cost, timestamp); per agente: `accounting`, `role`, `model`, stato, `attemptDetails` con codici di errore, `startedAt`/`durationMs`; per tool: nome, esito (`isError`) e timing dai `toolResult`/timing già usati dal Gantt; fasi/ondate e scope dalla mappa. Nessuna stima dai prompt; i turni sintetici a usage zero restano esclusi come oggi per il contesto.
+- **Per agente** (pannello di destra o vista dedicata, stile paper):
+  - crescita del contesto turno per turno (linea), con soglia della `contextWindow` del modello quando nota e i punti di compattazione se registrati;
+  - token per turno impilati: input nuovo, cache read, cache write, output; rapporto di cache hit;
+  - costo cumulato e durata dei turni; marcatori sui turni con tool falliti o solleciti (`User message`).
+- **Aggregati del workflow:**
+  - per **tool**: numero chiamate, tasso di errore, durata media/p95, token del turno che l'ha chiamato;
+  - per **role**, **model**, **fase/ondata**, **scope `parallel`**: token, cache hit, costo, durata, agenti falliti;
+  - top-N agenti per costo, contesto massimo e crescita più rapida; distribuzione delle chiamate per agente (pochi/molti tool).
+- **Analisi dei fail:**
+  - tassonomia dai dati: errori di tool (per nome e messaggio normalizzato), codici agente (`RESULT_INVALID`, `AGENT_FAILED`, budget, cancellazioni), tentativi e retry, solleciti di riparazione;
+  - per ogni fail: dove (agente, fase, turno), cosa è successo prima (ultime chiamate), se è stato recuperato (retry riuscito, `catch` nel workflow) o ha propagato;
+  - riepilogo «Errori» collegato al preset H8 e alla mappa (clic → card e inspector esistenti).
+- **Architettura e limiti:** aggregazione nel parent sulle trascrizioni già nella cache (stesso RPC della mappa, stessi limiti per pagina) con indicazione esplicita di copertura parziale (`≥`, «N agenti senza trascrizione»); grafici SVG generati localmente, senza librerie o fetch esterni né nuove dipendenze; nessun contenuto di prompt/argomenti/risultati, solo numeri, nomi di tool e codici. Export opzionale CSV/JSON dei numeri, mediato dal parent.
+- **Gate:** test unitari sugli aggregati (conteggi, somme, cache hit, copertura parziale, esclusione dei turni sintetici), test browser dei grafici in chiaro/scuro, verifica su run reali con molti agenti e sulla simulazione mista, nessuna regressione di apertura della mappa e del Gantt; i numeri devono coincidere con quelli del Gantt e delle statistiche dei box.
+
 ### Dipendenze
 
 La precedenza è **completamento baseline corrente + prova V0-D consegnata e visionata → conferma passaggio → H0 → H1 → H2 → H4 → H5 → H6 → H7**. W9 (deploy) non è un prerequisito dell'enhanced. **H3 è una proposta eventuale dopo l'audit/H2, non una dipendenza obbligatoria.** Prototipi layout H0 possono usare fixture, ma la prova di recupero deve leggere artefatti/sessioni prodotti dal runtime esistente senza nuova strumentazione. H6 riesegue i gate Windows/Linux anche dopo i cambi enhanced: il verde della baseline non vale automaticamente per il nuovo candidato.
