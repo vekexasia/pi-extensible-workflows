@@ -127,4 +127,3 @@ void test("pinned Archify provenance is still enforced", async () => {
   const root = await copyInputs("tampered", (bytes, path) => path.endsWith("vendor/archify/template.html") ? Buffer.concat([bytes, Buffer.from("<!-- tampered -->\n")]) : bytes);
   await assert.rejects(run(process.execPath, [generator, `--root=${root}`], { cwd: root, windowsHide: true, timeout: 60_000 }), /Pinned Archify template checksum mismatch/);
 });
-

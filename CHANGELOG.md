@@ -12,8 +12,82 @@
 - `piewf doctor` no longer crashes (0xC0000409) on Node 22 when it copies to a path with non-ASCII characters on Windows.
 - The Herdr extension listens on a named pipe on Windows instead of a filesystem socket, which failed with `EACCES`.
 - A failed workflow recovery releases its retry reservation before it reports the failure, so an immediate retry is accepted.
+- State and journal mutations await their best-effort summary cache writes before returning, so run completion and teardown cannot race a detached temporary-file writer. Summary failures still do not fail the authoritative write.
 - The Trajectory server decodes WebSocket frames incrementally. It accepts valid frames that arrive coalesced or split, and rejects oversized or invalid frames early.
+- The Trajectory server atomically persists its listening identity before listening callbacks or health checks can succeed. A lock write failure closes the listener and reports startup failure, rather than leaving a healthy server with an incomplete lock.
 - A stale Trajectory server whose PID was reused is signalled only when its PID, start time and fingerprint all match the lock. Otherwise only the unproven lock is removed.
+
+### Internal
+
+- Build and test against Pi 1.0.3; `@piewf/cli` bundles the same aligned Pi patch versions. This fixes the remaining shrinkwrapped `brace-expansion` vulnerability and removes the package verifier's advisory exceptions. Pi 1.0.3 renames the Azure provider from `azure-openai-responses` to `azure`; affected provider keys in auth, models and settings must be migrated.
+
+## [5.19.1] - 2026-10-05
+
+### New capabilities
+
+- Trajectory shows workflow script `shell()` and `tools.<name>()` calls: CALLS and the `script` Gantt lane share status and colours, with phase and timing. Tool arguments and results are not recorded in call state or shown in Trajectory (including live state and HTML exports/shares); tool errors keep only the code. The replay journal retains tool results unchanged. Shell calls keep inputs and output, with environment override names, not values. Calls are recorded without a count cap; tool metadata writes are best-effort, and journaled calls without finish timing show completed with unknown duration.
+
+## [5.19.0] - 2026-10-02
+
+### Breaking changes
+
+- `tools` is a reserved workflow global: registering a workflow function named `tools` fails with `GLOBAL_COLLISION`. Rename the function.
+
+### New capabilities
+
+- Workflow and subagent tools declare an `outputSchema` and return `structuredContent`, so Pi `codemode` scripts receive objects instead of JSON text. For example, `await tools.workflow_status({ runId })` resolves to `{ runId, workflowName, state, agents, ... }`. A completed foreground `workflow`, `workflow_retry`, or `workflow_resume` call resolves with the full `value`, even when the model sees only a result descriptor. Inside workflow agents, the child agent tools `agent` and `get_subagent_result` do the same, and Herdr-bridged tools keep their `outputSchema`.
+- Workflow scripts call the launching session's tools directly as `await tools.<name>(args)`, through Pi's `ctx.executeTool()`, with the names and results of Pi `codemode`. Permission handlers apply, results are journaled for resume and retry, the live workflow item shows calls in flight, and an unknown tool fails the launch with `UNKNOWN_TOOL`. Failed calls reject with the new `TOOL_FAILED` code.
+- `workflow_status`, `workflow_catalog`, and `subagents_inspect` carry the `readOnlyHint` tool annotation, so permission extensions that read annotations can skip confirming them.
+
+### Internal
+
+- Build and test against Pi 1.0.0. `@piewf/cli` bundles Pi 1.0.0.
+
+## [5.18.0] - 2026-09-30
+
+### Breaking changes
+
+- `pi-extensible-workflows` and `@piewf/herdr` require Pi 0.99.0 or later; their `@earendil-works/pi-coding-agent` peer dependency is now `>=0.99.0`. `@piewf/cli` bundles Pi 0.99.1.
+
+### New capabilities
+
+- Global model aliases appear in `/model` and `--model` as virtual models named `workflow/<alias>`, for example `workflow/cheap-model`. The alias target is read from settings on every request, and workflow agents and subagents that inherit the session model run on that target. The thinking level selected in `/model` replaces the one in the alias. Project and extension-provided aliases are not listed, and new aliases need `/reload`.
+- Workflow agents and standalone subagents load Pi's built-in `codemode`, `tool-search`, and `mcp` extensions, so they can reach the MCP servers from `mcp.json` through `codemode` or `tool_search`. `-builtin:<name>` in Pi settings still disables them. Workflow extension selectors name them `builtin:codemode`, `builtin:tool-search`, and `builtin:mcp`; a selector list that starts with `!*` needs `builtin:*` or those names to keep them.
+- The global `codemodeTools` workflow setting limits which workflow and subagent tools Pi `codemode` scripts may call: `"all"` (default), `"read-only"` (`workflow_status`, `workflow_catalog`, and `subagents_inspect`), or `"none"`. The model still calls every tool directly. Changes apply after `/reload`.
+- The agent tool ceiling includes the parent session's tools that only codemode scripts call or `tool_search` loads, such as MCP tools with the default exposure. Role and call tool selectors still restrict them.
+
+### Fixes
+
+- Prompt inspection in `piewf doctor` and role inspection renders the system prompt again on Pi 0.99, including changes made by `before_agent_start` handlers.
+- An agent that asks for a model of Pi's built-in `llama.cpp` provider fails with an error that explains why: Pi does not expose that extension to extension sessions. Declare the server as a provider in `models.json` instead.
+
+### Internal
+
+- Build and test against Pi 0.99.1. Package verification ignores three `brace-expansion` advisories that come from the `npm-shrinkwrap.json` of `@earendil-works/pi-coding-agent@0.99.1`.
+
+## [5.17.2] - 2026-09-28
+
+### Breaking changes
+
+- `subagents_inspect({})` lists only the runs of the current Pi session, matching `/subagents` and Trajectory. Pass `scope: "all"` to list every stored run as before. Lookup by `id` still resolves runs from any session ([#305](https://github.com/vekexasia/pi-extensible-workflows/pull/305)).
+
+### New capabilities
+
+- `piewf doctor` inspects a role file before it is installed: a role ending in `.md`, such as `piewf doctor ./roles/reviewer.md`, is read as a file relative to the current working directory, while other values still name an installed role. A missing file reports `ROLE_FILE_NOT_FOUND` ([#303](https://github.com/vekexasia/pi-extensible-workflows/issues/303)).
+
+### Fixes
+
+- `piewf doctor` no longer fails because of roles that another role overrides: it still reports their invalid frontmatter, but checks tools, models, and settings only for the roles that apply. A role tool missing from doctor's headless tool list is now a `ROLE_TOOL_INACTIVE` warning, because doctor cannot see tools that extensions add when a session starts and the runtime skips unavailable role tools. Role inspection and workflow agent sessions now skip the workflow host extensions of every installed copy of the package, so a Pi package installed next to `@piewf/cli` no longer fails with `Global name is already registered: reviewLoop` ([#302](https://github.com/vekexasia/pi-extensible-workflows/issues/302)).
+
+## [5.17.1] - 2026-09-26
+
+### Fixes
+
+- Running workflow agents and standalone subagents show a fixed status glyph before their names and keep the activity spinner visible after `[running]`, even without a current activity label.
+
+### Internal
+
+- Remove duplicated view and trajectory helpers, unused internal code, and tracked generated images. Preserve the public `pi-extensible-workflows/runtime` type exports.
 
 ## [5.17.0] - 2026-09-23
 

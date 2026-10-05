@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
 import { copyFile, mkdir, mkdtemp, readFile, rm, truncate, unlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -166,6 +167,49 @@ void test("Trajectory persists the server fingerprint in its listening lock", as
     server.closeIdleConnections();
     server.close();
     server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory publishes a complete replacement lock before listening callbacks and health", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-lock-readiness-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  const fingerprint = "replacement-server";
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, port, fingerprint: "starting-publisher", startedAt: 1 }));
+  const server = createTrajectoryServer(port, lockPath, { fingerprint });
+  let listeningLock = "";
+  // Observe the public listening event itself, not a delayed read after /health happens to finish.
+  server.once("listening", () => { listeningLock = readFileSync(lockPath, "utf8"); });
+  try {
+    await listen(server, port);
+    const lock = JSON.parse(listeningLock) as { pid: number; port: number; fingerprint: string; startedAt: number };
+    assert.equal(lock.fingerprint, fingerprint);
+    assert.equal(lock.pid, process.pid);
+    assert.equal(lock.port, port);
+    assert.ok(lock.startedAt > 1 && lock.startedAt <= Date.now());
+    const response = await fetch(`http://127.0.0.1:${String(port)}/health`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, pid: lock.pid, fingerprint: lock.fingerprint, startedAt: lock.startedAt });
+  } finally {
+    server.closeAllConnections(); server.closeIdleConnections();
+    await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory rejects startup and closes the listener when lock persistence fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-lock-failure-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "missing", "trajectory.lock"));
+  const closed = new Promise<void>((resolve) => server.once("close", resolve));
+  try {
+    await assert.rejects(listen(server, port), { code: "ENOENT" });
+    await closed;
+    assert.equal(server.listening, false);
+    await assert.rejects(fetch(`http://127.0.0.1:${String(port)}/health`, { signal: AbortSignal.timeout(300) }));
+  } finally {
+    server.closeAllConnections(); server.closeIdleConnections(); server.close(); server.unref();
     await rm(root, { recursive: true, force: true });
   }
 });

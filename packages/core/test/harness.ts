@@ -227,7 +227,8 @@ export class TestHarness {
       ...(this.agentDir ? [["PI_CODING_AGENT_DIR", this.agentDir] as const] : []),
     ];
     const environmentPrefix = environment.map(([name, value]) => `${name}=${JSON.stringify(value)}`).join(" ");
-    const cmd = `${environmentPrefix}${environmentPrefix ? " " : ""}pi${installedFlag} --no-builtin-tools${modelFlag} --session-id ${this.sessionId}`;
+    // Pi 1.0 defaults to fullscreen; regular mode keeps the startup header readable from the pane scrollback.
+    const cmd = `${environmentPrefix}${environmentPrefix ? " " : ""}pi${installedFlag} --tui-mode regular --no-builtin-tools${modelFlag} --session-id ${this.sessionId}`;
     herdr("pane", "run", this.paneId, cmd);
 
     // Wait for Pi to be ready

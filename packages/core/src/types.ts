@@ -29,7 +29,7 @@ export const WORKFLOW_BLOCKED_EVENT = "workflow:blocked";
 export const ERROR_CODES = [
   "CONFIG_ERROR", "INVALID_SETTINGS", "INVALID_SYNTAX", "INVALID_METADATA", "DUPLICATE_NAME", "INVALID_SCHEMA", "UNKNOWN_MODEL", "UNKNOWN_TOOL", "UNKNOWN_AGENT_TYPE",
   "RUN_OWNED", "RUN_NOT_FOUND", "REGISTRY_FROZEN", "GLOBAL_COLLISION", "MISSING_WORKFLOW", "RPC_LIMIT_EXCEEDED", "SHELL_FAILED", "AGENT_TIMEOUT", "AGENT_FAILED", "AGENT_RESULT_COLLECTED", "RESULT_INVALID",
-  "CANCELLED", "WORKER_UNRESPONSIVE", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "BUDGET_EXHAUSTED", "INTERNAL_ERROR",
+  "TOOL_FAILED", "CANCELLED", "WORKER_UNRESPONSIVE", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "BUDGET_EXHAUSTED", "INTERNAL_ERROR",
   ] as const;
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -97,8 +97,9 @@ export interface WorkflowExtensionSettingsValidatorContext { source: WorkflowExt
 export type WorkflowExtensionSettingsValidator = (settings: Readonly<WorkflowExtensionSettings>, context: Readonly<WorkflowExtensionSettingsValidatorContext>) => void;
 export interface WorkflowSessionStartEvent { type: "session_start"; reason: "startup" | "reload" | "new" | "resume" | "fork"; previousSessionFile?: string; settings: Readonly<WorkflowExtensionSettings> }
 export interface WorkflowRetentionSettings { olderThanDays?: number; maxTerminalRuns?: number }
-export interface WorkflowSettings { concurrency: number; backgroundWidget?: boolean; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
-export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget">>;
+export type CodemodeToolsSetting = "all" | "read-only" | "none";
+export interface WorkflowSettings { concurrency: number; backgroundWidget?: boolean; codemodeTools?: CodemodeToolsSetting; modelAliases?: Readonly<Record<string, string>>; skills?: readonly string[]; extensions?: readonly string[]; extensionSettings?: Readonly<WorkflowExtensionSettings>; tools?: readonly string[]; retention?: Readonly<WorkflowRetentionSettings> }
+export type WorkflowSettingsOverrides = Partial<Omit<WorkflowSettings, "backgroundWidget" | "codemodeTools">>;
 export interface WorkflowSettingsSources { concurrency: string; modelAliases: string; skills?: string; extensions?: string; tools?: string; extensionSettings?: string; retention?: string }
 export interface WorkflowSettingsResolution { globalSettingsPath: string; projectSettingsPath: string; projectTrusted: boolean; global: Readonly<WorkflowSettings>; project: Readonly<WorkflowSettingsOverrides>; effective: Readonly<WorkflowSettings>; sources: Readonly<WorkflowSettingsSources> }
 export interface AgentResourceSelectors { skills?: readonly string[]; extensions?: readonly string[]; tools?: readonly string[] }
@@ -178,6 +179,8 @@ export interface WorkflowRunEvent { type: string; message: string; timestamp?: n
 export interface WorkflowRetryProvenance { sourceRunId: string; lineageRootRunId: string; completedPaths: readonly string[]; incompletePaths: readonly string[]; namedWorktrees: readonly string[] }
 export interface WorkflowPhaseRecord { phase: string; afterAgent: number }
 export interface WorkflowPhaseShellActivity { phaseIndex: number; active: number; startedAt: number }
+/** A script call recorded for inspection. Tool payloads stay in the replay journal, not this record. Oversized shell inputs are JSON prefixes, with `inputBytes` their full size. */
+export interface WorkflowScriptCall { kind: "shell" | "tool"; name: string; path: string; input?: JsonValue; inputBytes?: number; phase?: string; startedAt: number; finishedAt?: number; error?: { code: WorkflowErrorCode; message?: string } }
 export interface RunRecord {
   id: string;
   workflowName: string;
@@ -194,6 +197,8 @@ export interface RunRecord {
   activeShells?: number;
   activeShellStartedAt?: number;
   activeShellsByPhase?: readonly WorkflowPhaseShellActivity[];
+  activeTools?: readonly { name: string; startedAt: number }[]; // Script tool calls in flight: a live overlay for rendering, never persisted.
+  scriptCalls?: readonly WorkflowScriptCall[];
   error?: WorkflowErrorShape;
   failedAt?: string;
   budget?: WorkflowBudget;
@@ -357,7 +362,9 @@ export interface FunctionIdentity { path: string; structuralPath: readonly strin
 export type AgentContinuity = "fresh" | "continued";
 export interface AgentIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; parentBreadcrumb?: string; worktreeOwner?: string; handle?: string; turn?: number }
 export interface ShellIdentity { structuralPath: readonly string[]; callSite: string; occurrence: number; worktreeOwner?: string }
-export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void> }
+/** A script `tools.<id>(args)` call: the n-th call of that tool within one structural scope. */
+export interface ToolIdentity { structuralPath: readonly string[]; occurrence: number }
+export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void>; tool?: (identifier: string, args: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: ToolIdentity) => Promise<JsonValue> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 export interface StaticWorkflowScope { kind: "parallel" | "pipeline"; name: string | null; key: string | null }
 export type StaticWorkflowExecution = "parallel" | "sequential";

@@ -665,8 +665,8 @@ void test("shares the registry between package imports and Pi's jiti loader", ()
   const script = `
 import { createRequire } from "node:module";
 import { join } from "node:path";
-const require = createRequire(import.meta.url);
-const { createJiti } = require(${JSON.stringify(join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent/node_modules/jiti"))});
+const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const { createJiti } = piRequire("jiti");
 const native = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/src/index.js")).href)});
 const jiti = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
 const source = await jiti.import(${JSON.stringify(join(process.cwd(), "src/index.ts"))});

@@ -5,12 +5,13 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createBashToolDefinition, createEditToolDefinition, createFindToolDefinition, createGrepToolDefinition, createLsToolDefinition, createReadToolDefinition, createWriteToolDefinition, DefaultPackageManager, getAgentDir, SettingsManager, DEFAULT_MAX_BYTES } from "@earendil-works/pi-coding-agent";
 import { listRunIds, RunStore, type AwaitingCheckpoint, type CompletedOperation, type EffectiveSystemPrompt, type PersistedRun } from "./persistence.js";
 import { navigatorAttentionSortByState } from "./host-view.js";
-import type { AgentAttemptSummary, AgentRecord, JsonValue, LaunchSnapshot, WorkflowAgentSessionReference } from "./types.js";
+import type { AgentAttemptSummary, AgentRecord, JsonValue, LaunchSnapshot, WorkflowAgentSessionReference, WorkflowErrorCode, WorkflowScriptCall } from "./types.js";
 import { normalizeSubagentRunRequest, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "../subagents/src/contracts.js";
 import { statusValue, subagentErrorValue } from "../subagents/src/decode.js";
 import { isNodeError, jsonValue, object, resourcePatternHasMagic, selectResourcesByLayers } from "./utils.js";
 import type { TrajectoryAction, TrajectoryTarget } from "./trajectory-contracts.js";
 import { canonicalPath, sameFilesystemPath } from "./paths.js";
+import { TOOL_TIMING_ENTRY_TYPE } from "./tool-timing.js";
 
 export const TRAJECTORY_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024;
 const TRAJECTORY_MAX_NON_TIMING_ENTRIES = 400;
@@ -22,7 +23,8 @@ export type TrajectoryAgentOutput =
   | { readonly status: "truncated"; readonly kind: "result" | "failure"; readonly bytes: number; readonly path?: string }
   | { readonly status: "unavailable" };
 export type TrajectoryAgent = AgentRecord & { readonly output: TrajectoryAgentOutput };
-export type TrajectoryRunRecord = Omit<PersistedRun, "agents"> & { readonly agents: readonly TrajectoryAgent[] };
+export type TrajectoryScriptCall = WorkflowScriptCall & { readonly output: TrajectoryAgentOutput | { readonly status: "completed" } | { readonly status: "failed" | "cancelled"; readonly code: WorkflowErrorCode } };
+export type TrajectoryRunRecord = Omit<PersistedRun, "agents" | "scriptCalls"> & { readonly agents: readonly TrajectoryAgent[]; readonly scriptCalls?: readonly TrajectoryScriptCall[] };
 export type TrajectoryRun = {
   run: TrajectoryRunRecord;
   snapshot: Readonly<LaunchSnapshot>;
@@ -124,7 +126,7 @@ function transcriptToolCallId(value: unknown): string | undefined {
   for (const part of message.content) if (object(part) && typeof part.id === "string") return part.id;
   return undefined;
 }
-function isTimingTranscriptEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === "pi-workflows:tool-timing"; }
+export function isTimingTranscriptEntry(value: unknown): boolean { return object(value) && value.type === "custom" && value.customType === TOOL_TIMING_ENTRY_TYPE; }
 function timingToolCallId(value: unknown): string | undefined {
   if (!object(value) || !isTimingTranscriptEntry(value) || !object(value.data)) return undefined;
   return typeof value.data.toolCallId === "string" ? value.data.toolCallId : undefined;
@@ -243,7 +245,8 @@ export function withPiToolDescriptionsForTools(tools: readonly string[], cwd: st
 function canonicalExtensionSelector(selector: string, base: string): string {
   const negated = selector.startsWith("!");
   const body = negated ? selector.slice(1) : selector;
-  if (body === "*" || body === "**" || body.startsWith("**/")) return selector;
+  // Built-in extensions are named `builtin:<name>`, not by a path.
+  if (body === "*" || body === "**" || body.startsWith("**/") || body.startsWith("builtin:")) return selector;
   const resolved = resolve(base, body);
   if (resourcePatternHasMagic(body)) return `${negated ? "!" : ""}${resolved}`;
   return `${negated ? "!" : ""}${canonicalPath(resolved)}`;
@@ -319,11 +322,17 @@ function failedAgentOutput(agent: PersistedRun["agents"][number]): TrajectoryAge
   const status = agent.state === "cancelled" ? "cancelled" : "failed";
   return { status, code: error?.code ?? (status === "cancelled" ? "CANCELLED" : "AGENT_FAILED"), message: error?.message ?? `Agent ${agent.state}` };
 }
+function operationOutput(operation: CompletedOperation): TrajectoryAgentOutput {
+  const bytes = serializedJsonBytes(operation.value);
+  return bytes > DEFAULT_MAX_BYTES ? { status: "truncated", kind: "result", bytes } : { status: "available", value: operation.value, bytes };
+}
+function outputForCall(call: WorkflowScriptCall, operation: CompletedOperation | undefined): TrajectoryScriptCall["output"] {
+  if (operation !== undefined) return call.kind === "tool" ? { status: "completed" } : operationOutput(operation);
+  if (call.error) return { status: call.error.code === "CANCELLED" ? "cancelled" : "failed", code: call.error.code, ...(call.kind === "shell" ? { message: call.error.message ?? "Shell failed" } : {}) };
+  return call.finishedAt === undefined ? { status: "pending" } : { status: "unavailable" };
+}
 function outputForAgent(agent: PersistedRun["agents"][number], operation: CompletedOperation | undefined): TrajectoryAgentOutput {
-  if (operation !== undefined) {
-    const bytes = serializedJsonBytes(operation.value);
-    return bytes > DEFAULT_MAX_BYTES ? { status: "truncated", kind: "result", bytes } : { status: "available", value: operation.value, bytes };
-  }
+  if (operation !== undefined) return operationOutput(operation);
   if (agent.state === "failed" || agent.state === "cancelled") return failedAgentOutput(agent);
   if (agent.state === "completed") return { status: "unavailable" };
   return { status: "pending" };
@@ -331,17 +340,27 @@ function outputForAgent(agent: PersistedRun["agents"][number], operation: Comple
 export function applyTrajectoryAgentOutputs(run: PersistedRun, operations: readonly CompletedOperation[]): TrajectoryRunRecord {
   const byPath = new Map(operations.map((operation) => [operation.path, operation]));
   const agents: readonly TrajectoryAgent[] = run.agents.map((agent) => ({ ...agent, output: outputForAgent(agent, agent.resultPath === undefined ? undefined : byPath.get(agent.resultPath)) }));
-  return { ...run, agents };
+  const scriptCalls = run.scriptCalls?.map((call): TrajectoryScriptCall => {
+    const recorded = { ...call, output: outputForCall(call, byPath.get(call.path)) };
+    if (call.kind === "tool") {
+      delete recorded.input;
+      delete recorded.inputBytes;
+      if (call.error) recorded.error = { code: call.error.code };
+    }
+    return recorded;
+  });
+  const rest: Omit<PersistedRun, "scriptCalls"> = run;
+  return { ...rest, agents, ...(scriptCalls === undefined ? {} : { scriptCalls }) };
 }
 function overlayTrajectoryRun(run: TrajectoryRunRecord, overlay: (run: PersistedRun) => PersistedRun): TrajectoryRunRecord {
-  const overlaid = overlay(run);
+  const overlaid: Omit<PersistedRun, "scriptCalls"> = overlay(run);
   const outputs = new Map(run.agents.map((agent) => [agent.id, agent.output]));
   const agents: readonly TrajectoryAgent[] = overlaid.agents.map((agent) => {
     const previous = outputs.get(agent.id);
     const output = previous?.status === "available" || previous?.status === "truncated" ? previous : outputForAgent(agent, undefined);
     return { ...agent, output };
   });
-  return { ...overlaid, agents };
+  return { ...overlaid, agents, ...(run.scriptCalls === undefined ? {} : { scriptCalls: run.scriptCalls }) };
 }
 async function loadTrajectoryRun(store: RunStore, includeTranscripts = true): Promise<TrajectoryRun> {
   const value = await store.load();

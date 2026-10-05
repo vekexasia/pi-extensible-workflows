@@ -53,8 +53,8 @@ function install(home: string, probe: TrajectoryProbe, agentDir?: string): { wor
     registerTool(tool) { tools.push(tool); },
     registerCommand(_name, options) { command = options.handler as WorkflowHandler; },
     on(name, handler) {
-      if (name === "session_start") start = handler as SessionStartHandler;
-      if (name === "session_shutdown") shutdowns.push(handler as () => Promise<void>);
+      if (name === "session_start") start = handler;
+      if (name === "session_shutdown") shutdowns.push(handler);
     },
     getThinkingLevel: () => "medium",
     getActiveTools: () => ["workflow"],
@@ -202,7 +202,7 @@ void test("Trajectory overlays live subagent status observed by the workflow reg
   const ctx = context(cwd, true);
   try {
     await host.start({}, ctx);
-    registerSubagentsExtension({ registerTool() {}, on(name, handler) { if (name === "session_shutdown") shutdown = handler as () => Promise<void>; } }, { manager });
+    registerSubagentsExtension({ registerTool() {}, on(name, handler) { if (name === "session_shutdown") shutdown = handler as () => Promise<void>; return () => {}; } }, { manager });
     await host.command("trajectory", ctx);
     const input = probe.inputs.at(-1);
     assert.ok(input);
@@ -237,7 +237,7 @@ void test("Trajectory routes subagent actions through the registered manager", a
     async stop(request: unknown, context: unknown) { calls.push({ action: "stop", request, context }); return { id: "old", state: "stopped" }; },
     async retry(request: unknown, context: unknown) { calls.push({ action: "retry", request, context }); return { id: "new", state: "running" }; },
   };
-  registerSubagentsExtension({ registerTool() {}, on(name, handler) { if (name === "session_shutdown") shutdown = handler as () => Promise<void>; } }, { manager });
+  registerSubagentsExtension({ registerTool() {}, on(name, handler) { if (name === "session_shutdown") shutdown = handler as () => Promise<void>; return () => {}; } }, { manager });
   const ctx = context(cwd, true);
   try {
     await host.start({}, ctx);

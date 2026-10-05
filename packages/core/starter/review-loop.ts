@@ -69,5 +69,3 @@ export const reviewLoop = defineWorkflowFunction({
   ),
 });
 
-export const reviewLoopInputSchema = reviewLoop.input;
-export const reviewLoopOutputSchema = reviewLoop.output;

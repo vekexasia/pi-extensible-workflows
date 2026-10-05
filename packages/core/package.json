@@ -1,6 +1,6 @@
 {
   "name": "pi-extensible-workflows",
-  "version": "5.17.0",
+  "version": "5.19.1",
   "description": "Deterministic multi-agent workflow orchestration for Pi",
   "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
   "repository": {
@@ -65,7 +65,6 @@
     "test:widget": "node ../../scripts/run-workspace-tests.mjs --workspace core --pattern test/background-widget.test.mjs --unset-herdr --timeout 30000",
     "test:run": "node ../../scripts/run-workspace-tests.mjs --workspace core --pattern=dist/test/**/*.test.js --pattern=dist/trajectory/test/**/*.test.js --exclude=dist/test/navigator.test.js --agent-dir --unset-herdr --expose-gc",
     "test:herdr": "node ../../scripts/run-herdr-tests.mjs",
-
     "acceptance": "npm run build && node ../../scripts/run-workspace-tests.mjs --workspace core --pattern dist/test/runtime-acceptance.test.js --agent-dir --unset-herdr --expose-gc",
     "evals": "npm run build && node dist/evals/src/workflow-evals.js",
     "evals:ambient": "node -e \"if (process.env.PI_WORKFLOW_EVAL_AMBIENT !== '1') { console.error('Ambient Tier D evals are opt-in. Set PI_WORKFLOW_EVAL_AMBIENT=1 to run them.'); process.exit(1); }\" && npm run build && node dist/evals/src/ambient-workflow-evals.js",
@@ -86,15 +85,15 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-coding-agent": ">=0.99.0",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.0",
-    "@earendil-works/pi-coding-agent": "0.85.0",
-    "@earendil-works/pi-server": "0.85.0",
-    "@earendil-works/pi-tui": "0.85.0",
+    "@earendil-works/pi-ai": "1.0.3",
+    "@earendil-works/pi-coding-agent": "1.0.3",
+    "@earendil-works/pi-server": "1.0.3",
+    "@earendil-works/pi-tui": "1.0.3",
     "@eslint/js": "10.0.1",
     "@types/node": "24.12.4",
     "esbuild": "^0.28.2",

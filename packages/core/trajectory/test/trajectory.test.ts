@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { applyTrajectoryAgentOutputs, createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectoryTranscriptLoader, applySystemPrompts, applyToolDescriptions, TRAJECTORY_MAX_TRANSCRIPT_BYTES } from "../../src/trajectory.js";
-import { minimalStatePublisher, trajectoryUrl } from "../src/index.js";
+import { minimalStatePublisher, trajectoryUrl, exportTrajectoryRunHtml } from "../src/index.js";
 import { RunStore } from "../../src/persistence.js";
 import { createLaunchSnapshot } from "../../src/utils.js";
 import type { PersistedRun } from "../../src/persistence.js";
@@ -43,6 +43,89 @@ void test("trajectory maps authoritative journal results to the selected agent o
   assert.deepEqual(next.agents[5]?.output, { status: "failed", code: "FAILED", message: "no" });
   assert.deepEqual(next.agents[6]?.output, { status: "cancelled", code: "CANCELLED", message: "stopped" });
   assert.deepEqual(next.agents[7]?.output, { status: "unavailable" });
+});
+
+void test("trajectory maps script call status without exposing tool payloads", () => {
+  const call = (path: string, extra: object = {}) => ({ kind: "tool", name: "read", path, input: { path: "private-argument" }, startedAt: 1, ...extra });
+  const run = { agents: [], scriptCalls: [call("tool/done"), call("tool/failed", { finishedAt: 2, error: { code: "TOOL_FAILED", message: "private-error" } }), call("tool/cancelled", { finishedAt: 2, error: { code: "CANCELLED", message: "private-error" } }), call("tool/running"), call("tool/lost", { finishedAt: 2 }), call("shell/done", { kind: "shell", name: "shell", input: { command: "echo hi" } })] } as unknown as PersistedRun;
+  const next = applyTrajectoryAgentOutputs(run, [{ path: "tool/done", value: "private-result" }, { path: "shell/done", value: "hi" }]);
+  assert.deepEqual(next.scriptCalls?.map(({ output }) => output), [
+    { status: "completed" },
+    { status: "failed", code: "TOOL_FAILED" },
+    { status: "cancelled", code: "CANCELLED" },
+    { status: "pending" },
+    { status: "unavailable" },
+    { status: "available", value: "hi", bytes: 4 },
+  ]);
+  assert.doesNotMatch(JSON.stringify(next), /private-/);
+  assert.equal(next.scriptCalls[0]?.finishedAt, undefined);
+  assert.equal(next.scriptCalls[5]?.finishedAt, undefined);
+  assert.equal(applyTrajectoryAgentOutputs({ agents: [] } as unknown as PersistedRun, []).scriptCalls, undefined);
+});
+
+void test("script call privacy holds for transcript runs, live metadata, and HTML exports", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-script-call-privacy-"));
+  t.after(() => { rmSync(home, { recursive: true, force: true }); });
+  const store = new RunStore(home, "session", "run", home);
+  const run: PersistedRun = { id: "run", workflowName: "privacy", cwd: home, sessionId: "session", state: "completed", agentSessions: [], agents: [], scriptCalls: [
+    { kind: "tool", name: "read", path: "tool/done", input: { path: "private-argument" }, inputBytes: 42, startedAt: 1 },
+    { kind: "tool", name: "read", path: "tool/failed", input: {}, startedAt: 1, finishedAt: 2, error: { code: "TOOL_FAILED", message: "private-error" } },
+    { kind: "shell", name: "shell", path: "shell/done", input: { command: "echo public-shell" }, startedAt: 1 },
+  ] };
+  await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "privacy" }, settings: { concurrency: 1 }, models: [], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.complete("tool/done", "private-result");
+  await store.complete("shell/done", "public-shell-output");
+  const loaded = await createTrajectoryRunLoader(home, "session", home)();
+  const live = minimalStatePublisher({ runs: await createTrajectoryRunMetadataLoader(home, "session", home)(), subagents: [] });
+  const html = await exportTrajectoryRunHtml({ cwd: home, sessionId: "session", runId: "run", home });
+  for (const serialized of [JSON.stringify(loaded), JSON.stringify(live), html]) {
+    assert.doesNotMatch(serialized, /private-argument|private-result|private-error/);
+    assert.match(serialized, /public-shell-output/);
+  }
+  assert.equal((await store.replay("tool/done"))?.value, "private-result", "journal values remain unchanged for replay");
+});
+
+void test("CALLS and script Gantt share status, colour, and unknown duration after interruption", () => {
+  const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
+  const callsStart = source.indexOf("    const scriptCalls =");
+  const callsEnd = source.indexOf("    function renderAgentSection", callsStart);
+  const ganttStart = source.indexOf("    function ganttLanes(");
+  const ganttEnd = source.indexOf("    // Only the lanes", ganttStart);
+  const stateStart = source.indexOf("    const stateClass =");
+  const stateEnd = source.indexOf("    const accounting =", stateStart);
+  const helpers = runInNewContext(`(() => {
+    const esc = (value) => String(value ?? ""); const json = JSON.stringify; const highlightCode = (value) => value; const fmtClock = String; const fmtRuntime = String;
+    const state = { currentRun: "run", callsOpen: new Set(), runLayout: { callsCollapsed: false } };
+    const startOf = () => new Date(0); const timelineSpan = () => 100; const barStyle = () => "left:1%;width:0.5%"; const renderOutputPane = () => "shell-output";
+    ${source.slice(stateStart, stateEnd)}
+    ${source.slice(callsStart, callsEnd)}
+    ${source.slice(ganttStart, ganttEnd)}
+    return { callState, callDuration, renderCalls, ganttLanes };
+  })()`) as { callState: (record: unknown, call: unknown) => string; callDuration: (call: unknown) => string; renderCalls: (record: unknown) => string; ganttLanes: (record: unknown, timings: Map<string, unknown>) => { key: string; html: string }[] };
+  const cases = [
+    { runState: "running", extra: {}, status: "running", colour: "spin" },
+    { runState: "completed", extra: {}, status: "interrupted", colour: "wait" },
+    { runState: "completed", extra: { finishedAt: 20 }, status: "completed", colour: "ok" },
+    { runState: "running", extra: { output: { status: "completed" } }, status: "completed", colour: "ok" },
+    { runState: "interrupted", extra: { output: { status: "available", value: "hi" }, kind: "shell", input: {} }, status: "completed", colour: "ok" },
+    { runState: "completed", extra: { error: { code: "TOOL_FAILED" } }, status: "failed", colour: "fail" },
+    { runState: "completed", extra: { error: { code: "CANCELLED" } }, status: "stopped", colour: "fail" },
+  ];
+  for (const { runState, extra, status, colour } of cases) {
+    const call = { kind: "tool", name: "read", path: "call", startedAt: 10, ...extra };
+    const record = { run: { state: runState, agents: [], scriptCalls: [call] } };
+    assert.equal(helpers.callState(record, call), status);
+    const lane = helpers.ganttLanes(record, new Map()).find(({ key }) => key === "calls")?.html ?? "";
+    assert.match(lane, new RegExp(`bar tool ${colour}`));
+    assert.match(lane, new RegExp(`title="[^"\n]*${status}`));
+    assert.equal(lane.includes("data-clock-bar-start"), status === "running");
+    assert.match(helpers.renderCalls(record), new RegExp(`g-run ${colour}`));
+    if (!("finishedAt" in extra)) {
+      assert.equal(helpers.callDuration(call), "—");
+      assert.doesNotMatch(lane, /0ms/);
+    }
+    if (call.kind === "tool") assert.doesNotMatch(helpers.renderCalls(record), /INPUT|OUTPUT|shell-output/);
+  }
 });
 
 void test("trajectory keeps runs with unavailable retry lineage visible", async () => {
@@ -180,12 +263,12 @@ void test("Trajectory preference storage failures preserve defaults", () => {
     setItem: () => { throw new Error("storage unavailable"); },
   };
   const helpers = runInNewContext(`(() => { ${source.slice(helperStart, helperEnd)}; const state = { runLayout: defaultRunLayout(), sidebarCollapsed: new Set() }; return { loadRunLayout, loadSidebarCollapsed, saveRunLayout, saveSidebarCollapsed }; })()`, { localStorage: storage }) as {
-    loadRunLayout: () => { swimHeight: number; ganttCollapsed: boolean; agentsCollapsed: boolean; logsCollapsed: boolean };
+    loadRunLayout: () => { swimHeight: number; ganttCollapsed: boolean; agentsCollapsed: boolean; callsCollapsed: boolean; logsCollapsed: boolean };
     loadSidebarCollapsed: () => Set<string>;
     saveRunLayout: () => void;
     saveSidebarCollapsed: () => void;
   };
-  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, logsCollapsed: false });
+  assert.deepEqual({ ...helpers.loadRunLayout() }, { swimHeight: 220, ganttCollapsed: false, agentsCollapsed: false, callsCollapsed: false, logsCollapsed: false });
   assert.deepEqual([...helpers.loadSidebarCollapsed()], []);
   assert.doesNotThrow(() => { helpers.saveRunLayout(); });
   assert.doesNotThrow(() => { helpers.saveSidebarCollapsed(); });

@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createServer } from "node:http";
 import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
+import { Value } from "typebox/value";
 import type { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createLocalPiSession, FairAgentScheduler, flushExtensionProviders, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
-import { WorkflowError, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
+import { reachableTools, WorkflowError, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
 import type { AgentResourcePolicy } from "../src/types.js";
 import type { RunStore } from "../src/persistence.js";
 import { testTransport, type TestPiSessionEvent } from "./test-transport.js";
@@ -1173,7 +1174,7 @@ void test("bare no-policy local sessions exclude the workflow host and retain co
   try {
     const session = await createLocalPiSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "no-policy-extensions" });
     try {
-      assert.deepEqual(session.getResourceInspection().extensions, [realpathSync(benignExtension), realpathSync(join(process.cwd(), "dist/trajectory/index.js"))]);
+      assert.deepEqual(session.getResourceInspection().extensions, [realpathSync(benignExtension), realpathSync(join(process.cwd(), "dist/trajectory/index.js")), "builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
       assert.deepEqual(readFileSync(lifecycleFile, "utf8").trim().split("\n"), ["start:startup"]);
     } finally {
       await session.dispose();
@@ -2134,6 +2135,25 @@ void test("child tool validates raw input and preserves extension options", asyn
   scheduler.cancel(parent.id);
   await parent.result;
 });
+void test("child agent tools return structured content for codemode scripts", async () => {
+  const scheduler = new FairAgentScheduler(async ({ prompt, signal }) => {
+    if (prompt !== "parent") return "done";
+    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
+    throw new WorkflowError("CANCELLED", "cancelled");
+  }, 2);
+  scheduler.addRun("run", 2);
+  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent"] });
+  const [agentTool, resultTool] = scheduler.toolsFor(parent.id);
+  assert.ok(agentTool?.outputSchema && resultTool?.outputSchema);
+  const spawned = await executeTool(agentTool, "call", { prompt: "child", label: "child" }) as { details: { id: string }; structuredContent?: unknown };
+  assert.deepEqual(spawned.structuredContent, { id: spawned.details.id });
+  assert.ok(Value.Check(agentTool.outputSchema, spawned.structuredContent));
+  const collected = await executeTool(resultTool, "collect", { id: spawned.details.id }) as { structuredContent?: unknown };
+  assert.deepEqual(collected.structuredContent, { id: spawned.details.id, ok: true, value: "done" });
+  assert.ok(Value.Check(resultTool.outputSchema, collected.structuredContent));
+  scheduler.cancel(parent.id);
+  await parent.result;
+});
 
 void test("nested agent roles resolve tools before scheduler spawn", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
@@ -2370,6 +2390,33 @@ void test("composes role resource selectors and reapplies them on retries", asyn
   ]);
   assert.deepEqual(basePolicy.effective, { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] });
 });
+void test("excludes workflow host entries from another installed package copy", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-host-copy-"));
+  const agentDir = join(rootDir, "agent");
+  const cwd = join(rootDir, "project");
+  const packageRoot = join(rootDir, "install", "node_modules", "pi-extensible-workflows");
+  const hostEntry = join(packageRoot, "dist", "starter", "index.js");
+  const marker = join(rootDir, "host-extension-loaded");
+  mkdirSync(dirname(hostEntry), { recursive: true });
+  mkdirSync(agentDir, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-extensible-workflows" }));
+  writeFileSync(hostEntry, `import { writeFileSync } from "node:fs"; export default function() { writeFileSync(${JSON.stringify(marker)}, "loaded"); }`);
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: [hostEntry] }));
+  const resourcePolicy: AgentResourcePolicy = { globalSettingsPath: "/workflow/settings.json", projectSettingsPath: "/project/.pi/pi-extensible-workflows/settings.json", projectTrusted: false, global: { skills: [], extensions: ["**/*"] }, project: { skills: [], extensions: [] }, effective: { skills: [], extensions: ["**/*"] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { extensions: ["**/*"] }, project: {} } };
+  let session: Awaited<ReturnType<typeof createLocalPiSession>> | undefined;
+  try {
+    session = await createLocalPiSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "host-copy", resourcePolicy });
+    assert.equal(existsSync(marker), false);
+    assert.ok(!session.herdrResourcePaths?.extensions.includes(realpathSync(hostEntry)));
+  } finally {
+    await session?.dispose();
+    rmSync(rootDir, { recursive: true, force: true });
+  }
+});
+
 void test("filters excluded native extensions before factories and skills before session registration", async () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resource-loader-"));
   const physicalRoot = join(fixtureRoot, "physical");
@@ -2413,7 +2460,7 @@ void test("filters excluded native extensions before factories and skills before
   const loaded = (session as typeof session & { resourceLoader: { getSkills(): { skills: Array<{ name: string }> }; getExtensions(): { extensions: Array<{ resolvedPath: string }> } } }).resourceLoader;
   const resourcePaths = session.herdrResourcePaths;
   assert.ok(resourcePaths);
-  assert.deepEqual(resourcePaths.extensions, [realpathSync(allowedExtension)]);
+  assert.deepEqual(resourcePaths.extensions, [realpathSync(allowedExtension), "builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
   assert.ok(resourcePaths.skills.includes(realpathSync(join(skillsDir, "kept-skill", "SKILL.md"))));
   assert.equal(resourcePaths.skills.some((path) => path.includes("disabled-skill")), false);
   assert.equal(existsSync(disabledMarker), false);
@@ -2454,6 +2501,38 @@ void test("filters excluded native extensions before factories and skills before
   await parent.dispose();
 });
 
+void test("agent sessions load Pi built-in extensions under settings and workflow selectors", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-builtins-"));
+  const agentDir = join(rootDir, "agent");
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  const extensions = async (resourcePolicy?: AgentResourcePolicy) => {
+    const session = await createLocalPiSession({ cwd: rootDir, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: ["read"], sessionLabel: "builtins", ...(resourcePolicy ? { resourcePolicy } : {}) });
+    try { return session.herdrResourcePaths?.extensions; } finally { await session.dispose(); }
+  };
+  assert.deepEqual(await extensions(), ["builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
+  const selectors = { skills: [], extensions: ["!*", "builtin:mcp"] };
+  assert.deepEqual(await extensions({ globalSettingsPath: "/workflow/settings.json", projectSettingsPath: "/project/.pi/pi-extensible-workflows/settings.json", projectTrusted: false, global: selectors, project: { skills: [], extensions: [] }, effective: selectors, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: selectors, project: {} } }), ["builtin:mcp"]);
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["-builtin:mcp"] }));
+  assert.deepEqual(await extensions(), ["builtin:codemode", "builtin:tool-search"]);
+  assert.deepEqual(reachableTools({ getActiveTools: () => ["read"], getAllTools: () => [{ name: "read", exposure: "direct" }, { name: "mcp__a__b", exposure: "codemode" }, { name: "mcp__a__c", exposure: "deferred" }, { name: "gone", exposure: "hidden" }] }), ["read", "mcp__a__b", "mcp__a__c"]);
+});
+void test("prompt inspection renders before_agent_start system prompt changes", async () => {
+  const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-prompt-inspection-"));
+  const agentDir = join(rootDir, "agent");
+  mkdirSync(join(agentDir, "extensions"), { recursive: true });
+  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+  writeFileSync(join(agentDir, "auth.json"), "{}");
+  const session = await createLocalPiSession({ cwd: rootDir, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "prompt-inspection", extensionFactories: [(pi) => { pi.on("before_agent_start", () => ({ systemPrompt: "Forced by extension" })); }] });
+  try {
+    const inspection = await session.preparePrompt("hello");
+    assert.deepEqual(inspection.diagnostics, []);
+    assert.equal(inspection.systemPrompt, "Forced by extension");
+  } finally {
+    await session.dispose();
+  }
+});
 void test("treats role system prompt bodies as literal content", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-literal-system-prompt-"));
   const agentDir = join(rootDir, "agent");
@@ -2520,7 +2599,7 @@ void test("applies ordered minimatch resource selectors and records concrete mat
   const skillNames = loaded.getSkills().skills.map(({ name }) => name);
   assert.ok(skillNames.includes("kept-skill"));
   assert.equal(skillNames.includes("disabled-skill"), false);
-  assert.deepEqual(loaded.getExtensions().extensions.map(({ resolvedPath }) => resolve(resolvedPath)), [resolve(allowedExtension)]);
+  assert.deepEqual(loaded.getExtensions().extensions.map(({ resolvedPath }) => resolvedPath.startsWith("builtin:") ? resolvedPath : resolve(resolvedPath)), [resolve(allowedExtension), "builtin:codemode", "builtin:tool-search", "builtin:mcp"]);
   assert.deepEqual(resourcePolicy.selectedSkills, ["kept-skill"]);
   await session.dispose();
 });

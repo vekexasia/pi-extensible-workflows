@@ -41,6 +41,7 @@ export const SUBAGENTS_RUN_PARAMETERS = Type.Object({
 
 export const SUBAGENTS_INSPECT_PARAMETERS = Type.Object({
   id: Type.Optional(Type.String({ description: "Subagent ID; omit to list ordered run summaries" })),
+  scope: Type.Optional(Type.Union([Type.Literal("session"), Type.Literal("all")], { description: "List scope when id is omitted: session (default) lists runs from the current Pi session; all lists every stored run" })),
 }, { additionalProperties: false });
 
 export const SUBAGENTS_ID_PARAMETERS = Type.Object({
@@ -60,13 +61,23 @@ export const SUBAGENTS_RETRY_PARAMETERS = Type.Object({
   id: Type.String({ description: "Failed or stopped subagent ID to retry" }),
 }, { additionalProperties: false });
 
-export const SUBAGENTS_TOOL_SCHEMAS = {
-  subagents_run: SUBAGENTS_RUN_PARAMETERS,
-  subagents_inspect: SUBAGENTS_INSPECT_PARAMETERS,
-  subagents_steer: SUBAGENTS_STEER_PARAMETERS,
-  subagents_stop: SUBAGENTS_STOP_PARAMETERS,
-  subagents_retry: SUBAGENTS_RETRY_PARAMETERS,
-} as const;
+// Structured results codemode scripts receive instead of the JSON text; nested records stay loose so they cannot drift from persistence.
+export const SUBAGENT_STATUS_OUTPUT = Type.Object({
+  id: Type.String(),
+  state: Type.String(),
+  sessionId: Type.Optional(Type.String()),
+  startedAt: Type.Optional(Type.Number()),
+  finishedAt: Type.Optional(Type.Number()),
+  attempts: Type.Optional(Type.Number()),
+  attemptDetails: Type.Optional(Type.Array(Type.Unknown())),
+  worktree: Type.Optional(Type.Object({ path: Type.String(), branch: Type.String() })),
+  error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String() })),
+  progress: Type.Optional(Type.Unknown()),
+  value: Type.Optional(Type.Unknown()),
+});
+// One run when id is given, otherwise the ordered run summaries; the summaries stay short in the codemode description.
+export const SUBAGENTS_INSPECT_OUTPUT = Type.Union([SUBAGENT_STATUS_OUTPUT, Type.Array(Type.Object({ id: Type.String(), state: Type.String() }))]);
+export const SUBAGENTS_STEER_OUTPUT = Type.Object({ id: Type.String(), accepted: Type.Boolean() });
 
 export type SubagentRunRequest = Static<typeof SUBAGENTS_RUN_PARAMETERS>;
 export function normalizeSubagentRunRequest(value: unknown): SubagentRunRequest {

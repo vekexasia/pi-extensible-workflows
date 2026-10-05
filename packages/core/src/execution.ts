@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AgentAttempt } from "./agent-execution.js";
-import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
+import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
 import { WorkflowError, roleNameOf, sumAccounting, zeroAccounting } from "./types.js";
-import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
+import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonDigest, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
 import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
 
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
@@ -275,6 +275,30 @@ const functions = Object.freeze(Object.fromEntries(Object.entries(config.functio
   Object.defineProperty(result, "toJSON", { value() { throw workError("INVALID_METADATA", "Workflow function result is a Promise; await it before serialization"); } });
   return result;
 }])));
+// tools.<id>(args) runs a Pi session tool through the host. Any identifier resolves, so a resumed run
+// replays journaled calls even when the tool is gone; the host rejects identifiers it cannot call.
+// A call is the n-th call with the same arguments in its scope, so replay does not depend on the
+// order in which concurrent calls start.
+const NOT_TOOLS = new Set(["then", "toJSON", "toString", "valueOf", "constructor"]);
+const sortedJson = value => Array.isArray(value) ? value.map(sortedJson) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map(key => [key, sortedJson(value[key])])) : value;
+const toolOccurrences = new Map();
+const toolCall = id => (...values) => {
+  if (worktreeOwners.getStore()) throw workError("INVALID_METADATA", "tools." + id + " is unavailable inside withWorktree: session tools resolve paths against the session working directory");
+  if (values.length > 1 || values[0] !== undefined && (!values[0] || typeof values[0] !== "object" || Array.isArray(values[0]))) throw workError("INVALID_METADATA", "tools." + id + " takes one arguments object");
+  const args = values[0] === undefined ? {} : values[0];
+  const structuralPath = inheritedAgentPath.getStore() || [];
+  const key = JSON.stringify([structuralPath, id, sortedJson(args)]);
+  const occurrence = (toolOccurrences.get(key) || 0) + 1;
+  toolOccurrences.set(key, occurrence);
+  return guardedResult(rpc("tool", [id, args, { structuralPath: [...structuralPath], occurrence }]), "tool");
+};
+const tools = new Proxy(Object.create(null), {
+  get: (_target, key) => typeof key === "string" && !NOT_TOOLS.has(key) ? toolCall(key) : undefined,
+  // Probing would branch on the session that resumed the run; the launch already checks named tools.
+  has: () => { throw workError("INVALID_METADATA", "Workflow scripts cannot probe tools with 'in'; call tools.<name>(...) directly, and the launch checks that the tool exists"); },
+  set: () => false,
+  defineProperty: () => false,
+});
 const recordEntries = (value, kind) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw workError("INVALID_METADATA", kind + " must be a record");
   return Object.entries(value);
@@ -335,7 +359,7 @@ const pipeline = async (operationName, items, stages) => {
   return Object.fromEntries(results.map(result => [result.name, result.value]));
 };
 const safeMath = Object.fromEntries(Object.getOwnPropertyNames(Math).filter(name => name !== "random").map(name => [name, Math[name]]));
-const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
+const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint, parallel, pipeline, phase, log, tools, args: config.args, Promise, JSON, Math: Object.freeze(safeMath) };
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
@@ -383,6 +407,14 @@ function readFunctionIdentity(value: unknown): FunctionIdentity {
 function readShellIdentity(value: unknown): ShellIdentity {
   const identity = readAgentIdentity(value);
   return { structuralPath: identity.structuralPath, callSite: identity.callSite, occurrence: identity.occurrence, ...(identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {}) };
+}
+function readToolIdentity(value: unknown): ToolIdentity {
+  if (!object(value) || !Array.isArray(value.structuralPath) || !value.structuralPath.every((part): part is string => typeof part === "string" && Boolean(part.trim())) || !positiveInteger(value.occurrence)) fail("INTERNAL_ERROR", "Invalid workflow tool identity");
+  return { structuralPath: [...value.structuralPath], occurrence: value.occurrence };
+}
+/** The journal path of a script tool call; the arguments' digest keeps calls with different arguments apart whatever order they start in. */
+export function toolIdentityPath(identifier: string, args: JsonValue, identity: ToolIdentity): string {
+  return operationPath("tool", ...identity.structuralPath, identifier, `args:${jsonDigest(args)}`, String(identity.occurrence));
 }
 export function agentHandleTurnPath(handle: string, turn: number): string {
   return operationPath("agent", "handle", handle, `turn:${String(turn)}`);
@@ -595,6 +627,11 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;
           value = branded({ name, ok: false, failedAt: name, error: workerErrorShape(typed) });
         }
+      } else if (method === "tool") {
+        if (typeof values[0] !== "string" || !object(values[1])) fail("INTERNAL_ERROR", "tool requires an identifier and object arguments");
+        const identity = readToolIdentity(values[2]);
+        if (!bridge.tool) fail("UNKNOWN_TOOL", `tools.${values[0]} is unavailable: this run has no session tools`);
+        value = await bridge.tool(values[0], values[1], controller.signal, identity);
       } else if (method === "worktree") {
         if (!bridge.worktree || typeof values[0] !== "string" || !values[0]) fail("INTERNAL_ERROR", "worktree requires an active host bridge and scope");
         value = await bridge.worktree(values[0], controller.signal);
@@ -649,4 +686,4 @@ export async function persistAgentAttempts(store: RunStore, id: string, attempts
     return { ...run, agents: run.agents.map((candidate) => candidate.id === id ? { ...candidate, attempts: attempts.length, attemptDetails, accounting: total } : candidate), agentSessions: [...run.agentSessions.filter(({ transport, sessionId }) => !sessionKeys.has(`${transport}:${sessionId}`)), ...sessions] };
   });
 }
-export type { AgentIdentity, FunctionIdentity, ShellIdentity, WorkflowBridge, WorkflowExecution } from "./types.js";
+export type { AgentIdentity, FunctionIdentity, ShellIdentity, ToolIdentity, WorkflowBridge, WorkflowExecution } from "./types.js";

@@ -15,7 +15,7 @@ test("discovers the copied directory as a trusted Pi extension", async () => {
     await mkdir(join(root, "node_modules"), { recursive: true });
     const packageEntry = fileURLToPath(import.meta.resolve("pi-extensible-workflows"));
     const packageRoot = join(dirname(packageEntry), "..", "..");
-    await symlink(packageRoot, join(root, "node_modules", "pi-extensible-workflows"), "dir");
+    await symlink(packageRoot, join(root, "node_modules", "pi-extensible-workflows"), process.platform === "win32" ? "junction" : "dir");
     await cp(dirname(fileURLToPath(import.meta.url)), destination, { recursive: true });
     const result = await discoverAndLoadExtensions([], root, join(root, ".pi", "agent"));
     assert.equal(result.errors.length, 0);

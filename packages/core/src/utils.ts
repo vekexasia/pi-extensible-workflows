@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { ERROR_CODES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WorkflowError, type JsonSchema, type JsonValue, type ModelSpec, type ThinkingLevel, type WorkflowErrorCode, type WorkflowExtensionSettings } from "./types.js";
 import { Minimatch } from "minimatch";
 export class SerialLane {
@@ -18,6 +19,15 @@ export function sanitizeDisplayText(value: string): string { return value.replac
 export { object as isObject };
 function isStringKey(key: PropertyKey): key is string { return typeof key === "string"; }
 function stringKeyValue(value: object, key: string): unknown { return object(value) ? value[key] : undefined; }
+function sortedJson(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(sortedJson);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map((key) => [key, sortedJson(value[key] as JsonValue)]));
+}
+/** A short digest of a JSON value that ignores object key order. */
+export function jsonDigest(value: JsonValue): string {
+  return createHash("sha256").update(JSON.stringify(sortedJson(value))).digest("hex").slice(0, 16);
+}
 export function jsonValue(value: unknown, seen = new Set<object>()): value is JsonValue {
   if (value === null || typeof value === "boolean" || typeof value === "string") return true;
   if (typeof value === "number") return Number.isFinite(value);
@@ -152,6 +162,24 @@ export function resolveModelReference(value: string, aliases: Readonly<Record<st
     unknownModel(reference, undefined, settingsPath);
   };
   return resolveReference(value, []);
+}
+type ToolSource = { getActiveTools(): string[]; getAllTools?(): readonly { name: string; exposure?: string }[] };
+/**
+ * Tools a session can reach, and so the ceiling for its agents: the declared tools plus the ones
+ * only codemode scripts call or tool_search loads, such as MCP tools with the default exposure.
+ * Agent sessions allow tools by name, so leaving these out would make them unreachable there.
+ */
+export function reachableTools(pi: ToolSource): string[] {
+  const undeclared = pi.getAllTools?.().filter(({ exposure }) => exposure === "codemode" || exposure === "deferred").map(({ name }) => name) ?? [];
+  return [...new Set([...pi.getActiveTools(), ...undeclared])];
+}
+/** Provider of the virtual models that expose workflow model aliases in `/model`. */
+export const VIRTUAL_MODEL_PROVIDER = "workflow";
+/** Child sessions do not load the workflow extension, so they receive the alias target instead of its virtual model. */
+export function physicalModel(spec: ModelSpec, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
+  if (spec.provider !== VIRTUAL_MODEL_PROVIDER || !modelAliasName(spec.model, aliases)) return spec;
+  const target = resolveModelReference(spec.model, aliases, knownModels, settingsPath);
+  return spec.thinking === undefined ? target : { ...target, thinking: spec.thinking };
 }
 export function modelCapability(value: string | ModelSpec, aliases?: Readonly<Record<string, string>>, knownModels?: ReadonlySet<string>, settingsPath?: string): string {
   const parsed = typeof value === "string" ? resolveModelReference(value, aliases, knownModels, settingsPath) : value;

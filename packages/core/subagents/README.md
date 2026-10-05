@@ -53,14 +53,14 @@ Every tool schema is a closed object. Unknown properties are rejected. The model
 | Tool | Input schema |
 | --- | --- |
 | `subagents_run` | `{ prompt: string, mode?: "background" \| "foreground", label?: string, model?: string, tools?: string[], skills?: string[], extensions?: string[], contextFiles?: string[], role?: string, worktree?: string, outputSchema?: object, retries?: integer 0..255, timeoutMs?: positive integer \| null }` |
-| `subagents_inspect` | `{ id?: string }` |
+| `subagents_inspect` | `{ id?: string, scope?: "session" \| "all" }` |
 | `subagents_steer` | `{ id: string, message: string }` |
 | `subagents_stop` | `{ id: string }` |
 | `subagents_retry` | `{ id: string }` |
 
 `prompt` is the only required `subagents_run` property. `mode` defaults to "background". Resource candidates start enabled, so plain positive top-level selector lists are additive and top-level `[]` adds no matches. Use `["!*", "read", "grep"]` to restrict a selector to those resources, or `["!*"]` to select none. A `role` string selects an existing workflow role. Model, tools, skills, extensions, and contextFiles are top-level `AgentOptions` overrides applied after the role file. Concrete models are `provider/model:thinking`. Capability selectors use ordered minimatch rules and are applied after global, trusted-project, and role selectors. Use `tools: ["*"]` to re-enable all tools after a role restriction.
 
-`subagents_inspect({})` returns all accessible run summaries ordered by start time. `subagents_inspect({ id })` returns the detailed lifecycle record, including state, start and finish timestamps, and the live snapshot under `progress`: `state`, cumulative `accounting`, `toolCalls`, `activity`, and `lastEventAt`. The snapshot state never includes the effective system prompt, and inspection has no `usage` field; token totals are derived from accounting. Materialized worktree path and branch are included when available. For completed runs it also includes `value`; for failed runs it includes `error`. A running run has no terminal value yet. Unknown IDs fail with `RUN_NOT_FOUND`.
+`subagents_inspect({})` returns the current Pi session's run summaries ordered by start time; `subagents_inspect({ scope: "all" })` lists every stored run. `subagents_inspect({ id })` returns the detailed lifecycle record, including state, start and finish timestamps, and the live snapshot under `progress`: `state`, cumulative `accounting`, `toolCalls`, `activity`, and `lastEventAt`. The snapshot state never includes the effective system prompt, and inspection has no `usage` field; token totals are derived from accounting. Materialized worktree path and branch are included when available. For completed runs it also includes `value`; for failed runs it includes `error`. A running run has no terminal value yet. Unknown IDs fail with `RUN_NOT_FOUND`.
 
 ## Launching and concurrency
 

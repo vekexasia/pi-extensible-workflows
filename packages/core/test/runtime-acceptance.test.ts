@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { callUnchecked, contextualWorkflowAction, executeTool, executeToolCall, testExtensionContext, testExtensionContextFor, testExtensionApi } from "./support.js";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, type TSchema } from "@earendil-works/pi-ai";
+import { Value } from "typebox/value";
 import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, loadingRegistry, localAgentTransport, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowExtension, runWorkflow, shellIdentityPath, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue, type WorkflowExtension } from "../src/index.js";
 import { createLocalPiSession } from "../src/agent-execution.js";
 import { listRunIds, runsDirectory, RunStore } from "../src/persistence.js";
@@ -728,7 +729,7 @@ void test("production child discovery does not replace the frozen parent workflo
   const benignExtension = join(childRoot, "benign-extension.mjs");
   writeFileSync(benignExtension, `import { appendFileSync } from "node:fs"; export default function(pi) { pi.on("session_start", (event) => appendFileSync(${JSON.stringify(lifecycleFile)}, "start:" + event.reason + "\\n")); pi.on("session_shutdown", (event) => appendFileSync(${JSON.stringify(lifecycleFile)}, "shutdown:" + event.reason + "\\n")); }`);
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: [packageRoot], extensions: [hostEntry, benignExtension] }));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: { value?: unknown } }> }> = [];
+  const tools: Array<{ name: string; outputSchema?: TSchema; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: { value?: unknown }; structuredContent?: unknown }> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   workflowExtension({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "workflow_catalog"], on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; } } as never, home, async () => {});
@@ -742,7 +743,8 @@ void test("production child discovery does not replace the frozen parent workflo
   const parentFunctions = Object.keys(parentRegistry.functions()).sort();
   const workflow = tools.find(({ name }) => name === "workflow");
   const catalog = tools.find(({ name }) => name === "workflow_catalog");
-  assert.ok(workflow && catalog);
+  assert.ok(workflow && catalog?.outputSchema);
+  for (const params of [{}, { name: "probe" }, { name: "missing" }]) assert.ok(Value.Check(catalog.outputSchema, (await catalog.execute("shape", params)).structuredContent), `catalog ${JSON.stringify(params)} matches its outputSchema`);
   const checkpoint = async () => ({
     registry: loadingRegistry(),
     frozen: loadingRegistry().frozen,
@@ -1267,12 +1269,21 @@ void test("workflow_status returns a safe current-project summary across session
   await current.create({ id: "run-current", workflowName: "status-check", cwd, sessionId: "current-session", state: "failed", error: { code: "AGENT_FAILED", message: "failed" }, failedAt: "agent/review", phase: "review", budget: { tokens: { hard: 100 } }, usage: { tokens: 10, costUsd: 0.5, durationMs: 20, agentLaunches: 1 }, delivery: { mode: "background", state: "pending", toolCallId: "private-call" }, agents: [agent], agentSessions: [{ transport: "local", sessionId: "private-session" }] }, snapshot("status-check"));
   const other = new RunStore(cwd, "other-session", "run-other", home);
   await other.create({ id: "run-other", workflowName: "other-status", cwd, sessionId: "other-session", state: "interrupted", agents: [], agentSessions: [] }, snapshot("other-status"));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }> }> = [];
+  const tools: Array<{ name: string; outputSchema?: TSchema; annotations?: { readOnlyHint?: boolean }; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown>; structuredContent?: unknown }> }> = [];
   workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
   const status = tools.find(({ name }) => name === "workflow_status");
-  assert.ok(status);
+  assert.ok(status?.outputSchema);
+  assert.deepEqual(status.annotations, { readOnlyHint: true });
   const context = { cwd, sessionManager: { getSessionId: () => "current-session" } };
   const result = await status.execute("status", { runId: "run-current" }, undefined, undefined, context);
+  assert.deepEqual(result.structuredContent, result.details, "codemode scripts receive the status object");
+  assert.ok(Value.Check(status.outputSchema, result.structuredContent));
+  const stop = tools.find(({ name }) => name === "workflow_stop");
+  assert.ok(stop?.outputSchema);
+  assert.equal(stop.annotations, undefined);
+  const stopped = await stop.execute("stop", { runId: "run-current" }, undefined, undefined, context);
+  assert.deepEqual(stopped.structuredContent, { runId: "run-current", state: "unknown", stopped: false, reason: "unknown_run" });
+  assert.ok(Value.Check(stop.outputSchema, stopped.structuredContent));
   assert.deepEqual(result.details, { runId: "run-current", workflowName: "status-check", state: "failed", error: { code: "AGENT_FAILED", message: "failed" }, failedAt: "agent/review", budget: { tokens: { hard: 100 } }, usage: { tokens: 10, costUsd: 0.5, durationMs: 20, agentLaunches: 1 }, phase: "review", delivery: { mode: "background", state: "pending" }, agents: [{ id: "run-current:1", label: "Review", path: "agent/review", state: "failed", lastEventAt: 1234, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }] });
   const firstContent = result.content[0];
   assert.ok(firstContent);

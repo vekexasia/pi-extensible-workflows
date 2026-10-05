@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createExtensionRuntime, ExtensionRunner, ModelRegistry, ModelRuntime, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createExtensionRuntime, ExtensionRunner, ModelRegistry, ModelRuntime, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionToolContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { ERROR_CODES, RUN_STATES } from "../src/index.js";
 import type { AgentTransportContext, JsonValue, WorkflowExtension, WorkflowFailureDiagnostics } from "../src/index.js";
 import type { WorkflowExtensionAPI } from "../src/host.js";
@@ -49,7 +49,7 @@ type TestWorkflowLogEntry = { workflowName: string; message: string };
 type TestExtensionApiOptions = {
   registerTool?(tool: TestTool): void;
   registerCommand?: ExtensionAPI["registerCommand"];
-  on?: ExtensionAPI["on"];
+  on?: (event: string, handler: never) => void;
   getThinkingLevel?: ExtensionAPI["getThinkingLevel"];
   getActiveTools?: ExtensionAPI["getActiveTools"];
   appendEntry?: (type: string, data: TestWorkflowLogEntry) => void;
@@ -72,7 +72,7 @@ export function testExtensionApi(options: TestExtensionApiOptions = {}): Workflo
     },
     getActiveTools: options.getActiveTools ?? (() => []),
     getThinkingLevel: options.getThinkingLevel ?? (() => "medium"),
-    on: options.on ?? (() => {}),
+    on: (event: string, handler: never) => { options.on?.(event, handler); return () => {}; },
     registerCommand: options.registerCommand ?? (() => {}),
     registerTool(tool) { options.registerTool?.(tool); },
     sendMessage(message, deliveryOptions) {
@@ -87,7 +87,11 @@ export function testExtensionApi(options: TestExtensionApiOptions = {}): Workflo
 }
 const testModelRegistry = new ModelRegistry(await ModelRuntime.create({ modelsPath: null }));
 const testExtensionRunner = new ExtensionRunner([], createExtensionRuntime(), "/repo", SessionManager.inMemory("/repo", { id: "test-session" }), testModelRegistry);
-export const testExtensionContext: ExtensionCommandContext = testExtensionRunner.createCommandContext();
+type TestContext = ExtensionCommandContext & ExtensionToolContext;
+function toolContext(context: ExtensionCommandContext): TestContext {
+  return Object.assign(context, { tools: [], executeTool: () => Promise.reject(new Error("executeTool is not available in tests")) });
+}
+export const testExtensionContext: TestContext = toolContext(testExtensionRunner.createCommandContext());
 const testTransportSignal = new AbortController().signal;
 export const testTransportContext = {
   run: { cwd: "/repo", sessionId: "test-session", runId: "test-run", workflow: { name: "test" }, args: null, signal: testTransportSignal },
@@ -96,12 +100,12 @@ export const testTransportContext = {
   signal: testTransportSignal,
   settings: {},
 } satisfies AgentTransportContext;
-export function testExtensionContextFor(overrides: object = {}): ExtensionCommandContext {
-  const context = testExtensionRunner.createCommandContext();
+export function testExtensionContextFor(overrides: object = {}): TestContext {
+  const context = toolContext(testExtensionRunner.createCommandContext());
   for (const [key, value] of Object.entries(overrides)) Object.defineProperty(context, key, { configurable: true, enumerable: true, writable: true, value });
   return context;
 }
-export function executeTool<T extends Pick<ToolDefinition, "execute">>(tool: T, toolCallId: Parameters<T["execute"]>[0], params: Parameters<T["execute"]>[1], context: ExtensionContext = testExtensionContext): Promise<unknown> {
+export function executeTool<T extends Pick<ToolDefinition, "execute">>(tool: T, toolCallId: Parameters<T["execute"]>[0], params: Parameters<T["execute"]>[1], context: ExtensionToolContext = testExtensionContext): Promise<unknown> {
   return tool.execute(toolCallId, params, undefined, undefined, context);
 }
 export function callUnchecked<T>(fn: (...args: never[]) => T, thisArg: unknown, args: readonly unknown[]): T {

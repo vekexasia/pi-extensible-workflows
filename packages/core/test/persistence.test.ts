@@ -882,6 +882,22 @@ void test("maintains an atomic compact summary and derives legacy summaries", as
   assert.deepEqual(legacy.replayablePaths, ["agent/one"]);
 });
 
+void test("run mutations settle their best-effort summary writes before returning", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-summary-settled-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const persistedSummary = () => decodeTestJsonRecord(readFileSync(join(store.directory, "summary.json"), "utf8"));
+  await store.saveState({ ...run(cwd), state: "paused" });
+  assert.equal(persistedSummary().state, "paused");
+  await store.complete("agent/one", "done");
+  assert.deepEqual(persistedSummary().replayablePaths, ["agent/one"]);
+  await store.updateState((current) => ({ ...current, state: "completed" }));
+  assert.equal(persistedSummary().state, "completed");
+  // Removing an owned terminal run must not race a detached summary temporary-file write.
+  rmSync(home, { recursive: true, force: true });
+});
+
 void test("loadSummary derives from authoritative state and journal when the projection is stale", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-summary-authority-"));
   const cwd = join(home, "project");

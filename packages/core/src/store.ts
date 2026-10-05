@@ -94,8 +94,8 @@ export class RunStore {
     });
     await write;
   }
-  //NOTE: summary.json is an optional derived cache (see OPTIONAL_RUN_FILES); a missed refresh self-heals because every reader (loadSummary, CLI inspector) recomputes from state/journal. Keep this best-effort so a cache hiccup never fails the primary write.
-  private refreshSummaryBestEffort(): void { void this.refreshSummary().catch(() => undefined); }
+  //NOTE: summary.json is an optional derived cache (see OPTIONAL_RUN_FILES); a missed refresh self-heals because every reader (loadSummary, CLI inspector) recomputes from state/journal. Keep failures best-effort, but await the owned write so completion, shutdown and deletion cannot race a detached cache writer.
+  private async refreshSummaryBestEffort(): Promise<void> { await this.refreshSummary().catch(() => undefined); }
 
   async isComplete(): Promise<boolean> {
     try { await Promise.all([access(join(this.directory, "snapshot.json")), access(join(this.directory, "journal.json")), access(join(this.directory, "ownership.json")), access(join(this.directory, "state.json"))]); return true; }
@@ -139,7 +139,7 @@ export class RunStore {
     const write = this.stateLane.run(async () => {
       this.#assertRunIdentity(run, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
       await atomicJson(join(this.directory, "state.json"), run);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
     });
     await write;
   }
@@ -152,7 +152,7 @@ export class RunStore {
       const result = await update(current);
       this.#assertRunIdentity(result, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
       await atomicJson(join(this.directory, "state.json"), result);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
       return result;
     });
     return write;
@@ -277,7 +277,7 @@ export class RunStore {
       journal.awaiting ??= {};
       const result = await update(journal);
       await atomicJson(join(this.directory, "journal.json"), journal);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
       return result;
     });
     return write;

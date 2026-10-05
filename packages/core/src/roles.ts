@@ -5,7 +5,7 @@ import type { AgentDefinition, AgentResourceSelectorSources, AgentResourceSelect
 import { registeredWorkflowRoleDirectoryRegistrations } from "./registry.js";
 import { resolveWorkflowSettings, validateContextFileScopes, validateSelectorList, validateWorkflowExtensionSettings, workflowSettingsPath } from "./settings.js";
 import { assertModelThinking, deepFreeze, object, errorText, fail, isNodeError, modelAliasName, modelCapability, resourcePatternHasMagic, resolveModelReference, selectResourcesByLayers, unmatchedResourcePatterns } from "./utils.js";
-import { canonicalPath } from "./paths.js";
+import { canonicalPath, extensionIdentity } from "./paths.js";
 
 const ROLE_DIRECTORY = "pi-extensible-workflows";
 // Preserve the role-file base when a discovered definition is resolved again through the public API.
@@ -237,7 +237,8 @@ export function loadAgentDefinitions(cwd: string, agentDir = getAgentDir(), proj
 export function canonicalExtensionSelector(selector: string, base = process.cwd()): string {
   const negated = selector.startsWith("!");
   const body = negated ? selector.slice(1) : selector;
-  if (body === "*" || body === "**" || body.startsWith("**/")) return selector;
+  // Built-in extensions are named `builtin:<name>`, not by a path.
+  if (body === "*" || body === "**" || body.startsWith("**/") || body.startsWith("builtin:")) return selector;
   const resolved = resolve(base, body);
   if (resourcePatternHasMagic(body)) return `${negated ? "!" : ""}${resolved}`;
   return `${negated ? "!" : ""}${canonicalPath(resolved)}`;
@@ -299,7 +300,7 @@ export function resolveRole(name: string | undefined, options: RoleResolutionOpt
     if (outsideRootTool) fail("UNKNOWN_TOOL", `Tool is outside the launching session boundary: ${outsideRootTool}`);
   }
   const selectedSkills = resources.skills === undefined ? undefined : selectResourcesByLayers(selectorLayers.skills, resources.skills);
-  const extensionResources = resources.extensions?.map((extension) => canonicalPath(extension));
+  const extensionResources = resources.extensions?.map((extension) => extensionIdentity(extension));
   const selectedExtensions = extensionResources === undefined ? undefined : selectResourcesByLayers(selectorLayers.extensions, extensionResources);
   const unmatchedSkills = resources.skills === undefined ? undefined : unmatchedResourcePatterns(selectorLayers.skills.flatMap((layer) => layer ?? []), resources.skills);
   const unmatchedExtensions = extensionResources === undefined ? undefined : unmatchedResourcePatterns(selectorLayers.extensions.flatMap((layer) => layer ?? []), extensionResources);

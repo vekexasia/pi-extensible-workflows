@@ -49,7 +49,7 @@ const ENTRY_TYPE = "piewf-run-receipt";
  * Repaint interval. Fast enough that the spinner reads as motion rather than a
  * stutter; the underlying data is only re-read when an event says it changed.
  */
-const REPAINT_MS = 125;
+export const REPAINT_MS = 125;
 
 /**
  * Filesystem rescan interval. Shell-only activity has no event, but it does not

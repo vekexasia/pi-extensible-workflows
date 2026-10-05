@@ -139,7 +139,7 @@ The model-facing surface is exactly:
 | Tool | Contract |
 | --- | --- |
 | `subagents_run` | Start one run. `prompt` is required; `mode` defaults to `background` and may be `foreground`. |
-| `subagents_inspect` | Omit `id` for summaries or provide it for detailed progress and terminal output. |
+| `subagents_inspect` | Omit `id` for current-session summaries (`scope: "all"` for every session) or provide it for detailed progress and terminal output. |
 | `subagents_steer` | Send one message to a running ID. |
 | `subagents_stop` | Stop one run and clean its worktree. |
 | `subagents_retry` | Start a fresh run from a failed or stopped request, with a new ID and the original mode. |
@@ -309,7 +309,7 @@ Dynamic roles do not create inline role definitions. The selected role name must
 
 Use a dynamic role when the choice must be made at runtime. Use a static role when possible because it gives earlier unknown-role, model, and tool errors and produces a smaller launch snapshot.
 
-`piewf doctor --role <name>` or `piewf doctor <name>` is the read-only way to inspect the effective role, model, tools, resources, setup hooks, and prepared system prompt. Add `--prompt <text>` when a prompt-dependent hook must be inspected. With `--json`, either role form adds `roleTarget` and adds `roleInspection` when inspection succeeds.
+`piewf doctor --role <name>` or `piewf doctor <name>` is the read-only way to inspect the effective role, model, tools, resources, setup hooks, and prepared system prompt. A role ending in `.md` is read as a role file instead, relative to the current working directory, so `piewf doctor ./roles/reviewer.md` checks a role before it is installed. Add `--prompt <text>` when a prompt-dependent hook must be inspected. With `--json`, either role form adds `roleTarget` and adds `roleInspection` when inspection succeeds.
 
 Role discovery is fail-closed. Invalid frontmatter or the rejected legacy selector in any packaged or global role file, or in any trusted-project role file, prevents the runtime from loading a partial role set. Doctor reports `ROLE_FRONTMATTER` or `AGENT_RESOURCE_SELECTOR_MIGRATION` plus `ROLE_LOAD_BLOCKED`; active role entries in the general report say `unavailable: role loading failed` and doctor exits `1`. See the [doctor reference](developers.html#operations) for exact diagnostics. A focused unavailable role reports `ROLE_NOT_FOUND`; a missing role at runtime fails with `UNKNOWN_AGENT_TYPE`.
 

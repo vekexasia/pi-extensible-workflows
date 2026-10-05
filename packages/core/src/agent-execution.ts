@@ -5,7 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { Compile } from "typebox/compile";
-import { createAgentSession, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type InlineExtension } from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext, ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 type HerdrModelContext = { readonly model: ExtensionContext["model"]; readonly modelRegistry: ModelRegistry | undefined };
 type AgentMessage = { role: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } } };
@@ -46,7 +46,7 @@ export interface PiResourceInspection {
   readonly systemPromptSource?: string;
 }
 import type { AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowRunContext, WorkflowSessionStartEvent } from "./types.js";
-import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorText, jsonObject, jsonValue, mergeWorkflowExtensionSettings, object, resolveModelReference, resourcePatternHasMagic, unmatchedResourcePatterns } from "./utils.js";
+import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorText, jsonObject, jsonValue, mergeWorkflowExtensionSettings, object, physicalModel, resolveModelReference, resourcePatternHasMagic, unmatchedResourcePatterns } from "./utils.js";
 import { SETTLED_AGENT_STATES, WorkflowError, isContextFileScope, zeroAccounting, type AgentDefinition, type AgentState } from "./types.js";
 import { createLiveSessionHandoff } from "./session-handoff.js";
 import { createToolTimingExtension } from "./tool-timing.js";
@@ -55,7 +55,7 @@ import { createPiRuntimeAgentRunner, isRuntimeAgentProviderError, normalizePiRun
 import type { RuntimeAgentProgress, RuntimeUsage } from "./runtime/agent-runner.js";
 import { defaultWorkflowResultSchema } from "./runtime/workflow-result.js";
 import { validateAgentOptions, validateSchema } from "./validation.js";
-import { canonicalPath } from "./paths.js";
+import { canonicalPath, extensionIdentity } from "./paths.js";
 import { canonicalExtensionSelector, resolveRole } from "./roles.js";
 import type { RunStore } from "./persistence.js";
 type AgentExecutionRunStore = Pick<RunStore, "recordSystemPrompt" | "validateWorktree" | "worktree" | "snapshotWorktree">;
@@ -141,16 +141,23 @@ function accounting(stats: WorkflowAgentSessionStats): AgentAccounting {
   return { input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, cost: stats.cost };
 }
 
-const extensionDirectory = dirname(fileURLToPath(import.meta.url));
-const workflowPackageRoot = basename(dirname(extensionDirectory)) === "dist" ? resolve(extensionDirectory, "../..") : resolve(extensionDirectory, "..");
-const WORKFLOW_HOST_ENTRIES = new Set([
-  canonicalPath(resolve(workflowPackageRoot, "src/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/src/index.js")),
-  canonicalPath(resolve(workflowPackageRoot, "starter/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/starter/index.js")),
-  canonicalPath(resolve(workflowPackageRoot, "subagents/index.ts")),
-  canonicalPath(resolve(workflowPackageRoot, "dist/subagents/index.js")),
-]);
+const WORKFLOW_HOST_ENTRY_PATHS = ["src/index.ts", "dist/src/index.js", "starter/index.ts", "dist/starter/index.js", "subagents/index.ts", "dist/subagents/index.js"];
+function isWorkflowHostEntry(path: string): boolean {
+  const entryPath = canonicalPath(path);
+  let packageRoot = dirname(entryPath);
+  while (packageRoot !== dirname(packageRoot)) {
+    const packageMetadataPath = join(packageRoot, "package.json");
+    if (existsSync(packageMetadataPath)) {
+      try {
+        const metadata: unknown = JSON.parse(readFileSync(packageMetadataPath, "utf8"));
+        if (typeof metadata !== "object" || metadata === null || !("name" in metadata) || metadata.name !== "pi-extensible-workflows") return false;
+        return WORKFLOW_HOST_ENTRY_PATHS.some((entry) => canonicalPath(join(packageRoot, entry)) === entryPath);
+      } catch { return false; }
+    }
+    packageRoot = dirname(packageRoot);
+  }
+  return false;
+}
 const WORKFLOW_DIRECTORY = "pi-extensible-workflows";
 function workflowSystemPromptPath(cwd: string, agentDir: string, projectTrusted: boolean): string | undefined {
   const projectPath = join(cwd, ".pi", WORKFLOW_DIRECTORY, "SYSTEM.md");
@@ -184,24 +191,29 @@ function loadPiPackageDirectory(): Promise<PiPackageDirectoryResolution> {
     }
   }).catch((error: unknown) => ({ error: `could not load @earendil-works/pi-coding-agent package metadata: ${errorText(error)}` }));
 }
-let nativePromptTemplateModule: Promise<NativePromptTemplateModule> | undefined;
-async function loadNativePromptTemplateModule(): Promise<NativePromptTemplateModule> {
+const nativeCoreModules = new Map<string, Promise<unknown>>();
+/** Pi does not export these core modules, so inspection loads them from the installed package. */
+async function loadNativeCoreModule(file: string, label: string): Promise<unknown> {
   const packageDirectory = await loadPiPackageDirectory();
-  let promptTemplatePath: string | undefined;
+  let modulePath: string | undefined;
   if (packageDirectory.directory) {
-    const candidate = resolve(packageDirectory.directory, "dist/core/prompt-templates.js");
-    if (existsSync(candidate)) promptTemplatePath = candidate;
+    const candidate = resolve(packageDirectory.directory, "dist/core", file);
+    if (existsSync(candidate)) modulePath = candidate;
   }
-  promptTemplatePath ??= resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core/prompt-templates.js");
+  modulePath ??= resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core", file);
   const packageDirectoryError = packageDirectory.error ? ` Package directory lookup failed: ${packageDirectory.error}` : "";
-  return nativePromptTemplateModule ??= import(pathToFileURL(promptTemplatePath).href).then((module) => module as NativePromptTemplateModule).catch((error: unknown) => { throw new Error(`Could not load Pi prompt templates.${packageDirectoryError}`, { cause: error }); });
+  let loaded = nativeCoreModules.get(file);
+  if (!loaded) { loaded = import(pathToFileURL(modulePath).href).catch((error: unknown) => { throw new Error(`Could not load Pi ${label}.${packageDirectoryError}`, { cause: error }); }); nativeCoreModules.set(file, loaded); }
+  return loaded;
 }
 async function expandPromptTemplateForInspection(text: string, templates: readonly { name: string; content: string }[]): Promise<string> {
-  return (await loadNativePromptTemplateModule()).expandPromptTemplate(text, templates);
+  return (await loadNativeCoreModule("prompt-templates.js", "prompt templates") as NativePromptTemplateModule).expandPromptTemplate(text, templates);
+}
+async function buildSystemPromptForInspection(options: unknown): Promise<string> {
+  return (await loadNativeCoreModule("system-prompt.js", "system prompt builder") as { buildSystemPrompt(options: unknown): string }).buildSystemPrompt(options);
 }
 type NativePromptSession = PiSession & {
-  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(prompt: string, images: undefined, systemPrompt: string, options: unknown): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
-  readonly _baseSystemPrompt?: string;
+  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(prompt: string, images: undefined, options: unknown): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
   readonly _baseSystemPromptOptions?: unknown;
   readonly _expandSkillCommand?: (text: string) => string;
   readonly promptTemplates?: readonly { name: string; content: string }[];
@@ -210,12 +222,11 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
   const session = native as NativePromptSession;
   const diagnostics: Array<{ type: "error"; message: string; source?: string }> = [];
   const runner = session._extensionRunner;
-  const baseSystemPrompt = typeof session._baseSystemPrompt === "string" ? session._baseSystemPrompt : session.systemPrompt ?? "";
+  const baseSystemPrompt = session.systemPrompt ?? "";
   const baseOptions = session._baseSystemPromptOptions;
   const expandSkillCommand = session._expandSkillCommand;
   const templates = session.promptTemplates;
   if (!runner) diagnostics.push({ type: "error", message: "Pi prompt inspection seam is unavailable: extension runner is missing", source: "Pi session" });
-  if (typeof session._baseSystemPrompt !== "string") diagnostics.push({ type: "error", message: "Pi prompt inspection seam is unavailable: base system prompt is missing", source: "Pi session" });
   if (baseOptions === undefined) diagnostics.push({ type: "error", message: "Pi prompt inspection seam is unavailable: base system prompt options are missing", source: "Pi session" });
   if (typeof expandSkillCommand !== "function") diagnostics.push({ type: "error", message: "Pi prompt inspection seam is unavailable: skill expansion is missing", source: "Pi session" });
   if (!Array.isArray(templates)) diagnostics.push({ type: "error", message: "Pi prompt inspection seam is unavailable: prompt templates are missing", source: "Pi session" });
@@ -239,9 +250,11 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
         catch (error) { diagnostics.push({ type: "error", message: `Pi prompt template expansion is unavailable: ${errorText(error)}`, source: "Pi session" }); }
       } else expandedPrompt = skillExpanded;
     }
-    const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart(expandedPrompt, undefined, baseSystemPrompt, baseOptions) : undefined;
-    const prepared = result as { messages?: readonly unknown[]; systemPrompt?: unknown } | undefined;
-    return { prompt: text, expandedPrompt, systemPrompt: typeof prepared?.systemPrompt === "string" ? prepared.systemPrompt : baseSystemPrompt, systemPromptOptions: baseOptions, messages: prepared?.messages ?? [], inputHandled, diagnostics };
+    const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart(expandedPrompt, undefined, baseOptions) : undefined;
+    const prepared = result as { messages?: readonly unknown[]; systemPromptOptions?: unknown } | undefined;
+    const systemPromptOptions = prepared?.systemPromptOptions ?? baseOptions;
+    const systemPrompt = prepared?.systemPromptOptions === undefined ? baseSystemPrompt : await buildSystemPromptForInspection(prepared.systemPromptOptions);
+    return { prompt: text, expandedPrompt, systemPrompt, systemPromptOptions, messages: prepared?.messages ?? [], inputHandled, diagnostics };
   } finally { unsubscribe?.(); }
 }
 
@@ -283,6 +296,23 @@ export function flushExtensionProviders(resourceLoader: DefaultResourceLoader, m
   return failures;
 }
 
+/**
+ * The CLI adds Pi's built-in extensions itself; SDK sessions only get them from these public
+ * factories (docs/sdk.md). As `builtin` entries they obey `-builtin:<name>` settings, and like the
+ * CLI's they are replaceable by an extension that registers the same tools or commands.
+ * NOTE: Pi does not export the built-in llama.cpp extension, so workflow agents cannot use models it
+ * provides. Declare the server as a provider in models.json instead.
+ */
+function builtinExtensions(): InlineExtension[] {
+  return [
+    { name: "codemode", factory: createCodemodeExtension(), replaceable: true, builtin: true },
+    { name: "tool-search", factory: createToolSearchExtension(), replaceable: true, builtin: true },
+    { name: "mcp", factory: createMcpExtension(), replaceable: true, builtin: true },
+  ];
+}
+const BUILTIN_EXTENSION_PREFIX = "builtin:";
+function isLlamaModel(model: ModelSpec): boolean { return model.provider === "llama.cpp"; }
+
 async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
@@ -295,13 +325,16 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
   const tools = [...new Set([...input.tools, ...customTools.map(({ name }) => name)])];
   let settingsManager: SettingsManager;
   let resourceLoader: DefaultResourceLoader;
+  const builtins = builtinExtensions();
+  const builtinNames = builtins.flatMap((extension) => typeof extension === "function" ? [] : [extension.name]);
+  const extensionFactories = [...builtins, ...(input.extensionFactories ?? [])];
   const policy = input.resourcePolicy;
   if (policy) {
     settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: false });
     settingsManager.setProjectTrusted(policy.projectTrusted);
-    const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
+    const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager, builtinExtensions: builtinNames });
     const resolved = await packageManager.resolve();
-    const discoveredExtensions = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => canonicalPath(path)))];
+    const discoveredExtensions = [...new Set(resolved.extensions.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => extensionIdentity(path)))];
     const selectorSources = policy.selectorSources;
     const selection = resolveRole(undefined, {
       cwd: input.cwd,
@@ -309,7 +342,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
       resources: { extensions: discoveredExtensions },
     });
     const selectedExtensions = selection.selectedExtensions ?? [];
-    const extensionPaths = selectedExtensions.filter((path) => !WORKFLOW_HOST_ENTRIES.has(path));
+    const extensionPaths = selectedExtensions.filter((path) => path.startsWith(BUILTIN_EXTENSION_PREFIX) || !isWorkflowHostEntry(path));
     policy.selectedExtensions = selectedExtensions;
     policy.unmatchedExtensions = selection.unmatchedExtensions ?? [];
     const skillPaths = [...new Set(resolved.skills.filter(({ enabled, metadata }) => enabled && (policy.projectTrusted || metadata.scope !== "project")).map(({ path }) => path))];
@@ -330,7 +363,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
       noSkills: true,
       noPromptTemplates: input.noPromptTemplates ?? false,
       additionalSkillPaths: [...new Set([...skillPaths, ...(input.additionalSkillPaths ?? [])])],
-      ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}),
+      extensionFactories,
       ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}),
       skillsOverride: (base) => {
         const disabledSkills = updateSkillMatches(base.skills);
@@ -342,10 +375,10 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     await resourceLoader.reload();
   } else {
     settingsManager = SettingsManager.create(input.cwd, agentDir, { projectTrusted: true });
-    const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager });
+    const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager, builtinExtensions: builtinNames });
     const resolved = await packageManager.resolve();
-    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => canonicalPath(path)).filter((path) => !WORKFLOW_HOST_ENTRIES.has(path)))];
-    resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, noPromptTemplates: input.noPromptTemplates ?? false, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
+    const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => extensionIdentity(path)).filter((path) => path.startsWith(BUILTIN_EXTENSION_PREFIX) || !isWorkflowHostEntry(path)))];
+    resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, noPromptTemplates: input.noPromptTemplates ?? false, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), extensionFactories, ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
   const providerFailures = flushExtensionProviders(resourceLoader, modelRuntime);
@@ -356,7 +389,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     // missing, so the failure travels with the complaint rather than being
     // swallowed — otherwise a misconfigured gateway reads as a typo in a model
     // name.
-    const because = providerFailures.length > 0 ? ` (provider registration failed — ${providerFailures.join("; ")})` : "";
+    const because = providerFailures.length > 0 ? ` (provider registration failed — ${providerFailures.join("; ")})` : isLlamaModel(input.model) ? " (Pi does not expose its built-in llama.cpp provider to extension sessions; declare the llama.cpp server as a provider in models.json and use that model instead)" : "";
     throw new WorkflowError("UNKNOWN_MODEL", `Unknown model: ${input.model.provider}/${input.model.model}${because}`);
   }
   const effectiveSessionStartEvent = input.settings === undefined && sessionStartEvent === undefined ? undefined : { ...(sessionStartEvent ?? { type: "session_start" as const, reason: "startup" as const }), settings: input.settings ?? Object.freeze({}) };
@@ -381,13 +414,13 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     await shutdown("quit").catch(() => undefined);
     throw error;
   }
-  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalPath(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalPath(filePath)) };
+  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => extensionIdentity(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalPath(filePath)) };
   const resourceInspection = (): PiResourceInspection => {
     const extensions = resourceLoader.getExtensions();
     const skills = resourceLoader.getSkills();
     const diagnostics = [...extensions.errors.map(({ path, error }) => ({ type: "error" as const, message: error, source: path })), ...skills.diagnostics.map(({ type, path, message }) => ({ type, message, ...(path ? { source: path } : {}) }))];
     const systemSource = systemPromptSource;
-    return { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => canonicalPath(resolvedPath)), skills: skills.skills.map(({ name }) => name), diagnostics, ...(systemSource ? { systemPromptSource: systemSource } : resourceLoader.getSystemPrompt() !== undefined ? { systemPromptSource: "Pi resource loader" } : {}) };
+    return { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => extensionIdentity(resolvedPath)), skills: skills.skills.map(({ name }) => name), diagnostics, ...(systemSource ? { systemPromptSource: systemSource } : resourceLoader.getSystemPrompt() !== undefined ? { systemPromptSource: "Pi resource loader" } : {}) };
   };
   const managedSession = Object.assign(session, {
     getLeafId: () => manager.getLeafId(),
@@ -944,7 +977,7 @@ export class WorkflowAgentExecutor {
       ...(options.contextFiles === undefined ? {} : { contextFiles: options.contextFiles }),
       ...(options.effectiveTools === undefined ? {} : { effectiveTools: options.effectiveTools }),
     });
-    return { model: resolved.model ?? this.root.model, ...(resolved.requestedModel === undefined ? {} : { requestedModel: resolved.requestedModel }), tools: resolved.tools ?? [], ...(resolved.overrideSystemPrompt ? { systemPrompt: resolved.prompt } : {}), systemPromptAppend: resolved.overrideSystemPrompt ? "" : resolved.prompt, ...(resolved.contextFiles === undefined ? {} : { contextFiles: resolved.contextFiles }) };
+    return { model: physicalModel(resolved.model ?? this.root.model, this.root.modelAliases, this.root.knownModels, this.root.settingsPath), ...(resolved.requestedModel === undefined ? {} : { requestedModel: resolved.requestedModel }), tools: resolved.tools ?? [], ...(resolved.overrideSystemPrompt ? { systemPrompt: resolved.prompt } : {}), systemPromptAppend: resolved.overrideSystemPrompt ? "" : resolved.prompt, ...(resolved.contextFiles === undefined ? {} : { contextFiles: resolved.contextFiles }) };
   }
 
   async execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, customTools: readonly ToolDefinition[] = [], setSteer?: (handler: (message: string) => void | Promise<void>) => void, beforeRetry?: () => void): Promise<AgentExecutionResult> {
@@ -1389,6 +1422,7 @@ export class FairAgentScheduler {
     const agentTool = defineTool({
       name: "agent", label: "Child Agent", description: "Start a direct child agent",
       parameters: Type.Object({ prompt: Type.String(), label: Type.String(), tools: Type.Optional(Type.Array(Type.String())), skills: Type.Optional(Type.Array(Type.String())), extensions: Type.Optional(Type.Array(Type.String())), model: Type.Optional(Type.String()), role: Type.Optional(Type.String()), contextFiles: Type.Optional(Type.Array(Type.String())), outputSchema: Type.Optional(Type.Record(Type.String(), Type.Unknown())), retries: Type.Optional(Type.Integer({ minimum: 0 })), timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()])) }, { additionalProperties: true }),
+      outputSchema: Type.Object({ id: Type.String() }),
       execute: async (_id, params) => {
         if (!isChildAgentToolParams(params)) throw new WorkflowError("INVALID_METADATA", "Invalid child agent parameters");
         validateAgentOptions(params);
@@ -1399,13 +1433,14 @@ export class FairAgentScheduler {
         Reflect.deleteProperty(agentOptions, "prompt");
         const options: ScheduledAgentOptions = { label: params.label, requestedLabel: params.label, cwd: parent.options.cwd, tools, agentOptions, ...(params.skills ? { skills: params.skills } : {}), ...(params.extensions ? { extensions: params.extensions } : {}), ...(params.model ? { model: params.model } : {}), ...(params.role ? { role: params.role } : {}), ...(params.contextFiles ? { contextFiles: params.contextFiles } : {}), ...(outputSchema === undefined ? {} : { schema: outputSchema }), ...(params.retries === undefined ? {} : { retries: params.retries }), ...(params.timeoutMs === undefined ? {} : { timeoutMs: params.timeoutMs }) };
         const child = this.spawn(parent.runId, params.prompt, options, parentId);
-        return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id } };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ id: child.id }) }], details: { id: child.id }, structuredContent: { id: child.id } };
       },
     });
     const resultTool = defineTool({
       name: "get_subagent_result", label: "Child Result", description: "Wait for a direct child and return its result once; repeated retrieval fails with AGENT_RESULT_COLLECTED",
       parameters: Type.Object({ id: Type.String() }),
-      execute: async (_id, params) => { const value = await this.result(parentId, params.id); if (!value.ok && value.error.code === "BUDGET_EXHAUSTED") throw new WorkflowError("BUDGET_EXHAUSTED", value.error.message); return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value }; }
+      outputSchema: Type.Object({ id: Type.String(), ok: Type.Boolean(), value: Type.Optional(Type.Unknown()), error: Type.Optional(Type.Object({ code: Type.String(), message: Type.String() })) }),
+      execute: async (_id, params) => { const value = await this.result(parentId, params.id); if (!value.ok && value.error.code === "BUDGET_EXHAUSTED") throw new WorkflowError("BUDGET_EXHAUSTED", value.error.message); return { content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value, structuredContent: value }; }
     });
     const steerTool = defineTool({
       name: "steer_subagent", label: "Steer Child", description: "Steer a running direct child",

@@ -810,7 +810,7 @@ void test("keeps the five workflow controls behind a private local registration 
   assert.ok(firstControlCall > factoryStart);
   const factory = source.slice(factoryStart, firstControlCall);
   assert.match(factory, /const result = await run\(params, signal, ctx\)/);
-  assert.match(factory, /return \{ content: \[\{ type: "text" as const, text: result\.text \}\], details: result\.details \}/);
+  assert.match(factory, /return \{ content: \[\{ type: "text" as const, text: result\.text \}\], details: result\.details, structuredContent: result\.structured as JsonValue \}/);
   assert.match(factory, /throw mainAgentError\(error\)/);
   assert.match(factory, /styledTextBlock\(workflowControlCall\(name, args, theme\)\)/);
   assert.match(factory, /workflowCatalogBlock\(workflowControlResult\(name, context.args, result, options.expanded, theme, context.isError\), options.expanded\)/);

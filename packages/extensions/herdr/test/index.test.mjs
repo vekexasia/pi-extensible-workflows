@@ -1032,7 +1032,8 @@ void test("hands back an idle restricted child only after the generated bridge r
   let resultAccepted = false;
   const resultTool = {
     name: "workflow_result", label: "Workflow Result", description: "Submit result", parameters: { type: "object", properties: { result: { type: "string" } }, required: ["result"], additionalProperties: false },
-    async execute() { resultAccepted = true; return { content: [{ type: "text", text: "accepted" }] }; },
+    outputSchema: { type: "object", properties: { accepted: { type: "boolean" } }, required: ["accepted"] },
+    async execute() { resultAccepted = true; return { content: [{ type: "text", text: "accepted" }], structuredContent: { accepted: true } }; },
   };
   const model = { provider: "fake", id: "model" };
   const modelRegistry = { find: () => model };
@@ -1064,10 +1065,12 @@ void test("hands back an idle restricted child only after the generated bridge r
     assert.match(bridge.extensionPath, /pi-herdr-tools-/, "the generated bridge must be loaded independently of restricted extensions");
     const bridgedResultTool = bridge.tools.get("workflow_result");
     assert.ok(bridgedResultTool);
+    assert.deepEqual(bridgedResultTool.outputSchema, resultTool.outputSchema, "bridged tools keep their outputSchema for codemode scripts");
     prompt = session.prompt("work");
     let promptSettled = false;
     void prompt.then(() => { promptSettled = true; }, () => { promptSettled = true; });
-    await bridgedResultTool.execute("result", { result: "done" }, controller.signal, () => {});
+    const bridgedResult = await bridgedResultTool.execute("result", { result: "done" }, controller.signal, () => {});
+    assert.deepEqual(bridgedResult.structuredContent, { accepted: true });
     assert.equal(resultAccepted, true);
     await new Promise((resolve) => globalThis.setImmediate(resolve));
     assert.equal(promptSettled, false, "workflow_result acceptance alone must not complete the child attempt");

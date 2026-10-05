@@ -26,7 +26,7 @@ Roles come from the bundled starter roles, `~/.pi/agent/pi-extensible-workflows/
 ## piewf
 
 ```sh
-piewf doctor [--role <role>] [--prompt <text>] [--json]
+piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json]
 piewf doctor cleanup [--older-than-days <days>] [--yes]
 piewf inspect [session-id] [--json|--summary] [--failed]
 piewf transcript <session-file>

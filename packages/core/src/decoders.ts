@@ -17,6 +17,7 @@ type PersistedAgent = RunRecord["agents"][number];
 type PersistedPhaseRecord = NonNullable<RunRecord["phaseHistory"]>[number];
 type PersistedShellActivity = NonNullable<RunRecord["activeShellsByPhase"]>[number];
 type PersistedDelivery = NonNullable<RunRecord["delivery"]>;
+type PersistedScriptCall = NonNullable<RunRecord["scriptCalls"]>[number];
 type PersistedIdentity = NonNullable<ScheduledAgentOptions["agentIdentity"]>;
 type PersistedOptions = ScheduledAgentOptions;
 
@@ -388,6 +389,22 @@ function decodeRunEvent(value: unknown): WorkflowRunEvent | undefined {
   if (timestamp === INVALID_PERSISTED_VALUE) return undefined;
   return { type: value.type, message: value.message, ...(timestamp === undefined ? {} : { timestamp }) };
 }
+function decodeScriptCall(value: unknown): PersistedScriptCall | undefined {
+  if (!object(value) || value.kind !== "shell" && value.kind !== "tool" || typeof value.name !== "string" || typeof value.path !== "string" || !finiteNumber(value.startedAt)) return undefined;
+  const shell = value.kind === "shell";
+  if (shell && !jsonValue(value.input)) return undefined;
+  const inputBytes = shell ? optionalNumber(value.inputBytes) : undefined;
+  const phase = optionalString(value.phase);
+  const finishedAt = optionalNumber(value.finishedAt);
+  let error: PersistedScriptCall["error"];
+  if (value.error !== undefined) {
+    if (shell) error = decodeWorkflowError(value.error);
+    else if (object(value.error) && typeof value.error.code === "string") error = { code: isWorkflowErrorCode(value.error.code) ? value.error.code : "INTERNAL_ERROR" };
+    if (!error) return undefined;
+  }
+  if (inputBytes === INVALID_PERSISTED_VALUE || phase === INVALID_PERSISTED_VALUE || finishedAt === INVALID_PERSISTED_VALUE) return undefined;
+  return { kind: value.kind, name: value.name, path: value.path, ...(shell && jsonValue(value.input) ? { input: value.input } : {}), ...(inputBytes === undefined ? {} : { inputBytes }), ...(phase === undefined ? {} : { phase }), startedAt: value.startedAt, ...(finishedAt === undefined ? {} : { finishedAt }), ...(error === undefined ? {} : { error }) };
+}
 function decodeDelivery(value: unknown): PersistedDelivery | undefined {
   if (!object(value)) return undefined;
   const mode = value.mode;
@@ -417,6 +434,8 @@ export function decodePersistedRun(value: unknown, allowLegacyAgentSessions = fa
   const budgetEvents = value.budgetEvents === undefined ? undefined : decodeArray(value.budgetEvents, decodeBudgetEvent);
   const events = value.events === undefined ? undefined : decodeArray(value.events, decodeRunEvent);
   const delivery = value.delivery === undefined ? undefined : decodeDelivery(value.delivery);
+  const scriptCalls = value.scriptCalls === undefined ? undefined : decodeArray(value.scriptCalls, decodeScriptCall);
+  if (value.scriptCalls !== undefined && !scriptCalls) return undefined;
   if (!agentSessions || !agents || parentRunId === INVALID_PERSISTED_VALUE || value.retry !== undefined && !retry || phase === INVALID_PERSISTED_VALUE || value.phaseHistory !== undefined && !phaseHistory || phaseHistoryIndex === INVALID_PERSISTED_VALUE || activeShells === INVALID_PERSISTED_VALUE || activeShellStartedAt === INVALID_PERSISTED_VALUE || value.activeShellsByPhase !== undefined && !activeShellsByPhase || value.error !== undefined && !error || failedAt === INVALID_PERSISTED_VALUE || value.budget !== undefined && !budget || budgetVersion === INVALID_PERSISTED_VALUE || value.budgetVersion !== undefined && !integer(budgetVersion) || value.usage !== undefined && !usage || value.budgetEvents !== undefined && !budgetEvents || value.events !== undefined && !events || value.delivery !== undefined && !delivery) return undefined;
   if (value.agentSessions === undefined && !allowLegacyAgentSessions) return undefined;
   return {
@@ -435,6 +454,7 @@ export function decodePersistedRun(value: unknown, allowLegacyAgentSessions = fa
     ...(activeShells === undefined ? {} : { activeShells }),
     ...(activeShellStartedAt === undefined ? {} : { activeShellStartedAt }),
     ...(activeShellsByPhase === undefined ? {} : { activeShellsByPhase }),
+    ...(scriptCalls === undefined ? {} : { scriptCalls }),
     ...(error === undefined ? {} : { error }),
     ...(failedAt === undefined ? {} : { failedAt }),
     ...(budget === undefined ? {} : { budget }),

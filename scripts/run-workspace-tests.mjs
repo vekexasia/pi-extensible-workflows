@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workspaces = { core: "packages/core", cli: "packages/cli" };
-const options = { patterns: [], excludes: [], concurrency: 20, agentDir: false, unsetHerdr: false, timeout: 120_000, reporter: "dot", exposeGc: false, cancelAfterMs: 0, namePattern: "" };
+// Cold Pi imports and process fixtures contend on Windows file I/O; twenty workers can exhaust a nested
+// fixture's deadline before it starts. Keep the native default bounded; --concurrency still permits stress runs.
+const options = { patterns: [], excludes: [], concurrency: process.platform === "win32" ? 4 : 20, agentDir: false, unsetHerdr: false, timeout: 120_000, reporter: "dot", exposeGc: false, cancelAfterMs: 0, namePattern: "" };
 
 function parseArgs(args) {
   for (let index = 0; index < args.length; index++) {

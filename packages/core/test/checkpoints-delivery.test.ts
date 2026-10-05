@@ -342,7 +342,7 @@ void test("a checkpoint answer persisted before resolver registration cannot han
 
 void test("foreground and background completion delivery share bounded results", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delivery-"));
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId: string; value?: unknown } }> }> = [];
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: { runId: string; value?: unknown }; structuredContent?: unknown }> }> = [];
   const messages: Array<{ message: { content: string }; options: { deliverAs?: string; triggerTurn?: boolean } | undefined }> = [];
   let markDelivered!: () => void;
   const delivered = new Promise<void>((resolve) => { markDelivered = resolve; });
@@ -358,6 +358,7 @@ void test("foreground and background completion delivery share bounded results",
   const ctx = { cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } };
   const background = await execute("id", { name: "large", script: `return "😀".repeat(13000);` }, new AbortController().signal, undefined, ctx);
   assert.match(background.content[0]?.text ?? "", /"state":"running"/);
+  assert.deepEqual(background.structuredContent, { runId: background.details?.runId, state: "running" });
   await delivered;
   assert.equal(messages.length, 1);
   const descriptor = JSON.parse(messages[0]?.message.content ?? "null") as { state: string; runId: string; resultPath: string; resultBytes: number; inlined: boolean };
@@ -383,6 +384,7 @@ void test("foreground and background completion delivery share bounded results",
   assert.equal(constrainedDescriptor.state, "completed");
   assert.equal(constrainedDescriptor.inlined, false);
   assert.ok(constrainedDescriptor.resultBytes > 5_000 && constrainedDescriptor.resultBytes <= 50 * 1024);
+  assert.deepEqual(constrained.structuredContent, { runId: constrainedDescriptor.runId, state: "completed", value: "x".repeat(5000) }, "codemode scripts receive the full value behind the descriptor");
   assert.doesNotMatch(constrained.content[0]?.text ?? "", /x{100}/);
   await waitForTurn();
   await waitForTurn();

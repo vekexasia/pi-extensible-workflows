@@ -24,6 +24,9 @@ export function canonicalPath(path: string): string {
   try { return realpathSync(absolute); } catch { return absolute; }
 }
 
+/** Pi names built-in extensions `builtin:<name>` instead of by a path; other extensions are files. */
+export function extensionIdentity(path: string): string { return path.startsWith("builtin:") ? path : canonicalPath(path); }
+
 export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
 
 export function projectStorageKey(cwd: string): string {

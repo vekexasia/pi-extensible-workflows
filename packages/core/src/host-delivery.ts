@@ -102,6 +102,7 @@ const WORKFLOW_ERROR_PROSE: Record<WorkflowErrorCode, (detail: string) => string
   RUN_NOT_FOUND: (detail) => /^Unknown workflow run\b/.test(detail) ? "The workflow run was not found." : `The workflow run was not found: ${detail}.`,
   RPC_LIMIT_EXCEEDED: (detail) => `The workflow communication data exceeded its size limit: ${detail}.`,
   SHELL_FAILED: (detail) => `The workflow shell command failed: ${detail}.`,
+  TOOL_FAILED: (detail) => `The workflow tool call failed: ${detail}.`,
   AGENT_TIMEOUT: (detail) => `The workflow agent timed out: ${detail}.`,
   AGENT_FAILED: (detail) => `The workflow agent failed: ${detail}.`,
   AGENT_RESULT_COLLECTED: (detail) => `The nested agent result was already collected: ${detail}.`,

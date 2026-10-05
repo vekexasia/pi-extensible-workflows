@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFile, rm, stat, writeFile } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
 import { sameFilesystemPath } from "../../src/paths.js";
+import { atomicWriteFile } from "../../src/io.js";
 import { SEMANTIC_MAP_ASSET_MANIFEST, type SemanticMapAssetName } from "./semantic-map-assets.js";
+import { TOOL_TIMING_ENTRY_TYPE } from "../../src/tool-timing.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
 type Socket = import("node:stream").Duplex;
@@ -18,9 +20,8 @@ const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 const MAX_PENDING_REQUESTS = 128;
 const TRANSCRIPT_REQUEST_TIMEOUT_MS = 10_000;
 const ACTION_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
-const TIMING_ENTRY_TYPE = "pi-workflows:tool-timing";
 function isTimingEntry(value: unknown): boolean {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "custom" && (value as { customType?: unknown }).customType === TIMING_ENTRY_TYPE);
+  return Boolean(value && typeof value === "object" && !Array.isArray(value) && (value as { type?: unknown }).type === "custom" && (value as { customType?: unknown }).customType === TOOL_TIMING_ENTRY_TYPE);
 }
 function compactTranscript(value: unknown): unknown {
   if (Array.isArray(value)) return value.filter(isTimingEntry);
@@ -616,7 +617,19 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     // Frames sent together with the upgrade request arrive in `head`; they share the socket decoder and lifecycle.
     receive(head);
   });
-  server.once("listening", () => { startedAt = Date.now(); void writeFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt })}\n`, { mode: 0o600 }).catch(() => { process.exitCode = 1; }); scheduleIdleExit(); });
+  server.once("listening", () => {
+    startedAt = Date.now();
+    try {
+      // Startup-only synchronous atomic replacement: neither listening callbacks nor /health may observe an
+      // unfinished lock, and the publisher's existing reservation stays intact until the server identity is ready.
+      atomicWriteFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt })}\n`, true);
+      scheduleIdleExit();
+    } catch (error) {
+      // A server without a persisted identity must not stay healthy or be adopted by another publisher.
+      server.close();
+      server.emit("error", error);
+    }
+  });
   server.on("close", () => { closed = true; if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; } });
   return server;
 }

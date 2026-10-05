@@ -63,7 +63,7 @@ function transcriptMessageLines(message: unknown): string[] {
 export function transcriptLines(entries: readonly SessionEntry[]): string[] {
   if (!entries.length) return ["(no active transcript entries)"];
   return entries.flatMap((entry, index) => {
-    const lines = entry.type === "message" ? transcriptMessageLines(entry.message) : entry.type === "model_change" ? [`[model] ${entry.provider}/${entry.modelId}`] : entry.type === "thinking_level_change" ? [`[thinking] ${entry.thinkingLevel}`] : entry.type === "compaction" ? ["[compaction]", ...entry.summary.split("\n")] : entry.type === "branch_summary" ? ["[branch summary]", ...entry.summary.split("\n")] : entry.type === "custom_message" ? [`[custom_message: ${entry.customType}]`, ...(typeof entry.content === "string" ? entry.content.split("\n") : entry.content.flatMap(transcriptPartLines))] : entry.type === "custom" ? [`[custom: ${entry.customType}]`] : entry.type === "label" ? [`[label] ${entry.label ?? ""}`] : [`[session info] ${entry.name ?? ""}`];
+    const lines = entry.type === "message" ? transcriptMessageLines(entry.message) : entry.type === "model_change" ? [`[model] ${entry.provider}/${entry.modelId}`] : entry.type === "thinking_level_change" ? [`[thinking] ${entry.thinkingLevel}`] : entry.type === "compaction" ? ["[compaction]", ...entry.summary.split("\n")] : entry.type === "branch_summary" ? ["[branch summary]", ...entry.summary.split("\n")] : entry.type === "custom_message" ? [`[custom_message: ${entry.customType}]`, ...(typeof entry.content === "string" ? entry.content.split("\n") : entry.content.flatMap(transcriptPartLines))] : entry.type === "custom" ? [`[custom: ${entry.customType}]`] : entry.type === "label" ? [`[label] ${entry.label ?? ""}`] : entry.type === "usage" ? [`[usage] ${entry.kind} ${entry.provider}/${entry.model}`] : entry.type === "context_edit" ? [`[context edit] ${entry.targetId}${entry.replacement === null ? " omitted" : " replaced"}`] : [`[session info] ${entry.name ?? ""}`];
     return index ? ["", ...lines] : lines;
   });
 }
@@ -122,7 +122,8 @@ function transcript(manager: SessionManager): TranscriptSummary {
 
 function readTranscript(path: string): TranscriptSummary | undefined {
   try {
-    if (!existsSync(path) || !statSync(path).isFile() || statSync(path).size === 0) return undefined;
+    const info = existsSync(path) ? statSync(path) : undefined;
+    if (!info?.isFile() || info.size === 0) return undefined;
     const manager = SessionManager.open(path);
     if (!manager.getHeader()) return undefined;
     const summary = transcript(manager);
@@ -155,7 +156,7 @@ function workflowEntries(manager: SessionManager): { calls: WorkflowCall[]; resu
     if (message.role === "assistant") for (const part of message.content) {
       if (part.type === "toolCall" && part.name === "workflow") calls.push({ id: part.id, arguments: part.arguments });
     }
-    if (message.role === "toolResult" && message.toolName === "workflow") results.set(message.toolCallId, { toolCallId: message.toolCallId, isError: message.isError, content: message.content, details: message.details as unknown });
+    if (message.role === "toolResult" && message.toolName === "workflow") results.set(message.toolCallId, { toolCallId: message.toolCallId, isError: message.isError, content: message.content, details: message.details });
   }
   return { calls, results };
 }

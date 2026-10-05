@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ToolAnnotations } from "@earendil-works/pi-coding-agent";
 import type { AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSet, ContextFileScope, JsonValue, WorkflowExtensionSettings, WorkflowRetentionSettings, WorkflowSettings, WorkflowSettingsOverrides, WorkflowSettingsResolution, WorkflowSettingsSources } from "./types.js";
 import { isContextFileScope } from "./types.js";
 import { annotateModelAliasError, deepFreeze, errorText, fail, isNodeError, jsonValue, modelCapability, object, positiveInteger, resourcePatternHasMagic, unknownModel, validateModelAliases, validateResourcePattern, validWorkflowExtensionNamespace } from "./utils.js";
@@ -14,7 +14,8 @@ export const DEFAULT_SETTINGS: Readonly<WorkflowSettings> = Object.freeze({ conc
 export function workflowSettingsPath(agentDir = getAgentDir()): string { return join(agentDir, ROLE_DIRECTORY, "settings.json"); }
 export function workflowProjectSettingsPath(cwd: string): string { return join(cwd, ".pi", ROLE_DIRECTORY, "settings.json"); }
 function normalizedResourcePath(value: string, settingsPath: string): string {
-  if (value === "*") return value;
+  // Built-in extensions are named `builtin:<name>`, not by a path.
+  if (value === "*" || value.startsWith("builtin:")) return value;
   let expanded = value === "~" ? homedir() : value.startsWith("~/") || value.startsWith("~\\") ? join(homedir(), value.slice(2)) : value;
   if (expanded.startsWith("file://")) expanded = fileURLToPath(expanded);
   const resolved = resolve(dirname(settingsPath), expanded);
@@ -107,7 +108,7 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
     fail("CONFIG_ERROR", `Invalid workflow settings JSON at ${path}: ${errorText(error)}`);
   }
   if (!object(parsed)) fail("INVALID_SETTINGS", `Workflow settings at ${path} must be an object`);
-  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", ...(partial ? [] : ["backgroundWidget"]) ]);
+  const allowed = new Set(["concurrency", "modelAliases", "skills", "extensions", "extensionSettings", "tools", "retention", ...(partial ? [] : ["backgroundWidget", "codemodeTools"]) ]);
   const unknown = Object.keys(parsed).find((key) => !allowed.has(key));
   if (Object.prototype.hasOwnProperty.call(parsed, "disabledAgentResources")) fail("INVALID_SETTINGS", `disabledAgentResources is no longer supported; use skills, extensions, and tools selectors (settings: ${path})`);
   if (unknown) fail("INVALID_SETTINGS", `Unknown workflow setting at ${path}: ${unknown}`);
@@ -115,6 +116,8 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   if (concurrency !== undefined && (!positiveInteger(concurrency) || concurrency > 16)) fail("INVALID_SETTINGS", `${path}.concurrency must be an integer from 1 to 16`);
   const backgroundWidget = parsed.backgroundWidget === undefined ? (partial ? undefined : DEFAULT_SETTINGS.backgroundWidget) : parsed.backgroundWidget;
   if (backgroundWidget !== undefined && typeof backgroundWidget !== "boolean") fail("INVALID_SETTINGS", `${path}.backgroundWidget must be a boolean`);
+  const codemodeTools = parsed.codemodeTools;
+  if (codemodeTools !== undefined && codemodeTools !== "all" && codemodeTools !== "read-only" && codemodeTools !== "none") fail("INVALID_SETTINGS", `${path}.codemodeTools must be "all", "read-only", or "none"`);
   const modelAliases = parsed.modelAliases === undefined ? undefined : validateModelAliases(parsed.modelAliases, path);
   const skills = validateSelectorList(parsed.skills, path, "skills");
   const tools = validateSelectorList(parsed.tools, path, "tools");
@@ -122,12 +125,27 @@ function parseSettings(path: string, partial: boolean): Readonly<WorkflowSetting
   const extensionSettings = parsed.extensionSettings === undefined ? undefined : validateWorkflowExtensionSettings(parsed.extensionSettings, path, "INVALID_SETTINGS");
   const retention = validateRetention(parsed.retention, path);
   return Object.freeze({
-    ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(modelAliases === undefined ? {} : { modelAliases }),
+    ...(concurrency === undefined ? {} : { concurrency }), ...(backgroundWidget === undefined ? {} : { backgroundWidget }), ...(codemodeTools === undefined ? {} : { codemodeTools }), ...(modelAliases === undefined ? {} : { modelAliases }),
     ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }),
     ...(extensionSettings === undefined ? {} : { extensionSettings }), ...(tools === undefined ? {} : { tools }), ...(retention === undefined ? {} : { retention }),
   });
 }
 export function loadSettings(path = workflowSettingsPath()): Readonly<WorkflowSettings> { return parseSettings(path, false); }
+const READ_ONLY_WORKFLOW_TOOLS: ReadonlySet<string> = new Set(["workflow_status", "workflow_catalog", "subagents_inspect"]);
+/**
+ * Exposure and annotations of a workflow or subagent tool. Under the global `codemodeTools` setting,
+ * `model-only` keeps the model's direct access and stops codemode scripts from calling the tool.
+ * Tools are registered once at load, so the setting is global and applies after a reload.
+ * Read-only tools carry `readOnlyHint` so permission extensions need not confirm them.
+ */
+export function workflowToolExposure(name: string, codemodeTools: WorkflowSettings["codemodeTools"]): { exposure?: "model-only"; annotations?: ToolAnnotations } {
+  const readOnly = READ_ONLY_WORKFLOW_TOOLS.has(name);
+  return { ...(codemodeTools === "none" || (codemodeTools === "read-only" && !readOnly) ? { exposure: "model-only" as const } : {}), ...(readOnly ? { annotations: { readOnlyHint: true } } : {}) };
+}
+/** The `codemodeTools` setting at load time. Invalid settings keep the default; launches report them. */
+export function loadCodemodeToolsSetting(agentDir?: string): WorkflowSettings["codemodeTools"] {
+  try { return loadSettings(workflowSettingsPath(agentDir)).codemodeTools; } catch { return undefined; }
+}
 export function loadSettingsOverrides(path: string): Readonly<WorkflowSettingsOverrides> { return parseSettings(path, true); }
 export function resolveWorkflowSettings(cwd: string, projectTrusted: boolean, globalSettingsPath = workflowSettingsPath()): WorkflowSettingsResolution {
   const projectSettingsPath = workflowProjectSettingsPath(cwd);

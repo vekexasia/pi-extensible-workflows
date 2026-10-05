@@ -315,7 +315,8 @@ try {
   checked("pi-role developer launch (JS entrypoint, literal argv)", node(cliBin["pi-role"], ["developer", "-p", literal], launchEnv), launched(literal));
   for (const [shell, result] of publicWrappers("pi-role", ["developer", "-p", "hello world"], launchEnv)) { checked(`pi-role developer launch (${shell} wrapper)`, result, launched("hello world")); wrappers += 1; }
 
-  // An audit finding fails the run, but only after the remaining smokes, so every later check is still reached and reported.
+  // Pi >=1.0.1 fixes its shrinkwrapped brace-expansion dependency; no per-advisory exception is needed.
+  // Report failures after the remaining smokes, so every later consumer check is still reached.
   let auditFailure;
   try {
     const audit = runNpm(["audit", "--prefix", installRoot, "--omit=dev"], { cwd: work, env: consumerEnv, timeout: 300_000 });

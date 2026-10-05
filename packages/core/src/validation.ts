@@ -12,7 +12,7 @@ export { loadAgentDefinitions, loadProjectAgentDefinitions, parseRoleMarkdown, w
 export type { WorkflowRoleDirectoryInput } from "./roles.js";
 
 import { validateContextFileScopes, validateSelectorList } from "./settings.js";
-export { DEFAULT_SETTINGS, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath } from "./settings.js";
+export { DEFAULT_SETTINGS, loadCodemodeToolsSetting, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./settings.js";
 
 export function validateCheckpoint(value: unknown): CheckpointInput {
   if (!object(value) || Object.keys(value).some((key) => !["name", "prompt", "context"].includes(key)) || typeof value.name !== "string" || value.name.trim() === "" || typeof value.prompt !== "string" || !jsonValue(value.context)) fail("INVALID_METADATA", "checkpoint requires only name, prompt, and JSON context");
@@ -217,6 +217,24 @@ function callHasTrailingComma(source: string, call: WorkflowCall): boolean {
     current = token;
   }
   return current?.type.label === ")" && previous?.type.label === ",";
+}
+
+/**
+ * The `tools.<id>` members a workflow script names statically. Any other use of `tools`, such as a
+ * local declaration that shadows the global or passing it around, makes the set unknowable: undefined.
+ */
+export function scriptToolReferences(script: string): string[] | undefined {
+  const body = workflowBody(script);
+  if (!body.trim()) return [];
+  const names = new Set<string>();
+  const opaque = (node: acorn.AnyNode, parent?: acorn.AnyNode): boolean => {
+    if (node.type === "Identifier" && node.name === "tools") {
+      if (parent?.type === "MemberExpression" && parent.object === node && !parent.computed && parent.property.type === "Identifier") names.add(parent.property.name);
+      else if (!(parent?.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand || parent?.type === "MemberExpression" && parent.property === node && !parent.computed)) return true;
+    }
+    return astChildren(node).some((child) => opaque(child, node));
+  };
+  return opaque(parseWorkflow(body)) ? undefined : [...names];
 }
 
 export function instrumentWorkflow(script: string): string {
