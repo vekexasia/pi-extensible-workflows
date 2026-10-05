@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { createTrajectoryController, trajectoryServerPath, type TrajectoryController } from "../src/index.js";
+import { SEMANTIC_MAP_BUILD_STAMP } from "../src/semantic-map-assets.js";
 import { isNodeError } from "../../src/utils.js";
 
 type TrajectoryLock = { pid: number; port: number; fingerprint?: string };
@@ -32,8 +33,12 @@ function input(home: string, port: number) {
 }
 async function currentFingerprint(): Promise<string> {
   const serverPath = fileURLToPath(new URL("../src/server.js", import.meta.url));
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const serverBytes = await readFile(serverPath);
+  return `${createHash("sha256").update(serverBytes).digest("hex")}:${SEMANTIC_MAP_BUILD_STAMP}`;
+}
+function alive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (isNodeError(error, "ESRCH")) return false; throw error; }
 }
 function kill(pid: number): void {
   try { process.kill(pid, "SIGKILL"); }
@@ -212,6 +217,74 @@ void test("unhealthy live Trajectory lock is replaced after the startup budget e
     assert.equal(lock.port, port);
     assert.equal(lock.fingerprint, fingerprint);
     assert.equal((await fetch(`http://127.0.0.1:${String(port)}/health`)).ok, true);
+    // Without a health answer from that pid, the lock cannot prove the process is a Trajectory server (Windows reuses pids).
+    assert.equal(alive(child.pid), true, "a live pid named by an unproven lock is never signalled");
+  } finally {
+    await cleanup(home, controllers, pids);
+  }
+});
+
+void test("a stale lock whose pid is reused by an innocent process never signals it, even when another Trajectory server answers", async () => {
+  const home = await mkdtemp(join(tmpdir(), "trajectory-lock-reused-pid-"));
+  const port = await availablePort();
+  const controllers: TrajectoryController[] = [];
+  const pids: number[] = [];
+  try {
+    // The innocent process reuses the pid recorded by an older server that is gone.
+    const innocent = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+    assert.ok(innocent.pid);
+    pids.push(innocent.pid);
+    // A different, stale-build Trajectory server owns the port and reports its own identity.
+    const orphanLock = join(home, "orphan.lock");
+    const childScript = `const { createTrajectoryServer } = await import(${JSON.stringify(new URL("../src/server.js", import.meta.url).href)}); createTrajectoryServer(${String(port)}, ${JSON.stringify(orphanLock)}, { fingerprint: "older" }).listen(${String(port)}, "127.0.0.1"); setInterval(() => {}, 1000);`;
+    const orphan = spawn(process.execPath, ["--input-type=module", "-e", childScript], { stdio: "ignore" });
+    assert.ok(orphan.pid);
+    pids.push(orphan.pid);
+    for (let attempt = 0; attempt < 100 && (await serverIdentity(port))?.fingerprint !== "older"; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal((await serverIdentity(port))?.pid, orphan.pid);
+    await mkdir(dirname(lockPath(home)), { recursive: true, mode: 0o700 });
+    await writeFile(lockPath(home), `${JSON.stringify({ pid: innocent.pid, port, fingerprint: "older", startedAt: Date.now() - 60_000 })}\n`, "utf8");
+
+    const controller = createTrajectoryController(home);
+    controllers.push(controller);
+    await controller.open(input(home, port));
+    await controller.close();
+    const lock = await readLock(home);
+    pids.push(lock.pid);
+
+    assert.equal(alive(innocent.pid), true, "the innocent process that reused the lock pid is untouched");
+    const served = await serverIdentity(port);
+    assert.equal(served?.fingerprint, await currentFingerprint());
+    assert.equal(lock.pid, served.pid);
+    assert.notEqual(lock.pid, innocent.pid);
+  } finally {
+    await cleanup(home, controllers, pids);
+  }
+});
+
+void test("a live lock pid that does not answer health with its own identity is never signalled", async () => {
+  const home = await mkdtemp(join(tmpdir(), "trajectory-lock-unproven-"));
+  const port = await availablePort();
+  const controllers: TrajectoryController[] = [];
+  const pids: number[] = [];
+  try {
+    const innocent = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+    assert.ok(innocent.pid);
+    pids.push(innocent.pid);
+    await mkdir(dirname(lockPath(home)), { recursive: true, mode: 0o700 });
+    // Stale build, with a start time: identity would be claimed only by the lock file, never by the process.
+    await writeFile(lockPath(home), `${JSON.stringify({ pid: innocent.pid, port, fingerprint: "older", startedAt: Date.now() - 60_000 })}\n`, "utf8");
+
+    const controller = createTrajectoryController(home);
+    controllers.push(controller);
+    await controller.open(input(home, port));
+    await controller.close();
+    const lock = await readLock(home);
+    pids.push(lock.pid);
+
+    assert.equal(alive(innocent.pid), true, "no signal without positive server identity");
+    assert.notEqual(lock.pid, innocent.pid);
+    assert.equal(lock.fingerprint, await currentFingerprint());
   } finally {
     await cleanup(home, controllers, pids);
   }

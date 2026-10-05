@@ -265,7 +265,10 @@ void test("persists exact effective system prompts as private run artifacts", as
   await Promise.all(prompts.map((prompt, index) => store.recordSystemPrompt({ sessionId: "native-a", attempt: 1, turn: index + 1, prompt })));
   const saved = await new RunStore(cwd, "session-a", "run-a", home).systemPrompts();
   assert.deepEqual(saved, prompts.map((prompt, index) => ({ sessionId: "native-a", attempt: 1, turn: index + 1, sha256: createHash("sha256").update(prompt).digest("hex"), prompt })));
-  assert.equal(statSync(store.systemPromptPath()).mode & 0o777, 0o600);
+  // Windows exposes no POSIX owner/group/other bits (only the read-only attribute); there the file must stay owner-writable.
+  const promptMode = statSync(store.systemPromptPath()).mode & 0o777;
+  if (process.platform === "win32") assert.equal(promptMode & 0o600, 0o600);
+  else assert.equal(promptMode, 0o600);
   assert.equal(readdirSync(join(store.directory, ".system-prompts", "bodies")).filter((name) => /^[0-9a-f]{64}$/.test(name)).length, 2);
 });
 void test("rejects tampered system-prompt bodies and malformed record names", async () => {
@@ -877,6 +880,22 @@ void test("maintains an atomic compact summary and derives legacy summaries", as
   assert.equal(legacy.runId, "run-a");
   assert.equal(legacy.state, "failed");
   assert.deepEqual(legacy.replayablePaths, ["agent/one"]);
+});
+
+void test("run mutations settle their best-effort summary writes before returning", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-summary-settled-"));
+  const cwd = join(home, "project");
+  const store = new RunStore(cwd, "session-a", "run-a", home);
+  await store.create(run(cwd), snapshot);
+  const persistedSummary = () => decodeTestJsonRecord(readFileSync(join(store.directory, "summary.json"), "utf8"));
+  await store.saveState({ ...run(cwd), state: "paused" });
+  assert.equal(persistedSummary().state, "paused");
+  await store.complete("agent/one", "done");
+  assert.deepEqual(persistedSummary().replayablePaths, ["agent/one"]);
+  await store.updateState((current) => ({ ...current, state: "completed" }));
+  assert.equal(persistedSummary().state, "completed");
+  // Removing an owned terminal run must not race a detached summary temporary-file write.
+  rmSync(home, { recursive: true, force: true });
 });
 
 void test("loadSummary derives from authoritative state and journal when the projection is stale", async () => {

@@ -626,6 +626,9 @@ void test("pause waits for parallel agents and blocks later operations until res
   await running;
   await waitForIssue105(async () => (await store.load()).run.state === "completed");
   assert.equal((await store.load()).run.state, "completed");
+  // Background resume detaches the tool result. Persisted completion precedes the asynchronous lifecycle event;
+  // wait for the event being asserted, not just the earlier state write.
+  await waitForIssue105(() => events.some(({ channel, data }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT && (data as { runId: string; state: string }).runId === runId && (data as { state: string }).state === "completed"));
   const stateEvents = events.filter(({ channel, data }) => channel === WORKFLOW_RUN_STATE_CHANGED_EVENT && (data as { runId: string }).runId === runId).map(({ data }) => (data as { state: string }).state);
   assert.deepEqual(stateEvents, ["pausing", "paused", "running", "completed"]);
   assert.equal(events.filter(({ channel, data }) => channel === WORKFLOW_RUN_RESUMED_EVENT && (data as { runId: string }).runId === runId).length, 1);

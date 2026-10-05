@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
-import { piArguments, resolvePiArguments } from "../src/pi-role.js";
+import { piArguments, resolvePiArguments, runPiRole } from "../src/pi-role.js";
 
 function fixture(): { cwd: string; agentDir: string } {
   const root = mkdtempSync(join(tmpdir(), "pi-role-"));
@@ -60,6 +60,45 @@ void test("pi-role trust flags follow pi: last flag wins, nothing after -- count
     const args = await resolvePiArguments("local", ["--no-approve", "-a"], cwd, agentDir);
     assert.deepEqual(args.slice(-4), ["--append-system-prompt", "Project role.\n", "--no-approve", "-a"]);
   } finally { rmSync(join(cwd, ".."), { recursive: true, force: true }); }
+});
+
+void test("pi-role launches the installed Pi Node shim with literal arguments and propagates its exit code", async () => {
+  const { cwd, agentDir } = fixture();
+  const root = join(cwd, "..", "process launch fixture with spaces");
+  const bin = join(root, "npm bin with spaces");
+  mkdirSync(bin, { recursive: true });
+  const entry = join(bin, "pi entry.mjs");
+  const capture = join(root, "captured arguments.json");
+  writeFileSync(entry, "import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PI_LAUNCH_CAPTURE, JSON.stringify(process.argv.slice(2))); process.exitCode = Number(process.env.PI_LAUNCH_EXIT);\n");
+  const shim = join(bin, "pi.cmd");
+  if (process.platform === "win32") writeFileSync(shim, String.raw`@ECHO off
+IF EXIST "%dp0%\node.exe" (SET "_prog=%dp0%\node.exe") ELSE (SET "_prog=node")
+"%_prog%" "%dp0%\pi entry.mjs" %*
+`);
+  else {
+    // POSIX npm bins are executable Node files named without an extension; strip `.cmd` (not a backslash) here.
+    writeFileSync(shim.replace(/\.cmd$/i, ""), `#!/usr/bin/env node
+import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PI_LAUNCH_CAPTURE, JSON.stringify(process.argv.slice(2))); process.exitCode = Number(process.env.PI_LAUNCH_EXIT);
+`);
+    chmodSync(shim.replace(/\.cmd$/i, ""), 0o755);
+  }
+  const originalPath = process.env.PATH;
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  try {
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    process.env.PI_LAUNCH_CAPTURE = capture;
+    process.env.PI_LAUNCH_EXIT = "7";
+    process.env.PATH = process.platform === "win32" ? bin : `${bin}${delimiter}${originalPath ?? ""}`;
+    assert.equal(await runPiRole(["developer", "--print", "argument with spaces & symbols", "café"]), 7);
+    const captured = JSON.parse(readFileSync(capture, "utf8")) as string[];
+    assert.deepEqual(captured.slice(-3), ["--print", "argument with spaces & symbols", "café"]);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH; else process.env.PATH = originalPath;
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    delete process.env.PI_LAUNCH_CAPTURE;
+    delete process.env.PI_LAUNCH_EXIT;
+    rmSync(join(cwd, ".."), { recursive: true, force: true });
+  }
 });
 
 void test("pi-role leaves context files to pi and uses --system-prompt for overriding roles", () => {

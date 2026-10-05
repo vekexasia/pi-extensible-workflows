@@ -8,7 +8,7 @@ import { createLaunchSnapshot, DEFAULT_SETTINGS, type RunState } from "pi-extens
 import { acquireSessionLease, RunStore, structuralPath } from "pi-extensible-workflows/persistence";
 import { doctorCleanup } from "../src/doctor-cleanup.js";
 import { runCli } from "../src/cli.js";
-import { readCliTestPersistedRun, readCliTestSessionOwner } from "./support.js";
+import { hasFileSymlinkCapability, readCliTestPersistedRun, readCliTestSessionOwner } from "./support.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const snapshot = createLaunchSnapshot({ script: "export const meta={name:'cleanup'}", args: {}, metadata: { name: "cleanup" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
@@ -18,11 +18,17 @@ function fixture(): { home: string; cwd: string } { const home = mkdtempSync(joi
 test.afterEach(() => { for (const home of temporaryTrees) rmSync(home, { recursive: true, force: true }); temporaryTrees.clear(); });
 async function withHomeAndCwd<T>(home: string, cwd: string, action: () => Promise<T>): Promise<T> {
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   const previousCwd = process.cwd();
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   process.chdir(cwd);
   try { return await action(); }
-  finally { process.chdir(previousCwd); if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; }
+  finally {
+    process.chdir(previousCwd);
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
+  }
 }
 async function makeRun(paths: { home: string; cwd: string }, runId: string, state: RunState, now: number, extra: Record<string, unknown> = {}, sessionId = "session-a"): Promise<RunStore> {
   const store = new RunStore(paths.cwd, sessionId, runId, paths.home);
@@ -253,7 +259,7 @@ void test("doctor cleanup fails closed for missing or corrupt persisted artifact
     assert.equal(existsSync(sibling.directory), true, mutation.file);
   }
 });
-void test("doctor cleanup fails closed for unsafe run mutations", async () => {
+void test("doctor cleanup fails closed for unsafe run mutations", async (t) => {
   const now = 1_000_000_000_000;
   const mutations = [
     { name: "symlinked state.json", message: /Run unsafe is corrupt or incomplete: Run artifact is not a regular file: .*state\.json/, mutate: (paths: { home: string; cwd: string }, store: RunStore) => { const state = join(store.directory, "state.json"); const target = join(paths.home, "state-target.json"); const contents = readFileSync(state, "utf8"); rmSync(state); writeFileSync(target, contents); symlinkSync(target, state); } },
@@ -262,7 +268,7 @@ void test("doctor cleanup fails closed for unsafe run mutations", async () => {
     { name: "legacy role override object", message: /ownership\[0\]\.options\.role is invalid/, mutate: (paths: { home: string; cwd: string }, store: RunStore) => { writeFileSync(join(store.directory, "ownership.json"), JSON.stringify([{ id: "owner", label: "owner", state: "completed", options: { label: "owner", cwd: paths.cwd, tools: [], role: { name: "reviewer", contextFiles: ["cwd"] } } }])); } },
     { name: "self parentRunId", message: /Run unsafe is corrupt or incomplete: Borrowed worktree source run is invalid/, mutate: (_paths: { home: string; cwd: string }, store: RunStore) => { const statePath = join(store.directory, "state.json"); const state = readCliTestPersistedRun(statePath); state.parentRunId = "unsafe"; writeFileSync(statePath, JSON.stringify(state)); } },
   ] as const;
-  for (const mutation of mutations) {
+  for (const mutation of mutations) await t.test(mutation.name, { skip: mutation.name.startsWith("symlink") && !hasFileSymlinkCapability() ? "File symlinks are unavailable without symlink capability on this runner; Linux CI exercises this regression." : false }, async () => {
     const paths = fixture();
     const corrupt = await makeRun(paths, "unsafe", "completed", now);
     const sibling = await makeRun(paths, "sibling", "completed", now);
@@ -276,9 +282,9 @@ void test("doctor cleanup fails closed for unsafe run mutations", async () => {
     assert.deepEqual(report.deleted, [], mutation.name);
     assert.equal(existsSync(corrupt.directory), true, mutation.name);
     assert.equal(existsSync(sibling.directory), true, mutation.name);
-  }
+  });
 });
-void test("doctor cleanup fails closed for unsafe session inventories", async () => {
+void test("doctor cleanup fails closed for unsafe session inventories", async (t) => {
   const now = 1_000_000_000_000;
   const mutations = [
     { name: "non-directory session root", mutate: (_paths: { home: string; cwd: string }, store: RunStore) => { const session = dirname(dirname(store.directory)); rmSync(session, { recursive: true }); writeFileSync(session, "preserve session root"); } },
@@ -288,7 +294,7 @@ void test("doctor cleanup fails closed for unsafe session inventories", async ()
     { name: "symlinked owner.json", mutate: (paths: { home: string; cwd: string }, store: RunStore) => { const owner = join(dirname(store.directory), "owner.json"); const target = join(paths.home, "owner-target.json"); writeFileSync(target, "{}"); symlinkSync(target, owner); } },
     { name: "hidden runs entry", mutate: (_paths: { home: string; cwd: string }, store: RunStore) => { mkdirSync(join(dirname(store.directory), ".hidden-run")); } },
   ] as const;
-  for (const mutation of mutations) {
+  for (const mutation of mutations) await t.test(mutation.name, { skip: mutation.name.startsWith("symlink") && !hasFileSymlinkCapability() ? "File symlinks are unavailable without symlink capability on this runner; Linux CI exercises this regression." : false }, async () => {
     const paths = fixture();
     const run = await makeRun(paths, "inventory-run", "completed", now);
     const artifact = join(paths.home, "preserve-artifact.txt");
@@ -298,7 +304,7 @@ void test("doctor cleanup fails closed for unsafe session inventories", async ()
     assert.deepEqual(report.deleted, [], mutation.name);
     assert.equal(report.failures.length, 1, mutation.name);
     assert.equal(readFileSync(artifact, "utf8"), mutation.name, mutation.name);
-  }
+  });
 });
 void test("doctor cleanup stops when the session lease token changes during rescanning", async () => {
   const paths = fixture(); const now = 1_000_000_000_000;

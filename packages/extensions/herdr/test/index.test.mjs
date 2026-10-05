@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -20,6 +20,13 @@ function writeFixtureStream(res, id = "fixture") {
     "data: [DONE]",
     "",
   ].join("\n\n"));
+}
+// Waits for a launch milestone but surfaces an early action rejection instead of leaving the test pending until the event loop drains.
+function reachedBefore(milestone, action, timeoutMs = 10_000) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = globalThis.setTimeout(() => reject(new Error(`Herdr action did not reach the expected milestone within ${String(timeoutMs)} ms`)), timeoutMs); });
+  const early = action.then(() => { throw new Error("Herdr action settled before the expected milestone"); });
+  return Promise.race([milestone, early, timeout]).finally(() => globalThis.clearTimeout(timer));
 }
 function settlesWithin(promise, timeoutMs = 2_000) { return new Promise((resolve) => { const timer = globalThis.setTimeout(() => resolve(false), timeoutMs); promise.then(() => { globalThis.clearTimeout(timer); resolve(true); }, () => { globalThis.clearTimeout(timer); resolve(true); }); }); }
 async function generatedBridge(command) {
@@ -219,8 +226,7 @@ void test("opens the active session after the handoff boundary and releases on c
   assert.equal(calls.length, 0);
   assert.deepEqual(workingMessages, ["reviewer: queued (waiting for a turn boundary)"]);
   handoff.observe({ type: "turn_end" });
-  await launched;
-  await idleObserved;
+  await reachedBefore(Promise.all([launched, idleObserved]), promise);
   await new Promise((resolve) => globalThis.setImmediate(resolve));
   assert.equal(actionSettled, false, "idle Herdr status must not end a manual live handoff");
   const lifecycle = await generatedBridge(runCommand);
@@ -885,7 +891,8 @@ void test("materializes a fresh session before launching a fully inspectable age
       const entries = readFileSync(sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
       assert.deepEqual(entries.map(({ type }) => type), ["session", "session_info"]);
       assert.equal(entries[0].id, "019fa4aa-610a-7459-832c-347866c35c5b");
-      assert.equal(entries[0].cwd, "/repo");
+      // Pi's SessionManager stores the resolved cwd; resolve() keeps "/repo" on POSIX and adds the current drive on Windows.
+      assert.equal(entries[0].cwd, resolve("/repo"));
       assert.equal(entries[1].name, "flow:review");
     }
     return "";

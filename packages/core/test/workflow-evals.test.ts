@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSyncExecutable } from "../src/process-launcher.js";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -18,7 +18,7 @@ void test("defines the cheap initial evaluation matrix", () => {
   assert.equal(INITIAL_WORKFLOW_EVAL_CASES.every(({ timeoutMs, maxCost }) => timeoutMs === undefined && maxCost > 0), true);
   const ordinaryCases = INITIAL_WORKFLOW_EVAL_CASES.filter(({ id }) => !id.startsWith("recovery-"));
   assert.equal(ordinaryCases.slice(1).every(({ prompt }) => !prompt.includes("workflow") && !prompt.includes("script:") && !prompt.includes("return agent(")), true);
-  assert.match(resolveWorkflowSkillPath(), /skills\/pi-extensible-workflows\/SKILL\.md$/);
+  assert.ok(resolveWorkflowSkillPath().endsWith(join("skills", "pi-extensible-workflows", "SKILL.md")));
 });
 void test("finds matching session JSONL files recursively", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-session-files-"));
@@ -76,8 +76,7 @@ void test("validates programmatic case overrides before starting Pi", async () =
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-override-"));
   const marker = join(root, "called");
   const piPath = join(root, "fake-pi.mjs");
-  writeFileSync(piPath, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "called");\n`);
-  chmodSync(piPath, 0o755);
+  writeFileSync(piPath, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "called");\n`);
   try {
     const invalid = { id: "invalid", prompt: "ignored", maxCost: 1, expectations: { unknown: true } };
     await assert.rejects(() => callUnchecked(runWorkflowEvals, undefined, [{ model: "fake/model", piCommand: piPath, cases: [invalid] }]), /options\.cases\[0\].*expectations\.unknown/);
@@ -87,8 +86,10 @@ void test("validates programmatic case overrides before starting Pi", async () =
   }
 });
 void test("does not publish the eval harness, cases, or fixtures", () => {
-  const output = execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: process.cwd(), encoding: "utf8" });
-  const reports = JSON.parse(output) as Array<{ files?: Array<{ path: string }> }>;
+  const result = spawnSyncExecutable("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: process.cwd(), encoding: "utf8" });
+  if (result.error) throw result.error;
+  assert.equal(result.status, 0, result.stderr.toString());
+  const reports = JSON.parse(result.stdout.toString()) as Array<{ files?: Array<{ path: string }> }>;
   const files = reports[0]?.files?.map(({ path }) => path) ?? [];
   assert.ok(files.length > 0);
   assert.equal(files.some((path) => path.startsWith("evals/") || path.startsWith("dist/evals/") || path.startsWith("test/")), false, "eval harness files must stay out of the published package");
@@ -133,8 +134,7 @@ void test("captures exact recovery selections without executing recovery", async
 void test("fixture scoring rejects completed-worktree recovery with wrong arguments", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-recovery-worktree-args-"));
   const piPath = join(root, "fake-pi.mjs");
-  writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "toolCall", name: "workflow", arguments: { name: "borrow-worktree", script: "return true;", parentRunId: "wrong-run" } }] }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n");`);
-  chmodSync(piPath, 0o755);
+  writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "toolCall", name: "workflow", arguments: { name: "borrow-worktree", script: "return true;", parentRunId: "wrong-run" } }] }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n");`);
   try {
     const result = await captureEvalCase({ case: { id: "recovery-completed-worktree", prompt: "borrow completed-run-42", maxCost: 1, expectedWorkflowCalls: 1, expectations: { firstTool: "workflow", firstBatchToolSequence: ["workflow"], parentToolSequence: ["workflow"], workflowCallCount: 1 } }, model: "fake/model", piCommand: piPath, maxCost: 1 });
     assert.equal(result.status, "failed");
@@ -143,11 +143,32 @@ void test("fixture scoring rejects completed-worktree recovery with wrong argume
     rmSync(root, { recursive: true, force: true });
   }
 });
+void test("eval Pi children get an isolated profile, temp and no Herdr pane variables", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi workflow eval env ü-"));
+  const piPath = join(root, "fake pi.mjs");
+  const capture = join(root, "env.json");
+  // No shebang or executable bit: the launcher runs Node entrypoints on process.execPath on every platform.
+  writeFileSync(piPath, `import { writeFileSync } from "node:fs"; const keys = ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "PI_CODING_AGENT_DIR", "TEMP", "TMP", "TMPDIR", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "Herdr_Tab_Id"]; writeFileSync(${JSON.stringify(capture)}, JSON.stringify(Object.fromEntries(keys.map((key) => [key, process.env[key] ?? null])))); process.exit(0);\n`);
+  const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH, Herdr_Tab_Id: process.env.Herdr_Tab_Id };
+  Object.assign(process.env, { HERDR_ENV: "1", HERDR_PANE_ID: "parent-pane", HERDR_SOCKET_PATH: join(root, "herdr.sock"), Herdr_Tab_Id: "parent-tab" });
+  try {
+    await captureEvalCase({ case: { id: "isolated-env", prompt: "noop", maxCost: 1, expectations: {} }, model: "fake/model", piCommand: piPath, maxCost: 1 });
+    const env = JSON.parse(readFileSync(capture, "utf8")) as Record<string, string | null>;
+    for (const key of ["HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "Herdr_Tab_Id"]) assert.equal(env[key], null, key);
+    const home = env.HOME ?? "";
+    assert.match(home, /pi-workflow-capture-[^\\/]+[\\/]home$/);
+    assert.equal(env.USERPROFILE, home);
+    for (const key of ["APPDATA", "LOCALAPPDATA", "PI_CODING_AGENT_DIR", "TEMP", "TMP", "TMPDIR"]) assert.ok(env[key]?.startsWith(home), `${key}=${String(env[key])}`);
+    assert.equal(existsSync(home), false, "the disposable case root is removed");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) if (value === undefined) Reflect.deleteProperty(process.env, key); else process.env[key] = value;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 void test("fixture scoring rejects a recovery tool call with the wrong run ID", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-recovery-args-"));
   const piPath = join(root, "fake-pi.mjs");
-  writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "toolCall", name: "workflow_retry", arguments: { runId: "wrong-run" } }] }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n");`);
-  chmodSync(piPath, 0o755);
+  writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "toolCall", name: "workflow_retry", arguments: { runId: "wrong-run" } }] }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n");`);
   try {
     const result = await captureEvalCase({ case: { id: "recovery-failed-run", prompt: "retry failed-run-42", maxCost: 1, expectedWorkflowCalls: 0, expectations: { firstTool: "workflow_retry", firstBatchToolSequence: ["workflow_retry"], parentToolSequence: ["workflow_retry"], workflowCallCount: 0 } }, model: "fake/model", piCommand: piPath, maxCost: 1 });
     assert.equal(result.status, "failed");
@@ -172,8 +193,7 @@ void test("matches captured validation results by tool-call id and retains schem
 void test("captures production-validated calls without execution and judges the first static candidate", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-fake-pi-"));
   const piPath = join(root, "fake-pi.mjs");
-  writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ criteria: [{ id: "intent", pass: true, evidence: "reviewer agent returns the review" }] }) }], provider: "fake", model: "judge", usage: { input: 5, output: 6, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } })); process.exit(0); } const sessionDir = value("--session-dir"); const id = value("--session-id"); if (!value("--skill")?.endsWith("skills/pi-extensible-workflows/SKILL.md")) process.exit(2); if (!value("--extension")?.endsWith("/eval-capture-extension.js")) process.exit(3); mkdirSync(sessionDir, { recursive: true }); const script = 'return await agent("fake", { role: "reviewer" });'; const rows = [{ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() }, { type: "message", id: "bad", parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "bad-call", name: "workflow", arguments: { script } }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }, { type: "message", id: "bad-result", parentId: "bad", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "bad-call", toolName: "workflow", content: [{ type: "text", text: "pi-extensible-workflows-eval-capture-v1:INVALID_METADATA: Inline workflows require name" }], isError: true } }, { type: "message", id: "good", parentId: "bad-result", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "good-call", name: "workflow", arguments: { name: "review", script } }], provider: "fake", model: "parent", usage: { input: 2, output: 4, cacheRead: 0, cost: { total: 0.01 } } } }, { type: "message", id: "good-result", parentId: "good", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "good-call", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false } }]; writeFileSync(join(sessionDir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
-  chmodSync(piPath, 0o755);
+  writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ criteria: [{ id: "intent", pass: true, evidence: "reviewer agent returns the review" }] }) }], provider: "fake", model: "judge", usage: { input: 5, output: 6, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } })); process.exit(0); } const sessionDir = value("--session-dir"); const id = value("--session-id"); if (!value("--skill")?.endsWith(join("skills", "pi-extensible-workflows", "SKILL.md"))) process.exit(2); if (!value("--extension")?.endsWith(join("eval-capture-extension.js"))) process.exit(3); mkdirSync(sessionDir, { recursive: true }); const script = 'return await agent("fake", { role: "reviewer" });'; const rows = [{ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() }, { type: "message", id: "bad", parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "bad-call", name: "workflow", arguments: { script } }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } }, { type: "message", id: "bad-result", parentId: "bad", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "bad-call", toolName: "workflow", content: [{ type: "text", text: "pi-extensible-workflows-eval-capture-v1:INVALID_METADATA: Inline workflows require name" }], isError: true } }, { type: "message", id: "good", parentId: "bad-result", timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "good-call", name: "workflow", arguments: { name: "review", script } }], provider: "fake", model: "parent", usage: { input: 2, output: 4, cacheRead: 0, cost: { total: 0.01 } } } }, { type: "message", id: "good-result", parentId: "good", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "good-call", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false } }]; writeFileSync(join(sessionDir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
   const result = await runIsolatedProcess({ case: { id: "capture", prompt: "review this", timeoutMs: 10_000, maxCost: 1, expectations: { workflowCallCount: { min: 1 }, requiredRoles: ["reviewer"] }, semanticCriteria: [{ id: "intent", description: "Return a reviewer assessment." }] }, model: "fake/model", piCommand: piPath, maxCost: 1 }, { childPath: join(process.cwd(), "dist/evals/src/workflow-evals-child.js"), timeoutMs: 25_000 });
   assertRecord(result.value);
   assert.equal(result.value.status, "passed");
@@ -207,10 +227,9 @@ void test("stops after a persisted validated capture without another parent turn
   const piPath = join(root, "fake-pi.mjs");
   const marker = join(root, "extra-parent-turn");
   try {
-    writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ criteria: [{ id: "intent", pass: true, evidence: "capture persisted" }] }) }], provider: "fake", model: "judge", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } })); process.exit(0); } const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const sessionPath = join(sessionDir, "parent.jsonl"); const script = 'return agent("captured")'; const assistant = { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "workflow", arguments: { name: "captured", script } }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; const result = { role: "toolResult", toolCallId: "call-1", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false }; const rows = [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }]; writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); setTimeout(() => { rows.push({ type: "message", message: result }); writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: result })); console.log(JSON.stringify({ type: "turn_end", message: assistant, toolResults: [result] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 200); }, 50); setInterval(() => {}, 1000);`);
-    chmodSync(piPath, 0o755);
+    writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify({ criteria: [{ id: "intent", pass: true, evidence: "capture persisted" }] }) }], provider: "fake", model: "judge", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } })); process.exit(0); } const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const sessionPath = join(sessionDir, "parent.jsonl"); const script = 'return agent("captured")'; const assistant = { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "workflow", arguments: { name: "captured", script } }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; const result = { role: "toolResult", toolCallId: "call-1", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false }; const rows = [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }]; writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); setTimeout(() => { rows.push({ type: "message", message: result }); writeFileSync(sessionPath, rows.map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: result })); console.log(JSON.stringify({ type: "turn_end", message: assistant, toolResults: [result] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 2_000); }, 50); setInterval(() => {}, 1000);`);
     const result = await captureEvalCase({ case: { id: "capture-stop", prompt: "capture one workflow", timeoutMs: 1_000, maxCost: 1, expectations: { workflowCallCount: 1 }, semanticCriteria: [{ id: "intent", description: "Capture the workflow." }] }, model: "fake/model", piCommand: piPath, maxCost: 1 });
-    assert.equal(result.status, "passed");
+    assert.equal(result.status, "passed", JSON.stringify(result));
     assert.equal(result.oracle?.assistantBatches.length, 1);
     assert.equal(result.workflows.length, 1);
     assert.equal(result.accounting.totalTokens, 7);
@@ -226,10 +245,9 @@ void test("stops at agent_end when no workflow call occurs", async () => {
   const piPath = join(root, "fake-pi.mjs");
   const marker = join(root, "extra-parent-turn");
   try {
-    writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "text", text: "direct answer" }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); console.log(JSON.stringify({ type: "agent_end", messages: [assistant] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 200); setInterval(() => {}, 1000);`);
-    chmodSync(piPath, 0o755);
+    writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const sessionDir = value("--session-dir"); const id = value("--session-id"); mkdirSync(sessionDir, { recursive: true }); const assistant = { role: "assistant", content: [{ type: "text", text: "direct answer" }], provider: "fake", model: "parent", usage: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } }; writeFileSync(join(sessionDir, "parent.jsonl"), [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: assistant }].map(JSON.stringify).join("\\n") + "\\n"); console.log(JSON.stringify({ type: "message_end", message: assistant })); console.log(JSON.stringify({ type: "agent_end", messages: [assistant] })); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "extra-parent-turn"), 2_000); setInterval(() => {}, 1000);`);
     const result = await captureEvalCase({ case: { id: "direct-stop", prompt: "answer directly", timeoutMs: 1_000, maxCost: 1, expectations: { workflowCallCount: 0 }, expectedWorkflowCalls: 0 }, model: "fake/model", piCommand: piPath, maxCost: 1 });
-    assert.equal(result.status, "passed");
+    assert.equal(result.status, "passed", JSON.stringify(result));
     assert.equal(result.oracle?.assistantBatches.length, 1);
     assert.equal(result.workflows.length, 0);
     assert.equal(result.accounting.totalTokens, 5);
@@ -244,7 +262,6 @@ void test("selects the required valid workflow set and records surplus valid cal
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-multiple-valid-"));
   const piPath = join(root, "fake-pi.mjs");
   writeFileSync(piPath, [
-    "#!/usr/bin/env node",
     "import { mkdirSync, writeFileSync } from 'node:fs'; import { join } from 'node:path';",
     "const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1];",
     "if (args.includes('--no-tools')) { console.log(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: JSON.stringify({ criteria: [{ id: 'intent', pass: true, evidence: 'two valid workflow calls' }] }) }], provider: 'fake', model: 'judge', usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.02 } } } })); process.exit(0); }",
@@ -254,7 +271,6 @@ void test("selects the required valid workflow set and records surplus valid cal
     `for (const [index, script] of scripts.entries()) { const toolCallId = 'call-' + index; rows.push({ type: 'message', message: { role: 'assistant', content: [{ type: 'toolCall', id: toolCallId, name: 'workflow', arguments: { name: 'workflow-' + index, script } }] } }, { type: 'message', message: { role: 'toolResult', toolCallId, toolName: 'workflow', content: [{ type: 'text', text: 'captured' }], details: { captureIdentity: 'pi-extensible-workflows-eval-capture-v1', realWorkflowAgentsLaunched: 0, validation: { valid: true, script } }, isError: false } }); }`,
     "writeFileSync(join(sessionDir, 'parent.jsonl'), rows.map(JSON.stringify).join('\\n') + '\\n');",
   ].join("\n"));
-  chmodSync(piPath, 0o755);
   const result = await runIsolatedProcess({ case: { id: "multiple-valid", prompt: "delegate twice", timeoutMs: 10_000, maxCost: 1, expectations: { workflowCallCount: { min: 2 }, minimumAgentCalls: 2 }, expectedWorkflowCalls: 2, semanticCriteria: [{ id: "intent", description: "Use both results." }] }, model: "fake/model", piCommand: piPath, maxCost: 1 }, { childPath: join(process.cwd(), "dist/evals/src/workflow-evals-child.js"), timeoutMs: 25_000 });
   assertRecord(result.value);
   assert.equal(result.value.status, "passed");
@@ -277,8 +293,7 @@ void test("skips the semantic judge when every captured call fails production va
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-invalid-"));
   const piPath = join(root, "fake-pi.mjs");
   const marker = join(root, "judge-ran");
-  writeFileSync(piPath, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { writeFileSync(${JSON.stringify(marker)}, "unexpected"); process.exit(9); } const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "bad", name: "workflow", arguments: { script: "return 1" } }], provider: "fake", model: "parent", usage: { input: 1, output: 1, cost: { total: 0.01 } } } }, { type: "message", message: { role: "toolResult", toolCallId: "bad", toolName: "workflow", content: [{ type: "text", text: "pi-extensible-workflows-eval-capture-v1:INVALID_METADATA: Inline workflows require name" }], isError: true } }]; writeFileSync(join(dir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
-  chmodSync(piPath, 0o755);
+  writeFileSync(piPath, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; if (args.includes("--no-tools")) { writeFileSync(${JSON.stringify(marker)}, "unexpected"); process.exit(9); } const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id, cwd: process.cwd() }, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "bad", name: "workflow", arguments: { script: "return 1" } }], provider: "fake", model: "parent", usage: { input: 1, output: 1, cost: { total: 0.01 } } } }, { type: "message", message: { role: "toolResult", toolCallId: "bad", toolName: "workflow", content: [{ type: "text", text: "pi-extensible-workflows-eval-capture-v1:INVALID_METADATA: Inline workflows require name" }], isError: true } }]; writeFileSync(join(dir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
   const result = await runIsolatedProcess({ case: { id: "invalid", prompt: "delegate", timeoutMs: 10_000, maxCost: 1, expectations: { workflowCallCount: { min: 1 } }, semanticCriteria: [{ id: "intent", description: "delegate" }] }, model: "fake/model", piCommand: piPath, maxCost: 1 }, { childPath: join(process.cwd(), "dist/evals/src/workflow-evals-child.js"), timeoutMs: 25_000 });
   assertRecord(result.value);
   assert.equal(result.value.status, "failed");
@@ -418,8 +433,7 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-budget-"));
   const fakePi = join(root, "fake-pi.mjs");
   const seededRole = join(root, "seeded-role");
-  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { existsSync, readFileSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const globalRole = join(process.env.HOME, ".pi", "agent", "pi-extensible-workflows", "roles", "developer.md"); const projectRole = join(process.cwd(), ".pi", "pi-extensible-workflows", "roles", "developer.md"); if (!existsSync(globalRole) || existsSync(projectRole)) process.exit(8); const content = readFileSync(globalRole, "utf8"); if (!content.includes("model: fake/model") || !content.includes("tools: [read, grep, find, bash]")) process.exit(9); writeFileSync(${JSON.stringify(join(root, "seeded-role"))}, "ok"); process.exit(7);\n`);
-  chmodSync(fakePi, 0o755);
+  writeFileSync(fakePi, `import { existsSync, readFileSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const globalRole = join(process.env.HOME, ".pi", "agent", "pi-extensible-workflows", "roles", "developer.md"); const projectRole = join(process.cwd(), ".pi", "pi-extensible-workflows", "roles", "developer.md"); if (!existsSync(globalRole) || existsSync(projectRole)) { console.error(JSON.stringify({ globalRole, exists: existsSync(globalRole), projectRole, projectExists: existsSync(projectRole) })); process.exit(8); } const content = readFileSync(globalRole, "utf8"); if (!content.includes("model: fake/model") || !content.includes("tools: [read, grep, find, bash]")) { console.error(content); process.exit(9); } writeFileSync(${JSON.stringify(join(root, "seeded-role"))}, "ok"); process.exit(7);\n`);
   try {
     const progress: string[] = [];
     const result = await runWorkflowEvals({
@@ -435,7 +449,7 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
     });
     assert.deepEqual(result.cases.map(({ accounting, limits }) => [accounting.cost.toFixed(2), limits.maxCost.toFixed(2)]), [["0.10", "0.10"], ["0.05", "0.05"]]);
     assert.equal(result.spent.toFixed(2), "0.15");
-    assert.equal(existsSync(seededRole), true);
+    assert.equal(existsSync(seededRole), true, JSON.stringify(result.cases));
     assert.match(progress.join("\n"), /first: starting[\s\S]*first: failed/);
     assert.match(formatEvalSummary(result), /first: failed[\s\S]*error:[\s\S]*Artifacts:/);
   } finally {

@@ -599,7 +599,7 @@ void test("extension roles flow through host guidance, preflight, launch snapsho
   const roleDirectory = join(home, "roles");
   const roleExtension = join(home, "role-extension.ts");
   mkdirSync(roleDirectory, { recursive: true });
-  writeFileSync(join(roleDirectory, "extension-reviewer.md"), `---\ndescription: Packaged review role\nmodel: anthropic/opus:high\ntools: [read, grep]\nskills: [role-skill]\nextensions: ["${roleExtension}"]\n---\nExtension prompt`);
+  writeFileSync(join(roleDirectory, "extension-reviewer.md"), `---\ndescription: Packaged review role\nmodel: anthropic/opus:high\ntools: [read, grep]\nskills: [role-skill]\nextensions: [${JSON.stringify(roleExtension)}]\n---\nExtension prompt`);
   const inputs: SessionInput[] = [];
   const prompts: string[] = [];
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: unknown }> }> = [];
@@ -665,8 +665,8 @@ void test("shares the registry between package imports and Pi's jiti loader", ()
   const script = `
 import { createRequire } from "node:module";
 import { join } from "node:path";
-const require = createRequire(import.meta.url);
-const { createJiti } = require(${JSON.stringify(join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent/node_modules/jiti"))});
+const piRequire = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
+const { createJiti } = piRequire("jiti");
 const native = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "dist/src/index.js")).href)});
 const jiti = createJiti(import.meta.url, { moduleCache: false, tryNative: false });
 const source = await jiti.import(${JSON.stringify(join(process.cwd(), "src/index.ts"))});

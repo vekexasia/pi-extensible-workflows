@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -38,6 +38,8 @@ void test("exportTrajectoryRunHtml renders a self-contained static run report", 
     assert.equal(html.includes('href="./'), false);
     assert.ok(html.includes('<script src="data:text/javascript;base64,'));
     assert.ok(html.includes('href="data:image/png;base64,'));
+    assert.ok(html.includes("Semantic Map is available for live Trajectory sessions only; this is a static export."));
+    assert.equal(html.includes('<iframe src="./semantic-map.html'), false);
     // The raw injected payload cannot terminate its script block early.
     assert.equal(html.includes("</script> world"), false);
     // $-sequences in transcripts must not trigger String.replace expansion and duplicate the document.
@@ -45,21 +47,29 @@ void test("exportTrajectoryRunHtml renders a self-contained static run report", 
     assert.ok(html.includes("$' $` $& replacement traps"));
     await assert.rejects(exportTrajectoryRunHtml({ cwd, sessionId: "session", runId: "missing", home }), /was not found/);
 
-    const stubGh = join(root, "gh");
-    writeFileSync(stubGh, "#!/bin/sh\ncp \"$4\" \"$GH_STUB_CAPTURE\"\necho 'https://gist.github.com/user/abc123def456'\n", { mode: 0o755 });
+    const stubGh = join(root, "gh stub.mjs");
+    writeFileSync(stubGh, "import { copyFileSync, writeFileSync } from 'node:fs'; copyFileSync(process.argv.at(-1), process.env.GH_STUB_CAPTURE); writeFileSync(process.env.GH_STUB_ARGS, JSON.stringify(process.argv.slice(2))); process.stdout.write('https://gist.github.com/user/abc123def456\\n');\n");
     const capture = join(root, "captured.html");
+    const argsCapture = join(root, "captured-args.json");
     process.env.GH_STUB_CAPTURE = capture;
+    process.env.GH_STUB_ARGS = argsCapture;
     try {
       const shared = await shareTrajectoryRun({ cwd, sessionId: "session", runId: "run", home, ghPath: stubGh });
       assert.equal(shared.gistUrl, "https://gist.github.com/user/abc123def456");
       assert.equal(shared.shareUrl, "https://vekexasia.github.io/pi-extensible-workflows/run.html#abc123def456");
       // The gist payload is the export itself under the viewer's default file name.
       assert.ok(readFileSync(capture, "utf8").includes("window.__PIEWF_STATIC__"));
+      // The stub ran as a real child process with literal argv; the temporary upload copy is removed afterwards.
+      const ghArgs = JSON.parse(readFileSync(argsCapture, "utf8")) as string[];
+      assert.deepEqual(ghArgs.slice(0, 3), ["gist", "create", "--public=false"]);
+      assert.match(ghArgs[3] ?? "", /piewf-share-.*trajectory\.html$/);
+      assert.equal(existsSync(ghArgs[3] ?? ""), false);
     } finally {
       delete process.env.GH_STUB_CAPTURE;
+      delete process.env.GH_STUB_ARGS;
     }
-    const badGh = join(root, "gh-bad");
-    writeFileSync(badGh, "#!/bin/sh\necho 'gh: not logged in' >&2\nexit 1\n", { mode: 0o755 });
+    const badGh = join(root, "gh bad.mjs");
+    writeFileSync(badGh, "process.stderr.write('gh: not logged in\\n'); process.exitCode = 1;\n");
     await assert.rejects(shareTrajectoryRun({ cwd, sessionId: "session", runId: "run", home, ghPath: badGh }), /not logged in/);
     await assert.rejects(shareTrajectoryRun({ cwd, sessionId: "session", runId: "run", home, ghPath: join(root, "gh-missing") }), /GitHub CLI \(gh\) is not installed/);
   } finally {

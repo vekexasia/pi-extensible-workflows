@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,11 +16,9 @@ void test("relative PI_WORKFLOW_TRACE_DIR is rooted at packages/core, not the ca
   const packageTraceDir = resolve(coreRoot, relativeTraceDir);
   const cwdTraceDir = resolve(executionRoot, relativeTraceDir);
   writeFileSync(join(executionRoot, "auth.json"), "{}");
-  writeFileSync(fakePi, `#!/usr/bin/env node
-process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "workflow_catalog", args: {} }) + "\\n");
+  writeFileSync(fakePi, `process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "workflow_catalog", args: {} }) + "\\n");
 process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolName: "workflow", args: { name: "tddDev", script: "async function tddDev() { return 'npm test'; }" } }) + "\\n");
 `);
-  chmodSync(fakePi, 0o755);
   rmSync(packageTraceDir, { recursive: true, force: true });
 
   try {

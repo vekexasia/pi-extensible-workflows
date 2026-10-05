@@ -12,7 +12,7 @@
  * Requires: HERDR_ENV=1, pi CLI with auth, built dist/.
  */
 
-import { execFileSync } from "node:child_process";
+import { spawnSyncExecutable } from "../src/process-launcher.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -68,7 +68,12 @@ export interface RunInput {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function herdr(...args: string[]): string {
-  return execFileSync("herdr", args, { encoding: "utf8", timeout: 30_000 }).trim();
+  const result = spawnSyncExecutable("herdr", args, { encoding: "utf8", timeout: 30_000, maxBuffer: 1024 * 1024 });
+  if (result.error) throw result.error;
+  const stdout = typeof result.stdout === "string" ? result.stdout : result.stdout.toString("utf8");
+  const stderr = typeof result.stderr === "string" ? result.stderr : result.stderr.toString("utf8");
+  if (result.status !== 0) throw new Error(stderr.trim() || `herdr exited with ${String(result.status)}`);
+  return stdout.trim();
 }
 
 function herdrJson(...args: string[]): unknown {

@@ -10,6 +10,7 @@ import { processAlive } from "../../src/session-lease.js";
 import { errorText, isNodeError, object, positiveInteger } from "../../src/utils.js";
 import { isTimingTranscriptEntry, isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
 import { shareTrajectoryRun } from "./export.js";
+import { SEMANTIC_MAP_BUILD_STAMP } from "./semantic-map-assets.js";
 
 const DEFAULT_TRAJECTORY_PORT = 7432;
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
@@ -38,8 +39,8 @@ export function trajectoryServerPath(moduleDirectory = dirname(fileURLToPath(imp
   return path;
 }
 async function trajectoryFingerprint(serverPath: string): Promise<string> {
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const serverBytes = await readFile(serverPath);
+  return `${createHash("sha256").update(serverBytes).digest("hex")}:${SEMANTIC_MAP_BUILD_STAMP}`;
 }
 function publisherId(cwd: string, sessionId: string): string { return createHash("sha256").update(`${cwd}\n${sessionId}`).digest("hex").slice(0, 16); }
 function trajectoryPort(value: unknown): number { return positiveInteger(value) && value <= 65535 ? value : DEFAULT_TRAJECTORY_PORT; }
@@ -56,7 +57,6 @@ async function serverHealth(port: number): Promise<ServerHealth | undefined> {
     return { ...(positiveInteger(body.pid) ? { pid: body.pid } : {}), ...(typeof body.fingerprint === "string" ? { fingerprint: body.fingerprint } : {}), ...(positiveInteger(body.startedAt) ? { startedAt: body.startedAt } : {}) };
   } catch { return undefined; }
 }
-async function serverHealthy(port: number): Promise<boolean> { return await serverHealth(port) !== undefined; }
 
 function signalProcess(pid: number, signal: NodeJS.Signals): void {
   try {
@@ -65,20 +65,29 @@ function signalProcess(pid: number, signal: NodeJS.Signals): void {
     if (!isNodeError(error, "ESRCH")) throw error;
   }
 }
-async function stopStaleServer(lock: TrajectoryLock): Promise<void> {
+type ServerIdentity = { pid: number; port: number; startedAt: number };
+// A pid alone is never proof: Windows reuses pids and has no cheap creation-time check, and a lock file can outlive its server.
+// Only the Trajectory server answering /health on that port with this exact pid and start time proves the pid is still that server.
+function answersAs(health: ServerHealth | undefined, identity: ServerIdentity): boolean {
+  return health?.pid === identity.pid && health.startedAt === identity.startedAt && typeof health.fingerprint === "string";
+}
+async function stopStaleServer(identity: ServerIdentity): Promise<void> {
   // During startup, the lock can name the current Pi process rather than the detached server.
-  if (lock.pid === process.pid) return;
-  // NOTE: after a reboot the pid can belong to an unrelated process; startedAt (checked against /proc ctime) is the only proof it is still ours.
-  if (!await processAlive(lock.pid, lock.startedAt)) return;
-  signalProcess(lock.pid, "SIGTERM");
+  if (identity.pid === process.pid) return;
+  if (!answersAs(await serverHealth(identity.port), identity)) return;
+  signalProcess(identity.pid, "SIGTERM");
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
-    if (!await serverHealthy(lock.port)) break;
+    if (!answersAs(await serverHealth(identity.port), identity)) return;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await delay(Math.min(50, remaining));
   }
-  if (await processAlive(lock.pid, lock.startedAt)) signalProcess(lock.pid, "SIGKILL");
+  // Escalate only while the same server still proves its identity; a pid that stopped answering is left alone.
+  if (answersAs(await serverHealth(identity.port), identity)) signalProcess(identity.pid, "SIGKILL");
+}
+function lockIdentity(lock: TrajectoryLock): ServerIdentity | undefined {
+  return lock.startedAt === undefined ? undefined : { pid: lock.pid, port: lock.port, startedAt: lock.startedAt };
 }
 
 async function readLock(path: string): Promise<TrajectoryLock | undefined> {
@@ -109,7 +118,9 @@ async function resolveExistingServer(lockPath: string, existing: TrajectoryLock,
   const health = await serverHealth(existing.port);
   if (health) {
     if (existing.fingerprint === fingerprint && health.fingerprint === fingerprint) return existing;
-    await stopStaleServer(existing);
+    // Stop the lock's server only if it is the one answering; any other occupant is handled by its own reported identity.
+    const identity = lockIdentity(existing);
+    if (identity) await stopStaleServer(identity);
     await rm(lockPath, { force: true });
     return undefined;
   }
@@ -118,8 +129,8 @@ async function resolveExistingServer(lockPath: string, existing: TrajectoryLock,
       await waitForServer(existing.port, fingerprint);
       return existing;
     } catch {
-      // A live lock can still name the attaching process during startup; after the bounded wait, replace the unrecoverable startup owner and retry normally.
-      await stopStaleServer(existing);
+      // A live lock can still name the attaching process during startup, or a pid reused by an unrelated process.
+      // Nothing answers as that server, so it is never signalled: the unproven lock is replaced and startup retries normally.
       await rm(lockPath, { force: true });
       return undefined;
     }
@@ -158,7 +169,7 @@ async function ensureTrajectoryServer(agentDir: string, configuredPort: number):
   } finally { await lockHandle?.close(); }
   // A server can answer on the port without owning the lock, e.g. one whose lock was lost; it reports its pid, so replace it before spawning.
   const occupant = await serverHealth(configuredPort);
-  if (occupant?.pid !== undefined && occupant.fingerprint !== fingerprint) await stopStaleServer({ pid: occupant.pid, port: configuredPort, ...(occupant.startedAt === undefined ? {} : { startedAt: occupant.startedAt }) });
+  if (occupant?.pid !== undefined && occupant.startedAt !== undefined && occupant.fingerprint !== fingerprint) await stopStaleServer({ pid: occupant.pid, port: configuredPort, startedAt: occupant.startedAt });
   try {
     // NOTE: under a Bun-compiled pi binary process.execPath is the pi CLI, and Bun's node:http never writes the WebSocket 101 upgrade (oven-sh/bun#28157), so the server must run on a real node from PATH.
     const child = spawn(process.versions.bun ? "node" : process.execPath, [serverPath, "--port", String(configuredPort), "--lock", lockPath, "--fingerprint", fingerprint], { detached: true, stdio: "ignore" });

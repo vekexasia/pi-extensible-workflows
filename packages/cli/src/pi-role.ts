@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
 import { constants } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DefaultPackageManager, DefaultResourceLoader, ProjectTrustStore, SettingsManager, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { discoverRoles, loadRole, resolveRole, type ResolvedRole, type WorkflowRoleDirectoryInput } from "pi-extensible-workflows/roles";
 import { CONTEXT_FILE_SCOPES, WorkflowError, errorText, resourcePatternHasMagic, sameFilesystemPath, type AgentDefinition } from "pi-extensible-workflows";
+import { spawnExecutable } from "pi-extensible-workflows/process";
 
 // Pi builtin tools stand in for the workflow session boundary; extension tool names selected by the role pass through.
 const PI_BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -80,10 +80,20 @@ export async function runPiRole(argv: readonly string[]): Promise<number> {
   try { args = await resolvePiArguments(name, rest); }
   catch (error) { process.stderr.write(`pi-role: ${errorText(error)}\n`); return 1; }
   return new Promise((done) => {
-    const child = spawn("pi", args, { stdio: "inherit" });
-    process.on("SIGINT", () => {}); // the child owns the terminal; it handles Ctrl+C and exits
-    child.on("error", (error) => { process.stderr.write(`pi-role: ${errorText(error)}\n`); done(1); });
-    child.on("exit", (code, signal) => { done(signal ? 128 + constants.signals[signal] : code ?? 1); });
+    const ignoreInterrupt = () => {}; // The terminal child handles Ctrl+C; wait for its exit status.
+    let settled = false;
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      process.removeListener("SIGINT", ignoreInterrupt);
+      done(code);
+    };
+    let child: ReturnType<typeof spawnExecutable>;
+    try { child = spawnExecutable("pi", args, { stdio: "inherit", windowsHide: false }); }
+    catch (error) { process.stderr.write(`pi-role: ${errorText(error)}\n`); finish(1); return; }
+    process.on("SIGINT", ignoreInterrupt);
+    child.once("error", (error) => { process.stderr.write(`pi-role: ${errorText(error)}\n`); finish(1); });
+    child.once("exit", (code, signal) => { finish(signal ? 128 + constants.signals[signal] : code ?? 1); });
   });
 }
 

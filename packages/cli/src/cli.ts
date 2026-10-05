@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { chmodSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, extname, join } from "node:path";
+import { basename, delimiter, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
@@ -385,9 +385,10 @@ function writeLauncher(destination: string, workflowName: string, force: boolean
   mkdirSync(parent, { recursive: true });
   const tempDir = mkdtempSync(join(parent, ".pi-extensible-workflows-"));
   const tempPath = join(tempDir, "launcher");
+  const tempCommandPath = join(tempDir, "launcher.cmd");
+  const commandPath = `${destination}.cmd`;
   try {
     const source = `#!/usr/bin/env node
-import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -395,11 +396,35 @@ let cli;
 try { cli = await import(pathToFileURL(join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "npm", "node_modules", "@piewf/cli", "dist", "src", "cli.js")).href); } catch {}
 if (!cli) try { cli = await import(import.meta.resolve("@piewf/cli")); } catch {}
 if (cli) process.exitCode = await cli.runCli(["run", ${JSON.stringify(workflowName)}, ...process.argv.slice(2)]);
-else { const result = spawnSync("piewf", ["run", ${JSON.stringify(workflowName)}, ...process.argv.slice(2)], { stdio: "inherit" }); if (result.error) { console.error("Could not resolve @piewf/cli; install it or put piewf on PATH."); process.exitCode = 1; } else process.exitCode = result.status ?? 1; }
+else {
+  let processLauncher;
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  try { processLauncher = await import(pathToFileURL(join(agentDir, "npm", "node_modules", "pi-extensible-workflows", "dist", "src", "process-launcher.js")).href); } catch {}
+  if (!processLauncher) { console.error("Could not resolve @piewf/cli; install it or put piewf on PATH."); process.exitCode = 1; }
+  else { const result = processLauncher.spawnSyncExecutable("piewf", ["run", ${JSON.stringify(workflowName)}, ...process.argv.slice(2)], { stdio: "inherit" }); if (result.error) { console.error("Could not resolve @piewf/cli; install it or put piewf on PATH."); process.exitCode = 1; } else process.exitCode = result.status ?? 1; }
+}
 `;
     writeFileSync(tempPath, source, { mode: 0o755 });
     chmodSync(tempPath, 0o755);
-    if (force) renameSync(tempPath, destination);
+    if (process.platform === "win32") {
+      writeFileSync(tempCommandPath, `@ECHO off\r\nSETLOCAL\r\nSET "script=%~dp0%~n0"\r\nIF EXIST "%~dp0node.exe" (SET "_prog=%~dp0node.exe") ELSE (SET "_prog=node")\r\n"%_prog%" "%script%" %*\r\n`);
+      if (force) {
+        renameSync(tempPath, destination);
+        renameSync(tempCommandPath, commandPath);
+      } else {
+        try { linkSync(tempCommandPath, commandPath); }
+        catch (error) {
+          if (isNodeError(error, "EEXIST")) throw new Error(`Destination already exists: ${commandPath}; use --force to replace it`, { cause: error });
+          throw error;
+        }
+        try { linkSync(tempPath, destination); }
+        catch (error) {
+          unlinkSync(commandPath);
+          if (isNodeError(error, "EEXIST")) throw new Error(`Destination already exists: ${destination}; use --force to replace it`, { cause: error });
+          throw error;
+        }
+      }
+    } else if (force) renameSync(tempPath, destination);
     else {
       try { linkSync(tempPath, destination); }
       catch (error) {
@@ -581,10 +606,10 @@ async function exportWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
     writeLauncher(destination, workflowName, force);
     if (!output) {
       const binDir = join(homedir(), ".local", "bin");
-      const pathEntries = (process.env.PATH ?? "").split(":").filter(Boolean);
+      const pathEntries = (process.env.PATH ?? "").split(delimiter).filter(Boolean);
       if (!pathEntries.some((entry) => sameFilesystemPath(entry, binDir))) options.stderr(`Warning: ${binDir} is not in PATH\n`);
     }
-    options.write(`Exported ${destination}\n`);
+    options.write(`Exported ${destination}${process.platform === "win32" ? ` (Windows command: ${destination}.cmd)` : ""}\n`);
     return 0;
   });
 }

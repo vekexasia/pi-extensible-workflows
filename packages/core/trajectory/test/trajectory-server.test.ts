@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, truncate, unlink, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createTrajectoryServer } from "../src/server.js";
+import { SEMANTIC_MAP_ASSET_MANIFEST, SEMANTIC_MAP_BUILD_STAMP } from "../src/semantic-map-assets.js";
 
 async function availablePort(): Promise<number> {
   const probe = createNetServer();
@@ -144,10 +146,20 @@ void test("Trajectory persists the server fingerprint in its listening lock", as
   const root = await mkdtemp(join(tmpdir(), "trajectory-server-lock-"));
   const port = await availablePort();
   const fingerprint = "server-hash:html-hash";
-  const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { fingerprint });
+  const lockPath = join(root, "trajectory.lock");
+  const server = createTrajectoryServer(port, lockPath, { fingerprint });
   await listen(server, port);
   try {
-    const lock: unknown = JSON.parse(await readFile(join(root, "trajectory.lock"), "utf8"));
+    let lockText: string | undefined;
+    for (let attempt = 0; attempt < 50 && lockText === undefined; attempt += 1) {
+      try {
+        const candidate = await readFile(lockPath, "utf8");
+        if (candidate.trim()) lockText = candidate;
+        else await new Promise((resolve) => setTimeout(resolve, 10));
+      } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
+    }
+    assert.ok(lockText, "listening lock is persisted");
+    const lock: unknown = JSON.parse(lockText);
     assert.ok(typeof lock === "object" && lock !== null && "startedAt" in lock && typeof lock.startedAt === "number" && lock.startedAt <= Date.now());
     assert.deepEqual({ ...lock, startedAt: undefined }, { pid: process.pid, port, fingerprint, startedAt: undefined });
   } finally {
@@ -155,6 +167,49 @@ void test("Trajectory persists the server fingerprint in its listening lock", as
     server.closeIdleConnections();
     server.close();
     server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory publishes a complete replacement lock before listening callbacks and health", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-lock-readiness-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  const fingerprint = "replacement-server";
+  await writeFile(lockPath, JSON.stringify({ pid: process.pid, port, fingerprint: "starting-publisher", startedAt: 1 }));
+  const server = createTrajectoryServer(port, lockPath, { fingerprint });
+  let listeningLock = "";
+  // Observe the public listening event itself, not a delayed read after /health happens to finish.
+  server.once("listening", () => { listeningLock = readFileSync(lockPath, "utf8"); });
+  try {
+    await listen(server, port);
+    const lock = JSON.parse(listeningLock) as { pid: number; port: number; fingerprint: string; startedAt: number };
+    assert.equal(lock.fingerprint, fingerprint);
+    assert.equal(lock.pid, process.pid);
+    assert.equal(lock.port, port);
+    assert.ok(lock.startedAt > 1 && lock.startedAt <= Date.now());
+    const response = await fetch(`http://127.0.0.1:${String(port)}/health`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, pid: lock.pid, fingerprint: lock.fingerprint, startedAt: lock.startedAt });
+  } finally {
+    server.closeAllConnections(); server.closeIdleConnections();
+    await new Promise<void>((resolve) => server.close(() => { resolve(); }));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory rejects startup and closes the listener when lock persistence fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-lock-failure-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "missing", "trajectory.lock"));
+  const closed = new Promise<void>((resolve) => server.once("close", resolve));
+  try {
+    await assert.rejects(listen(server, port), { code: "ENOENT" });
+    await closed;
+    assert.equal(server.listening, false);
+    await assert.rejects(fetch(`http://127.0.0.1:${String(port)}/health`, { signal: AbortSignal.timeout(300) }));
+  } finally {
+    server.closeAllConnections(); server.closeIdleConnections(); server.close(); server.unref();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -170,6 +225,7 @@ void test("Trajectory HTTP and WebSocket boundaries require localhost and origin
     assert.equal((await fetch(`${base}/health`, { headers: { host: `localhost:${String(port)}` } })).status, 200);
     assert.equal((await fetch(`${base}/health?token=ignored`)).status, 200);
     for (const path of ["/", "/index.html", "/marked.min.js"]) assert.equal((await fetch(`${base}${path}`)).status, 200);
+    assert.equal((await fetch(`${base}/semantic-map.html`, { headers: { origin: "http://evil.test" } })).status, 403);
     assert.equal((await fetch(`${base}/health`, { headers: { origin: "http://evil.test" } })).status, 403);
     const valid = await handshake(port, `http://127.0.0.1:${String(port)}`);
     assert.match(valid.response, /^HTTP\/1\.1 101 Switching Protocols/);
@@ -194,6 +250,161 @@ void test("Trajectory HTTP and WebSocket boundaries require localhost and origin
     server.closeIdleConnections();
     server.close();
     server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory serves only versioned Semantic Map artifacts with restrictive policies and exact routes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-semantic-map-"));
+  const port = await availablePort();
+  const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { fingerprint: "server:semantic-map-stamp" });
+  await listen(server, port);
+  try {
+    const base = `http://127.0.0.1:${String(port)}`;
+    const page = await fetch(`${base}/`);
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get("cache-control"), "no-store");
+    assert.equal(page.headers.get("x-content-type-options"), "nosniff");
+    assert.match(page.headers.get("content-security-policy") ?? "", /frame-src 'self'/);
+    assert.match(page.headers.get("content-security-policy") ?? "", new RegExp(`ws://127\\.0\\.0\\.1:${String(port)}`));
+    const paths = [
+      [`/semantic-map.html?v=${SEMANTIC_MAP_BUILD_STAMP}&embed=1&theme=dark`, "text/html; charset=utf-8", "semantic-map.html"],
+      [`/semantic-map.js?v=${SEMANTIC_MAP_BUILD_STAMP}`, "application/javascript; charset=utf-8", "semantic-map.js"],
+      [`/semantic-map.css?v=${SEMANTIC_MAP_BUILD_STAMP}`, "text/css; charset=utf-8", "semantic-map.css"]
+    ] as const;
+    for (const [route, mime, asset] of paths) {
+      const response = await fetch(`${base}${route}`);
+      assert.equal(response.status, 200, route);
+      assert.equal(response.headers.get("content-type"), mime);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), await readFile(new URL(`../assets/${asset}`, import.meta.url)));
+      if (asset === "semantic-map.html") {
+        const csp = response.headers.get("content-security-policy") ?? "";
+        assert.match(csp, /default-src 'none'/);
+        assert.match(csp, /connect-src 'none'/);
+        assert.match(csp, /object-src 'none'/);
+        assert.match(csp, /script-src 'self' 'unsafe-inline'/);
+        assert.match(csp, /style-src 'self' 'unsafe-inline'/);
+      } else assert.equal(response.headers.has("content-security-policy"), false);
+    }
+    for (const path of ["/semantic-map.json", "/semantic-map/semantic-map.js", "/%252e%252e/semantic-map.js", `/semantic-map.json?v=${SEMANTIC_MAP_BUILD_STAMP}`, `/semantic-map/semantic-map.js?v=${SEMANTIC_MAP_BUILD_STAMP}`]) assert.equal((await fetch(`${base}${path}`)).status, 404, path);
+    // The version is mandatory and must name this build: never fall back to the current bytes.
+    const stale = "0000000000000000";
+    const rejectedQueries = ["", "?build=ignored", "?embed=1&theme=dark", "?v=", "?v", `?V=${SEMANTIC_MAP_BUILD_STAMP}`, `?v=${SEMANTIC_MAP_BUILD_STAMP}&v=${SEMANTIC_MAP_BUILD_STAMP}`, `?v=${SEMANTIC_MAP_BUILD_STAMP}&v=${stale}`, `?v=${SEMANTIC_MAP_BUILD_STAMP.toUpperCase()}`, `?v=${SEMANTIC_MAP_BUILD_STAMP}0`, `?v=${SEMANTIC_MAP_BUILD_STAMP.slice(1)}`, "?v=not-a-build-stamp", `?v=${stale}`, `?v=${stale}&embed=1&theme=dark`];
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) {
+      for (const query of rejectedQueries) {
+        const response = await fetch(`${base}/${name}${query}`);
+        assert.equal(response.status, 404, `${name}${query}`);
+        assert.equal(response.headers.get("cache-control"), "no-store", `${name}${query}`);
+        assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+        assert.match(response.headers.get("content-type") ?? "", /^application\/json/);
+        assert.deepEqual(await response.json(), { error: "Not found" });
+      }
+      for (const method of ["POST", "PUT", "DELETE", "HEAD"]) assert.equal((await fetch(`${base}/${name}?v=${SEMANTIC_MAP_BUILD_STAMP}`, { method })).status, 404, `${method} ${name}`);
+      assert.equal((await fetch(`${base}/${name}?v=${SEMANTIC_MAP_BUILD_STAMP}`, { headers: { origin: "http://evil.test" } })).status, 403);
+    }
+  } finally {
+    server.closeAllConnections(); server.closeIdleConnections(); server.close(); server.unref();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+/** Copies the bundled server with its build files into `root`, laid out like the installed package. */
+async function installBuild(root: string): Promise<{ server: string; parent: string; asset: (name: string) => string }> {
+  const server = join(root, "trajectory", "src", "server.js");
+  const parent = join(root, "trajectory", "src", "assets", "index.html");
+  const asset = (name: string) => join(root, "trajectory", "assets", name);
+  await mkdir(join(root, "trajectory", "src", "assets"), { recursive: true });
+  await mkdir(join(root, "trajectory", "assets"), { recursive: true });
+  await copyFile(new URL("../src/server.js", import.meta.url), server);
+  await copyFile(new URL("../src/assets/index.html", import.meta.url), parent);
+  for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await copyFile(new URL(`../assets/${name}`, import.meta.url), asset(name));
+  return { server, parent, asset };
+}
+
+void test("Trajectory server A never serves build B, partial or truncated files, and never reads the viewer at attach", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-ab-"));
+  const port = await availablePort();
+  const build = await installBuild(root);
+  const originals = new Map<string, Buffer>();
+  for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) originals.set(name, await readFile(build.asset(name)));
+  const parentA = await readFile(build.parent);
+  // Start without the 800 KB viewer: attach and state must not depend on reading or hashing it.
+  await unlink(build.asset("semantic-map.html"));
+  const child = spawn(process.execPath, [build.server, "--port", String(port), "--lock", join(root, "trajectory.lock"), "--fingerprint", "server-a"], { stdio: "ignore", windowsHide: true });
+  let socket: Socket | undefined;
+  const base = `http://127.0.0.1:${String(port)}`;
+  const route = (name: string, version = SEMANTIC_MAP_BUILD_STAMP) => `${base}/${name}?v=${version}${name === "semantic-map.html" ? "&embed=1&theme=dark" : ""}`;
+  const expectIncoherent = async (url: string, label: string) => {
+    const response = await fetch(url);
+    assert.equal(response.status, 503, label);
+    assert.equal(response.headers.get("cache-control"), "no-store", label);
+    assert.equal(response.headers.get("x-content-type-options"), "nosniff", label);
+    assert.match(response.headers.get("content-type") ?? "", /^application\/json/, label);
+    assert.equal(response.headers.has("content-security-policy"), false, label);
+    assert.deepEqual(await response.json(), { error: "Trajectory build files do not match the running server" }, label);
+  };
+  const expectServed = async (name: string) => {
+    const response = await fetch(route(name));
+    assert.equal(response.status, 200, name);
+    assert.equal(response.headers.get("cache-control"), "no-store");
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), originals.get(name), `${name} is build A's exact bytes`);
+  };
+  try {
+    const connected = await handshakeWhenReady(port, base);
+    socket = connected.socket;
+    assert.match(connected.response, /^HTTP\/1\.1 101 Switching Protocols/);
+    socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    assert.equal((await readJsonFrame(socket) as { type?: unknown }).type, "state", "attach works while the viewer file is absent");
+    // Missing viewer: every member of the incomplete set fails closed, including siblings whose own bytes are intact.
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectIncoherent(route(name), `missing viewer: ${name}`);
+    await writeFile(build.asset("semantic-map.html"), originals.get("semantic-map.html") ?? Buffer.alloc(0));
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectServed(name);
+    assert.equal((await fetch(`${base}/`)).status, 200);
+    // Old URL (other build) against this server stays 404 even though coherent bytes exist.
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) assert.equal((await fetch(route(name, "0123456789abcdef"))).status, 404);
+
+    // Same-size in-place replacement that keeps A's stamp marker text: only the bytes tell.
+    const js = originals.get("semantic-map.js") ?? Buffer.alloc(0);
+    assert.ok(js.toString("utf8").includes(`build ${SEMANTIC_MAP_BUILD_STAMP}`));
+    const replaced = Buffer.from(js);
+    replaced[replaced.length - 2] = replaced[replaced.length - 2] === 0x3b ? 0x20 : 0x3b;
+    assert.equal(replaced.length, SEMANTIC_MAP_ASSET_MANIFEST.assets["semantic-map.js"].bytes);
+    await writeFile(build.asset("semantic-map.js"), replaced);
+    await expectIncoherent(route("semantic-map.js"), "same-size B js with retained marker");
+    await expectServed("semantic-map.html");
+    // Truncated file that still starts with A's marker: the requested file and its siblings refuse to serve.
+    await writeFile(build.asset("semantic-map.js"), js);
+    await truncate(build.asset("semantic-map.js"), 200);
+    assert.ok((await readFile(build.asset("semantic-map.js"), "utf8")).includes(`build ${SEMANTIC_MAP_BUILD_STAMP}`));
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectIncoherent(route(name), `truncated js: ${name}`);
+    await writeFile(build.asset("semantic-map.js"), js);
+    // Missing stylesheet and a build-B stylesheet carrying A's header.
+    await unlink(build.asset("semantic-map.css"));
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectIncoherent(route(name), `missing css: ${name}`);
+    await writeFile(build.asset("semantic-map.css"), `/* Semantic Map ${SEMANTIC_MAP_BUILD_STAMP} */\n.b-build { color: red; }\n`);
+    await expectIncoherent(route("semantic-map.css"), "css B with retained header");
+    await writeFile(build.asset("semantic-map.css"), originals.get("semantic-map.css") ?? Buffer.alloc(0));
+    // Viewer HTML replaced by a longer build-B file that keeps A's references.
+    await writeFile(build.asset("semantic-map.html"), Buffer.concat([originals.get("semantic-map.html") ?? Buffer.alloc(0), Buffer.from("<!-- build B -->\n")]));
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectIncoherent(route(name), `longer html B: ${name}`);
+    await writeFile(build.asset("semantic-map.html"), originals.get("semantic-map.html") ?? Buffer.alloc(0));
+    // Parent shell B with a different stamp beside server A: the parent is not served either.
+    await writeFile(build.parent, parentA.toString("utf8").replaceAll(SEMANTIC_MAP_BUILD_STAMP, "0123456789abcdef"));
+    for (const path of ["/", "/index.html"]) await expectIncoherent(`${base}${path}`, `parent B ${path}`);
+    await unlink(build.parent);
+    await expectIncoherent(`${base}/`, "missing parent");
+    await writeFile(build.parent, parentA);
+
+    // Restored build A is served again: checks are per request, not a sticky startup verdict.
+    const page = await fetch(`${base}/`);
+    assert.equal(page.status, 200);
+    assert.deepEqual(Buffer.from(await page.arrayBuffer()), parentA);
+    for (const name of ["semantic-map.html", "semantic-map.js", "semantic-map.css"]) await expectServed(name);
+  } finally {
+    socket?.destroy();
+    if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await waitForExit(child, 5000).catch(() => undefined); }
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -451,15 +662,18 @@ void test("Trajectory rejects an oversized subagent transcript reply", async () 
   const sockets: Socket[] = [];
   try {
     const origin = `http://127.0.0.1:${String(port)}`;
-    const publisher = await handshake(port, origin);
-    sockets.push(publisher.socket);
-    publisher.socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "one" })));
-    publisher.socket.write(maskedFrame(publisherMessage));
-    await new Promise((resolve) => setTimeout(resolve, 100));
     const browser = await handshake(port, origin);
     sockets.push(browser.socket);
-    const state = readJsonFrame(browser.socket);
+    const initial = readJsonFrame(browser.socket);
     browser.socket.write(maskedFrame(JSON.stringify({ type: "ui:attach" })));
+    await initial;
+    const publisher = await handshake(port, origin);
+    sockets.push(publisher.socket);
+    // Attach and state share one write, so the server must consume both frames even though their sum exceeds the per-frame cap.
+    const coalesced = Buffer.concat([maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "one" })), maskedFrame(publisherMessage)]);
+    assert.ok(coalesced.length > maxFrameBytes + 14);
+    const state = readJsonFrame(browser.socket, (candidate) => Boolean((candidate as { publishers?: { subagents?: unknown[] }[] }).publishers?.[0]?.subagents?.length));
+    publisher.socket.write(coalesced);
     const value = await state as { publishers?: { subagents?: { id?: unknown; transcript?: unknown[] }[] }[] };
     const current = value.publishers?.[0]?.subagents?.[0];
     assert.ok(current);

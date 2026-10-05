@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { RPC_LIMIT_BYTES, RunStore, WorkflowAgentExecutor, createLaunchSnapshot, loadAgentDefinitions, resolveAgentResourcePolicy, resolveWorkflowSettings, runWorkflow, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
+import workflowExtension, { RPC_LIMIT_BYTES, RunStore, WorkflowAgentExecutor, canonicalPath, createLaunchSnapshot, loadAgentDefinitions, resolveAgentResourcePolicy, resolveWorkflowSettings, runWorkflow, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
@@ -48,6 +48,57 @@ void test("untrusted project policy cannot influence launch validation", async (
 
   assert.throws(() => validateWorkflowLaunch({ name: "untrusted", script: `return agent("review", { role: "reviewer" });` }, { cwd, agentDir, projectTrusted: false, availableModels: new Set(["openai/gpt"]), rootTools: new Set(), knownModels: new Set(["openai/gpt"]), settingsPath: globalSettingsPath }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
   assert.deepEqual(await listRunIds(cwd, "session", root), []);
+});
+
+void test("filesystem aliases neither widen untrusted project policy nor bypass global exclusions", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust alias ü-"));
+  try {
+    const project = join(root, "Project Ω");
+    const projectAlias = join(root, "Project Junction ü");
+    const agentDir = join(root, "Agent Dir ü");
+    const extensions = join(root, "Extensions Ω");
+    const extensionsAlias = join(root, "Extensions Junction ü");
+    const guarded = join(extensions, "Guarded Ext.ts");
+    const globalSettingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
+    mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    mkdirSync(join(project, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
+    mkdirSync(extensions);
+    writeFileSync(guarded, "export default () => {};\n");
+    symlinkSync(project, projectAlias, process.platform === "win32" ? "junction" : "dir");
+    symlinkSync(extensions, extensionsAlias, process.platform === "win32" ? "junction" : "dir");
+    const physicalGuarded = realpathSync.native(guarded);
+    const drive = (path: string): string => /^[A-Z]:/.test(path) ? `${path.charAt(0).toLowerCase()}${path.slice(1)}` : path;
+    const upper = guarded.toUpperCase();
+    const guardedAliases = [join(extensionsAlias, "Guarded Ext.ts"), drive(guarded).split(sep).join("/"), ...(upper !== guarded && existsSync(upper) ? [upper] : [])];
+    if (process.platform === "win32") assert.equal(guardedAliases.length, 3, "Windows fixtures must exercise junction, drive/separator, and case aliases");
+    writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "safe.md"), "Global role");
+    writeFileSync(join(project, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Untrusted project role");
+    writeFileSync(globalSettingsPath, JSON.stringify({ skills: ["global-only"], extensions: ["*", ...guardedAliases.map((alias) => `!${alias}`)] }));
+    writeFileSync(join(project, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ skills: ["project-only"], extensions: [join(extensionsAlias, "Guarded Ext.ts")] }));
+
+    const projectAliases = [projectAlias, drive(projectAlias), ...(existsSync(projectAlias.toUpperCase()) && projectAlias.toUpperCase() !== projectAlias ? [projectAlias.toUpperCase()] : [])];
+    for (const cwd of projectAliases) {
+      const resolution = resolveWorkflowSettings(cwd, false, globalSettingsPath);
+      assert.equal(resolution.projectTrusted, false);
+      assert.deepEqual(resolution.project, {});
+      assert.deepEqual(resolution.effective.skills, ["global-only"]);
+      assert.deepEqual(resolution.effective.extensions, ["*", ...guardedAliases.map(() => `!${physicalGuarded}`)], cwd);
+      assert.equal(canonicalPath(guarded), physicalGuarded);
+      const policy = resolveAgentResourcePolicy(cwd, false, globalSettingsPath);
+      assert.equal(policy.projectTrusted, false);
+      assert.equal(policy.effective.skills.includes("project-only"), false);
+      assert.ok(policy.effective.extensions.every((selector) => selector === "*" || selector === `!${physicalGuarded}`));
+      const roles = loadAgentDefinitions(cwd, agentDir, false);
+      assert.equal(roles.reviewer, undefined);
+      assert.deepEqual(roles.safe, { prompt: "Global role" });
+    }
+
+    const missingAlias = join(extensionsAlias, "Missing Ext ü.ts");
+    writeFileSync(globalSettingsPath, JSON.stringify({ extensions: [`!${missingAlias}`] }));
+    assert.deepEqual(resolveWorkflowSettings(projectAlias, false, globalSettingsPath).effective.extensions, [`!${missingAlias}`]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 void test("workflow JavaScript cannot cross filesystem, network, or process boundaries", async () => {

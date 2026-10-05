@@ -2,7 +2,7 @@ import { existsSync, realpathSync, readFileSync } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { Compile } from "typebox/compile";
 import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, type InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -203,7 +203,7 @@ async function loadNativeCoreModule(file: string, label: string): Promise<unknow
   modulePath ??= resolve(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "core", file);
   const packageDirectoryError = packageDirectory.error ? ` Package directory lookup failed: ${packageDirectory.error}` : "";
   let loaded = nativeCoreModules.get(file);
-  if (!loaded) { loaded = import(modulePath).catch((error: unknown) => { throw new Error(`Could not load Pi ${label}.${packageDirectoryError}`, { cause: error }); }); nativeCoreModules.set(file, loaded); }
+  if (!loaded) { loaded = import(pathToFileURL(modulePath).href).catch((error: unknown) => { throw new Error(`Could not load Pi ${label}.${packageDirectoryError}`, { cause: error }); }); nativeCoreModules.set(file, loaded); }
   return loaded;
 }
 async function expandPromptTemplateForInspection(text: string, templates: readonly { name: string; content: string }[]): Promise<string> {
@@ -245,8 +245,10 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
     let expandedPrompt = current;
     if (!inputHandled) {
       const skillExpanded = typeof expandSkillCommand === "function" ? expandSkillCommand.call(session, current) : current;
-      try { expandedPrompt = await expandPromptTemplateForInspection(skillExpanded, Array.isArray(templates) ? templates : []); }
-      catch (error) { diagnostics.push({ type: "error", message: `Pi prompt template expansion is unavailable: ${errorText(error)}`, source: "Pi session" }); }
+      if (Array.isArray(templates) && templates.length > 0) {
+        try { expandedPrompt = await expandPromptTemplateForInspection(skillExpanded, templates); }
+        catch (error) { diagnostics.push({ type: "error", message: `Pi prompt template expansion is unavailable: ${errorText(error)}`, source: "Pi session" }); }
+      } else expandedPrompt = skillExpanded;
     }
     const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart(expandedPrompt, undefined, baseOptions) : undefined;
     const prepared = result as { messages?: readonly unknown[]; systemPromptOptions?: unknown } | undefined;
@@ -359,6 +361,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
       noExtensions: true,
       additionalExtensionPaths: extensionPaths,
       noSkills: true,
+      noPromptTemplates: input.noPromptTemplates ?? false,
       additionalSkillPaths: [...new Set([...skillPaths, ...(input.additionalSkillPaths ?? [])])],
       extensionFactories,
       ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}),
@@ -375,7 +378,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     const packageManager = new DefaultPackageManager({ cwd: input.cwd, agentDir, settingsManager, builtinExtensions: builtinNames });
     const resolved = await packageManager.resolve();
     const extensionPaths = [...new Set(resolved.extensions.filter(({ enabled }) => enabled).map(({ path }) => extensionIdentity(path)).filter((path) => path.startsWith(BUILTIN_EXTENSION_PREFIX) || !isWorkflowHostEntry(path)))];
-    resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), extensionFactories, ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
+    resourceLoader = new DefaultResourceLoader({ cwd: input.cwd, agentDir, settingsManager, noExtensions: true, noPromptTemplates: input.noPromptTemplates ?? false, additionalExtensionPaths: extensionPaths, ...(input.additionalSkillPaths?.length ? { additionalSkillPaths: [...input.additionalSkillPaths] } : {}), extensionFactories, ...(contextFilesOverride ? { agentsFilesOverride: contextFilesOverride } : {}), ...systemPromptOptions, ...(input.systemPromptAppend ? { appendSystemPromptOverride: (base) => [...base, input.systemPromptAppend ?? ""] } : {}) });
     await resourceLoader.reload();
   }
   const providerFailures = flushExtensionProviders(resourceLoader, modelRuntime);

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { loadSettings, parseRoleMarkdown, preflight, prepareAgentSetupForInspection, resolveWorkflowSettings, selectResourcesByLayers, localAgentTransport, WorkflowAgentExecutor, WorkflowError } from "../src/index.js";
 import { decodeLaunchSnapshot } from "../src/decoders.js";
@@ -65,7 +65,8 @@ void test("child capability selectors can re-enable discovered skills and extens
     selectorSources: { global: { skills: ["*", "!operator-skill"], extensions: ["**/*", "!**/unsafe.mjs"] }, project: {} },
   };
   const prepared = await prepareAgentSetupForInspection({ cwd: "/tmp", model: { provider: "test", model: "model" }, tools: new Set(["read"]), availableModels: new Set(["test/model"]), agentResourcePolicy: () => structuredClone(policy) }, "child", { label: "child", workflowName: "test", skills: ["operator-skill"], extensions: ["/opt/unsafe.mjs"], tools: ["!*", "read"] }, localAgentTransport);
-  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy?.effective, { skills: ["*", "!operator-skill", "operator-skill"], extensions: ["**/*", "!**/unsafe.mjs", "/opt/unsafe.mjs"], tools: ["!*", "read"] });
+  // Call-level extension paths are resolved against the cwd; on Windows a rooted path gains the current drive.
+  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy?.effective, { skills: ["*", "!operator-skill", "operator-skill"], extensions: ["**/*", "!**/unsafe.mjs", resolve("/opt/unsafe.mjs")], tools: ["!*", "read"] });
 });
 
 void test("capability layers preserve default-enabled candidates and parent boundaries", () => {

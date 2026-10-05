@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnExecutable, terminateProcessTree } from "../../src/process-launcher.js";
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -217,20 +218,10 @@ export function removeAmbientFixtureRepository(repository: AmbientFixtureReposit
   return !existsSync(repository.root);
 }
 
-function terminateProcess(child: ChildProcess, signal: NodeJS.Signals): boolean {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
-    else child.kill(signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function killProcessGroup(child: ChildProcess): Promise<boolean> {
-  let terminated = terminateProcess(child, "SIGTERM");
+  let terminated = await terminateProcessTree(child, "SIGTERM");
   await new Promise((resolve) => setTimeout(resolve, 100));
-  if (child.exitCode === null) terminated = terminateProcess(child, "SIGKILL") || terminated;
+  if (child.exitCode === null) terminated = await terminateProcessTree(child, "SIGKILL") || terminated;
   return terminated;
 }
 
@@ -277,7 +268,7 @@ export async function runAmbientPiProcess(input: AmbientPiProcessInput): Promise
   let stdout = "";
   let stderr = "";
   let killPromise: Promise<boolean> | undefined;
-  const child = spawn(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, {
+  const child = spawnExecutable(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, {
     cwd: input.worktree,
     env: { ...process.env, ...input.environment, PI_CODING_AGENT_SESSION_DIR: input.sessionDir },
     detached: process.platform !== "win32",
@@ -292,26 +283,24 @@ export async function runAmbientPiProcess(input: AmbientPiProcessInput): Promise
       totalCost += usageCost(event.message);
       if (totalCost > input.maxCost && !budgetExceeded) {
         budgetExceeded = true;
-        void requestKill().then((terminated) => { processGroupTerminated ||= terminated; });
-        controller.abort();
+        void requestKill().then((terminated) => { processGroupTerminated ||= terminated; controller.abort(); });
       }
     } catch { /* Ignore non-JSON diagnostics in print mode. */ }
   };
   let lineBuffer = "";
-  child.stdout.on("data", (chunk: Buffer) => {
+  child.stdout?.on("data", (chunk: Buffer) => {
     stdout = `${stdout}${chunk.toString()}`.slice(-64_000);
     lineBuffer += chunk.toString();
     const lines = lineBuffer.split("\n");
     lineBuffer = lines.pop() ?? "";
     for (const line of lines) if (line) inspect(line);
   });
-  child.stderr.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
+  child.stderr?.on("data", (chunk: Buffer) => { stderr = `${stderr}${chunk.toString()}`.slice(-64_000); });
   child.once("error", () => { /* close still reports the terminated child. */ });
   const close = new Promise<number | null>((resolve) => { child.once("close", (code) => { resolve(code); }); });
   const timer = setTimeout(() => {
     timedOut = true;
-    void requestKill().then((terminated) => { processGroupTerminated ||= terminated; });
-    controller.abort();
+    void requestKill().then((terminated) => { processGroupTerminated ||= terminated; controller.abort(); });
   }, input.timeoutMs);
   const exitCode = await close;
   clearTimeout(timer);

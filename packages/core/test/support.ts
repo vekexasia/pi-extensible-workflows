@@ -221,3 +221,19 @@ export function decodeTestRunDetails(value: unknown): { readonly runId: string }
   if (!isTestRecord(value) || typeof value.runId !== "string") throw new Error("Invalid test run details");
   return { runId: value.runId };
 }
+
+/**
+ * Relocates the test home for code that reads `os.homedir()` or `HOME`. `os.homedir()` reads HOME on POSIX but
+ * USERPROFILE on Windows, so both are set; the returned function restores the previous values.
+ */
+export function useTestHome(home: string): () => void {
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  return () => {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
+  };
+}

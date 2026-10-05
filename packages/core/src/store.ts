@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
@@ -13,7 +13,7 @@ import {
   type Journal, type PendingWorkflowDecision, type PersistedOwnershipNode,
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference,
 } from "./decoders.js";
-import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json } from "./io.js";
+import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json, renameWithRetry } from "./io.js";
 import { runsDirectory, safePart, structuralPath } from "./paths.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
@@ -77,7 +77,7 @@ export class RunStore {
       await atomicJson(join(temporary, "state.json"), run);
       await createSystemPromptStorage(temporary, true);
       await atomicJson(join(temporary, "summary.json"), summaryFromRun(run, this.directory, { completed: {} }, undefined, new Date().toISOString()));
-      await rename(temporary, this.directory);
+      await renameWithRetry(temporary, this.directory);
     } catch (error) {
       await rm(temporary, { recursive: true, force: true });
       throw error;
@@ -94,8 +94,8 @@ export class RunStore {
     });
     await write;
   }
-  //NOTE: summary.json is an optional derived cache (see OPTIONAL_RUN_FILES); a missed refresh self-heals because every reader (loadSummary, CLI inspector) recomputes from state/journal. Keep this best-effort so a cache hiccup never fails the primary write.
-  private refreshSummaryBestEffort(): void { void this.refreshSummary().catch(() => undefined); }
+  //NOTE: summary.json is an optional derived cache (see OPTIONAL_RUN_FILES); a missed refresh self-heals because every reader (loadSummary, CLI inspector) recomputes from state/journal. Keep failures best-effort, but await the owned write so completion, shutdown and deletion cannot race a detached cache writer.
+  private async refreshSummaryBestEffort(): Promise<void> { await this.refreshSummary().catch(() => undefined); }
 
   async isComplete(): Promise<boolean> {
     try { await Promise.all([access(join(this.directory, "snapshot.json")), access(join(this.directory, "journal.json")), access(join(this.directory, "ownership.json")), access(join(this.directory, "state.json"))]); return true; }
@@ -139,7 +139,7 @@ export class RunStore {
     const write = this.stateLane.run(async () => {
       this.#assertRunIdentity(run, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
       await atomicJson(join(this.directory, "state.json"), run);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
     });
     await write;
   }
@@ -152,7 +152,7 @@ export class RunStore {
       const result = await update(current);
       this.#assertRunIdentity(result, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
       await atomicJson(join(this.directory, "state.json"), result);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
       return result;
     });
     return write;
@@ -277,7 +277,7 @@ export class RunStore {
       journal.awaiting ??= {};
       const result = await update(journal);
       await atomicJson(join(this.directory, "journal.json"), journal);
-      this.refreshSummaryBestEffort();
+      await this.refreshSummaryBestEffort();
       return result;
     });
     return write;

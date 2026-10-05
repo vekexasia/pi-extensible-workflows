@@ -1,17 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
 import { sameFilesystemPath } from "../../src/paths.js";
+import { atomicWriteFile } from "../../src/io.js";
+import { SEMANTIC_MAP_ASSET_MANIFEST, type SemanticMapAssetName } from "./semantic-map-assets.js";
 import { TOOL_TIMING_ENTRY_TYPE } from "../../src/tool-timing.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
 type Socket = import("node:stream").Duplex;
 type ClientKind = "publisher" | "browser";
 type RunFocus = { publisherId: string; runId: string };
-type Client = { socket: Socket; kind: ClientKind; publisherId?: string; buffer: Buffer; pendingState: Buffer | undefined; pendingDeliver: (() => void) | undefined; backpressured: boolean; superseded: boolean; focusAware?: boolean; focus?: RunFocus; sentTiming?: Map<string, number> };
+type Client = { socket: Socket; kind: ClientKind; publisherId?: string; frames: FrameDecoder; pendingState: Buffer | undefined; pendingDeliver: (() => void) | undefined; backpressured: boolean; superseded: boolean; focusAware?: boolean; focus?: RunFocus; sentTiming?: Map<string, number> };
 type State = { type: "state"; publishers: readonly unknown[]; updatedAt: number; initial?: boolean; truncated?: boolean };
 type PendingRequest = { requestId: string; kind: "transcript" | "action"; browser: Client; publisherId: string; publisher: Client; target: { runId?: string; agentId?: string; subagentId?: string; revision?: number }; timer: ReturnType<typeof setTimeout> };
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
@@ -201,41 +203,117 @@ function send(client: Client, value: unknown, maxBytes: number): void {
   } catch { client.socket.destroy(); }
 }
 
-function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly string[] {
-  client.buffer = Buffer.concat([client.buffer, chunk]);
-  if (client.buffer.length > maxBytes + 14) throw new Error("Trajectory WebSocket buffer is too large");
-  const messages: string[] = [];
-  while (client.buffer.length >= 2) {
-    const first = client.buffer[0] ?? 0;
-    const second = client.buffer[1] ?? 0;
+/** Incremental decoder state: unconsumed bytes plus how many bytes the next frame header or body still needs. */
+export type FrameDecoder = { chunks: Buffer[]; buffered: number; needed: number; closed: boolean };
+export type WebSocketFrame = { opcode: number; payload: Buffer };
+export function createFrameDecoder(): FrameDecoder { return { chunks: [], buffered: 0, needed: 2, closed: false }; }
+
+/**
+ * Yields complete client frames in wire order. `maxBytes` bounds each frame, not the coalesced chunk, so every
+ * complete frame is consumed first and only the residual partial frame (< maxBytes + 14 bytes) stays buffered.
+ * Declared length, mask, RSV, FIN, and opcode are rejected from the header before any body is buffered or allocated.
+ */
+export function* decodeFrames(decoder: FrameDecoder, chunk: Buffer, maxBytes: number): Generator<WebSocketFrame, void, undefined> {
+  if (decoder.closed || chunk.length === 0) return;
+  decoder.chunks.push(chunk);
+  decoder.buffered += chunk.length;
+  // Split bodies accumulate as chunk references and are joined once, when the whole header or frame has arrived.
+  if (decoder.buffered < decoder.needed) return;
+  let buffer = decoder.chunks.length === 1 ? chunk : Buffer.concat(decoder.chunks, decoder.buffered);
+  // Keep decoder state consistent at every yield so a consumer that stops or throws leaves no double-delivered bytes.
+  const retain = (rest: Buffer, needed: number): void => { decoder.chunks = rest.length ? [rest] : []; decoder.buffered = rest.length; decoder.needed = needed; };
+  // A partial residual is copied so it does not pin the larger coalesced chunk it was sliced from.
+  const wait = (needed: number): void => { retain(Buffer.from(buffer), needed); };
+  retain(buffer, 2);
+  for (;;) {
+    if (buffer.length < 2) { wait(2); return; }
+    const first = buffer[0] ?? 0;
+    const second = buffer[1] ?? 0;
     const opcode = first & 0x0f;
-    const masked = (second & 0x80) !== 0;
-    if ((first & 0x70) !== 0 || (first & 0x80) === 0 || !masked) throw new Error("Invalid Trajectory WebSocket frame");
+    if ((first & 0x70) !== 0 || (first & 0x80) === 0 || (second & 0x80) === 0) throw new Error("Invalid Trajectory WebSocket frame");
+    if (opcode !== 0x1 && opcode !== 0x8 && opcode !== 0x9 && opcode !== 0xA) throw new Error("Unsupported Trajectory WebSocket frame");
     let offset = 2;
     let length = second & 0x7f;
-    if (length === 126) { if (client.buffer.length < 4) break; length = client.buffer.readUInt16BE(2); offset = 4; }
-    else if (length === 127) { if (client.buffer.length < 10) break; const longLength = client.buffer.readBigUInt64BE(2); if (longLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
+    if (length === 126) { if (buffer.length < 4) { wait(4); return; } length = buffer.readUInt16BE(2); offset = 4; }
+    else if (length === 127) { if (buffer.length < 10) { wait(10); return; } const longLength = buffer.readBigUInt64BE(2); if (longLength >= BigInt(maxBytes)) throw new Error("Trajectory WebSocket frame is too large"); length = Number(longLength); offset = 10; }
     if (length >= maxBytes) throw new Error("Trajectory WebSocket frame is too large");
-    if (opcode >= 0x8 && (length > 125 || (first & 0x80) === 0)) throw new Error("Invalid Trajectory WebSocket control frame");
-    if (client.buffer.length < offset + 4 + length) break;
-    const mask = client.buffer.subarray(offset, offset + 4); offset += 4;
-    const data = client.buffer.subarray(offset, offset + length);
-    client.buffer = client.buffer.subarray(offset + length);
-    if (opcode === 0x8) { client.socket.end(); break; }
-    if (opcode === 0x9) { const pong = Buffer.alloc(2 + length); pong[0] = 0x8a; pong[1] = length; for (let index = 0; index < length; index += 1) pong[index + 2] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0); writeFrame(client, pong, false); continue; }
-    if (opcode === 0xA) continue;
-    if (opcode !== 0x1) throw new Error("Unsupported Trajectory WebSocket frame");
-    const decoded = Buffer.alloc(length);
-    for (let index = 0; index < length; index += 1) decoded[index] = (data[index] ?? 0) ^ (mask[index % 4] ?? 0);
-    messages.push(decoded.toString("utf8"));
+    if (opcode >= 0x8 && length > 125) throw new Error("Invalid Trajectory WebSocket control frame");
+    const total = offset + 4 + length;
+    if (buffer.length < total) { wait(total); return; }
+    const mask = buffer.subarray(offset, offset + 4);
+    const payload = Buffer.allocUnsafe(length);
+    for (let index = 0; index < length; index += 1) payload[index] = (buffer[offset + 4 + index] ?? 0) ^ (mask[index % 4] ?? 0);
+    buffer = buffer.subarray(total);
+    // Nothing after a close frame is interpreted.
+    if (opcode === 0x8) { decoder.closed = true; buffer = Buffer.alloc(0); }
+    retain(buffer, 2);
+    yield { opcode, payload };
+    if (decoder.closed) return;
   }
-  return messages;
+}
+
+/** Applies control frames on the socket and hands each text message to `onMessage` in wire order. */
+function receiveFrames(client: Client, chunk: Buffer, maxBytes: number, onMessage: (message: string) => void): void {
+  for (const { opcode, payload } of decodeFrames(client.frames, chunk, maxBytes)) {
+    if (opcode === 0x8) { client.socket.end(); return; }
+    if (opcode === 0x9) { writeFrame(client, Buffer.concat([Buffer.from([0x8a, payload.length]), payload]), false); continue; }
+    if (opcode === 0xA) continue;
+    onMessage(payload.toString("utf8"));
+  }
 }
 
 function writeJson(response: ServerResponse, status: number, value: unknown): void {
   const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store" });
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store", "x-content-type-options": "nosniff" });
   response.end(body);
+}
+function writeAsset(response: ServerResponse, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
+  response.writeHead(200, { "content-type": contentType, "content-length": body.byteLength, "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", ...headers });
+  response.end(body);
+}
+function parentContentSecurityPolicy(port: number): string {
+  return `default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:${String(port)}; frame-src 'self'; child-src 'self'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
+}
+const SEMANTIC_MAP_CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+type SemanticMapBrowserAsset = Exclude<SemanticMapAssetName, "index.html">;
+const SEMANTIC_MAP_ASSETS = new Map<string, { name: SemanticMapBrowserAsset; file: URL; contentType: string }>([
+  ["/semantic-map.html", { name: "semantic-map.html", file: new URL("../assets/semantic-map.html", import.meta.url), contentType: "text/html; charset=utf-8" }],
+  ["/semantic-map.js", { name: "semantic-map.js", file: new URL("../assets/semantic-map.js", import.meta.url), contentType: "application/javascript; charset=utf-8" }],
+  ["/semantic-map.css", { name: "semantic-map.css", file: new URL("../assets/semantic-map.css", import.meta.url), contentType: "text/css; charset=utf-8" }]
+]);
+const PARENT_SHELL = new URL("./assets/index.html", import.meta.url);
+const BUILD_STAMP_PATTERN = /^[0-9a-f]{16}$/;
+/** Exactly one well-formed `v` naming the build this server was bundled with; anything else is a different or unknown build. */
+function requestsServableBuild(url: URL): boolean {
+  const versions = url.searchParams.getAll(SEMANTIC_MAP_ASSET_MANIFEST.versionParameter);
+  return versions.length === 1 && BUILD_STAMP_PATTERN.test(versions[0] ?? "") && versions[0] === SEMANTIC_MAP_ASSET_MANIFEST.stamp;
+}
+const matchesDigest = (name: SemanticMapAssetName, bytes: Buffer): boolean => {
+  const expected = SEMANTIC_MAP_ASSET_MANIFEST.assets[name];
+  return bytes.byteLength === expected.bytes && createHash("sha256").update(bytes).digest("hex") === expected.sha256;
+};
+/**
+ * Reads one build file on request and returns it only if its bytes are the ones this server was built with.
+ * An in-place update can leave a running server beside newer, partial or truncated files (even ones still
+ * carrying the old stamp text), so the stamp alone is not trusted: size and SHA-256 of the bytes actually read are.
+ */
+async function readCoherent(name: SemanticMapAssetName, file: URL): Promise<Buffer | undefined> {
+  try {
+    // Cheap size check first so a replaced, oversized file is never read into memory.
+    if ((await stat(file)).size !== SEMANTIC_MAP_ASSET_MANIFEST.assets[name].bytes) return undefined;
+    const bytes = await readFile(file);
+    return matchesDigest(name, bytes) ? bytes : undefined;
+  } catch { return undefined; }
+}
+/** Sibling viewer files must be present at their built sizes, so a partial update never serves a half set. */
+async function semanticSiblingsPresent(requested: SemanticMapBrowserAsset): Promise<boolean> {
+  const checks = [...SEMANTIC_MAP_ASSETS.values()].filter((asset) => asset.name !== requested).map(async (asset) => {
+    try { return (await stat(asset.file)).size === SEMANTIC_MAP_ASSET_MANIFEST.assets[asset.name].bytes; } catch { return false; }
+  });
+  return (await Promise.all(checks)).every(Boolean);
+}
+function writeIncoherentBuild(response: ServerResponse): void {
+  writeJson(response, 503, { error: "Trajectory build files do not match the running server" });
 }
 function authorized(request: IncomingMessage, port: number): boolean {
   const origin = request.headers.origin;
@@ -462,46 +540,54 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     catch { writeJson(response, 400, { error: "Invalid request" }); return; }
     if (!authorized(request, port)) { writeJson(response, 403, { error: "Forbidden" }); return; }
     const path = url.pathname;
+    const requestPath = (request.url ?? "/").split(/[?#]/, 1)[0] ?? "/";
+    if (requestPath !== path) { writeJson(response, 404, { error: "Not found" }); return; }
     // The identity lets an attaching Pi tell its own server from any other one answering on the port.
     if (request.method === "GET" && path === "/health") { writeJson(response, 200, { ok: true, pid: process.pid, fingerprint: serverFingerprint, startedAt }); return; }
     if (request.method === "GET" && (path === "/" || path === "/index.html")) {
-      void readFile(new URL("./assets/index.html", import.meta.url)).then((html) => {
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": html.byteLength, "cache-control": "no-store" });
-        response.end(html);
+      void readCoherent("index.html", PARENT_SHELL).then((html) => {
+        if (html === undefined) { writeIncoherentBuild(response); return; }
+        writeAsset(response, html, "text/html; charset=utf-8", { "content-security-policy": parentContentSecurityPolicy(port) });
       }).catch(() => { writeJson(response, 500, { error: "Trajectory UI is unavailable" }); });
+      return;
+    }
+    const semanticAsset = request.method === "GET" ? SEMANTIC_MAP_ASSETS.get(path) : undefined;
+    if (semanticAsset) {
+      // A missing, duplicated, malformed or other build's version is never answered with this build's bytes.
+      if (!requestsServableBuild(url)) { writeJson(response, 404, { error: "Not found" }); return; }
+      void Promise.all([readCoherent(semanticAsset.name, semanticAsset.file), semanticSiblingsPresent(semanticAsset.name)]).then(([asset, siblings]) => {
+        if (asset === undefined || !siblings) { writeIncoherentBuild(response); return; }
+        writeAsset(response, asset, semanticAsset.contentType, path === "/semantic-map.html" ? { "content-security-policy": SEMANTIC_MAP_CONTENT_SECURITY_POLICY } : {});
+      }).catch(() => { writeJson(response, 500, { error: "Semantic Map asset is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/marked.min.js") {
       void readFile(new URL("./assets/marked.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory markdown renderer is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/morphdom.min.js") {
       void readFile(new URL("./assets/morphdom.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory DOM diffing library is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/prism.min.js") {
       void readFile(new URL("./assets/prism.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory syntax highlighting library is unavailable" }); });
       return;
     }
     if (request.method === "GET" && (path === "/favicon.png" || path === "/favicon.ico")) {
       void readFile(new URL("./assets/favicon.png", import.meta.url)).then((icon) => {
-        response.writeHead(200, { "content-type": "image/png", "content-length": icon.byteLength, "cache-control": "no-store" });
-        response.end(icon);
+        writeAsset(response, icon, "image/png");
       }).catch(() => { writeJson(response, 404, { error: "Not found" }); });
       return;
     }
     writeJson(response, 404, { error: "Not found" });
   });
-  server.on("upgrade", (request, socket) => {
+  server.on("upgrade", (request, socket, head: Buffer) => {
     let url: URL;
     try { url = new URL(request.url ?? "/", `http://127.0.0.1:${String(port)}`); }
     catch { socket.destroy(); return; }
@@ -509,7 +595,7 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     if (!authorized(request, port) || url.pathname !== "/ws" || typeof key !== "string") { socket.destroy(); return; }
     const accept = createHash("sha1").update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest("base64");
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    const client: Client = { socket, kind: "publisher", buffer: Buffer.alloc(0), pendingState: undefined, pendingDeliver: undefined, backpressured: false, superseded: false };
+    const client: Client = { socket, kind: "publisher", frames: createFrameDecoder(), pendingState: undefined, pendingDeliver: undefined, backpressured: false, superseded: false };
     socket.on("drain", () => {
       const pendingState = client.pendingState;
       const pendingDeliver = client.pendingDeliver;
@@ -519,16 +605,31 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
       if (pendingState !== undefined) writeFrame(client, pendingState, true, pendingDeliver);
     });
     clients.add(client);
-    socket.on("data", (chunk: unknown) => {
-      if (!Buffer.isBuffer(chunk)) return;
-      try { for (const message of parseFrames(client, chunk, maxFrameBytes)) handleMessage(client, message); } catch { socket.destroy(); }
-    });
+    const receive = (chunk: unknown): void => {
+      if (!Buffer.isBuffer(chunk) || socket.destroyed) return;
+      try { receiveFrames(client, chunk, maxFrameBytes, (message) => { handleMessage(client, message); }); } catch { socket.destroy(); }
+    };
+    socket.on("data", receive);
     socket.on("close", () => { disconnect(client); });
     socket.on("error", () => { disconnect(client); });
     // A dropped tab only sends FIN, and an upgraded socket stays half-open until this side closes it.
     socket.on("end", () => { socket.destroy(); });
+    // Frames sent together with the upgrade request arrive in `head`; they share the socket decoder and lifecycle.
+    receive(head);
   });
-  server.once("listening", () => { startedAt = Date.now(); void writeFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt })}\n`, { mode: 0o600 }).catch(() => { process.exitCode = 1; }); scheduleIdleExit(); });
+  server.once("listening", () => {
+    startedAt = Date.now();
+    try {
+      // Startup-only synchronous atomic replacement: neither listening callbacks nor /health may observe an
+      // unfinished lock, and the publisher's existing reservation stays intact until the server identity is ready.
+      atomicWriteFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt })}\n`, true);
+      scheduleIdleExit();
+    } catch (error) {
+      // A server without a persisted identity must not stay healthy or be adopted by another publisher.
+      server.close();
+      server.emit("error", error);
+    }
+  });
   server.on("close", () => { closed = true; if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; } });
   return server;
 }

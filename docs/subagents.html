@@ -92,6 +92,7 @@
         <p>Open <code>/workflow trajectory</code> to inspect standalone subagents in Trajectory's local browser UI. Each publisher session shows a sibling <code>SUBAGENTS</code> section beside its workflow runs, scoped to the current Pi session and sorted attention-first: running, failed, stopped, then completed.</p>
         <p>The publisher home view includes a subagent Gantt with one lane per subagent and matching tool-timing bars. Select a subagent to open its own view with the transcript event timeline, searchable events, model, tools, accounting, result or failure, and worktree path and branch when available. Use <strong>Agent details</strong> to inspect Prompt, Tools, Skills, Extensions, Environment, and Output without selecting a system-prompt event.</p>
         <p>While a subagent is running, its view exposes <code>Stop</code> and <code>Steer</code>. Failed or stopped subagents expose <code>Retry</code>; retry starts a fresh subagent with a new ID and follows that ID in the UI. Pause, resume, and checkpoint controls are not shown for subagents.</p>
+        <p>The live <strong>Semantic Map</strong> tab can also be opened from a focused subagent, with the keyboard as well as the mouse. It draws a bounded projection, not a complete graph, and loads nothing until you open it. Its limits, versioned assets and retry behavior are described in the Trajectory section of the <a href="llm.md">LLM reference</a>.</p>
       </section>
       <section id="execution">
         <h2>Execution and lifecycle</h2>

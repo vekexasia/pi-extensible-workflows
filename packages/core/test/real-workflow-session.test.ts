@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess } from "node:child_process";
+import { spawnExecutable, terminateProcessTree } from "../src/process-launcher.js";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,12 +16,7 @@ const defaultPrompt = functionName === "developUntilApproved"
   ? "Add and export a clampScore(score) function from src/score.js that clamps numeric scores to the inclusive range 0 through 10. Have a developer implement the change, then have a reviewer inspect the implementation and tests; iterate until the reviewer approves. Use the reusable workflow capabilities available in this session and do not implement the feature directly."
   : "Add and export a grade(score) function from src/score.js. It must return 'fail' below 1, 'pass' from 1 through 4, and 'distinction' from 5 upward. Use the reusable TDD workflow capability available in this session with npm test; do not implement the feature directly.";
 
-function terminate(child: ChildProcess): void {
-  try {
-    if (child.pid && process.platform !== "win32") process.kill(-child.pid, "SIGTERM");
-    else child.kill("SIGTERM");
-  } catch { /* Already exited. */ }
-}
+function terminate(child: ChildProcess): void { void terminateProcessTree(child, "SIGTERM"); }
 
 void test(`a clean real Pi session composes ${functionName} in a workflow script`, { skip: !enabled, timeout: 120_000 }, async () => {
   const sourceAgentDir = process.env.PI_WORKFLOW_EVAL_SOURCE_AGENT_DIR;
@@ -59,15 +55,15 @@ void test(`a clean real Pi session composes ${functionName} in a workflow script
   let buffer = "";
   const lines: string[] = [];
   let workflowCall: Record<string, unknown> | undefined;
-  const child = spawn(process.env.PI_WORKFLOW_TEST_PI ?? "pi", args, {
+  const child = spawnExecutable(process.env.PI_WORKFLOW_TEST_PI ?? "pi", args, {
     cwd: worktree.path,
     env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";
-  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-  child.stdout.on("data", (chunk: Buffer) => {
+  child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  child.stdout?.on("data", (chunk: Buffer) => {
     buffer += chunk.toString();
     const complete = buffer.split("\n");
     buffer = complete.pop() ?? "";

@@ -293,6 +293,7 @@ export interface SessionInput {
   systemPromptAppend?: string;
   extensionFactories?: InlineExtension[];
   additionalSkillPaths?: readonly string[];
+  noPromptTemplates?: boolean;
   contextFiles?: readonly ContextFileScope[];
   resourcePolicy?: AgentResourcePolicy;
   readonly settings?: Readonly<WorkflowExtensionSettings>;

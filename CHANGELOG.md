@@ -1,6 +1,26 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- Trajectory has an optional **Semantic Map** tab beside the default Gantt. Nothing about the map loads until you click the tab. It then opens a pinned, standalone Archify viewer in an opaque `allow-scripts`-only sandbox and sends it bounded, allowlisted live snapshots over one private message port. The viewer opens no second WebSocket and has no storage or telemetry. The map shows at most 16 agents, 8 recorded relations and 16 tool calls per agent. The viewer payload is capped at 512 KiB, 500 nodes and 1500 edges. Closing or hiding the tab stops all map work. The map is live-only: static exports and shared reports keep the Gantt and explain that the map is not included.
+- The three Semantic Map assets are served only at build-versioned URLs (`?v=<stamp>`), with a strict CSP, `nosniff`, `no-referrer` and `no-store`. A missing, duplicate, malformed or stale version gets 404. Asset bytes that no longer match the running server's build get 503. A page from an older build shows an explicit Retry instead of reopening the map on its own.
+
+### Fixes
+
+- Native Windows development no longer needs Bash or POSIX helpers. Build, test runners, process launching and the package verifier run from `cmd` and PowerShell, and test fixtures isolate `HOME`/`USERPROFILE`.
+- `piewf doctor` no longer crashes (0xC0000409) on Node 22 when it copies to a path with non-ASCII characters on Windows.
+- The Herdr extension listens on a named pipe on Windows instead of a filesystem socket, which failed with `EACCES`.
+- A failed workflow recovery releases its retry reservation before it reports the failure, so an immediate retry is accepted.
+- State and journal mutations await their best-effort summary cache writes before returning, so run completion and teardown cannot race a detached temporary-file writer. Summary failures still do not fail the authoritative write.
+- The Trajectory server decodes WebSocket frames incrementally. It accepts valid frames that arrive coalesced or split, and rejects oversized or invalid frames early.
+- The Trajectory server atomically persists its listening identity before listening callbacks or health checks can succeed. A lock write failure closes the listener and reports startup failure, rather than leaving a healthy server with an incomplete lock.
+- A stale Trajectory server whose PID was reused is signalled only when its PID, start time and fingerprint all match the lock. Otherwise only the unproven lock is removed.
+
+### Internal
+
+- Build and test against Pi 1.0.3; `@piewf/cli` bundles the same aligned Pi patch versions. This fixes the remaining shrinkwrapped `brace-expansion` vulnerability and removes the package verifier's advisory exceptions. Pi 1.0.3 renames the Azure provider from `azure-openai-responses` to `azure`; affected provider keys in auth, models and settings must be migrated.
+
 ## [5.19.1] - 2026-10-05
 
 ### New capabilities

@@ -282,7 +282,9 @@ void test("non-TTY inspection discovers persisted runs without a transcript", as
   const store = new RunStore(cwd, sessionId, "run-persisted", home);
   await store.create({ id: "run-persisted", workflowName: "persisted", cwd, sessionId, state: "completed", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "persisted" }, settings: { concurrency: 1 }, models: [], tools: [], agentTypes: [], schemas: [] }));
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     let json = "";
     assert.equal(await runCli(["inspect", sessionId, "--json"], { cwd, isTTY: false }, (text) => { json += text; }), 0);
@@ -295,6 +297,7 @@ void test("non-TTY inspection discovers persisted runs without a transcript", as
     assert.match(concise, /persisted.*completed/);
   } finally {
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
   }
 });
 void test("filters persisted inspection to failed runs", async () => {
@@ -305,7 +308,9 @@ void test("filters persisted inspection to failed runs", async () => {
   await new RunStore(cwd, sessionId, "completed-run", home).create({ id: "completed-run", workflowName: "completed", cwd, sessionId, state: "completed", agents: [], agentSessions: [] }, snapshot("completed"));
   await new RunStore(cwd, sessionId, "failed-run", home).create({ id: "failed-run", workflowName: "failed", cwd, sessionId, state: "failed", agents: [], agentSessions: [] }, snapshot("failed"));
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try {
     let summary = "";
     assert.equal(await runCli(["inspect", sessionId, "--summary", "--failed"], { cwd, isTTY: false }, (text) => { summary += text; }), 0);
@@ -321,5 +326,6 @@ void test("filters persisted inspection to failed runs", async () => {
     assert.deepEqual(parsed.runs.map(({ runId, state }) => ({ runId, state })), [{ runId: "failed-run", state: "failed" }]);
   } finally {
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
   }
 });

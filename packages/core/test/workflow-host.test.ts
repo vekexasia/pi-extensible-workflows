@@ -273,7 +273,8 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.ok(existsSync(join(skillPath, "pi-extensible-workflows", "SKILL.md")));
   const skillSource = readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8");
   assert.match(skillSource, /Call `workflow_catalog` once to list functions and model aliases before the first workflow for a task/);
-  const shellExample = /Example use of `shell`:[\s\S]*?```js\n([\s\S]*?)\n```/.exec(skillSource)?.[1];
+  // The skill may be checked out with CRLF line endings on Windows.
+  const shellExample = /Example use of `shell`:[\s\S]*?```js\r?\n([\s\S]*?)\r?\n```/.exec(skillSource)?.[1];
   assert.ok(shellExample);
   assert.match(skillSource, /return \{ ok: true \};/);
   assert.doesNotThrow(() => preflight(shellExample, { models: new Set(), tools: new Set(), agentTypes: new Set() }));

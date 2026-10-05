@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { decodeLaunchSnapshot } from "../src/decoders.js";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
-import { testExtensionApi } from "./support.js";
+import { testExtensionApi, useTestHome } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatNavigatorDashboard, formatNavigatorRun, loadAgentDefinitions, loadSettings, mergeWorkflowExtensionSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, resourcePatternMatches, resolveAgentResourcePolicy, resolveModelReference, resolveWorkflowSettings, RunStore, runWorkflow, saveModelAliases, selectResourcesByLayers, structuralPath, validateModelAliases, WorkflowAgentExecutor, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WorkflowError, WorkflowRegistry } from "../src/index.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
@@ -16,9 +16,8 @@ void test("loads markdown agent roles only from canonical global and project dir
   const cwd = join(home, "project");
   const defaultAgentDir = join(home, ".pi", "agent");
   const customAgentDir = join(home, "custom-agent");
-  const previousHome = process.env.HOME;
+  const restoreHome = useTestHome(home);
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.HOME = home;
   delete process.env.PI_CODING_AGENT_DIR;
   try {
     mkdirSync(join(defaultAgentDir, "pi-extensible-workflows", "roles"), { recursive: true });
@@ -54,11 +53,11 @@ void test("loads markdown agent roles only from canonical global and project dir
     assert.deepEqual(customRoles.custom, { prompt: "Custom role" });
     assert.deepEqual(customRoles.collision, { prompt: "Custom collision" });
   } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    restoreHome();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 });
-void test("loads markdown agent roles deployed as per-file symlinks", () => {
+void test("loads markdown agent roles deployed as per-file symlinks", (t) => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlinked-roles-")));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
@@ -66,11 +65,31 @@ void test("loads markdown agent roles deployed as per-file symlinks", () => {
   const target = join(root, "source-role.md");
   mkdirSync(roleDirectory, { recursive: true });
   writeFileSync(target, "---\ndescription: Linked role\n---\nLinked body");
-  symlinkSync(target, join(roleDirectory, "linked.md"));
-  symlinkSync(join(root, "missing-role.md"), join(roleDirectory, "dangling.md"));
+  try { symlinkSync(target, join(roleDirectory, "linked.md"), "file"); } catch (error) {
+    if (process.platform === "win32" && (error as NodeJS.ErrnoException).code === "EPERM") { t.skip("file-symlink capability unavailable: EPERM without SeCreateSymbolicLinkPrivilege/Developer Mode; role-directory junctions are covered separately and POSIX gates run this case"); return; }
+    throw error;
+  }
+  symlinkSync(join(root, "missing-role.md"), join(roleDirectory, "dangling.md"), "file");
   writeFileSync(join(roleDirectory, "sibling.md"), "Sibling role");
   const roles = loadAgentDefinitions(cwd, agentDir, true, []);
   assert.deepEqual(roles.linked, { prompt: "Linked body", description: "Linked role" });
+  assert.deepEqual(roles.sibling, { prompt: "Sibling role" });
+});
+// Directory junctions need no symlink privilege on Windows (the type is ignored on POSIX), so this exercises the
+// role scanner's link branch everywhere: links to directories and dangling links named *.md are not roles.
+void test("ignores role-directory links that resolve to directories or nothing", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-junction-roles-")));
+  const cwd = join(root, "project");
+  const agentDir = join(root, "agent");
+  const roleDirectory = join(agentDir, "pi-extensible-workflows", "roles");
+  mkdirSync(roleDirectory, { recursive: true });
+  mkdirSync(join(root, "directory-role.md"));
+  symlinkSync(join(root, "directory-role.md"), join(roleDirectory, "directory.md"), "junction");
+  symlinkSync(join(root, "missing-directory"), join(roleDirectory, "dangling.md"), "junction");
+  writeFileSync(join(roleDirectory, "sibling.md"), "Sibling role");
+  const roles = loadAgentDefinitions(cwd, agentDir, true, []);
+  assert.equal(roles.directory, undefined);
+  assert.equal(roles.dangling, undefined);
   assert.deepEqual(roles.sibling, { prompt: "Sibling role" });
 });
 
@@ -115,8 +134,7 @@ void test("strict role selectors normalize relative and portable extension paths
   const extension = join(root, "role-extension.ts");
   mkdirSync(join(root, "roles"), { recursive: true });
   writeFileSync(extension, "");
-  const previousHome = process.env.HOME;
-  process.env.HOME = root;
+  const restoreHome = useTestHome(root);
   try {
     const definition = parseRoleMarkdown(`---\nskills: [role-skill, role-skill]\nextensions:\n  - "../role-extension.ts"\n  - "~/role-extension.ts"\n  - "${pathToFileURL(extension).href}"\n---\nbody`, true, rolePath);
     assert.deepEqual(definition, { prompt: "body", skills: ["role-skill", "role-skill"], extensions: [extension, extension, extension] });
@@ -127,7 +145,7 @@ void test("strict role selectors normalize relative and portable extension paths
       "---\nextensions: [2]\n---\nbody",
     ]) assert.throws(() => parseRoleMarkdown(content, true, rolePath), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    restoreHome();
   }
 });
 
@@ -178,9 +196,8 @@ void test("default settings follow the effective agent directory", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-settings-"));
   const agentDir = join(home, ".pi", "agent");
   const customAgentDir = join(home, "custom-agent");
-  const previousHome = process.env.HOME;
+  const restoreHome = useTestHome(home);
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.HOME = home;
   delete process.env.PI_CODING_AGENT_DIR;
   try {
     mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
@@ -191,7 +208,7 @@ void test("default settings follow the effective agent directory", () => {
     writeFileSync(join(customAgentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 6 }));
     assert.deepEqual(loadSettings(), { concurrency: 6, backgroundWidget: true });
   } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    restoreHome();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
 });
@@ -342,8 +359,9 @@ void test("preserves rooted extension glob selectors", () => {
   for (const [selector, resource] of cases) {
     writeFileSync(path, JSON.stringify({ extensions: [selector] }));
     const normalized = loadSettings(path).extensions?.[0] ?? "";
-    assert.equal(normalized, selector);
-    assert.equal(resourcePatternMatches(resource, normalized), true);
+    // Rooted selectors resolve against the current drive on Windows; resolve() is the identity for them on POSIX.
+    assert.equal(normalized, resolve(selector));
+    assert.equal(resourcePatternMatches(resolve(resource), normalized), true);
   }
 });
 void test("matches Windows extension paths using portable glob separators", () => {
@@ -358,7 +376,8 @@ void test("canonicalizes symlinked extension glob prefixes", () => {
   const path = join(root, "settings.json");
   const realExtensions = join(root, "real", "extensions");
   mkdirSync(realExtensions, { recursive: true });
-  symlinkSync(realExtensions, join(root, "link"));
+  // A junction needs no symlink privilege on Windows; POSIX ignores the type and creates a directory symlink.
+  symlinkSync(realExtensions, join(root, "link"), "junction");
   writeFileSync(path, JSON.stringify({ extensions: ["link/*.ts"] }));
   const normalized = loadSettings(path).extensions ?? [];
   assert.deepEqual(normalized, [join(realExtensions, "*.ts")]);

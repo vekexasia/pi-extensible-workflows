@@ -95,7 +95,7 @@ void test("records and validates portable workflow source metadata", () => {
 void test("marks a symlinked starter roles directory as builtin", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-role-link-"));
   const link = join(root, "roles");
-  symlinkSync(fileURLToPath(new URL("../starter/roles/", import.meta.url)), link, "dir");
+  symlinkSync(fileURLToPath(new URL("../starter/roles/", import.meta.url)), link, "junction"); // A junction needs no symlink privilege on Windows; POSIX ignores the type.
   const registry = new WorkflowRegistry();
   registry.register({ version: "1.0.0", headline: "Starter roles", roleDirectories: [link] });
   assert.equal(registry.roleDirectoryRegistrations()[0]?.builtin, true);

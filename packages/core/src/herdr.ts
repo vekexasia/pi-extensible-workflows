@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawnExecutable } from "./process-launcher.js";
 import { isObject } from "./utils.js";
 
 export type HerdrPaneAction = "live";
@@ -11,8 +11,27 @@ export interface HerdrWorkspacePane { workspaceId: string; tabId: string; paneId
 export type HerdrCommandRunner = (args: readonly string[]) => Promise<string>;
 
 export const herdrCommandRunner: HerdrCommandRunner = (args) => new Promise<string>((resolve, reject) => {
-  execFile("herdr", [...args], { encoding: "utf8", maxBuffer: 1024 * 1024 }, (error, stdout) => {
-    if (error) { reject(new Error(error.message)); return; }
+  let child: ReturnType<typeof spawnExecutable>;
+  try { child = spawnExecutable("herdr", args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); }
+  catch (error) { reject(new Error(error instanceof Error ? error.message : String(error))); return; }
+  let stdout = "";
+  let stderr = "";
+  let stdoutBytes = 0;
+  let exceededBuffer = false;
+  let spawnError: Error | undefined;
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string) => {
+    stdoutBytes += Buffer.byteLength(chunk, "utf8");
+    if (stdoutBytes > 1024 * 1024) { exceededBuffer = true; child.kill(); }
+    else stdout += chunk;
+  });
+  child.stderr?.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-1024 * 1024); });
+  child.once("error", (error: Error) => { spawnError = error; });
+  child.once("close", (code, signal) => {
+    if (exceededBuffer) { reject(new Error("Herdr output exceeded the 1 MiB limit.")); return; }
+    if (spawnError) { reject(new Error(spawnError.message)); return; }
+    if (code !== 0 || signal) { reject(new Error(stderr.trim() || `herdr exited with ${signal ?? String(code)}`)); return; }
     resolve(stdout);
   });
 });

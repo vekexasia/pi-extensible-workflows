@@ -21,10 +21,10 @@
     "dist/src"
   ],
   "scripts": {
-    "build": "npm --prefix ../.. run build --workspace=../core && rm -rf dist && tsc -p tsconfig.json && chmod +x dist/src/cli.js dist/src/pi-role.js",
+    "build": "node ../../scripts/workspace-build.mjs cli",
     "inspect": "node dist/src/cli.js inspect",
-    "test": "npm run build && TEST_FILES='dist/test/*.test.js' npm run test:run",
-    "test:run": "files=${TEST_FILES:-dist/test/*.test.js}; printf '%s\\n' $files | xargs -n1 -P20 sh -c 'tmp=$(mktemp -d); TMPDIR=\"$tmp\" node --test --test-concurrency=1 --test-timeout=60000 --test-force-exit --test-reporter=dot \"$1\"; status=$?; rm -rf \"$tmp\"; exit $status' sh",
+    "test": "npm run build && npm run test:run",
+    "test:run": "node ../../scripts/run-workspace-tests.mjs --workspace cli --pattern=dist/test/**/*.test.js --unset-herdr --timeout 300000",
     "lint": "eslint .",
     "prepack": "npm run build"
   },
@@ -41,10 +41,10 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-server": "1.0.0",
-    "@earendil-works/pi-tui": "1.0.0",
+    "@earendil-works/pi-ai": "1.0.3",
+    "@earendil-works/pi-coding-agent": "1.0.3",
+    "@earendil-works/pi-server": "1.0.3",
+    "@earendil-works/pi-tui": "1.0.3",
     "pi-extensible-workflows": "5.19.1",
     "typebox": "1.3.7"
   },

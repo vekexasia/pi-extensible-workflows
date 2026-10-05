@@ -1,6 +1,22 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { isPersistedRun, type PersistedRun } from "pi-extensible-workflows/persistence";
+
+export function hasFileSymlinkCapability(): boolean {
+  const root = mkdtempSync(join(tmpdir(), "piewf-file-symlink-capability-"));
+  try {
+    const target = join(root, "target");
+    writeFileSync(target, "target");
+    symlinkSync(target, join(root, "link"), "file");
+    return true;
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    if (code === "EPERM" || code === "EACCES" || code === "ENOTSUP" || code === "ENOSYS") return false;
+    throw error;
+  } finally { rmSync(root, { recursive: true, force: true }); }
+}
 
 export type CliTestPackageMetadata = { version?: string; bin?: Record<string, string> };
 

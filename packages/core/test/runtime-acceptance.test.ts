@@ -474,7 +474,8 @@ void test("a real paused run survives shutdown, replays completed shell work, an
   const command = commands[0]?.handler;
   const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
   assert.ok(workflow && command && shutdown);
-  const firstRun = workflow.execute("id", { name: "paused-restart", script: `await shell("printf x >> ${marker}"); await agent("pause here", {label:"pause-agent"}); await shell("printf y >> ${marker}"); return true;`, foreground: true }, new AbortController().signal, undefined, context);
+  // JSON.stringify keeps Windows backslashes out of JavaScript escapes; the double quotes keep paths with spaces intact for cmd.exe and sh.
+  const firstRun = workflow.execute("id", { name: "paused-restart", script: `await shell(${JSON.stringify(`printf x >> "${marker}"`)}); await agent("pause here", {label:"pause-agent"}); await shell(${JSON.stringify(`printf y >> "${marker}"`)}); return true;`, foreground: true }, new AbortController().signal, undefined, context);
   void firstRun.catch(() => undefined);
   await started;
   const runId = (await listRunIds(cwd, "session", home))[0];
@@ -1065,7 +1066,7 @@ void test("workflow_retry replays a journaled shell mutation while completing in
   const retry = tools.find(({ name }) => name === "workflow_retry");
   assert.ok(workflow && retry);
   const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  const command = `printf x >> ${marker}`;
+  const command = `printf x >> "${marker}"`;
   const started = await workflow.execute("id", { name: "partial-shell-retry", script: `await shell(${JSON.stringify(command)}); await agent("later failure"); return true;` }, new AbortController().signal, undefined, context);
   const parentRunId = started.details.runId;
   assert.ok(parentRunId);

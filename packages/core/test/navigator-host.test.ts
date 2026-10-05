@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { executeCommand, testExtensionApi } from "./support.js";
 import workflowExtension, { agentActionLabels, createLaunchSnapshot, DEFAULT_SETTINGS, formatAgentDetail, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPhaseDashboard, registerWorkflowExtension, RunStore, openWorkflowArtifact, WorkflowError, WORKFLOW_BLOCKED_EVENT } from "../src/index.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { structuralPath } from "../src/persistence.js";
+import { createProcessFixture } from "./process-fixtures.js";
 
 type OwnershipNodes = Parameters<RunStore["saveOwnership"]>[0];
 const delayedOwnership = new Map<string, { start: () => void; cleanup: Promise<void> }>();
@@ -720,19 +721,19 @@ void test("navigator returns to the picker after deleting a run", async () => {
   assert.equal(existsSync(keepStore.directory), true);
 });
 void test("navigator opens the workflow script in the configured external editor", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-external-editor-"));
+  const home = mkdtempSync(join(tmpdir(), "pi extensible workflows external editor-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
   const script = ["// SCRIPT_START", ...Array.from({ length: 20 }, (_, index) => `const line${String(index)} = ${String(index)};`), "// SCRIPT_END"].join("\n");
   const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "running", phase: "view", agents: [], agentSessions: [] }, snapshot);
-  const editorPath = join(home, "fake-editor.sh");
+  const editorPath = join(home, "fake editor.mjs");
   const editedPath = join(home, "edited-content");
   const openedPath = join(home, "opened-path");
-  writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { encoding: "utf8", mode: 0o755 });
+  writeFileSync(editorPath, "import { copyFileSync, writeFileSync } from 'node:fs'; const [edited, opened, artifact] = process.argv.slice(2); writeFileSync(opened, artifact); copyFileSync(artifact, edited);\n");
   const previousVisual = process.env.VISUAL;
   const previousEditor = process.env.EDITOR;
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
+  process.env.VISUAL = `"${process.execPath}" "${editorPath}" "${editedPath}" "${openedPath}"`;
   process.env.EDITOR = process.env.VISUAL;
   let stops = 0;
   let pickerCalls = 0;
@@ -777,13 +778,13 @@ void test("navigator opens the workflow script in the configured external editor
   }
 });
 void test("external artifact failures restore the TUI and remove temporary copies", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-external-editor-failure-"));
-  const editorPath = join(home, "failing-editor.sh");
+  const home = mkdtempSync(join(tmpdir(), "pi extensible workflows external editor failure-"));
+  const editorPath = join(home, "failing editor.mjs");
   const openedPath = join(home, "opened-path");
-  writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\nexit 7\n", { encoding: "utf8", mode: 0o755 });
+  writeFileSync(editorPath, "import { writeFileSync } from 'node:fs'; const [opened, artifact] = process.argv.slice(2); writeFileSync(opened, artifact); process.exitCode = 7;\n");
   const events: string[] = [];
   const tui = { stop() { events.push("stop"); }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
-  const exitCode = await openWorkflowArtifact(tui, `${editorPath} ${openedPath}`, { extension: ".md", content: "read-only" });
+  const exitCode = await openWorkflowArtifact(tui, `"${process.execPath}" "${editorPath}" "${openedPath}"`, { extension: ".md", content: "read-only" });
   assert.equal(exitCode, 7);
   const opened = readFileSync(openedPath, "utf8");
   assert.equal(existsSync(opened), false);
@@ -791,21 +792,69 @@ void test("external artifact failures restore the TUI and remove temporary copie
   assert.equal(await openWorkflowArtifact(tui, join(home, "missing-editor"), { extension: ".js", content: "return true;" }), null);
   assert.deepEqual(events, ["stop", "start", "render", "stop", "start", "render"]);
 });
+void test("external editor commands run through a real process with literal arguments, including trusted Windows batch launchers", async () => {
+  const fixture = createProcessFixture("piewf editor café ");
+  const previousForwarder = process.env.PIEWF_FORWARD_NODE;
+  try {
+    const bin = join(fixture.root, "editor bin ü");
+    const entry = join(bin, "editor.mjs");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(entry, "import { readFileSync, writeFileSync } from 'node:fs'; const args = process.argv.slice(2); const artifact = args.at(-1); writeFileSync(args[0], JSON.stringify({ args: args.slice(1, -1), artifact, content: readFileSync(artifact, 'utf8') })); process.exitCode = Number(args[1] === 'fail' ? 5 : 0);\n");
+    // Windows editors such as VS Code's `code` are plain batch launchers; POSIX uses the Node entrypoint directly.
+    process.env.PIEWF_FORWARD_NODE = process.execPath;
+    const launcher = process.platform === "win32" ? `"${fixture.writeBatchForwarder(bin, "fake editor", entry)}"` : `"${process.execPath}" "${entry}"`;
+    const literal = ["space value", "café ü 日本", "& | < > ^ ( ) ;", "%PATH% !USERNAME! $HOME"];
+    const capture = join(fixture.root, "editor capture.json");
+    const events: string[] = [];
+    const tui = { stop() { events.push("stop"); }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
+    const command = `${launcher} "${capture}" ${literal.map((value) => `"${value}"`).join(" ")}`;
+    assert.equal(await openWorkflowArtifact(tui, command, { extension: ".md", content: "EDITOR CONTENT ü" }), 0);
+    const captured = JSON.parse(readFileSync(capture, "utf8")) as { args: string[]; artifact: string; content: string };
+    assert.deepEqual(captured.args, literal);
+    assert.equal(captured.content, "EDITOR CONTENT ü");
+    assert.match(captured.artifact, /artifact\.md$/);
+    assert.equal(existsSync(captured.artifact), false, "temporary artifact copy must be removed");
+    assert.deepEqual(events, ["stop", "start", "render"]);
+    assert.equal(await openWorkflowArtifact(tui, `${launcher} "${capture}" fail`, { extension: ".json", content: "{}" }), 5);
+    const failed = JSON.parse(readFileSync(capture, "utf8")) as { artifact: string };
+    assert.equal(existsSync(failed.artifact), false);
+    assert.deepEqual(events, ["stop", "start", "render", "stop", "start", "render"]);
+  } finally {
+    if (previousForwarder === undefined) delete process.env.PIEWF_FORWARD_NODE; else process.env.PIEWF_FORWARD_NODE = previousForwarder;
+    fixture.cleanup();
+  }
+});
+void test("a non-executable .sh EDITOR is never opened through a shell or file association", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi extensible workflows sh editor-"));
+  const marker = join(home, "sh-editor-ran");
+  const editor = join(home, "fake-editor.sh");
+  writeFileSync(editor, `#!/bin/sh\necho ran > "${marker}"\n`, { mode: 0o644 });
+  const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-workflow-editor-")));
+  const events: string[] = [];
+  const tui = { stop() { events.push("stop"); }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
+  try {
+    assert.equal(await openWorkflowArtifact(tui, `"${editor}"`, { extension: ".md", content: "never shown" }), null);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(existsSync(marker), false);
+    assert.deepEqual(events, ["stop", "start", "render"]);
+    assert.deepEqual(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-workflow-editor-") && !before.has(name)), []);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
 void test("navigator opens a persisted top-level agent prompt and result in the external editor", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-result-editor-"));
+  const home = mkdtempSync(join(tmpdir(), "pi extensible workflows agent result editor-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
   const resultPath = "agent/reviewer/callsite%3Areviewer/occurrence%3A1";
   const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agent-result" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
   await store.create({ id: "run", workflowName: "agent-result", cwd, sessionId: "session", state: "completed", phase: "review", agents: [{ id: "agent", name: "reviewer", path: "agent", state: "completed", prompt: "PROMPT_START\nInspect the target\nPROMPT_END", systemPrompt: "SYSTEM_PROMPT_START\nFollow the workflow\nSYSTEM_PROMPT_END", resultPath, structuralPath: ["reviewer"], model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], agentSessions: [] }, snapshot);
   await store.complete(resultPath, { answer: 42 });
-  const editorPath = join(home, "fake-editor.sh");
+  const editorPath = join(home, "fake editor.mjs");
   const editedPath = join(home, "edited-content");
   const openedPath = join(home, "opened-path");
-  writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { encoding: "utf8", mode: 0o755 });
+  writeFileSync(editorPath, "import { copyFileSync, writeFileSync } from 'node:fs'; const [edited, opened, artifact] = process.argv.slice(2); writeFileSync(opened, artifact); copyFileSync(artifact, edited);\n");
   const previousVisual = process.env.VISUAL;
   const previousEditor = process.env.EDITOR;
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
+  process.env.VISUAL = `"${process.execPath}" "${editorPath}" "${editedPath}" "${openedPath}"`;
   process.env.EDITOR = process.env.VISUAL;
   let stops = 0;
   let starts = 0;
@@ -842,32 +891,20 @@ void test("navigator opens a persisted top-level agent prompt and result in the 
           }
           assert.fail(`Timed out selecting ${label}`);
         };
+        // Read the editor's copy only after its process closed and the TUI restarted: on Windows a concurrent
+        // read of a file that the child is still copying fails with EBUSY.
         await openAction("Open system prompt in editor");
-        let deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("SYSTEM_PROMPT_START")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitForStarts(1);
         assert.ok(existsSync(editedPath), "external editor was not invoked for the system prompt");
         assert.match(readFileSync(editedPath, "utf8"), /SYSTEM_PROMPT_START[\s\S]*SYSTEM_PROMPT_END/);
         assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.md$/);
-        await waitForStarts(1);
         await openAction("Open prompt in editor");
-        deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("PROMPT_START")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitForStarts(2);
         assert.ok(existsSync(editedPath), "external editor was not invoked for the prompt");
         assert.match(readFileSync(editedPath, "utf8"), /PROMPT_START[\s\S]*PROMPT_END/);
         assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.md$/);
-        await waitForStarts(2);
         await openAction("Open result in editor");
-        deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("\"answer\": 42")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
+        await waitForStarts(3);
         assert.ok(existsSync(editedPath), "external editor was not invoked for the result");
         assert.match(readFileSync(editedPath, "utf8"), /"answer": 42/);
         assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.json$/);
@@ -875,7 +912,6 @@ void test("navigator opens a persisted top-level agent prompt and result in the 
         const cleanupDeadline = Date.now() + 5_000;
         while (existsSync(artifactPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
         assert.equal(existsSync(artifactPath), false);
-        await waitForStarts(3);
         component.dispose?.();
         return undefined;
       },

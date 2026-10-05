@@ -13,7 +13,7 @@ import { reachableTools, WorkflowError, type AgentExecutionResult, type AgentToo
 import type { AgentResourcePolicy } from "../src/types.js";
 import type { RunStore } from "../src/persistence.js";
 import { testTransport, type TestPiSessionEvent } from "./test-transport.js";
-import { executeTool, executeToolUnchecked, testTransportContext } from "./support.js";
+import { executeTool, executeToolUnchecked, testTransportContext, useTestHome } from "./support.js";
 import { defaultWorkflowResultSchema } from "../src/runtime/workflow-result.js";
 type TestEventMessage = NonNullable<TestPiSessionEvent["message"]>;
 type TestAssistantMessageEvent = NonNullable<TestPiSessionEvent["assistantMessageEvent"]>;
@@ -432,7 +432,7 @@ void test("applies call-level context files over the role file", async () => {
   assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "scoped" }), { model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPrompt: "Scoped role", systemPromptAppend: "", contextFiles: ["global", "project"] });
   const prepared = await prepareAgentSetupForInspection(roleRoot, "probe", { label: "a", workflowName: "w", role: "scoped", skills: ["extra"], extensions: [] }, localAgentTransport);
   assert.ok(prepared.setup.sessionInput.resourcePolicy);
-  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy.effective, { skills: ["global", "role-skill", "extra"], extensions: ["/global.ts", "/role.ts"] });
+  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy.effective, { skills: ["global", "role-skill", "extra"], extensions: ["/global.ts", resolve("/role.ts")] });
 });
 void test("passes role prompt as system append, not task text", async () => {
   let input: unknown;
@@ -2265,6 +2265,9 @@ void test("setup hooks may narrow the prepared resource policy", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-hook-resource-policy-"));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
+  // Pi walks project .agents/skills up to the repository root, or the filesystem root outside a repository. The
+  // marker bounds that walk to the fixture: Windows temp directories sit inside the user profile, whose skills leak in otherwise.
+  mkdirSync(join(rootDir, ".git"), { recursive: true });
   mkdirSync(join(agentDir, "skills", "secret"), { recursive: true });
   mkdirSync(join(agentDir, "skills", "kept"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -2316,6 +2319,8 @@ void test("setup hooks preserve interleaved resource narrowing", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-hook-interleaved-resource-policy-"));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
+  // Bound Pi's ancestor .agents/skills discovery to the fixture (see "setup hooks may narrow the prepared resource policy").
+  mkdirSync(join(rootDir, ".git"), { recursive: true });
   mkdirSync(join(agentDir, "skills", "secret"), { recursive: true });
   mkdirSync(join(agentDir, "skills", "kept"), { recursive: true });
   mkdirSync(cwd, { recursive: true });
@@ -2378,8 +2383,8 @@ void test("composes role resource selectors and reapplies them on retries", asyn
   await executor.execute("other", { label: "other", workflowName: "flow", role: "scout" });
   await executor.execute("plain", { label: "plain", workflowName: "flow" });
   assert.deepEqual(policies.map(({ effective }) => effective), [
-    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", roleExtension, "/global.ts"], tools: ["!*", "read"] },
-    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", roleExtension, "/global.ts"], tools: ["!*", "read"] },
+    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", resolve(roleExtension), resolve("/global.ts")], tools: ["!*", "read"] },
+    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", resolve(roleExtension), resolve("/global.ts")], tools: ["!*", "read"] },
     { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"], tools: ["!*", "read", "grep"] },
     { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] },
   ]);
@@ -2550,8 +2555,7 @@ void test("loads workflow SYSTEM.md with project trust and precedence", async ()
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-system-prompt-"));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
-  const previousHome = process.env.HOME;
-  process.env.HOME = rootDir;
+  const restoreHome = useTestHome(rootDir);
   try {
     mkdirSync(join(agentDir, "extensions"), { recursive: true });
     mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
@@ -2571,7 +2575,7 @@ void test("loads workflow SYSTEM.md with project trust and precedence", async ()
     assert.doesNotMatch(trusted.systemPrompt ?? "", /Global workflow system/);
     await trusted.dispose();
   } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    restoreHome();
   }
 });
 void test("applies ordered minimatch resource selectors and records concrete matches", async () => {

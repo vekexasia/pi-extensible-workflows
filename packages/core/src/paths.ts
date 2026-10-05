@@ -10,11 +10,17 @@ export function safePart(value: string): string { return value.replace(/[^a-zA-Z
 
 /**
  * Resolves a path to its filesystem spelling, including symlink and platform aliases.
+ * The operating system's resolver is authoritative so Windows drive-letter, case,
+ * and junction aliases converge on one physical spelling; the portable resolver
+ * only covers volumes where the native resolver cannot open the object.
  * A missing path safely falls back to its absolute lexical spelling rather than
  * guessing at the identity of an object that does not exist.
  */
 export function canonicalPath(path: string): string {
   const absolute = resolve(path);
+  try { return realpathSync.native(absolute); } catch (error) {
+    if (isNodeError(error, "ENOENT") || isNodeError(error, "ENOTDIR")) return absolute;
+  }
   try { return realpathSync(absolute); } catch { return absolute; }
 }
 

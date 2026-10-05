@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { delimiter, join } from "node:path";
 import test from "node:test";
-import { createHerdrAgentReporter, herdrPaneCommand, herdrPaneId, openHerdrPane, openHerdrWorkspacePane, waitForHerdrPane } from "../src/herdr.js";
+import { createProcessFixture, isProcessAlive, readPid, waitFor } from "./process-fixtures.js";
+import { createHerdrAgentReporter, herdrCommandRunner, herdrPaneCommand, herdrPaneId, openHerdrPane, openHerdrWorkspacePane, waitForHerdrPane } from "../src/herdr.js";
 
 void test("gates Herdr actions on the managed pane environment", () => {
   assert.equal(herdrPaneId({ HERDR_ENV: "0", HERDR_PANE_ID: "pane" }), undefined);
@@ -298,4 +301,37 @@ void test("does not let status notifications suppress idle handback", async () =
     return JSON.stringify({ result: { agent: { agent_status: reports === 1 ? "working" : "idle" } } });
   };
   assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0, onStatus: () => { throw new Error("notification failed"); } }), "idle");
+});
+
+void test("the default Herdr runner launches a PATH-resolved executable with literal arguments and bounded output", async () => {
+  const fixture = createProcessFixture("piewf herdr runner café ");
+  const previousPath = process.env.PATH;
+  try {
+    const bin = join(fixture.root, "herdr bin ü");
+    const pidFile = join(fixture.root, "flood.pid");
+    const source = [
+      "import { writeFileSync } from 'node:fs';",
+      "const args = process.argv.slice(2);",
+      "if (args[0] === 'fail') { process.stderr.write('herdr stub: socket unavailable'); process.exit(3); }",
+      `if (args[0] === 'flood') { writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdout.write('x'.repeat(2 * 1024 * 1024)); setInterval(() => {}, 1000); }`,
+      "else process.stdout.write(JSON.stringify({ args, cwd: process.cwd() }));",
+    ].join("\n");
+    mkdirSync(bin, { recursive: true });
+    if (process.platform === "win32") fixture.writeNpmShim(bin, "herdr", join(bin, "herdr stub.mjs"));
+    // Windows resolves the npm-style shim to its Node entrypoint; POSIX needs an executable file on PATH.
+    writeFileSync(process.platform === "win32" ? join(bin, "herdr stub.mjs") : join(bin, "herdr"), process.platform === "win32" ? source : `#!/usr/bin/env node\n${source}\n`, { mode: 0o755 });
+    process.env.PATH = process.platform === "win32" ? bin : `${bin}${delimiter}${previousPath ?? ""}`;
+    const literal = ["pane", "split", "--cwd", "dir with spaces ü", "& | < > ^ %PATH% !USERNAME! $HOME", "quote\"inside"];
+    const output = JSON.parse(await herdrCommandRunner(literal)) as { args: string[] };
+    assert.deepEqual(output.args, literal);
+    await assert.rejects(herdrCommandRunner(["fail"]), /herdr stub: socket unavailable/);
+    await assert.rejects(herdrCommandRunner(["flood"]), /exceeded the 1 MiB limit/);
+    const pid = readPid(pidFile);
+    assert.equal(await waitFor(() => !isProcessAlive(pid), 10_000), true, "the flooding Herdr child must be stopped");
+    process.env.PATH = join(fixture.root, "empty path");
+    await assert.rejects(herdrCommandRunner(["pane", "list"]), /ENOENT/);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    fixture.cleanup();
+  }
 });

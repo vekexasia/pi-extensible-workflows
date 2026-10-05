@@ -1,17 +1,21 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+// Recursive fixture copies use the promise API: Node 22's native cpSync crashes or writes mis-encoded paths on Windows when a path is non-ASCII.
+import { cp } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
 import { writePortableWorkflowBundle } from "../src/bundles.js";
 import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
 import { registerWorkflowExtension, resetWorkflowRegistry, WorkflowRegistry } from "pi-extensible-workflows";
-import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
+import { cliTestErrorOutput, hasFileSymlinkCapability, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
+
+test.afterEach(() => { resetWorkflowRegistry(); });
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   return {
@@ -23,6 +27,42 @@ function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
     functions: {},
     ...overrides,
   };
+}
+
+const FILE_SYMLINKS_AVAILABLE = hasFileSymlinkCapability();
+
+function writePiCommand(directory: string, source: string): void {
+  const entry = join(directory, "pi.mjs");
+  writeFileSync(entry, source);
+  if (process.platform === "win32") {
+    writeFileSync(join(directory, "pi.cmd"), String.raw`@ECHO off
+SETLOCAL
+IF EXIST "%dp0%\node.exe" (SET "_prog=%dp0%\node.exe") ELSE (SET "_prog=node")
+"%_prog%" "%dp0%\pi.mjs" %*
+`);
+  } else {
+    const executable = join(directory, "pi");
+    writeFileSync(executable, `#!/usr/bin/env node\n${source}`, { mode: 0o755 });
+    chmodSync(executable, 0o755);
+  }
+}
+
+function writePackageShim(source: string, destination: string): void {
+  mkdirSync(join(destination, "dist"), { recursive: true });
+  copyFileSync(join(source, "package.json"), join(destination, "package.json"));
+  const implementation = join(source, "dist", "index.js");
+  writeFileSync(join(destination, "dist", "index.js"), `export * from ${JSON.stringify(pathToFileURL(implementation).href)};`);
+}
+
+// Engine copies live outside the workspace, so their runtime dependency closure is installed beside them the way npm would;
+// otherwise resolution depends on whatever node_modules happen to exist above the temporary directory.
+const ENGINE_RUNTIME_PACKAGES = ["acorn", "minimatch", "brace-expansion", "balanced-match", "typebox"] as const;
+async function installEngineDependencies(modules: string): Promise<void> {
+  const workspaceNodeModules = join(process.cwd(), "../../node_modules");
+  mkdirSync(modules, { recursive: true });
+  await cp(join(process.cwd(), "../core"), join(modules, "pi-extensible-workflows"), { recursive: true });
+  for (const name of ENGINE_RUNTIME_PACKAGES) await cp(join(workspaceNodeModules, name), join(modules, name), { recursive: true });
+  for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) writePackageShim(join(workspaceNodeModules, "@earendil-works", name), join(modules, "@earendil-works", name));
 }
 
 function configureRoleInspection(paths: ReturnType<typeof fixture>): (cwd: string, agentDir: string) => Promise<DoctorPiState> {
@@ -44,18 +84,52 @@ function fixture(): { root: string; cwd: string; agentDir: string; settingsPath:
 }
 
 async function withHome<T>(home: string, action: () => Promise<T>): Promise<T> {
-  const previous = process.env.HOME;
+  const previous = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE };
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   try { return await action(); }
-  finally { if (previous === undefined) delete process.env.HOME; else process.env.HOME = previous; }
+  finally {
+    if (previous.HOME === undefined) delete process.env.HOME; else process.env.HOME = previous.HOME;
+    if (previous.USERPROFILE === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previous.USERPROFILE;
+  }
 }
 async function withHomeAndCwd<T>(home: string, cwd: string, action: () => Promise<T>): Promise<T> {
   const previousHome = process.env.HOME;
+  const previousUserProfile = process.env.USERPROFILE;
   const previousCwd = process.cwd();
   process.env.HOME = home;
+  process.env.USERPROFILE = home;
   process.chdir(cwd);
   try { return await action(); }
-  finally { process.chdir(previousCwd); if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; }
+  finally {
+    process.chdir(previousCwd);
+    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    if (previousUserProfile === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = previousUserProfile;
+  }
+}
+
+function bundleCommand(bundle: string, args: readonly string[]): { command: string; args: string[] } {
+  const launcher = process.platform === "win32" ? join(bundle, `${basename(bundle)}.cmd`) : join(bundle, basename(bundle));
+  if (process.platform !== "win32") return { command: launcher, args: [...args] };
+  const quote = (value: string) => `"${value.replaceAll("\"", "\"\"")}"`;
+  const command = [quote(launcher), ...args].join(" ");
+  return { command: "cmd.exe", args: ["/d", "/c", command] };
+}
+
+type BundleProcessOptions = { cwd?: string; env?: NodeJS.ProcessEnv; encoding?: "utf8"; stdio?: "pipe" };
+
+function runBundleFileSync(bundle: string, args: readonly string[], options: BundleProcessOptions = {}): string {
+  const invocation = bundleCommand(bundle, args);
+  if (invocation.command !== "cmd.exe") return execFileSync(invocation.command, invocation.args, { ...options, encoding: "utf8" });
+  const result = spawnSync(invocation.command, invocation.args, { ...options, encoding: "utf8", windowsVerbatimArguments: true });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr);
+  return result.stdout;
+}
+
+function spawnBundleFileSync(bundle: string, args: readonly string[], options: BundleProcessOptions = {}): ReturnType<typeof spawnSync> {
+  const invocation = bundleCommand(bundle, args);
+  return spawnSync(invocation.command, invocation.args, { ...options, encoding: "utf8", ...(invocation.command === "cmd.exe" ? { windowsVerbatimArguments: true } : {}) });
 }
 
 function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, functionDefinition: string, args: readonly string[], abort = false): { status: number | null; stdout: string; stderr: string } {
@@ -63,7 +137,7 @@ function runIsolatedCli(paths: { root: string; cwd: string; agentDir: string }, 
   const indexUrl = pathToFileURL(join(process.cwd(), "../core", "dist", "src", "index.js")).href;
   const cliUrl = pathToFileURL(join(process.cwd(), "dist", "src", "cli.js")).href;
   writeFileSync(script, [`import { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};`, `import { runCli } from ${JSON.stringify(cliUrl)};`, `registerWorkflowExtension({ version: "1.0.0", headline: "Isolated CLI", functions: { ${functionDefinition} } });`, "const controller = new AbortController();", abort ? "setImmediate(() => controller.abort());" : "", `const exit = await runCli(${JSON.stringify(args)}, { cwd: ${JSON.stringify(paths.cwd)}, agentDir: ${JSON.stringify(paths.agentDir)}, signal: controller.signal, stderr: (text) => process.stderr.write(text) });`, "process.exitCode = exit;"].join("\n"));
-  const result = spawnSync(process.execPath, [script], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" } });
+  const result = spawnSync(process.execPath, [script], { cwd: process.cwd(), encoding: "utf8", timeout: 10_000, env: { ...process.env, HOME: paths.root, USERPROFILE: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" } });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 void test("doctor reports malformed settings and Pi discovery rejection diagnostics", async () => {
@@ -93,7 +167,7 @@ void test("doctor reports extension validator diagnostics", async () => {
   assert.match(invalid.message, /acme\.enabled/);
   assert.equal(doctorExitCode(report), 1);
 });
-void test("doctor discovers per-file symlinked role files", async () => {
+void test("doctor discovers per-file symlinked role files", { skip: FILE_SYMLINKS_AVAILABLE ? false : "File symlinks are unavailable without symlink capability on this runner; Linux CI exercises this regression." }, async () => {
   const paths = fixture();
   const target = join(paths.root, "source-role.md");
   const link = join(paths.agentDir, "pi-extensible-workflows", "roles", "linked.md");
@@ -373,7 +447,7 @@ void test("doctor resolves a relative role file from the selected cwd", async ()
   assert.ok(output.includes(`Role: \`pre-install\` - \`${join(paths.cwd, "pre-install.md")}\``));
   assert.match(output, /Relative local role/);
 });
-void test("doctor reports a symlinked role file by the requested path", async () => {
+void test("doctor reports a symlinked role file by the requested path", { skip: FILE_SYMLINKS_AVAILABLE ? false : "File symlinks are unavailable without symlink capability on this runner; Linux CI exercises this regression." }, async () => {
   const paths = fixture();
   const discoverPi = configureRoleInspection(paths);
   const target = join(paths.root, "source.md");
@@ -553,10 +627,8 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
   assert.equal(output, "Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
-  const bin = join(paths.root, "bin", "piewf");
-  mkdirSync(join(paths.root, "bin"), { recursive: true });
-  symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
-  const linkedOutput = execFileSync(bin, ["doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root }, encoding: "utf8" });
+  const cliPath = join(process.cwd(), "dist", "src", "cli.js");
+  const linkedOutput = execFileSync(process.execPath, [cliPath, "doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root, USERPROFILE: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" }, encoding: "utf8" });
   assert.match(linkedOutput, /^# pi-extensible-workflows doctor/m);
   assert.equal(existsSync(join(paths.root, ".pi", "agent", "auth.json")), false);
 });
@@ -602,7 +674,7 @@ void test("headless CLI rejects blank numbers before creating a run and persists
   const definition = 'numericEcho: { description: "Echo a number", input: { type: "object", properties: { value: { type: "number" } }, required: ["value"], additionalProperties: false }, output: { type: "number" }, run: (input) => input.value }';
   try {
     const invalid = runIsolatedCli(paths, definition, ["run", "numericEcho", "--value="]);
-    assert.equal(invalid.status, 1, invalid.stderr);
+    assert.equal(invalid.status, 1, JSON.stringify(invalid));
     assert.equal(invalid.stdout, "");
     assert.match(invalid.stderr, /Error: Invalid number/);
     assert.doesNotMatch(invalid.stderr, /Run ID:/);
@@ -611,7 +683,7 @@ void test("headless CLI rejects blank numbers before creating a run and persists
     assert.equal(valid.status, 0, valid.stderr);
     assert.equal(valid.stdout, "0\n");
     assert.match(valid.stderr, /Run ID: [0-9a-f-]+/);
-    const results = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith("/result.json"));
+    const results = readdirSync(paths.root, { recursive: true }).map(String).filter((path) => path.endsWith(`${sep}result.json`));
     assert.equal(results.length, 1);
     assert.equal(readFileSync(join(paths.root, results[0] ?? ""), "utf8").trim(), "0");
   } finally { rmSync(paths.root, { recursive: true, force: true }); }
@@ -649,7 +721,8 @@ void test("exported launchers are executable and delegate unchanged arguments", 
   const paths = fixture();
   let output = "";
   let warning = "";
-  await withHome(paths.root, () => runCli(["export", "cliEcho"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { warning += text; } }, (text) => { output += text; }));
+  const exported = await withHome(paths.root, () => runCli(["export", "cliEcho"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { warning += text; } }, (text) => { output += text; }));
+  assert.equal(exported, 0, warning);
   const destination = join(paths.root, ".local", "bin", "cli-echo");
   const cliPath = join(process.cwd(), "dist", "src", "cli.js");
   assert.equal(lstatSync(destination).isSymbolicLink(), false);
@@ -657,6 +730,11 @@ void test("exported launchers are executable and delegate unchanged arguments", 
   assert.match(launcher, /^#!\/usr\/bin\/env node\n/);
   assert.match(launcher, /import\.meta\.resolve\("@piewf\/cli"\)/);
   assert.match(launcher, /@piewf\/cli/);
+  if (process.platform === "win32") {
+    const commandPath = `${destination}.cmd`;
+    assert.equal(existsSync(commandPath), true);
+    assert.match(readFileSync(commandPath, "utf8"), /%~n0/);
+  }
   assert.match(output, /Exported .*cli-echo/);
   assert.match(warning, /not in PATH/);
 
@@ -664,10 +742,22 @@ void test("exported launchers are executable and delegate unchanged arguments", 
   const fallbackCli = join(packageRoot, "dist", "src");
   const indexUrl = pathToFileURL(join(process.cwd(), "../core", "dist", "src", "index.js")).href;
   mkdirSync(fallbackCli, { recursive: true });
+  const agentNodeModules = join(paths.agentDir, "npm", "node_modules");
+  const workspaceNodeModules = join(process.cwd(), "../../node_modules");
+  await cp(join(process.cwd(), "../core"), join(agentNodeModules, "pi-extensible-workflows"), { recursive: true });
+  for (const name of ["acorn", "minimatch", "typebox"]) await cp(join(workspaceNodeModules, name), join(agentNodeModules, name), { recursive: true });
+  const agentPackages = join(agentNodeModules, "@earendil-works");
+  for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) writePackageShim(join(workspaceNodeModules, "@earendil-works", name), join(agentPackages, name));
+  const externalPackages = join(agentNodeModules, "@earendil-works");
+  for (const name of ["pi-coding-agent", "pi-ai", "pi-tui"]) writePackageShim(join(workspaceNodeModules, "@earendil-works", name), join(externalPackages, name));
   writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "@piewf/cli", version: "4.0.2" }));
   writeFileSync(join(fallbackCli, "cli.js"), `import { registerWorkflowExtension } from ${JSON.stringify(indexUrl)};\nimport { runCli } from ${JSON.stringify(pathToFileURL(cliPath).href)};\nregisterWorkflowExtension({ version: "1.0.0", headline: "Real runner", functions: { cliEcho: { description: "Echo", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) } } });\nexport { runCli };\n`);
-  const realOutput = execFileSync(destination, ["7"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" }, encoding: "utf8" });
-  assert.equal(realOutput, '{"issue":7}\n');
+  const launchEnv = { ...process.env, HOME: paths.root, USERPROFILE: paths.root, PI_CODING_AGENT_DIR: paths.agentDir, PI_OFFLINE: "1" };
+  const realOutput = process.platform === "win32"
+    ? spawnSync("cmd.exe", ["/d", "/c", `"${destination}.cmd" 7`], { cwd: paths.cwd, env: launchEnv, encoding: "utf8", windowsVerbatimArguments: true })
+    : { status: 0, stdout: execFileSync(destination, ["7"], { cwd: paths.cwd, env: launchEnv, encoding: "utf8" }), stderr: "" };
+  assert.equal(realOutput.status, 0, realOutput.stderr);
+  assert.equal(realOutput.stdout, '{"issue":7}\n');
 });
 
 void test("export refuses existing files and replaces them only with --force", async () => {
@@ -680,28 +770,37 @@ void test("export refuses existing files and replaces them only with --force", a
   assert.equal(await runCli(["export", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
   assert.equal(readFileSync(destination, "utf8"), "keep me\n");
   assert.match(error, /use --force/);
+  resetWorkflowRegistry();
   registerCliExtension();
   assert.equal(await runCli(["export", "cliEcho", "--output", destination, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
   assert.match(readFileSync(destination, "utf8"), /^#!\/usr\/bin\/env node\n/);
-  registerCliExtension();
 
-  const target = join(paths.root, "bin", "target");
-  const link = join(paths.root, "bin", "cli-link");
-  writeFileSync(target, "keep target\n");
-  symlinkSync(target, link);
-  assert.equal(await runCli(["export", "cliEcho", "--output", link], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
-  assert.equal(lstatSync(link).isSymbolicLink(), true);
-  assert.equal(readFileSync(target, "utf8"), "keep target\n");
-  registerCliExtension();
-  assert.equal(await runCli(["export", "cliEcho", "--output", link, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
-  assert.equal(lstatSync(link).isSymbolicLink(), false);
-  assert.equal(readFileSync(target, "utf8"), "keep target\n");
   const directory = join(paths.root, "bin", "destination-directory");
   mkdirSync(directory);
+  resetWorkflowRegistry();
   registerCliExtension();
   assert.equal(await runCli(["export", "cliEcho", "--output", directory, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 1);
   assert.equal(lstatSync(directory).isDirectory(), true);
 });
+void test("export refuses file symlink destinations without replacing the target", { skip: FILE_SYMLINKS_AVAILABLE ? false : "File symlinks are unavailable without symlink capability on this runner; Linux CI exercises this regression." }, async () => {
+  registerCliExtension();
+  const paths = fixture();
+  const target = join(paths.root, "target");
+  const link = join(paths.root, "cli-link");
+  writeFileSync(target, "keep target\\n");
+  symlinkSync(target, link, "file");
+  let error = "";
+  assert.equal(await runCli(["export", "cliEcho", "--output", link], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: (text) => { error += text; } }), 1);
+  assert.match(error, /symlink/);
+  assert.equal(lstatSync(link).isSymbolicLink(), true);
+  assert.equal(readFileSync(target, "utf8"), "keep target\\n");
+  resetWorkflowRegistry();
+  registerCliExtension();
+  assert.equal(await runCli(["export", "cliEcho", "--output", link, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir }, () => {}), 0);
+  assert.equal(lstatSync(link).isSymbolicLink(), false);
+  assert.equal(readFileSync(target, "utf8"), "keep target\\n");
+});
+
 void test("export bundle forwards explicit trust override", async () => {
   registerCliExtension();
   const paths = fixture();
@@ -729,12 +828,16 @@ void test("portable bundle export writes a self-contained payload and external-r
   assert.deepEqual(manifest.requirements, { roles: [], aliases: [], tools: [], commands: [], environment: [] });
   assert.notEqual(manifest.runtime.pi, "");
   assert.notEqual(manifest.runtime["@piewf/cli"], "unknown");
-  assert.equal(lstatSync(join(destination, "cli-echo")).mode & 0o111, 0o111);
+  if (process.platform === "win32") {
+    assert.equal(existsSync(join(destination, "cli-echo.cmd")), true);
+    assert.match(readFileSync(join(destination, "cli-echo.cmd"), "utf8"), /payload\\runner\.mjs/);
+  } else assert.equal(lstatSync(join(destination, "cli-echo")).mode & 0o111, 0o111);
   assert.match(readFileSync(join(destination, "cli-echo"), "utf8"), /payload\/runner\.mjs/);
   assert.match(readFileSync(join(destination, "payload", "workflow.mjs"), "utf8"), /registerWorkflowExtension/);
   assert.match(readFileSync(join(destination, "payload", "runner.mjs"), "utf8"), /@piewf\/cli@/);
   assert.match(output, /Run .* setup/);
   writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt:medium\n---\nReview the result");
+  resetWorkflowRegistry();
   registerCliExtension();
   const selectedDestination = join(paths.root, "selected-bundle");
   assert.equal(await runCli(["bundle", "cliEcho", "--output", selectedDestination, "--role", "reviewer", "--command", "git", "--environment", "REVIEW_TOKEN"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 0);
@@ -998,16 +1101,16 @@ void test("portable bundle setup resolves an external runtime, launches, and fai
   const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
   mkdirSync(join(agentDir, "npm", "node_modules", "@piewf"), { recursive: true });
   mkdirSync(join(piRoot, "dist", "core", "tools"), { recursive: true });
-  symlinkSync(process.cwd(), join(agentDir, "npm", "node_modules", "@piewf/cli"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"), join(piRoot, "dist", "index.js"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "tools", "index.js"), join(piRoot, "dist", "core", "tools", "index.js"));
+  await cp(process.cwd(), join(agentDir, "npm", "node_modules", "@piewf/cli"), { recursive: true });
+  await installEngineDependencies(join(agentDir, "npm", "node_modules"));
+  const piPackage = join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent");
+  writeFileSync(join(piRoot, "dist", "index.js"), `export * from ${JSON.stringify(pathToFileURL(join(piPackage, "dist", "index.js")).href)};`);
+  writeFileSync(join(piRoot, "dist", "core", "tools", "index.js"), `export * from ${JSON.stringify(pathToFileURL(join(piPackage, "dist", "core", "tools", "index.js")).href)};`);
   writeFileSync(join(piRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.80.9" }));
-  const piExecutable = join(piRoot, "dist", "pi");
-  writeFileSync(piExecutable, "#!/usr/bin/env node\nif (process.argv[2] === \"--version\") console.log(\"0.82.0\");\n", { mode: 0o755 });
-  chmodSync(piExecutable, 0o755);
+  writePiCommand(join(piRoot, "dist"), 'if (process.argv[2] === "--version") console.log("0.82.0");\n');
   writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:@piewf/cli"] }));
   const workflow = { name: "e2e", version: "1.0.0", headline: "Bundle", description: "Bundle e2e", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
-  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" };
+  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}${delimiter}${process.env.PATH ?? ""}`, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" };
   const sourcePath = join(root, "e2e-extension.mjs");
   writeFileSync(sourcePath, [
     'import { registerWorkflowExtension } from "pi-extensible-workflows";',
@@ -1021,14 +1124,14 @@ void test("portable bundle setup resolves an external runtime, launches, and fai
   ].join("\n"));
   const source = { module: pathToFileURL(sourcePath).href, export: "default" };
   const create = async (name: string, requirements: Record<string, readonly string[]>, piVersion = ">=0.82.0 <0.83.0", aliasTargets?: Readonly<Record<string, string>>): Promise<string> => { const destination = join(root, name); await writePortableWorkflowBundle({ destination, command: name, workflow, source, dependencies: ["typebox"], requirements, ...(aliasTargets ? { aliasTargets } : {}), piVersion, engineVersion: ">=5.0.0 <6.0.0" }); return destination; };
-  const runFailure = (bundle: string): string => { try { execFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
-  const launchFailure = (bundle: string): string => { try { execFileSync(bundle, ["7"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
-  const setupResult = (bundle: string): ReturnType<typeof spawnSync> => spawnSync(join(bundle, basename(bundle)), ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  const runFailure = (bundle: string): string => { try { runBundleFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
+  const launchFailure = (bundle: string): string => { try { runBundleFileSync(bundle, ["7"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
+  const setupResult = (bundle: string): ReturnType<typeof spawnSync> => spawnBundleFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8" });
   const bundle = await create("e2e", { roles: [], aliases: [], tools: [], commands: [], environment: [] });
   assert.equal(readCliTestManifest(join(bundle, "manifest.json")).version, 2);
-  execFileSync(join(bundle, "e2e"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  runBundleFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8" });
   assert.ok(existsSync(join(bundle, "bundle-state.json")));
-  assert.equal(execFileSync(join(bundle, "e2e"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
+  assert.equal(runBundleFileSync(bundle, ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
   // Hand-written version 1 fixture (stringified run, no bundled extension) on the current launcher scaffolding.
   const v1Bundle = await create("v1-e2e", { roles: [], aliases: [], tools: [], commands: [], environment: [] });
   rmSync(join(v1Bundle, "payload", "extension.mjs"));
@@ -1041,18 +1144,18 @@ void test("portable bundle setup resolves an external runtime, launches, and fai
     "}",
     "",
   ].join("\n"));
-  execFileSync(join(v1Bundle, "v1-e2e"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  runBundleFileSync(v1Bundle, ["setup", "--yes"], { env: environment, encoding: "utf8" });
   assert.equal(readCliTestBundleState(join(v1Bundle, "bundle-state.json")).version, 1);
-  assert.equal(execFileSync(join(v1Bundle, "v1-e2e"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
+  assert.equal(runBundleFileSync(v1Bundle, ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
   const statePath = join(bundle, "bundle-state.json");
   const state = readCliTestBundleState(statePath);
   state.engine = "0.0.0";
   writeFileSync(statePath, JSON.stringify(state));
-  assert.match(launchFailure(join(bundle, "e2e")), /Bundle setup is missing or stale/);
+  assert.match(launchFailure(bundle), /Bundle setup is missing or stale/);
   const piMismatch = await create("pi-mismatch", { roles: [], aliases: [], tools: [], commands: [], environment: [] }, ">=0.81.0 <0.82.0");
-  assert.match(launchFailure(join(piMismatch, "pi-mismatch")), /Bundle requires Pi >=0\.81\.0 <0\.82\.0; found 0\.82\.0/);
+  assert.match(launchFailure(piMismatch), /Bundle requires Pi >=0\.81\.0 <0\.82\.0; found 0\.82\.0/);
   const builtinTools = await create("builtin-tools", { roles: [], aliases: [], tools: ["grep", "find", "ls"], commands: [], environment: [] });
-  execFileSync(join(builtinTools, "builtin-tools"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  runBundleFileSync(builtinTools, ["setup", "--yes"], { env: environment, encoding: "utf8" });
   const skillSource = join(root, "selected-skill");
   mkdirSync(skillSource);
   writeFileSync(join(skillSource, "SKILL.md"), "---\nname: selected-skill\ndescription: Selected bundle skill\n---\nSelected skill instructions");
@@ -1060,12 +1163,12 @@ void test("portable bundle setup resolves an external runtime, launches, and fai
   await writePortableWorkflowBundle({ destination: skillBundle, command: "skill-bundle", workflow, source, dependencies: ["typebox"], resources: { skills: [skillSource] }, piVersion: ">=0.82.0 <0.83.0", engineVersion: ">=5.0.0 <6.0.0" });
   const skillManifest = readCliTestManifest(join(skillBundle, "manifest.json"));
   assert.deepEqual(skillManifest.payload?.skills, ["selected-skill"]);
-  execFileSync(join(skillBundle, "skill-bundle"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  assert.equal(execFileSync(join(skillBundle, "skill-bundle"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
+  runBundleFileSync(skillBundle, ["setup", "--yes"], { env: environment, encoding: "utf8" });
+  assert.equal(runBundleFileSync(skillBundle, ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
   const missingCommand = await create("missing-command", { roles: [], aliases: [], tools: [], commands: ["bundle-command-that-is-not-installed"], environment: [] });
-  assert.match(runFailure(join(missingCommand, "missing-command")), /Missing required external command/);
+  assert.match(runFailure(missingCommand), /Missing required external command/);
   const missingAlias = await create("missing-alias", { roles: [], aliases: ["missing-model"], tools: [], commands: [], environment: [] });
-  assert.match(runFailure(join(missingAlias, "missing-alias")), /Required model alias is unknown/);
+  assert.match(runFailure(missingAlias), /Required model alias is unknown/);
   const missingEnvironment = await create("missing-environment", { roles: [], aliases: [], tools: [], commands: [], environment: ["BUNDLE_REQUIRED_ENV"] });
   const environmentFailure = setupResult(missingEnvironment);
   assert.notEqual(environmentFailure.status, 0);
@@ -1088,13 +1191,14 @@ void test("portable bundle setup installs a missing compatible engine and fails 
   const agentDir = join(root, "agent");
   const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
   mkdirSync(join(piRoot, "dist", "core", "tools"), { recursive: true });
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"), join(piRoot, "dist", "index.js"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "tools", "index.js"), join(piRoot, "dist", "core", "tools", "index.js"));
+  const piPackage = join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent");
+  writeFileSync(join(piRoot, "dist", "index.js"), `export * from ${JSON.stringify(pathToFileURL(join(piPackage, "dist", "index.js")).href)};`);
+  writeFileSync(join(piRoot, "dist", "core", "tools", "index.js"), `export * from ${JSON.stringify(pathToFileURL(join(piPackage, "dist", "core", "tools", "index.js")).href)};`);
   writeFileSync(join(piRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.80.9" }));
-  const piExecutable = join(piRoot, "dist", "pi");
-  writeFileSync(piExecutable, `#!/usr/bin/env node
-import { cpSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+  const piSource = `import { copyFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { cp } from "node:fs/promises";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 const args = process.argv.slice(2);
 if (args[0] === "--version") console.log("0.82.0");
 else if (args[0] !== "install") process.exit(2);
@@ -1102,23 +1206,36 @@ else if (process.env.BUNDLE_INSTALL_MODE === "fail") { console.error("fake insta
 else {
   const target = join(process.env.PI_CODING_AGENT_DIR, "npm", "node_modules", "@piewf", "cli");
   rmSync(target, { recursive: true, force: true });
-  cpSync(process.env.BUNDLE_ENGINE_SOURCE, target, { recursive: true });
-  rmSync(join(target, "node_modules"), { recursive: true, force: true }); // fixture builds its own node_modules; drop whatever the engine source copied
-  mkdirSync(join(target, "node_modules"), { recursive: true });
-  symlinkSync(process.env.BUNDLE_CORE_SOURCE, join(target, "node_modules", "pi-extensible-workflows"));
-  mkdirSync(join(target, "node_modules", "@earendil-works"), { recursive: true });
-  symlinkSync(process.env.BUNDLE_AGENT_SOURCE, join(target, "node_modules", "@earendil-works", "pi-coding-agent"));
-  symlinkSync(process.env.BUNDLE_TYPEBOX_SOURCE, join(target, "node_modules", "typebox"));
-  symlinkSync(process.env.BUNDLE_PI_AI_SOURCE, join(target, "node_modules", "@earendil-works", "pi-ai"));
+  await cp(process.env.BUNDLE_ENGINE_SOURCE, target, { recursive: true });
+  rmSync(join(target, "node_modules"), { recursive: true, force: true });
+  const modules = join(target, "node_modules");
+  mkdirSync(modules, { recursive: true });
+  await cp(process.env.BUNDLE_CORE_SOURCE, join(modules, "pi-extensible-workflows"), { recursive: true });
+  const sourceNodeModules = join(process.env.BUNDLE_CORE_SOURCE, "..", "..", "node_modules");
+  await cp(join(sourceNodeModules, "acorn"), join(modules, "acorn"), { recursive: true });
+  await cp(join(sourceNodeModules, "minimatch"), join(modules, "minimatch"), { recursive: true });
+  await cp(join(sourceNodeModules, "brace-expansion"), join(modules, "brace-expansion"), { recursive: true });
+  await cp(join(sourceNodeModules, "balanced-match"), join(modules, "balanced-match"), { recursive: true });
+  mkdirSync(join(modules, "@earendil-works"), { recursive: true });
+  const installNodePackageShim = (source, destination) => {
+    mkdirSync(join(destination, "dist"), { recursive: true });
+    copyFileSync(join(source, "package.json"), join(destination, "package.json"));
+    const implementation = join(source, "dist", "index.js");
+    writeFileSync(join(destination, "dist", "index.js"), "export * from " + JSON.stringify(pathToFileURL(implementation).href) + ";");
+  };
+  installNodePackageShim(process.env.BUNDLE_AGENT_SOURCE, join(modules, "@earendil-works", "pi-coding-agent"));
+  await cp(process.env.BUNDLE_TYPEBOX_SOURCE, join(modules, "typebox"), { recursive: true });
+  installNodePackageShim(process.env.BUNDLE_PI_AI_SOURCE, join(modules, "@earendil-works", "pi-ai"));
+  installNodePackageShim(process.env.BUNDLE_PI_TUI_SOURCE, join(modules, "@earendil-works", "pi-tui"));
   if (process.env.BUNDLE_INSTALL_MODE === "incompatible") writeFileSync(join(target, "package.json"), JSON.stringify({ name: "@piewf/cli", version: "3.0.0" }));
-}` , { mode: 0o755 });
-  chmodSync(piExecutable, 0o755);
+}`;
+  writePiCommand(join(piRoot, "dist"), piSource);
   const workflow = { name: "install", version: "1.0.0", headline: "Bundle", description: "Bundle install", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
   const typeboxSource = dirname(dirname(createRequire(import.meta.url).resolve("typebox")));
-  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", BUNDLE_ENGINE_SOURCE: process.cwd(), BUNDLE_CORE_SOURCE: join(process.cwd(), "../core"), BUNDLE_AGENT_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent"), BUNDLE_TYPEBOX_SOURCE: typeboxSource, BUNDLE_PI_AI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-ai") };
+  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}${delimiter}${process.env.PATH ?? ""}`, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", BUNDLE_ENGINE_SOURCE: process.cwd(), BUNDLE_CORE_SOURCE: join(process.cwd(), "../core"), BUNDLE_AGENT_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent"), BUNDLE_TYPEBOX_SOURCE: typeboxSource, BUNDLE_PI_AI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-ai"), BUNDLE_PI_TUI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-tui") };
   const source = writeCliTestExtensionSource(join(root, "install-extension.mjs"), workflow, "async run(input) { return input.value; }");
   const create = async (name: string): Promise<string> => { const destination = join(root, name); await writePortableWorkflowBundle({ destination, command: name, workflow, source, piVersion: ">=0.82.0 <0.83.0", engineVersion: ">=5.0.0 <6.0.0" }); return destination; };
-  const runSetup = (bundle: string, mode: string): ReturnType<typeof spawnSync> => spawnSync(join(bundle, basename(bundle)), ["setup", "--yes"], { env: { ...environment, BUNDLE_INSTALL_MODE: mode }, encoding: "utf8" });
+  const runSetup = (bundle: string, mode: string): ReturnType<typeof spawnSync> => spawnBundleFileSync(bundle, ["setup", "--yes"], { env: { ...environment, BUNDLE_INSTALL_MODE: mode }, encoding: "utf8" });
   const installed = await create("installed");
   const success = runSetup(installed, "success");
   assert.equal(success.status, 0, String(success.stderr));
@@ -1126,7 +1243,7 @@ else {
   const packageMetadata = readCliTestPackageMetadata(join(process.cwd(), "package.json"));
    assert.equal(installedPackage.version, packageMetadata.version);
   assert.ok(existsSync(join(installed, "bundle-state.json")));
-  assert.equal(execFileSync(join(installed, "installed"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
+  assert.equal(runBundleFileSync(installed, ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
   rmSync(join(agentDir, "npm"), { recursive: true, force: true });
   const failed = await create("failed");
   const failure = runSetup(failed, "fail");

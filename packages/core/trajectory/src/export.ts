@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { spawnExecutable } from "../../src/process-launcher.js";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,12 +52,29 @@ export async function exportTrajectoryRunHtml(options: TrajectoryExportOptions):
 
 function runGh(ghPath: string, args: readonly string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(ghPath, [...args], { encoding: "utf8", maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) {
-        const notFound = (error as NodeJS.ErrnoException).code === "ENOENT";
-        reject(new Error(notFound ? "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/ and run `gh auth login`." : stderr.trim() || error.message));
+    let stdout = "";
+    let stderr = "";
+    let exceededBuffer = false;
+    let spawnError: NodeJS.ErrnoException | undefined;
+    let child: ReturnType<typeof spawnExecutable>;
+    try { child = spawnExecutable(ghPath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true }); }
+    catch (error) { reject(error instanceof Error ? error : new Error(String(error))); return; }
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (Buffer.byteLength(stdout, "utf8") > 1024 * 1024) { exceededBuffer = true; child.kill(); }
+    });
+    child.stderr?.on("data", (chunk: string) => { stderr = `${stderr}${chunk}`.slice(-1024 * 1024); });
+    child.once("error", (error: NodeJS.ErrnoException) => { spawnError = error; });
+    child.once("close", (code, signal) => {
+      if (exceededBuffer) { reject(new Error("GitHub CLI output exceeded the 1 MiB limit.")); return; }
+      if (spawnError) {
+        const notFound = spawnError.code === "ENOENT";
+        reject(new Error(notFound ? "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/ and run `gh auth login`." : spawnError.message));
         return;
       }
+      if (code !== 0 || signal) { reject(new Error(stderr.trim() || `GitHub CLI exited with ${signal ?? String(code)}`)); return; }
       resolve(stdout);
     });
   });

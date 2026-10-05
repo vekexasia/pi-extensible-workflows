@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -20,8 +20,7 @@ void test("ambient evals require explicit opt-in and execute capture safely", as
   const artifactsDir = mkdtempSync(join(tmpdir(), "pi-workflow-ambient-artifacts-"));
   const fakeRoot = mkdtempSync(join(tmpdir(), "pi-workflow-ambient-parent-"));
   const fakePi = join(fakeRoot, "fake-pi.mjs");
-  writeFileSync(fakePi, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() }, { type: "message", id: "call", parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "workflow-call", name: "workflow", arguments: { name: "ambient-capture", script: "return 'captured';", foreground: true } }], provider: "fake", model: "model", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } } } }, { type: "message", id: "result", parentId: "call", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "workflow-call", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0 }, isError: false } }]; writeFileSync(join(dir, "ambient.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
-  chmodSync(fakePi, 0o755);
+  writeFileSync(fakePi, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id, timestamp: new Date().toISOString(), cwd: process.cwd() }, { type: "message", id: "call", parentId: null, timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "toolCall", id: "workflow-call", name: "workflow", arguments: { name: "ambient-capture", script: "return 'captured';", foreground: true } }], provider: "fake", model: "model", usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } } } }, { type: "message", id: "result", parentId: "call", timestamp: new Date().toISOString(), message: { role: "toolResult", toolCallId: "workflow-call", toolName: "workflow", content: [{ type: "text", text: "captured" }], details: { captureIdentity: "pi-extensible-workflows-eval-capture-v1", realWorkflowAgentsLaunched: 0 }, isError: false } }]; writeFileSync(join(dir, "ambient.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");`);
   const result = await runAmbientWorkflowEvals({
     cases: [{ id: "captured", prompt: "ignored", timeoutMs: 2_000, maxCost: 0.01 }],
     provider: "fake", model: "model", piCommand: fakePi, artifactsDir, environment: { PI_WORKFLOW_EVAL_AMBIENT: "1" },
@@ -47,14 +46,12 @@ void test("ambient fixture cases use separate disposable worktrees and clean suc
   const repository = createAmbientFixtureRepository();
   const fakeRoot = mkdtempSync(join(tmpdir(), "pi-workflow-ambient-fake-pi-"));
   const fakePi = join(fakeRoot, "fake-pi.mjs");
-  writeFileSync(fakePi, `#!/usr/bin/env node
-import { appendFileSync, writeFileSync } from "node:fs";
+  writeFileSync(fakePi, `import { appendFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const args = process.argv.slice(2);
 writeFileSync(join(process.cwd(), "invocation.json"), JSON.stringify(args));
 appendFileSync(join(process.cwd(), "src/score.js"), "\\n// edited only in this worktree\\n");
 `);
-  chmodSync(fakePi, 0o755);
   const original = readFileSync(join(repository.fixtureRoot, "src/score.js"), "utf8");
   const paths: string[] = [];
   try {
@@ -83,8 +80,7 @@ appendFileSync(join(process.cwd(), "src/score.js"), "\\n// edited only in this w
     paths.push(second.path);
     assert.notEqual(second.path, paths[0]);
     const failingPi = join(fakeRoot, "failing-pi.mjs");
-    writeFileSync(failingPi, "#!/usr/bin/env node\nprocess.exit(7);\n");
-    chmodSync(failingPi, 0o755);
+    writeFileSync(failingPi, "process.exit(7);\n");
     const failure = await runAmbientPiProcess({ worktree: second.path, sessionDir: join(repository.root, "sessions", "second"), prompt: "ignored", provider: "fake", model: "model", piCommand: failingPi, timeoutMs: 2_000, maxCost: 1 });
     assert.equal(failure.exitCode, 7);
     assert.equal(failure.timedOut, false);
@@ -93,8 +89,7 @@ appendFileSync(join(process.cwd(), "src/score.js"), "\\n// edited only in this w
 
     const third = createAmbientCaseWorktree(repository, "timeout");
     const slowPi = join(fakeRoot, "slow-pi.mjs");
-    writeFileSync(slowPi, "#!/usr/bin/env node\nsetInterval(() => {}, 1_000);\n");
-    chmodSync(slowPi, 0o755);
+    writeFileSync(slowPi, "setInterval(() => {}, 1_000);\n");
     const timeout = await runAmbientPiProcess({ worktree: third.path, sessionDir: join(repository.root, "sessions", "timeout"), prompt: "ignored", provider: "fake", model: "model", piCommand: slowPi, timeoutMs: 50, maxCost: 1 });
     assert.equal(timeout.timedOut, true);
     assert.equal(timeout.processGroupTerminated, true);
@@ -114,7 +109,7 @@ void test("ambient evals reject missing config and select requested cases", asyn
   for (const [environment, message] of missingConfig) await assert.rejects(runAmbientWorkflowEvals({ environment }), message);
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-ambient-filter-"));
   const artifactsDir = join(root, "artifacts"); const fakePi = join(root, "fake-pi.mjs");
-  writeFileSync(fakePi, "#!/usr/bin/env node\nprocess.exit(0);\n"); chmodSync(fakePi, 0o755);
+  writeFileSync(fakePi, "process.exit(0);\n");
   try {
     const result = await runAmbientWorkflowEvals({ cases: [{ id: "first", prompt: "one", timeoutMs: 1000, maxCost: 1 }, { id: "second", prompt: "two", timeoutMs: 1000, maxCost: 1 }], caseIds: ["second"], provider: "fake", model: "model", piCommand: fakePi, artifactsDir, environment: { PI_WORKFLOW_EVAL_AMBIENT: "1" } });
     assert.deepEqual(result.cases.map(({ id }) => id), ["second"]);
@@ -128,12 +123,12 @@ void test("ambient evals reject missing config and select requested cases", asyn
 void test("ambient Pi budget aborts and malformed capture still cleans every fixture", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-workflow-ambient-edge-"));
   const budgetPi = join(root, "budget-pi.mjs");
-  writeFileSync(budgetPi, "#!/usr/bin/env node\nconsole.log(JSON.stringify({ type: 'message_end', message: { usage: { cost: { total: 2 } } } })); setInterval(() => {}, 1000);\n"); chmodSync(budgetPi, 0o755);
+  writeFileSync(budgetPi, "console.log(JSON.stringify({ type: 'message_end', message: { usage: { cost: { total: 2 } } } })); setInterval(() => {}, 1000);\n");
   try {
     const budget = await runAmbientPiProcess({ worktree: root, sessionDir: join(root, "budget-session"), prompt: "wait", provider: "fake", model: "model", piCommand: budgetPi, timeoutMs: 10_000, maxCost: 1 });
     assert.equal(budget.budgetExceeded, true); assert.equal(budget.timedOut, false); assert.equal(budget.processGroupTerminated, true);
     const malformedPi = join(root, "malformed-pi.mjs");
-    writeFileSync(malformedPi, `#!/usr/bin/env node\nimport { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id }, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "workflow", arguments: { name: "bad-capture" } }] } }, { type: "message", message: { role: "toolResult", toolName: "workflow", content: [{ type: "text", text: "not capture metadata" }], details: { realWorkflowAgentsLaunched: 1 }, isError: false } }]; writeFileSync(join(dir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");\n`); chmodSync(malformedPi, 0o755);
+    writeFileSync(malformedPi, `import { mkdirSync, writeFileSync } from "node:fs"; import { join } from "node:path"; const args = process.argv.slice(2); const value = name => args[args.indexOf(name) + 1]; const dir = value("--session-dir"); const id = value("--session-id"); mkdirSync(dir, { recursive: true }); const rows = [{ type: "session", version: 3, id }, { type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "workflow", arguments: { name: "bad-capture" } }] } }, { type: "message", message: { role: "toolResult", toolName: "workflow", content: [{ type: "text", text: "not capture metadata" }], details: { realWorkflowAgentsLaunched: 1 }, isError: false } }]; writeFileSync(join(dir, "parent.jsonl"), rows.map(JSON.stringify).join("\\n") + "\\n");\n`);
     const artifactsDir = join(root, "artifacts");
     const result = await runAmbientWorkflowEvals({ cases: [{ id: "malformed", prompt: "capture", timeoutMs: 1000, maxCost: 1 }], provider: "fake", model: "model", piCommand: malformedPi, artifactsDir, environment: { PI_WORKFLOW_EVAL_AMBIENT: "1" } });
     const item = result.cases[0]; assert.ok(item); assert.equal(item.status, "failed"); assert.equal(item.manifest.cleanup.captureIdentityVerified, false);

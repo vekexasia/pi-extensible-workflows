@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { spawnSyncExecutable } from "../src/process-launcher.js";
 import { createServer } from "node:net";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,18 +16,24 @@ function installPackage(root: string, agentDir: string): void {
   const tarballs = join(root, "tarballs");
   const npmRoot = join(root, "npm");
   mkdirSync(tarballs, { recursive: true, mode: 0o700 });
-  execFileSync("npm", ["pack", "--workspace=packages/core", "--pack-destination", tarballs], { cwd: repositoryRoot, stdio: "pipe", timeout: 120_000 });
+  const packed = spawnSyncExecutable("npm", ["pack", "--workspace=packages/core", "--pack-destination", tarballs], { cwd: repositoryRoot, encoding: "utf8", timeout: 120_000 });
+  if (packed.error) throw packed.error;
+  assert.equal(packed.status, 0, packed.stderr.toString());
   const tarball = readdirSync(tarballs).find((name) => name.endsWith(".tgz"));
   assert.ok(tarball, "npm pack did not produce a package tarball");
-  execFileSync("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", join(tarballs, tarball)], { stdio: "pipe", timeout: 120_000 });
+  const installed = spawnSyncExecutable("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", join(tarballs, tarball)], { encoding: "utf8", timeout: 120_000 });
+  if (installed.error) throw installed.error;
+  assert.equal(installed.status, 0, installed.stderr.toString());
   const packagePath = join(npmRoot, "node_modules", "pi-extensible-workflows");
   assert.ok(existsSync(join(packagePath, "package.json")), "npm did not install pi-extensible-workflows");
-  execFileSync("pi", ["install", packagePath], {
+  const piInstall = spawnSyncExecutable("pi", ["install", packagePath], {
     cwd: root,
-    env: { ...process.env, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
-    stdio: "pipe",
+    env: { ...process.env, HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
+    encoding: "utf8",
     timeout: 30_000,
   });
+  if (piInstall.error) throw piInstall.error;
+  assert.equal(piInstall.status, 0, piInstall.stderr.toString());
 }
 
 function stopTrajectoryServer(agentDir: string): void {

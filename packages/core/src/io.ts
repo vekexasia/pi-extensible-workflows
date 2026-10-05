@@ -11,7 +11,7 @@ const execute = promisify(execFile);
 const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800] as const;
 const syncSleepBuffer = new Int32Array(new SharedArrayBuffer(4));
 function retryableRenameError(error: unknown): boolean { return isNodeError(error, "EPERM") || isNodeError(error, "EBUSY") || isNodeError(error, "EACCES"); }
-async function renameWithRetry(from: string, to: string): Promise<void> {
+export async function renameWithRetry(from: string, to: string): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try { await rename(from, to); return; }
     catch (error) {

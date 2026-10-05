@@ -1356,7 +1356,7 @@ test("reports an invalid navigator retry result without leaving the picker", asy
 });
 
 test("opens bounded prompt and result artifacts while terminal runs hide system prompts", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-editors-"));
+  const cwd = await mkdtemp(join(tmpdir(), "subagents navigator editors-"));
   const storageDir = join(cwd, "storage");
   const id = "run-editors";
   await mkdir(join(storageDir, id), { recursive: true });
@@ -1370,12 +1370,12 @@ test("opens bounded prompt and result artifacts while terminal runs hide system 
     async stop() {},
     async retry() {},
   };
-  const editorPath = join(cwd, "fake-editor.sh");
+  const editorPath = join(cwd, "fake editor.mjs");
   const editedPath = join(cwd, "edited-content");
   const openedPath = join(cwd, "opened-path");
-  await writeFile(editorPath, "#!/bin/sh\ncat \"$3\" > \"$1\"\nprintf '%s' \"$3\" > \"$2\"\n", { mode: 0o755 });
+  await writeFile(editorPath, "import { copyFileSync, writeFileSync } from 'node:fs'; const [edited, opened, artifact] = process.argv.slice(2); writeFileSync(opened, artifact); copyFileSync(artifact, edited);\n");
   const previous = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
+  process.env.VISUAL = [process.execPath, editorPath, editedPath, openedPath].map((value) => `"${value}"`).join(" ");
   process.env.EDITOR = process.env.VISUAL;
   process.env.PI_CODING_AGENT_DIR = cwd;
   const commands = [];
@@ -1520,7 +1520,7 @@ test("runs one background subagent with context-derived setup and execution opti
   assert.equal(typeof roleOnAttempt, "function");
   assert.equal(typeof roleOnProgress, "function");
   assert.deepEqual(roleOptions, { label: "role", workflowName: "subagents", role: "reviewer" });
-  await rm(cwd, { recursive: true, force: true });
+  await removeTestTree(cwd);
 });
 
 test("keeps top-level model with a role and persists a background execution failure", async () => {
@@ -1552,7 +1552,7 @@ test("keeps top-level model with a role and persists a background execution fail
   assert.equal(typeof onProgress, "function");
   assert.deepEqual(options, { label: "reviewer", workflowName: "subagents", role: "reviewer", model: "fixture/cheap:high" });
   assert.deepEqual((await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).error, { code: "AGENT_FAILED", message: "agent failed" });
-  await rm(cwd, { recursive: true, force: true });
+  await removeTestTree(cwd);
 });
 test("returns foreground terminal envelopes, preserves mode for retry, and suppresses follow-ups", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-foreground-terminal-"));
@@ -1740,13 +1740,26 @@ test("disposes each replaced injected session once after a stopped run settles",
   }
 });
 
-async function waitFor(predicate, onTimeout) {
-  for (let attempt = 0; attempt < 1000; attempt += 1) {
+async function waitFor(predicate, onTimeout, maxAttempts = 1_000) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
   await onTimeout?.();
   throw new Error("Timed out waiting for subagent state");
+}
+
+async function removeTestTree(path) {
+  let lastError;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try { await rm(path, { recursive: true, force: true }); return; }
+    catch (error) {
+      lastError = error;
+      if (!new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EACCES"]).has(error?.code)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw lastError;
 }
 
 function deferredExecution(prompt, pending, started) {
@@ -2061,9 +2074,19 @@ test("persists failed background subagents for repeatable lookup", async () => {
     assert.deepEqual((await manager.inspect({ id: launched.id }, context)).error, expectedFailure);
 
     const runDirectory = join(storageDir, launched.id);
-    assert.equal((await stat(storageDir)).mode & 0o777, 0o700);
-    assert.equal((await stat(runDirectory)).mode & 0o777, 0o700);
-    assert.equal((await stat(join(runDirectory, "request.json"))).mode & 0o777, 0o600);
+    const storageStat = await stat(storageDir);
+    const runStat = await stat(runDirectory);
+    const requestStat = await stat(join(runDirectory, "request.json"));
+    assert.equal(storageStat.isDirectory(), true);
+    assert.equal(runStat.isDirectory(), true);
+    assert.equal(requestStat.isFile(), true);
+    // Node's Windows mode bits do not represent the effective ACL; do not mutate ACLs here.
+    if (process.platform !== "win32") {
+      assert.equal(storageStat.mode & 0o777, 0o700);
+      assert.equal(runStat.mode & 0o777, 0o700);
+      assert.equal(requestStat.mode & 0o777, 0o600);
+    }
+    await waitFor(async () => stat(join(runDirectory, "failure.json")).then(() => true, () => false));
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "request.json"), "utf8")), { prompt: "fail me", mode: "background", label: "failure" });
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "failure.json"), "utf8")), expectedFailure);
 
@@ -2421,7 +2444,9 @@ test("session shutdown disposes active subagent sessions and rejects controls", 
 });
 
 test("uses RunStore worktrees and removes them after a standalone run", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-"));
+  // Short temp names: run worktrees nest the repository name twice below .worktrees/.pi/workflows/projects/..., and long
+  // fixture names alone push Windows real-git worktrees past MAX_PATH (git: "Filename too long").
+  const cwd = await mkdtemp(join(tmpdir(), "sa-wt-"));
   await writeFile(join(cwd, "README.md"), "base\n");
   await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
   execFileSync("git", ["init", "-q"], { cwd });
@@ -2444,8 +2469,16 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
   });
   const context = await managerContext(cwd);
   try {
-    const launched = await manager.run({ prompt: "work", worktree: "actual" }, context);
-    await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
+    let launchTimer;
+    const launchTimeout = new Promise((_, reject) => { launchTimer = globalThis.setTimeout(() => reject(new Error("Timed out creating the standalone Git worktree")), 15_000); });
+    let launched;
+    try { launched = await Promise.race([manager.run({ prompt: "work", worktree: "actual" }, context), launchTimeout]); }
+    finally { globalThis.clearTimeout(launchTimer); }
+    await waitFor(
+      async () => (await manager.inspect({ id: launched.id }, context)).state === "completed",
+      async () => { const status = await manager.inspect({ id: launched.id }, context); const failure = await readFile(join(cwd, "subagents-storage", launched.id, "failure.json"), "utf8").catch(() => "missing"); process.stderr.write(`Worktree run diagnostics: ${JSON.stringify({ status, failure })}\\n`); },
+      10_000,
+    );
     assert.equal(typeof worktreePath, "string");
     await waitFor(async () => typeof worktreePath === "string" && !(await stat(worktreePath).then(() => true, () => false)));
     await waitFor(() => typeof branch === "string" && execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
@@ -2455,7 +2488,8 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
   }
 });
 test("isolates concurrent real-git worktrees with the same name", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-concurrent-"));
+  // Short temp name for Windows MAX_PATH; see "uses RunStore worktrees and removes them after a standalone run".
+  const cwd = await mkdtemp(join(tmpdir(), "sa-wtc-"));
   await writeFile(join(cwd, "README.md"), "base\n");
   await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
   execFileSync("git", ["init", "-q"], { cwd });

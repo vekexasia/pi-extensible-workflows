@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { writePortableWorkflowBundle } from "../src/bundles.js";
+import { portablePiVersion, writePortableWorkflowBundle } from "../src/bundles.js";
 
 type BundlePayload = { register: (registerWorkflowExtension: (extension: unknown) => void) => Promise<void> };
 
@@ -246,6 +246,32 @@ void test("bundle shim omits invalid emitted names", async () => {
     const shim = readFileSync(join(destination, "payload", "node_modules", "pi-extensible-workflows", "index.mjs"), "utf8");
     assert.equal(shim, "\n");
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("bundle records the Pi version from a PATH-resolved Pi launch and reports unknown for failures", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi extensible workflows bundle pi version ü-"));
+  const bin = join(root, "npm bin with spaces");
+  const previousPath = process.env.PATH;
+  const previousExit = process.env.PI_VERSION_STUB_EXIT;
+  try {
+    mkdirSync(bin, { recursive: true });
+    const source = "process.stdout.write(['0.99.1', 'extra diagnostics', ''].join(String.fromCharCode(10))); process.exitCode = Number(process.env.PI_VERSION_STUB_EXIT ?? '0');";
+    if (process.platform === "win32") {
+      // Real npm cmd-shim shape: the launcher resolves its Node entrypoint and never runs cmd.exe.
+      writeFileSync(join(bin, "pi entry.mjs"), source);
+      writeFileSync(join(bin, "pi.cmd"), "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nIF EXIST \"%dp0%\\node.exe\" (SET \"_prog=%dp0%\\node.exe\") ELSE (SET \"_prog=node\")\r\n\"%_prog%\" \"%dp0%\\pi entry.mjs\" %*\r\n");
+    } else writeFileSync(join(bin, "pi"), `#!/usr/bin/env node\n${source}\n`, { mode: 0o755 });
+    process.env.PATH = process.platform === "win32" ? bin : `${bin}${delimiter}${previousPath ?? ""}`;
+    assert.equal(portablePiVersion(), "0.99.1");
+    process.env.PI_VERSION_STUB_EXIT = "4";
+    assert.equal(portablePiVersion(), "unknown");
+    process.env.PATH = join(root, "empty path");
+    assert.equal(portablePiVersion(), "unknown");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+    if (previousExit === undefined) delete process.env.PI_VERSION_STUB_EXIT; else process.env.PI_VERSION_STUB_EXIT = previousExit;
     rmSync(root, { recursive: true, force: true });
   }
 });

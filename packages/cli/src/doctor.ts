@@ -317,7 +317,7 @@ async function inspectRoleSession(cwd: string, agentDir: string, roleName: strin
     diagnostics.push(...setupDiagnostics);
     return undefined;
   }
-  const session = await (async () => { try { return await createLocalPiSession({ ...prepared.setup.sessionInput, sessionManager: SessionManager.inMemory() }); } catch (error) { setupDiagnostics.push(diagnostic("error", "ROLE_INSPECTION", errorText(error), rolePath)); return undefined; } })();
+  const session = await (async () => { try { return await createLocalPiSession({ ...prepared.setup.sessionInput, noPromptTemplates: true, sessionManager: SessionManager.inMemory() }); } catch (error) { setupDiagnostics.push(diagnostic("error", "ROLE_INSPECTION", errorText(error), rolePath)); return undefined; } })();
   if (!session) { diagnostics.push(...setupDiagnostics); return undefined; }
   try {
     const promptResult = await session.preparePrompt(prompt);
