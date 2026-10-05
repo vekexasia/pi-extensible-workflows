@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
 import { sameFilesystemPath } from "../../src/paths.js";
+import { SEMANTIC_MAP_ASSET_MANIFEST, type SemanticMapAssetName } from "./semantic-map-assets.js";
 import { TOOL_TIMING_ENTRY_TYPE } from "../../src/tool-timing.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
@@ -234,8 +235,56 @@ function parseFrames(client: Client, chunk: Buffer, maxBytes: number): readonly 
 
 function writeJson(response: ServerResponse, status: number, value: unknown): void {
   const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store" });
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body), "cache-control": "no-store", "x-content-type-options": "nosniff" });
   response.end(body);
+}
+function writeAsset(response: ServerResponse, body: Buffer, contentType: string, headers: Record<string, string> = {}): void {
+  response.writeHead(200, { "content-type": contentType, "content-length": body.byteLength, "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer", ...headers });
+  response.end(body);
+}
+function parentContentSecurityPolicy(port: number): string {
+  return `default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:${String(port)}; frame-src 'self'; child-src 'self'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'`;
+}
+const SEMANTIC_MAP_CONTENT_SECURITY_POLICY = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; font-src data:; connect-src 'none'; worker-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+type SemanticMapBrowserAsset = Exclude<SemanticMapAssetName, "index.html">;
+const SEMANTIC_MAP_ASSETS = new Map<string, { name: SemanticMapBrowserAsset; file: URL; contentType: string }>([
+  ["/semantic-map.html", { name: "semantic-map.html", file: new URL("../assets/semantic-map.html", import.meta.url), contentType: "text/html; charset=utf-8" }],
+  ["/semantic-map.js", { name: "semantic-map.js", file: new URL("../assets/semantic-map.js", import.meta.url), contentType: "application/javascript; charset=utf-8" }],
+  ["/semantic-map.css", { name: "semantic-map.css", file: new URL("../assets/semantic-map.css", import.meta.url), contentType: "text/css; charset=utf-8" }]
+]);
+const PARENT_SHELL = new URL("./assets/index.html", import.meta.url);
+const BUILD_STAMP_PATTERN = /^[0-9a-f]{16}$/;
+/** Exactly one well-formed `v` naming the build this server was bundled with; anything else is a different or unknown build. */
+function requestsServableBuild(url: URL): boolean {
+  const versions = url.searchParams.getAll(SEMANTIC_MAP_ASSET_MANIFEST.versionParameter);
+  return versions.length === 1 && BUILD_STAMP_PATTERN.test(versions[0] ?? "") && versions[0] === SEMANTIC_MAP_ASSET_MANIFEST.stamp;
+}
+const matchesDigest = (name: SemanticMapAssetName, bytes: Buffer): boolean => {
+  const expected = SEMANTIC_MAP_ASSET_MANIFEST.assets[name];
+  return bytes.byteLength === expected.bytes && createHash("sha256").update(bytes).digest("hex") === expected.sha256;
+};
+/**
+ * Reads one build file on request and returns it only if its bytes are the ones this server was built with.
+ * An in-place update can leave a running server beside newer, partial or truncated files (even ones still
+ * carrying the old stamp text), so the stamp alone is not trusted: size and SHA-256 of the bytes actually read are.
+ */
+async function readCoherent(name: SemanticMapAssetName, file: URL): Promise<Buffer | undefined> {
+  try {
+    // Cheap size check first so a replaced, oversized file is never read into memory.
+    if ((await stat(file)).size !== SEMANTIC_MAP_ASSET_MANIFEST.assets[name].bytes) return undefined;
+    const bytes = await readFile(file);
+    return matchesDigest(name, bytes) ? bytes : undefined;
+  } catch { return undefined; }
+}
+/** Sibling viewer files must be present at their built sizes, so a partial update never serves a half set. */
+async function semanticSiblingsPresent(requested: SemanticMapBrowserAsset): Promise<boolean> {
+  const checks = [...SEMANTIC_MAP_ASSETS.values()].filter((asset) => asset.name !== requested).map(async (asset) => {
+    try { return (await stat(asset.file)).size === SEMANTIC_MAP_ASSET_MANIFEST.assets[asset.name].bytes; } catch { return false; }
+  });
+  return (await Promise.all(checks)).every(Boolean);
+}
+function writeIncoherentBuild(response: ServerResponse): void {
+  writeJson(response, 503, { error: "Trajectory build files do not match the running server" });
 }
 function authorized(request: IncomingMessage, port: number): boolean {
   const origin = request.headers.origin;
@@ -462,40 +511,48 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     catch { writeJson(response, 400, { error: "Invalid request" }); return; }
     if (!authorized(request, port)) { writeJson(response, 403, { error: "Forbidden" }); return; }
     const path = url.pathname;
+    const requestPath = (request.url ?? "/").split(/[?#]/, 1)[0] ?? "/";
+    if (requestPath !== path) { writeJson(response, 404, { error: "Not found" }); return; }
     // The identity lets an attaching Pi tell its own server from any other one answering on the port.
     if (request.method === "GET" && path === "/health") { writeJson(response, 200, { ok: true, pid: process.pid, fingerprint: serverFingerprint, startedAt }); return; }
     if (request.method === "GET" && (path === "/" || path === "/index.html")) {
-      void readFile(new URL("./assets/index.html", import.meta.url)).then((html) => {
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8", "content-length": html.byteLength, "cache-control": "no-store" });
-        response.end(html);
+      void readCoherent("index.html", PARENT_SHELL).then((html) => {
+        if (html === undefined) { writeIncoherentBuild(response); return; }
+        writeAsset(response, html, "text/html; charset=utf-8", { "content-security-policy": parentContentSecurityPolicy(port) });
       }).catch(() => { writeJson(response, 500, { error: "Trajectory UI is unavailable" }); });
+      return;
+    }
+    const semanticAsset = request.method === "GET" ? SEMANTIC_MAP_ASSETS.get(path) : undefined;
+    if (semanticAsset) {
+      // A missing, duplicated, malformed or other build's version is never answered with this build's bytes.
+      if (!requestsServableBuild(url)) { writeJson(response, 404, { error: "Not found" }); return; }
+      void Promise.all([readCoherent(semanticAsset.name, semanticAsset.file), semanticSiblingsPresent(semanticAsset.name)]).then(([asset, siblings]) => {
+        if (asset === undefined || !siblings) { writeIncoherentBuild(response); return; }
+        writeAsset(response, asset, semanticAsset.contentType, path === "/semantic-map.html" ? { "content-security-policy": SEMANTIC_MAP_CONTENT_SECURITY_POLICY } : {});
+      }).catch(() => { writeJson(response, 500, { error: "Semantic Map asset is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/marked.min.js") {
       void readFile(new URL("./assets/marked.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory markdown renderer is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/morphdom.min.js") {
       void readFile(new URL("./assets/morphdom.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory DOM diffing library is unavailable" }); });
       return;
     }
     if (request.method === "GET" && path === "/prism.min.js") {
       void readFile(new URL("./assets/prism.min.js", import.meta.url)).then((script) => {
-        response.writeHead(200, { "content-type": "application/javascript; charset=utf-8", "content-length": script.byteLength, "cache-control": "no-store" });
-        response.end(script);
+        writeAsset(response, script, "application/javascript; charset=utf-8");
       }).catch(() => { writeJson(response, 500, { error: "Trajectory syntax highlighting library is unavailable" }); });
       return;
     }
     if (request.method === "GET" && (path === "/favicon.png" || path === "/favicon.ico")) {
       void readFile(new URL("./assets/favicon.png", import.meta.url)).then((icon) => {
-        response.writeHead(200, { "content-type": "image/png", "content-length": icon.byteLength, "cache-control": "no-store" });
-        response.end(icon);
+        writeAsset(response, icon, "image/png");
       }).catch(() => { writeJson(response, 404, { error: "Not found" }); });
       return;
     }

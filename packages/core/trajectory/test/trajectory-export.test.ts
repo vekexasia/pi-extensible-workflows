@@ -38,6 +38,8 @@ void test("exportTrajectoryRunHtml renders a self-contained static run report", 
     assert.equal(html.includes('href="./'), false);
     assert.ok(html.includes('<script src="data:text/javascript;base64,'));
     assert.ok(html.includes('href="data:image/png;base64,'));
+    assert.ok(html.includes("Semantic Map is available for live Trajectory sessions only; this is a static export."));
+    assert.equal(html.includes('<iframe src="./semantic-map.html'), false);
     // The raw injected payload cannot terminate its script block early.
     assert.equal(html.includes("</script> world"), false);
     // $-sequences in transcripts must not trigger String.replace expansion and duplicate the document.

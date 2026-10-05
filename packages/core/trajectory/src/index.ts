@@ -10,6 +10,7 @@ import { processAlive } from "../../src/session-lease.js";
 import { errorText, isNodeError, object, positiveInteger } from "../../src/utils.js";
 import { isTimingTranscriptEntry, isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
 import { shareTrajectoryRun } from "./export.js";
+import { SEMANTIC_MAP_BUILD_STAMP } from "./semantic-map-assets.js";
 
 const DEFAULT_TRAJECTORY_PORT = 7432;
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
@@ -38,8 +39,8 @@ export function trajectoryServerPath(moduleDirectory = dirname(fileURLToPath(imp
   return path;
 }
 async function trajectoryFingerprint(serverPath: string): Promise<string> {
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const serverBytes = await readFile(serverPath);
+  return `${createHash("sha256").update(serverBytes).digest("hex")}:${SEMANTIC_MAP_BUILD_STAMP}`;
 }
 function publisherId(cwd: string, sessionId: string): string { return createHash("sha256").update(`${cwd}\n${sessionId}`).digest("hex").slice(0, 16); }
 function trajectoryPort(value: unknown): number { return positiveInteger(value) && value <= 65535 ? value : DEFAULT_TRAJECTORY_PORT; }

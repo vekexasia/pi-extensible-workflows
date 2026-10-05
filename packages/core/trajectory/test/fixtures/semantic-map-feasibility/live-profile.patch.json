@@ -1,0 +1,22 @@
+[
+  {
+    "find": "      var items = Array.prototype.map.call(svg.querySelectorAll('[data-node-id]'), function (node) {",
+    "replacement": "      function collectItems() { return Array.prototype.map.call(svg.querySelectorAll('[data-node-id]'), function (node) {"
+  },
+  {
+    "find": "      });\n\n      function resultButtons() {",
+    "replacement": "      }); }\n      var items = collectItems();\n\n      function resultButtons() {"
+  },
+  {
+    "find": "        context: function () { return context.kind; },\n        count: items.length",
+    "replacement": "        context: function () { return context.kind; },\n        refresh: function () { items = collectItems(); render(input.value); return items.length; },\n        get count() { return items.length; }"
+  },
+  {
+    "find": "</head>",
+    "replacement": "  <link rel=\"stylesheet\" href=\"/live-profile.css\">\n</head>"
+  },
+  {
+    "find": "</body>",
+    "replacement": "  <script src=\"/live-profile.js\"></script>\n</body>"
+  }
+]

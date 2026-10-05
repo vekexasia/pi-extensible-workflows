@@ -44,7 +44,15 @@
     "subagents/README.md",
     "skills",
     "examples",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "trajectory/vendor/archify/LICENSE",
+    "!dist/trajectory/src/assets/semantic-map.html",
+    "!dist/trajectory/src/assets/semantic-map.js",
+    "!dist/trajectory/src/assets/semantic-map.css",
+    "!trajectory/src/assets/semantic-map.html",
+    "!trajectory/src/assets/semantic-map.js",
+    "!trajectory/src/assets/semantic-map.css",
+    "!trajectory/src/semantic-map.css"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json && cp -R trajectory/src/assets dist/trajectory/src/assets && cp -R trajectory/src/assets dist/trajectory/assets && esbuild src/index.ts starter/index.ts subagents/index.ts trajectory/index.ts --bundle --format=esm --platform=node --packages=external --sourcemap --sources-content=false --outbase=. --outdir=dist && esbuild trajectory/src/server.ts --bundle --format=esm --platform=node --sourcemap --sources-content=false --outfile=dist/trajectory/src/server.js",
