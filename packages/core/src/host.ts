@@ -1299,7 +1299,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const roles = Object.entries(loadAgentDefinitions(ctx.cwd, extensionAgentDir, projectTrusted(ctx), currentRoleSources())).filter(([, definition]) => definition.description);
     if (!roles.length) return;
     const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- \`${name}\`: ${String(definition.description)}`).join("\n")}`;
-    return { systemPrompt: `${event.systemPrompt}\n\n${content}` };
+    const { appendSystemPrompt } = event.systemPromptOptions;
+    event.systemPromptOptions.appendSystemPrompt = appendSystemPrompt ? `${appendSystemPrompt}\n\n${content}` : content;
   });
   const workflowTool: ToolDefinition<typeof WORKFLOW_TOOL_PARAMETERS, WorkflowToolResult, WorkflowProgressRenderState> = {
     name: "workflow",

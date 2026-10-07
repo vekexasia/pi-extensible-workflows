@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,23 +12,39 @@ import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { waitForIssue105 } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
-void test("advertises only described effective roles in the system prompt while workflow is active", () => {
-  type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
+void test("appends only described effective roles without forcing the system prompt while workflow is active", (t) => {
+  type StartEvent = { systemPrompt: string; systemPromptOptions: { appendSystemPrompt?: string } };
+  type StartHandler = (event: StartEvent, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
   let handler: StartHandler | undefined;
   const activeTools = ["workflow"];
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-guidance-"));
+  t.after(() => { rmSync(cwd, { recursive: true, force: true }); });
+  const agentDir = join(cwd, "agent");
+  mkdirSync(join(agentDir, "pi-ext-roles", "roles"), { recursive: true });
+  for (const name of ["developer", "reviewer", "scout", "oracle", "researcher"]) writeFileSync(join(agentDir, "pi-ext-roles", "roles", `${name}.md`), "UNDESCRIBED ROLE BODY");
   mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
   writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "project-reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model:medium\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
   writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: unknown) { if (name === "before_agent_start") handler = candidate as StartHandler; } }));
+  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: unknown) { if (name === "before_agent_start") handler = candidate as StartHandler; } }), cwd, undefined, undefined, agentDir);
   assert.ok(handler);
-  const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
-  const guidance = result?.systemPrompt ?? "";
-  assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
-  assert.match(guidance, /`project-reviewer`: Reviews correctness/);
-  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|workflow_catalog/);
-  const untrustedGuidance = handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false })?.systemPrompt ?? "";
-  assert.doesNotMatch(untrustedGuidance, /project-reviewer|Reviews correctness/);
+  const content = "Workflow role descriptions:\n- `project-reviewer`: Reviews correctness";
+  for (const appendSystemPrompt of [undefined, "", "EXISTING APPEND"]) {
+    const event: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: appendSystemPrompt === undefined ? {} : { appendSystemPrompt } };
+    assert.equal(handler(event, { cwd }), undefined);
+    assert.equal(event.systemPrompt, "BASE SYSTEM");
+    assert.equal(event.systemPromptOptions.appendSystemPrompt, appendSystemPrompt ? `${appendSystemPrompt}\n\n${content}` : content);
+    assert.doesNotMatch(event.systemPromptOptions.appendSystemPrompt ?? "", /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|workflow_catalog/);
+  }
+  const untrusted: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: { appendSystemPrompt: "EXISTING APPEND" } };
+  assert.equal(handler(untrusted, { cwd, isProjectTrusted: () => false }), undefined);
+  assert.deepEqual(untrusted.systemPromptOptions, { appendSystemPrompt: "EXISTING APPEND" });
+  const undescribed: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: {} };
+  assert.equal(handler(undescribed, { cwd: agentDir }), undefined);
+  assert.deepEqual(undescribed.systemPromptOptions, {});
+  activeTools.length = 0;
+  const inactive: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: { appendSystemPrompt: "EXISTING APPEND" } };
+  assert.equal(handler(inactive, { cwd }), undefined);
+  assert.deepEqual(inactive.systemPromptOptions, { appendSystemPrompt: "EXISTING APPEND" });
 });
 
 void test("foreground lifecycle events are redacted and throwing listeners cannot stop execution", async () => {

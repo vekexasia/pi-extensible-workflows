@@ -603,7 +603,7 @@ void test("extension roles flow through host guidance, preflight, launch snapsho
   const inputs: SessionInput[] = [];
   const prompts: string[] = [];
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: unknown }> }> = [];
-  let guidanceHandler: ((event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined) | undefined;
+  let guidanceHandler: ((event: { systemPrompt: string; systemPromptOptions: { appendSystemPrompt?: string } }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
   const createSession = async (input: SessionInput): Promise<TestPiSession> => {
     inputs.push(input);
@@ -621,8 +621,9 @@ void test("extension roles flow through host guidance, preflight, launch snapsho
   unsubscribe();
   unsubscribeInactive();
   assert.ok(guidanceHandler);
-  const guidance = guidanceHandler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => true })?.systemPrompt ?? "";
-  assert.match(guidance, /`extension-reviewer`: Packaged review role/);
+  const event = { systemPrompt: "BASE SYSTEM", systemPromptOptions: { appendSystemPrompt: "EXISTING APPEND" } };
+  assert.equal(guidanceHandler(event, { cwd, isProjectTrusted: () => true }), undefined);
+  assert.match(event.systemPromptOptions.appendSystemPrompt, /^EXISTING APPEND\n\nWorkflow role descriptions:[\s\S]*`extension-reviewer`: Packaged review role/);
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const result = await workflow.execute("role-launch", { name: "extension-role-launch", script: `return await agent("delegate", { role: "extension-reviewer" });`, foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" } });
