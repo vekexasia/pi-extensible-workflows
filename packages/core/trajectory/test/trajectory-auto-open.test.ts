@@ -86,7 +86,7 @@ function snapshot(name: string) {
     settings: DEFAULT_SETTINGS,
     models: ["openai/gpt"],
     tools: [],
-    agentTypes: [],
+    agentConfigurations: {},
     schemas: [],
   });
 }

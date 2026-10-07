@@ -1,10 +1,10 @@
-import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type AgentDefinition, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
 
 export interface EffectiveSystemPrompt { sessionId: string; attempt: number; turn: number; sha256: string; prompt: string }
 export type PersistedRun = RunRecord;
-export interface RunSummaryAgent { id: string; name: string; label?: string; state: string; role?: string; attempts: number }
+export interface RunSummaryAgent { id: string; name: string; label?: string; state: string; attempts: number }
 export interface RunSummaryArtifacts { runDirectory: string; statePath: string; journalPath: string; snapshotPath: string; workflowPath: string; resultPath: string; summaryPath: string }
 export interface RunSummary { schemaVersion: 1; runId: string; sessionId: string; workflowName: string; state: RunRecord["state"]; createdAt: string; updatedAt: string; terminalAt?: string; usage: WorkflowBudgetUsage; agents: readonly RunSummaryAgent[]; error?: RunRecord["error"]; failedAt?: string; replayablePaths: readonly string[]; incompletePaths: readonly string[]; artifacts: RunSummaryArtifacts }
 export interface CompletedOperation { path: string; value: JsonValue }
@@ -75,29 +75,18 @@ function decodeAgentResourceSelectors(value: unknown): AgentResourceSelectors | 
   return { ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(tools === undefined ? {} : { tools }) };
 }
 function decodeContextFileScopes(value: unknown): ContextFileScope[] | undefined { return decodeArray(value, (scope) => isContextFileScope(scope) ? scope : undefined); }
-export function decodeAgentDefinition(value: unknown): AgentDefinition | undefined {
-  if (!object(value)) return undefined;
-  const prompt = optionalString(value.prompt);
-  const description = optionalString(value.description);
-  const model = optionalString(value.model);
-  const thinking = value.thinking;
-  const tools = value.tools === undefined ? undefined : decodeStringArray(value.tools);
-  const skills = value.skills === undefined ? undefined : decodeStringArray(value.skills);
-  const extensions = value.extensions === undefined ? undefined : decodeStringArray(value.extensions);
-  const overrideSystemPrompt = optionalBoolean(value.overrideSystemPrompt);
+export function decodePreparedAgentConfiguration(value: unknown): PreparedAgentConfiguration | undefined {
+  if (!object(value) || !jsonValue(value) || typeof value.projectTrusted !== "boolean" || typeof value.systemPromptAppend !== "string") return undefined;
+  const model = decodeModelSpec(value.model);
+  const tools = decodeStringArray(value.tools);
+  const skills = decodeStringArray(value.skills);
+  const extensions = decodeStringArray(value.extensions);
+  const settings = decodeWorkflowExtensions(value.settings);
   const contextFiles = value.contextFiles === undefined ? undefined : decodeContextFileScopes(value.contextFiles);
-  const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
-  if (prompt === INVALID_PERSISTED_VALUE || description === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || overrideSystemPrompt === INVALID_PERSISTED_VALUE) return undefined;
-  if (thinking !== undefined && !isThinkingLevel(thinking) || value.tools !== undefined && !tools || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || value.contextFiles !== undefined && !contextFiles || value.extensionSettings !== undefined && !extensionSettings) return undefined;
-  const rawProvenance = value.provenance;
-  if (rawProvenance !== undefined && (!object(rawProvenance) || typeof rawProvenance.path !== "string" || rawProvenance.scope !== undefined && (typeof rawProvenance.scope !== "string" || !["builtin", "extension", "global", "project"].includes(rawProvenance.scope)) || rawProvenance.owner !== undefined && typeof rawProvenance.owner !== "string" || rawProvenance.priority !== undefined && !finiteNumber(rawProvenance.priority))) return undefined;
-  const provenance = rawProvenance as AgentDefinition["provenance"];
-  const foldedModel = typeof model === "string" && thinking !== undefined && !model.includes(":") ? `${model}:${thinking}` : model;
-  return {
-    ...(provenance === undefined ? {} : { provenance: structuredClone(provenance) }),
-    ...(prompt === undefined ? {} : { prompt }), ...(description === undefined ? {} : { description }), ...(foldedModel === undefined ? {} : { model: foldedModel }),
-    ...(tools === undefined ? {} : { tools }), ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }), ...(overrideSystemPrompt === undefined ? {} : { overrideSystemPrompt }), ...(contextFiles === undefined ? {} : { contextFiles }), ...(extensionSettings === undefined ? {} : { extensionSettings }),
-  };
+  const label = optionalString(value.label);
+  const systemPrompt = optionalString(value.systemPrompt);
+  if (!model || !tools || !skills || !extensions || !settings || label === INVALID_PERSISTED_VALUE || systemPrompt === INVALID_PERSISTED_VALUE || value.contextFiles !== undefined && !contextFiles) return undefined;
+  return { model, tools, skills, extensions, settings, projectTrusted: value.projectTrusted, systemPromptAppend: value.systemPromptAppend, ...(contextFiles === undefined ? {} : { contextFiles }), ...(label === undefined ? {} : { label }), ...(systemPrompt === undefined ? {} : { systemPrompt }) };
 }
 function decodeWorkflowMetadata(value: unknown): LaunchSnapshot["metadata"] | undefined {
   if (!object(value) || typeof value.name !== "string") return undefined;
@@ -199,17 +188,22 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
   const parentBreadcrumb = optionalString(value.parentBreadcrumb);
   const worktreeOwner = optionalString(value.worktreeOwner);
   const model = optionalString(value.model);
-  const role = typeof value.role === "string" ? value.role : undefined;
   const contextFiles = value.contextFiles === undefined ? undefined : decodeContextFileScopes(value.contextFiles);
   const schema = value.schema === undefined ? undefined : decodeJsonObject(value.schema);
   const retries = optionalNumber(value.retries);
   const timeoutMs = value.timeoutMs;
+  if (value.projectTrusted !== undefined && typeof value.projectTrusted !== "boolean") return undefined;
+  const rawCapabilities = value.capabilities;
+  const capabilities = rawCapabilities === undefined ? undefined : object(rawCapabilities) ? { tools: decodeStringArray(rawCapabilities.tools), skills: decodeStringArray(rawCapabilities.skills), extensions: decodeStringArray(rawCapabilities.extensions) } : undefined;
+  if (rawCapabilities !== undefined && (!capabilities?.tools || !capabilities.skills || !capabilities.extensions)) return undefined;
+  const configuration = value.configuration === undefined ? undefined : decodePreparedAgentConfiguration(value.configuration);
+  if (value.configuration !== undefined && configuration === undefined) return undefined;
   const agentOptions = value.agentOptions === undefined ? undefined : decodeJsonObject(value.agentOptions);
   const agentIdentity = value.agentIdentity === undefined ? undefined : decodeIdentity(value.agentIdentity);
   const sessionPath = optionalString(value.sessionPath);
   const continuity = value.continuity === undefined ? undefined : isAgentContinuity(value.continuity) ? value.continuity : INVALID_PERSISTED_VALUE;
   const extensionSettings = value.extensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.extensionSettings);
-  if (sessionPath === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.role !== undefined && typeof value.role !== "string") || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity) || (value.extensionSettings !== undefined && !extensionSettings)) return undefined;
+  if (sessionPath === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || requestedLabel === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || model === INVALID_PERSISTED_VALUE || value.skills !== undefined && !skills || value.extensions !== undefined && !extensions || (value.contextFiles !== undefined && !contextFiles) || (value.schema !== undefined && !schema) || retries === INVALID_PERSISTED_VALUE || (retries !== undefined && !integer(retries)) || (timeoutMs !== undefined && timeoutMs !== null && !finiteNumber(timeoutMs)) || (value.agentOptions !== undefined && !agentOptions) || (value.agentIdentity !== undefined && !agentIdentity) || (value.extensionSettings !== undefined && !extensionSettings)) return undefined;
   return {
     label: value.label,
     ...(requestedLabel === undefined ? {} : { requestedLabel }),
@@ -219,7 +213,6 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
     ...(skills === undefined ? {} : { skills }), ...(extensions === undefined ? {} : { extensions }),
     ...(worktreeOwner === undefined ? {} : { worktreeOwner }),
     ...(model === undefined ? {} : { model }),
-    ...(role === undefined ? {} : { role }),
     ...(contextFiles === undefined ? {} : { contextFiles }),
     ...(schema === undefined ? {} : { schema }),
     ...(retries === undefined ? {} : { retries }),
@@ -227,6 +220,9 @@ function decodeScheduledAgentOptions(value: unknown): PersistedOptions | undefin
     ...(sessionPath === undefined ? {} : { sessionPath }),
     ...(continuity === undefined ? {} : { continuity }),
     ...(agentOptions === undefined ? {} : { agentOptions }),
+    ...(configuration === undefined ? {} : { configuration }),
+    ...(value.projectTrusted === undefined ? {} : { projectTrusted: value.projectTrusted }),
+    ...(capabilities?.tools && capabilities.skills && capabilities.extensions ? { capabilities: { tools: capabilities.tools, skills: capabilities.skills, extensions: capabilities.extensions } } : {}),
     ...(agentIdentity === undefined ? {} : { agentIdentity }),
     ...(extensionSettings === undefined ? {} : { extensionSettings }),
   };
@@ -264,17 +260,13 @@ function decodeAgentResourceInspection(value: unknown): AgentResourceInspection 
   const unmatchedTools = decodeStringArray(value.unmatchedTools);
   const rawSources = value.selectorSources;
   const sourceRecord = object(rawSources) ? rawSources : undefined;
-  const defaultsRecord = sourceRecord?.defaults;
-  const defaults = object(defaultsRecord) ? { global: decodeAgentResourceSelectors(defaultsRecord.global), project: decodeAgentResourceSelectors(defaultsRecord.project) } : undefined;
-  if (defaultsRecord !== undefined && (!defaults?.global || !defaults.project)) return undefined;
   const sources = sourceRecord === undefined ? undefined : {
     global: decodeAgentResourceSelectors(sourceRecord.global),
     project: decodeAgentResourceSelectors(sourceRecord.project),
-    ...(sourceRecord.role === undefined ? {} : { role: decodeAgentResourceSelectors(sourceRecord.role) }),
     ...(sourceRecord.call === undefined ? {} : { call: decodeAgentResourceSelectors(sourceRecord.call) }),
   };
-  if (!selectors || !skills || !extensions || !tools || !unmatchedSkills || !unmatchedExtensions || !unmatchedTools || rawSources !== undefined && (!sources || !sources.global || !sources.project || sources.role === undefined && sourceRecord?.role !== undefined || sources.call === undefined && sourceRecord?.call !== undefined)) return undefined;
-  return { selectors: { skills: [...(selectors.skills ?? [])], extensions: [...(selectors.extensions ?? [])], tools: [...(selectors.tools ?? [])] }, skills, extensions, tools, unmatchedSkills, unmatchedExtensions, unmatchedTools, ...(sources === undefined ? {} : { selectorSources: { ...(defaults?.global && defaults.project ? { defaults: { global: defaults.global, project: defaults.project } } : {}), global: sources.global ?? {}, project: sources.project ?? {}, ...(sources.role === undefined ? {} : { role: sources.role }), ...(sources.call === undefined ? {} : { call: sources.call }) } }) };
+  if (!selectors || !skills || !extensions || !tools || !unmatchedSkills || !unmatchedExtensions || !unmatchedTools || rawSources !== undefined && (!sources || !sources.global || !sources.project || sources.call === undefined && sourceRecord?.call !== undefined)) return undefined;
+  return { selectors: { skills: [...(selectors.skills ?? [])], extensions: [...(selectors.extensions ?? [])], tools: [...(selectors.tools ?? [])] }, skills, extensions, tools, unmatchedSkills, unmatchedExtensions, unmatchedTools, ...(sources === undefined ? {} : { selectorSources: { global: sources.global ?? {}, project: sources.project ?? {}, ...(sources.call === undefined ? {} : { call: sources.call }) } }) };
 }
 function decodeAgentSetupSummary(value: unknown): NonNullable<NonNullable<AgentRecord["attemptDetails"]>[number]["setup"]> | undefined {
   if (!object(value) || typeof value.cwd !== "string") return undefined;
@@ -312,7 +304,6 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
   const worktreeOwner = optionalString(value.worktreeOwner);
   const handle = optionalString(value.handle);
   const continuity = value.continuity === undefined ? undefined : isAgentContinuity(value.continuity) ? value.continuity : INVALID_PERSISTED_VALUE;
-  const role = optionalString(value.role);
   const requestedModel = optionalString(value.requestedModel);
   const startedAt = optionalNumber(value.startedAt);
   const durationMs = optionalNumber(value.durationMs);
@@ -321,7 +312,7 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
   const toolCalls = value.toolCalls === undefined ? undefined : decodeArray(value.toolCalls, decodeAgentToolCall);
   const activity = value.activity === undefined ? undefined : decodeAgentActivity(value.activity);
   const lastEventAt = optionalNumber(value.lastEventAt);
-  if (systemPrompt === INVALID_PERSISTED_VALUE || prompt === INVALID_PERSISTED_VALUE || label === INVALID_PERSISTED_VALUE || parentId === INVALID_PERSISTED_VALUE || resultPath === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || role === INVALID_PERSISTED_VALUE || requestedModel === INVALID_PERSISTED_VALUE || startedAt === INVALID_PERSISTED_VALUE || durationMs === INVALID_PERSISTED_VALUE || lastEventAt === INVALID_PERSISTED_VALUE || handle === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || handle !== undefined && !positiveInteger(value.turn)) return undefined;
+  if (systemPrompt === INVALID_PERSISTED_VALUE || prompt === INVALID_PERSISTED_VALUE || label === INVALID_PERSISTED_VALUE || parentId === INVALID_PERSISTED_VALUE || resultPath === INVALID_PERSISTED_VALUE || parentBreadcrumb === INVALID_PERSISTED_VALUE || worktreeOwner === INVALID_PERSISTED_VALUE || requestedModel === INVALID_PERSISTED_VALUE || startedAt === INVALID_PERSISTED_VALUE || durationMs === INVALID_PERSISTED_VALUE || lastEventAt === INVALID_PERSISTED_VALUE || handle === INVALID_PERSISTED_VALUE || continuity === INVALID_PERSISTED_VALUE || handle !== undefined && !positiveInteger(value.turn)) return undefined;
   if (!model || !tools || value.structuralPath !== undefined && !structuralPath || value.attemptDetails !== undefined && !attemptDetails || value.accounting !== undefined && !accounting || value.toolCalls !== undefined && !toolCalls || value.activity !== undefined && !activity) return undefined;
   return {
     ...(systemPrompt === undefined ? {} : { systemPrompt }),
@@ -338,7 +329,6 @@ function decodeAgent(value: unknown): AgentRecord | undefined {
     ...(worktreeOwner === undefined ? {} : { worktreeOwner }),
     ...(handle === undefined ? {} : { handle, turn: value.turn as number }),
     ...(continuity === undefined ? {} : { continuity }),
-    ...(role === undefined ? {} : { role }),
     ...(requestedModel === undefined ? {} : { requestedModel }),
     model,
     tools,
@@ -487,13 +477,11 @@ export function decodeLaunchSnapshot(value: unknown): LaunchSnapshot | undefined
   const phases = value.phases === undefined ? undefined : decodeStringArray(value.phases);
   const models = decodeStringArray(value.models);
   const tools = decodeStringArray(value.tools);
-  const agentTypes = decodeStringArray(value.agentTypes);
-  const roles = value.roles === undefined ? undefined : decodeRecord(value.roles, decodeAgentDefinition);
-  const projectRoles = value.projectRoles === undefined ? undefined : decodeStringArray(value.projectRoles);
+  const agentConfigurations = decodeRecord(value.agentConfigurations, decodePreparedAgentConfiguration);
   const schemas = decodeArray(value.schemas, decodeJsonObject);
-  if (identityVersion === INVALID_PERSISTED_VALUE || value.identityVersion !== undefined && !integer(identityVersion) || launchMode !== undefined && !isLaunchMode(launchMode) || args === undefined || !metadata || !settings || value.settingsSources !== undefined && !settingsSources || value.budget !== undefined && !budget || settingsPath === INVALID_PERSISTED_VALUE || value.modelAliases !== undefined && !modelAliases || value.phases !== undefined && !phases || !models || !tools || !agentTypes || value.roles !== undefined && !roles || value.projectRoles !== undefined && !projectRoles || !schemas) return undefined;
+  if (identityVersion !== LAUNCH_SNAPSHOT_IDENTITY_VERSION || launchMode !== undefined && !isLaunchMode(launchMode) || args === undefined || !metadata || !settings || value.settingsSources !== undefined && !settingsSources || value.budget !== undefined && !budget || settingsPath === INVALID_PERSISTED_VALUE || value.modelAliases !== undefined && !modelAliases || value.phases !== undefined && !phases || !models || !tools || !agentConfigurations || !schemas) return undefined;
   return {
-    ...(identityVersion === undefined ? {} : { identityVersion }),
+    identityVersion: LAUNCH_SNAPSHOT_IDENTITY_VERSION,
     ...(launchMode === undefined ? {} : { launchMode }),
     script: value.script,
     args,
@@ -506,9 +494,7 @@ export function decodeLaunchSnapshot(value: unknown): LaunchSnapshot | undefined
     ...(phases === undefined ? {} : { phases }),
     models,
     tools,
-    agentTypes,
-    ...(roles === undefined ? {} : { roles }),
-    ...(projectRoles === undefined ? {} : { projectRoles }),
+    agentConfigurations,
     schemas,
   };
 }

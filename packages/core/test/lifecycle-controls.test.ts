@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,40 +12,7 @@ import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { waitForIssue105 } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
-void test("appends only described effective roles without forcing the system prompt while workflow is active", (t) => {
-  type StartEvent = { systemPrompt: string; systemPromptOptions: { appendSystemPrompt?: string } };
-  type StartHandler = (event: StartEvent, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
-  let handler: StartHandler | undefined;
-  const activeTools = ["workflow"];
-  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-guidance-"));
-  t.after(() => { rmSync(cwd, { recursive: true, force: true }); });
-  const agentDir = join(cwd, "agent");
-  mkdirSync(join(agentDir, "pi-ext-roles", "roles"), { recursive: true });
-  for (const name of ["developer", "reviewer", "scout", "oracle", "researcher"]) writeFileSync(join(agentDir, "pi-ext-roles", "roles", `${name}.md`), "UNDESCRIBED ROLE BODY");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "project-reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model:medium\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: unknown) { if (name === "before_agent_start") handler = candidate as StartHandler; } }), cwd, undefined, undefined, agentDir);
-  assert.ok(handler);
-  const content = "Workflow role descriptions:\n- `project-reviewer`: Reviews correctness";
-  for (const appendSystemPrompt of [undefined, "", "EXISTING APPEND"]) {
-    const event: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: appendSystemPrompt === undefined ? {} : { appendSystemPrompt } };
-    assert.equal(handler(event, { cwd }), undefined);
-    assert.equal(event.systemPrompt, "BASE SYSTEM");
-    assert.equal(event.systemPromptOptions.appendSystemPrompt, appendSystemPrompt ? `${appendSystemPrompt}\n\n${content}` : content);
-    assert.doesNotMatch(event.systemPromptOptions.appendSystemPrompt ?? "", /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|workflow_catalog/);
-  }
-  const untrusted: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: { appendSystemPrompt: "EXISTING APPEND" } };
-  assert.equal(handler(untrusted, { cwd, isProjectTrusted: () => false }), undefined);
-  assert.deepEqual(untrusted.systemPromptOptions, { appendSystemPrompt: "EXISTING APPEND" });
-  const undescribed: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: {} };
-  assert.equal(handler(undescribed, { cwd: agentDir }), undefined);
-  assert.deepEqual(undescribed.systemPromptOptions, {});
-  activeTools.length = 0;
-  const inactive: StartEvent = { systemPrompt: "BASE SYSTEM", systemPromptOptions: { appendSystemPrompt: "EXISTING APPEND" } };
-  assert.equal(handler(inactive, { cwd }), undefined);
-  assert.deepEqual(inactive.systemPromptOptions, { appendSystemPrompt: "EXISTING APPEND" });
-});
+
 
 void test("foreground lifecycle events are redacted and throwing listeners cannot stop execution", async () => {
   const events: Array<{ channel: string; data: unknown }> = [];
@@ -336,7 +303,7 @@ void test("workflow_stop reports unknown and terminal runs and persists cancella
   const result = (await stop.execute("id", { runId: "missing" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(result.content[0].text), { runId: "missing", state: "unknown", stopped: false, reason: "unknown_run" });
   const foreignStore = new RunStore(home, "other-session", "foreign", home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "foreign" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "foreign" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await foreignStore.create({ id: "foreign", workflowName: "foreign", cwd: home, sessionId: "other-session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const foreignResult = (await stop.execute("id", { runId: "foreign" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(foreignResult.content[0].text), { runId: "foreign", state: "unknown", stopped: false, reason: "unknown_run" });
@@ -421,7 +388,7 @@ void test("session recovery emits interruption as state change only", async () =
   const cwd = join(home, "project");
   const runId = "interrupted-run";
   const store = new RunStore(cwd, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "interrupted" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "interrupted" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: runId, workflowName: "interrupted", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const events: Array<{ channel: string; data: unknown }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -486,7 +453,7 @@ void test("resuming a launched trusted-project run keeps per-run concurrency and
   assert.equal(resumed.run.state, "completed");
   assert.equal(resumed.snapshot.settings.concurrency, 4);
   assert.equal(resumed.snapshot.settingsSources?.concurrency, "per-run options");
-  assert.deepEqual(resumed.snapshot.settings.skills, ["project-old"]);
+  assert.deepEqual(resumed.snapshot.settings.skills, []);
   await shutdown?.();
 });
 

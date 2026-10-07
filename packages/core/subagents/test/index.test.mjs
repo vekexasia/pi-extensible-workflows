@@ -97,7 +97,7 @@ test("keeps top-level model as a call option with a role", () => {
     model: "fable-5:high",
   });
   assert.throws(() => normalizeSubagentRunRequest({ prompt: "x", role: "reviewer", thinking: "high" }));
-  assert.throws(() => normalizeSubagentRunRequest({ prompt: "x", role: { name: "reviewer" }, model: "new" }));
+  assert.deepEqual(normalizeSubagentRunRequest({ prompt: "x", role: { name: "reviewer" }, model: "new" }).role, { name: "reviewer" });
 });
 test("renders subagent calls and background or foreground progress consistently", () => {
   const manager = { async run() {}, async inspect() {}, async steer() {}, async stop() {}, async retry() {} };
@@ -108,9 +108,9 @@ test("renders subagent calls and background or foreground progress consistently"
   const theme = { fg: (_color, text) => text, bold: (text) => text };
   const args = { prompt: "Check docs drift", label: "scout", mode: "foreground", role: "reviewer" };
   const call = run.renderCall(args, theme, {}).render(80).join("\n");
-  assert.equal(call, "subagent scout mode=foreground role=reviewer");
+  assert.equal(call, "subagent scout mode=foreground");
   assert.doesNotMatch(call, /Check docs drift/);
-  assert.equal(run.renderCall({ prompt: "partial", label: "scout", role: null }, theme, {}).render(80).join("\n"), "subagent scout mode=background role=none");
+  assert.equal(run.renderCall({ prompt: "partial", label: "scout", role: null }, theme, {}).render(80).join("\n"), "subagent scout mode=background");
   const narrowCall = run.renderCall({ prompt: "a long prompt", label: "a very long label", mode: "foreground", role: "reviewer" }, theme, {}).render(12);
   assert.equal(narrowCall.length, 1);
   assert.match(narrowCall[0], /…/);
@@ -122,7 +122,7 @@ test("renders subagent calls and background or foreground progress consistently"
     theme,
     { args: { ...args, mode: "background" }, state: backgroundState, invalidate() {} },
   ).render(80).join("\n");
-  assert.match(background, /^✓ Subagent: scout.*\[launched\].*mode=background role=reviewer/);
+  assert.match(background, /^✓ Subagent: scout.*\[launched\].*mode=background/);
   assert.equal(backgroundState.subagentSpinner, undefined);
 
   const foregroundState = {};
@@ -133,7 +133,7 @@ test("renders subagent calls and background or foreground progress consistently"
     theme,
     context,
   ).render(80).join("\n");
-  assert.match(partial, /Subagent: scout.*\[running\].*mode=foreground role=reviewer.*runtime=1s/);
+  assert.match(partial, /Subagent: scout.*\[running\].*mode=foreground.*runtime=1s/);
   assert.match(partial, /reasoning · thinking/);
   assert.equal(run.renderCall(args, theme, { state: foregroundState }).render(80).length, 0);
   assert.doesNotMatch(partial, /stalled\?/);
@@ -152,7 +152,7 @@ test("renders subagent calls and background or foreground progress consistently"
     theme,
     context,
   ).render(120).join("\n");
-  assert.match(completed, /Subagent: scout \[completed\] mode=foreground role=reviewer 5t · \$0\.001 runtime=/, "the header carries tokens and cost like the workflow header");
+  assert.match(completed, /Subagent: scout \[completed\] mode=foreground 5t · \$0\.001 runtime=/, "the header carries tokens and cost like the workflow header");
   assert.match(completed, /id=foreground/);
   assert.doesNotMatch(completed, /tokens=/);
   assert.equal(foregroundState.subagentSpinner, undefined);
@@ -431,7 +431,7 @@ test("opens the /subagents dashboard and picker and inspects durable status with
     assert.doesNotMatch(pickerOptions[0].join("\n"), /run-other/);
     assert.doesNotMatch(pickerOptions[0].join("\n"), /run-malformed/);
     assert.match(detailScreens[0], /Selected subagent: run-2/);
-    assert.match(detailScreens[0], /Role: \(none\)/);
+    assert.doesNotMatch(detailScreens[0], /Role:/);
     assert.doesNotMatch(detailScreens[0], /Result|done/, "the prompt and result open in the editor, as in /workflow");
 
     await command.options.handler("", tuiContext);
@@ -439,7 +439,7 @@ test("opens the /subagents dashboard and picker and inspects durable status with
     assert.match(initial, /Runs +\| Selected subagent: reviewer/);
     assert.match(initial, /→ • reviewer/);
     assert.ok(initial.indexOf("reviewer ·") < initial.indexOf("newest ·") && initial.indexOf("newest ·") < initial.indexOf("run-2 ·"), initial);
-    assert.match(initial, /Role: critic/);
+    assert.doesNotMatch(initial, /Role:/);
     assert.doesNotMatch(initial, /run-other|run-malformed/);
     assert.match(selected, /→ • run-2/);
     assert.match(selected, /Selected subagent: run-2/);
@@ -717,7 +717,7 @@ test("matches workflow agent detail fields and runs standalone registered and co
         assert.match(renders.at(-1), /Activity: read/);
         assert.match(renders.at(-1), /stalled\? 10m/);
         assert.match(renders.at(-1), /Model: fixture\/model/);
-        assert.match(renders.at(-1), /Role: scout/);
+        assert.doesNotMatch(renders.at(-1), /Role:/);
         assert.match(renders.at(-1), /Tools: read/);
         assert.match(renders.at(-1), /Attempts: 2/);
         assert.match(renders.at(-1), /Duration: 10m/);
@@ -1421,10 +1421,10 @@ test("opens bounded prompt and result artifacts while terminal runs hide system 
     await rm(cwd, { recursive: true, force: true });
   }
 });
-test("exposes closed tool schemas and minimal prompt guidance", () => {
-  assert.deepEqual(Object.keys(SUBAGENTS_RUN_PARAMETERS.properties), ["prompt", "mode", "label", "model", "tools", "skills", "extensions", "contextFiles", "role", "worktree", "outputSchema", "retries", "timeoutMs"]);
+test("exposes extensible run options and closed control schemas and minimal prompt guidance", () => {
+  assert.deepEqual(Object.keys(SUBAGENTS_RUN_PARAMETERS.properties), ["prompt", "mode", "label", "model", "tools", "skills", "extensions", "contextFiles", "worktree", "outputSchema", "retries", "timeoutMs"]);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.required, ["prompt"]);
-  assert.equal(SUBAGENTS_RUN_PARAMETERS.additionalProperties, false);
+  assert.equal(SUBAGENTS_RUN_PARAMETERS.additionalProperties, true);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.properties.mode.anyOf.map(({ const: value }) => value), ["background", "foreground"]);
 
   assert.deepEqual(Object.keys(SUBAGENTS_INSPECT_PARAMETERS.properties), ["id", "scope"]);
@@ -1463,11 +1463,10 @@ async function managerContext(cwd) {
 test("runs one background subagent with context-derived setup and execution options", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-run-success-"));
   const agentDir = join(cwd, "agent");
-  await mkdir(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+  await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ modelAliases: { cheap: "fixture/cheap" }, skills: ["global-skill"], extensions: ["global-extension"] }));
   await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
   await writeFile(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ skills: ["project-skill"], extensions: ["project-extension"] }));
-  await writeFile(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: fixture/role-model:high\ntools: [read]\ndescription: Review work\n---\nReview carefully.");
   const sessionTransport = { id: "test", async createSession() { throw new Error("session should be supplied to the injected executor"); } };
   const controller = new AbortController();
   let root;
@@ -1503,11 +1502,13 @@ test("runs one background subagent with context-derived setup and execution opti
   assert.deepEqual(root.agentResourcePolicy().global, { skills: ["global-skill"], extensions: [join(agentDir, "pi-extensible-workflows", "global-extension")] });
   assert.deepEqual(root.agentResourcePolicy().project, { skills: ["project-skill"], extensions: [join(cwd, ".pi", "pi-extensible-workflows", "project-extension")] });
   assert.deepEqual(root.agentResourcePolicy().effective, { skills: ["global-skill", "project-skill"], extensions: [join(agentDir, "pi-extensible-workflows", "global-extension"), join(cwd, ".pi", "pi-extensible-workflows", "project-extension")] });
-  assert.equal(root.agentDefinitions.reviewer.model, "fixture/role-model:high");
   assert.equal(execution.task, "inspect");
-  const { onAttempt, onProgress, ...options } = execution.options;
+  const { onAttempt, onProgress, onConfiguration, configuration, agentOptions, ...options } = execution.options;
   assert.equal(typeof onAttempt, "function");
   assert.equal(typeof onProgress, "function");
+  assert.equal(typeof onConfiguration, "function");
+  assert.ok(configuration);
+  assert.ok(agentOptions);
   assert.deepEqual(options, { label: "review", workflowName: "subagents", model: "cheap:high", tools: ["read"], schema: outputSchema, retries: 2, timeoutMs: 500 });
   assert.notEqual(execution.signal, controller.signal);
   assert.equal(root.runContext.runId, launch.details.id);
@@ -1517,10 +1518,13 @@ test("runs one background subagent with context-derived setup and execution opti
   const roleLaunch = await runTool.execute("call-role", { prompt: "review", label: "role", role: "reviewer" }, controller.signal, undefined, context);
   await waitFor(() => execution?.task === "review");
   assert.equal(roleLaunch.details.state, "running");
-  const { onAttempt: roleOnAttempt, onProgress: roleOnProgress, ...roleOptions } = execution.options;
+  const { onAttempt: roleOnAttempt, onProgress: roleOnProgress, onConfiguration: roleOnConfiguration, configuration: roleConfiguration, agentOptions: roleAgentOptions, ...roleOptions } = execution.options;
   assert.equal(typeof roleOnAttempt, "function");
   assert.equal(typeof roleOnProgress, "function");
-  assert.deepEqual(roleOptions, { label: "role", workflowName: "subagents", role: "reviewer" });
+  assert.deepEqual(roleOptions, { label: "role", workflowName: "subagents" });
+  assert.equal(roleAgentOptions.role, "reviewer");
+  assert.equal(typeof roleOnConfiguration, "function");
+  assert.equal(roleConfiguration.systemPromptAppend, "");
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -1548,10 +1552,13 @@ test("keeps top-level model with a role and persists a background execution fail
   const launched = await runTool.execute("call-2", { prompt: "inspect", role: "reviewer", model: "fixture/cheap:high" }, controller.signal, undefined, extensionContext);
   await waitFor(async () => (await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).state === "failed");
   assert.equal(launches, 1);
-  const { onAttempt, onProgress, ...options } = execution;
+  const { onAttempt, onProgress, onConfiguration, configuration, agentOptions, ...options } = execution;
   assert.equal(typeof onAttempt, "function");
   assert.equal(typeof onProgress, "function");
-  assert.deepEqual(options, { label: "reviewer", workflowName: "subagents", role: "reviewer", model: "fixture/cheap:high" });
+  assert.equal(typeof onConfiguration, "function");
+  assert.ok(configuration);
+  assert.ok(agentOptions);
+  assert.deepEqual(options, { label: "subagent", workflowName: "subagents", model: "fixture/cheap:high" });
   assert.deepEqual((await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).error, { code: "AGENT_FAILED", message: "agent failed" });
   await rm(cwd, { recursive: true, force: true });
 });
@@ -2354,11 +2361,11 @@ test("delivers completion and failure through steering messages while the parent
     parent.endRun();
     assert.deepEqual(messages.map(({ options }) => options), [{ deliverAs: "steer", triggerTurn: true }, { deliverAs: "steer", triggerTurn: true }]);
     assert.deepEqual(messages.map(({ message }) => ({ customType: message.customType, display: message.display, details: message.details })), [
-      { customType: "subagents", display: true, details: { id: success.id, label: "docs-check", role: "scout", state: "completed" } },
-      { customType: "subagents", display: true, details: { id: failure.id, label: "tests-check", role: "reviewer", state: "failed", error: { code: "AGENT_FAILED", message: "failed background work" } } },
+      { customType: "subagents", display: true, details: { id: success.id, label: "docs-check", state: "completed" } },
+      { customType: "subagents", display: true, details: { id: failure.id, label: "tests-check", state: "failed", error: { code: "AGENT_FAILED", message: "failed background work" } } },
     ]);
-    assert.match(messages[0].message.content, /Subagent docs-check role=scout \([^)]+\) completed/);
-    assert.match(messages[1].message.content, /Subagent tests-check role=reviewer \([^)]+\) failed/);
+    assert.match(messages[0].message.content, /Subagent docs-check \([^)]+\) completed/);
+    assert.match(messages[1].message.content, /Subagent tests-check \([^)]+\) failed/);
     // A follow-up would only be delivered by endRun, that is after the parent already collected both
     // results, which is the staleness this delivery mode exists to avoid.
     const delivered = (id) => events.findIndex(([kind, value]) => kind === "delivered" && value === id);
@@ -3320,7 +3327,7 @@ test("rejects malformed persisted attempt metadata at the manager boundary", asy
     await rm(cwd, { recursive: true, force: true });
   }
 });
-test("freezes standalone extension settings and role definitions across live and cold retries", async () => {
+test("freezes prepared standalone settings across live and cold retries", async () => {
   resetWorkflowRegistry();
   const root = await mkdtemp(join(tmpdir(), "subagents-frozen-settings-retry-"));
   const cwd = join(root, "project");
@@ -3328,23 +3335,21 @@ test("freezes standalone extension settings and role definitions across live and
   const storageDir = join(root, "storage");
   const globalSettingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
   const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
-  const rolePath = join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
   const observed = [];
   const received = [];
   const writeConfiguration = async (value) => {
-    await mkdir(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
     await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
     await writeFile(globalSettingsPath, JSON.stringify({ extensionSettings: { acme: { global: value } } }));
     await writeFile(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: value } } }));
-    await writeFile(rolePath, `---\nextensionSettings: {"acme":{"role":"${value}"}}\n---\nReview`);
   };
   const context = await managerContext(cwd);
-  registerWorkflowExtension({ version: "1.0.0", headline: "Frozen settings fixture", validateSettings(settings, source) { observed.push({ source: source.source, role: source.role, settings: structuredClone(settings) }); } });
+  registerWorkflowExtension({ version: "1.0.0", headline: "Frozen settings fixture", validateSettings(settings, source) { observed.push({ source: source.source, settings: structuredClone(settings) }); } });
   const dependencies = {
     agentDir,
     storageDir,
     createExecutor(rootValue) {
-      received.push({ settings: structuredClone(rootValue.extensionSettings), role: structuredClone(rootValue.agentDefinitions.reviewer.extensionSettings) });
+      received.push({ settings: structuredClone(rootValue.extensionSettings) });
       return { async execute() { if (received.length === 1) throw new Error("first retry fixture failure"); return { value: "retried", attempts: [], cwd }; } };
     },
   };
@@ -3352,27 +3357,22 @@ test("freezes standalone extension settings and role definitions across live and
   try {
     await writeConfiguration("old");
     manager = createSubagentManager(dependencies);
-    const liveSource = await manager.run({ prompt: "live", role: "reviewer" }, context);
+    const liveSource = await manager.run({ prompt: "live" }, context);
     await waitFor(async () => (await manager.inspect({ id: liveSource.id }, context)).state === "failed");
     await writeConfiguration("new");
     const liveRetry = await manager.retry({ id: liveSource.id }, context);
     await waitFor(async () => (await manager.inspect({ id: liveRetry.id }, context)).state === "completed");
     assert.deepEqual(received, [
-      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
-      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+      { settings: { acme: { project: "old" } } },
+      { settings: { acme: { project: "old" } } },
     ]);
-    assert.deepEqual(observed.filter(({ source }) => source === "global" || source === "project").map(({ source, settings }) => ({ source, settings })), [
-      { source: "global", settings: { acme: { global: "old" } } },
-      { source: "project", settings: { acme: { project: "old" } } },
-      { source: "global", settings: { acme: { global: "old" } } },
-      { source: "project", settings: { acme: { project: "old" } } },
-    ]);
+
     await manager.dispose();
     manager = undefined;
     received.length = 0;
     await writeConfiguration("old");
     manager = createSubagentManager(dependencies);
-    const coldSource = await manager.run({ prompt: "cold", role: "reviewer" }, context);
+    const coldSource = await manager.run({ prompt: "cold" }, context);
     await waitFor(async () => (await manager.inspect({ id: coldSource.id }, context)).state === "failed");
     await manager.dispose();
     manager = undefined;
@@ -3381,8 +3381,8 @@ test("freezes standalone extension settings and role definitions across live and
     const coldRetry = await manager.retry({ id: coldSource.id }, context);
     await waitFor(async () => (await manager.inspect({ id: coldRetry.id }, context)).state === "completed");
     assert.deepEqual(received, [
-      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
-      { settings: { acme: { project: "old" } }, role: { acme: { role: "old" } } },
+      { settings: { acme: { project: "old" } } },
+      { settings: { acme: { project: "old" } } },
     ]);
   } finally {
     await manager?.dispose();
@@ -3390,36 +3390,33 @@ test("freezes standalone extension settings and role definitions across live and
     await rm(root, { recursive: true, force: true });
   }
 });
-test("validates standalone global, project, role, and effective settings before session creation", async () => {
+test("validates standalone global, project, and prepared settings before session creation", async () => {
   resetWorkflowRegistry();
   const root = await mkdtemp(join(tmpdir(), "subagents-settings-validation-"));
   const cwd = join(root, "project");
   const agentDir = join(root, "agent");
   const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
   const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
-  const rolePath = join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
   const seen = [];
   const context = await managerContext(cwd);
   let manager;
   const writeConfiguration = async () => {
-    await mkdir(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
+    await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
     await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
     await writeFile(settingsPath, JSON.stringify({ modelAliases: { cheap: "fixture/cheap" }, extensionSettings: { acme: { global: true } } }));
     await writeFile(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: true } } }));
-    await writeFile(rolePath, "---\nextensionSettings: {\"acme\":{\"role\":true}}\n---\nReview");
   };
-  registerWorkflowExtension({ version: "1.0.0", headline: "Settings validation fixture", validateSettings(settings, context) { seen.push({ source: context.source, role: context.role, path: context.settingsPath, settings: structuredClone(settings) }); } });
+  registerWorkflowExtension({ version: "1.0.0", headline: "Settings validation fixture", validateSettings(settings, context) { seen.push({ source: context.source, path: context.settingsPath, settings: structuredClone(settings) }); } });
   try {
     await writeConfiguration();
     const transportValue = { id: "inspection", async createSession() { throw new Error("inspection must not create a session"); } };
     manager = createSubagentManager({ agentDir, storageDir: join(root, "storage"), transport: transportValue, createExecutor(rootValue, nextTransport) { return { async execute(task, options) { const prepared = await prepareAgentSetupForInspection(rootValue, task, options, nextTransport); return { value: prepared.setup.prepared.settings ?? {}, attempts: [], cwd }; } }; } });
-    const result = await manager.run({ prompt: "validate", mode: "foreground", role: "reviewer" }, context);
+    const result = await manager.run({ prompt: "validate", mode: "foreground" }, context);
     assert.equal(result.state, "completed");
-    assert.deepEqual(seen.map(({ source }) => source), ["global", "project", "role"]);
+    assert.deepEqual(seen.map(({ source }) => source), ["global", "project", "effective", "effective", "effective"]);
     assert.equal(seen[0].path, settingsPath);
     assert.equal(seen[1].path, projectSettingsPath);
-    assert.equal(seen[2].role, "reviewer");
-    assert.equal(seen[2].path, projectSettingsPath);
+    assert.equal(seen[2].path, undefined);
     await manager.dispose();
   } finally {
     await manager?.dispose();
@@ -3433,42 +3430,3 @@ function deferred() {
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
   return { promise, resolve, reject };
 }
-
-test("shared roles settings reach standalone preparation and explicit consumer/call overrides", async () => {
-  resetWorkflowRegistry();
-  const root = await mkdtemp(join(tmpdir(), "subagents-shared-roles-"));
-  const agentDir = join(root, "agent");
-  const cwd = join(root, "project");
-  const sharedPath = join(agentDir, "pi-ext-roles", "settings.json");
-  const consumerPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  const captured = [];
-  const context = await managerContext(cwd);
-  const transport = { id: "inspection", async createSession() { throw new Error("inspection must not create a session"); } };
-  const manager = createSubagentManager({
-    agentDir, storageDir: join(root, "storage"), transport,
-    getActiveTools: () => ["read", "grep", "subagents_run"],
-    createExecutor(rootValue, nextTransport) {
-      return { async execute(task, options) {
-        const prepared = await prepareAgentSetupForInspection(rootValue, task, options, nextTransport);
-        captured.push(prepared.setup.prepared);
-        return { value: "prepared", attempts: [], cwd };
-      } };
-    },
-  });
-  try {
-    await mkdir(join(agentDir, "pi-ext-roles", "roles"), { recursive: true });
-    await writeFile(sharedPath, JSON.stringify({ modelAliases: { selected: "fixture/cheap:high" }, tools: ["!*", "read"], skills: ["!*", "shared-*"], extensionSettings: { acme: { shared: true } } }));
-    await writeFile(join(agentDir, "pi-ext-roles", "roles", "custom.md"), "---\nmodel: selected\n---\nShared standalone role");
-    assert.equal((await manager.run({ prompt: "shared", role: "custom", mode: "foreground" }, context)).state, "completed");
-    assert.deepEqual(captured[0].model, { provider: "fixture", model: "cheap", thinking: "high" });
-    assert.deepEqual(captured[0].tools, ["read"]);
-    assert.deepEqual(captured[0].settings, { acme: { shared: true } });
-    assert.deepEqual(captured[0].resourcePolicy.selectorSources.defaults.global.skills, ["!*", "shared-*"]);
-    await mkdir(dirname(consumerPath), { recursive: true });
-    await writeFile(consumerPath, JSON.stringify({ modelAliases: { selected: "fixture/role-model:low" }, tools: ["grep"], extensionSettings: {} }));
-    assert.equal((await manager.run({ prompt: "consumer", role: "custom", tools: ["!*", "grep"], mode: "foreground" }, context)).state, "completed");
-    assert.deepEqual(captured[1].model, { provider: "fixture", model: "role-model", thinking: "low" });
-    assert.deepEqual(captured[1].tools, ["grep"]);
-    assert.deepEqual(captured[1].settings, { acme: { shared: true } });
-  } finally { await manager.dispose(); resetWorkflowRegistry(); await rm(root, { recursive: true, force: true }); }
-});

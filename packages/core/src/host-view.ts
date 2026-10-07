@@ -639,7 +639,6 @@ export interface AgentDetailPresentation {
   readonly lastEventAt?: number;
   readonly structuralPath?: readonly string[];
   readonly model?: AgentRecord["model"];
-  readonly role?: string;
   readonly tools?: readonly string[];
   readonly attempts?: number;
   readonly startedAt?: number;
@@ -664,7 +663,6 @@ export function formatAgentDetail(agent: Readonly<AgentDetailPresentation>, styl
     `State: ${state(agent.state)}`,
     ...(agent.structuralPath?.length ? [`Structural path: ${agent.structuralPath.join(" > ")}`] : []),
     ...(model === undefined ? [] : [`Model: ${model}`]),
-    `Role: ${agent.role ?? "(none)"}`,
     `Tools: ${tools}`,
     ...(agent.attempts !== undefined && Number.isFinite(agent.attempts) && agent.attempts > 1 ? [`Attempts: ${String(agent.attempts)}`] : []),
     ...(duration === undefined ? [] : [`Duration: ${formatWorkflowRuntime(duration)}`]),
@@ -778,11 +776,10 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   const byId = new Map(run.agents.map((agent) => [agent.id, agent]));
   lines.push(...renderGroupedAgents(run.agents, ({ agent, index, depth }, grouped) => {
     const model = `${agent.model.provider}/${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`;
-    const role = agent.role ? ` role=${agent.role}` : "";
     const tools = ` tools=${agent.tools.join(",") || "(none)"}`;
     const accounting = agent.accounting ? ` input=${String(agent.accounting.input)} output=${String(agent.accounting.output)} cache-read=${String(agent.accounting.cacheRead)} cache-write=${String(agent.accounting.cacheWrite)} cost=${formatCost(agent.accounting.cost) || "$0.00"}` : "";
     const indent = "  ".repeat((grouped ? 2 : 1) + depth);
-    const result = [`${indent}#${String(index + 1)} ${grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId)} state=${agent.state} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${role}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`];
+    const result = [`${indent}#${String(index + 1)} ${grouped ? agent.label ?? agent.name : agentBreadcrumb(agent, byId)} state=${agent.state} model=${model}${agent.requestedModel ? ` requested=${agent.requestedModel}` : ""}${tools} attempts=${String(agent.attempts)} retries=${String(Math.max(0, agent.attempts - 1))}${accounting}`];
     for (const attempt of agent.attemptDetails ?? []) result.push(`${indent}  attempt ${String(attempt.attempt)}${attempt.error ? ` error=${attempt.error.code}: ${attempt.error.message}` : ""}`);
     for (const call of agent.toolCalls ?? []) result.push(`${indent}  tool ${call.name} state=${call.state}`);
     const activity = !SETTLED_AGENT_STATES.has(agent.state) ? formatAgentActivity(agent, "⠦", PLAIN_WORKFLOW_PROGRESS_STYLES, now) : "";

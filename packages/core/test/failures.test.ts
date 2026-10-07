@@ -182,14 +182,13 @@ void test("foreground failures patch finalized tool results with bounded diagnos
   assert.equal(diagnostic.error.code, "AGENT_FAILED");
   assert.match(diagnostic.error.message, /provider failed/);
   assert.ok(diagnostic.failedAgent);
-  assert.equal(diagnostic.failedAgent.role, undefined);
   assert.deepEqual(diagnostic.failedAgent.structuralPath, ["reviewers", "bad"]);
   assert.equal(diagnostic.failedAgent.attempt, 1);
   const locator = diagnostic.failedAgent.session?.locator;
   const sessionFile = typeof locator === "object" && locator !== null && !Array.isArray(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : "";
   assert.match(sessionFile, /diagnostics:bad:attempt-1/);
   assert.ok(diagnostic.completedSiblingAgents);
-  assert.deepEqual(diagnostic.completedSiblingAgents.map(({ label, role, structuralPath }) => ({ label, role, structuralPath })), [{ label: "good", role: undefined, structuralPath: ["reviewers", "good"] }]);
+  assert.deepEqual(diagnostic.completedSiblingAgents.map(({ label, structuralPath }) => ({ label, structuralPath })), [{ label: "good", structuralPath: ["reviewers", "good"] }]);
   assert.deepEqual(diagnostic.completedSiblingPaths, [["reviewers", "good"]]);
   assert.match(formatWorkflowFailureDiagnostics(diagnostic), /Completed sibling agents: good path=reviewers > good/);
   assert.ok(diagnostic.retry);
@@ -345,7 +344,7 @@ void test("background and cold-resumed terminal failures deliver artifacts witho
   }), home, async () => {}, testTransport(createSession));
   const stop = tools.find(({ name }) => name === "workflow_stop");
   assert.ok(start && command && stop);
-  const snapshot = (name: string, script: string) => createLaunchSnapshot({ script, args: null, metadata: { name }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = (name: string, script: string) => createLaunchSnapshot({ script, args: null, metadata: { name }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const stopped = new RunStore(home, sessionId, "stopped-run", home);
   const interrupted = new RunStore(home, sessionId, "interrupted-run", home);
   const waitingScript = "phase('build'); return await agent('wait');";

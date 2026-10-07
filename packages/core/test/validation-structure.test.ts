@@ -5,15 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const validationPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../src/validation.ts");
-const rolesPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../src/roles.ts");
 
-void test("parseRoleMarkdown delegates parsing to the independent role API with workflow-owned settings validation", () => {
-  const source = readFileSync(rolesPath, "utf8");
-  assert.match(source, /import \* as roles from "@piewf\/pi-ext-roles\/roles";/);
-  assert.match(source, /validateDefinition\(roleApi\(\(\) => roles\.parseRoleMarkdown\(content, strict, rolePath\)\), rolePath\)/);
-  assert.match(source, /validateWorkflowExtensionSettings\(definition\.extensionSettings/);
-  assert.doesNotMatch(source, /parseFrontmatter|\bunquote\b/, "the compatibility adapter must not maintain a second parser");
-});
 
 void test("static analysis reads AST property keys through one helper", () => {
   const source = readFileSync(validationPath, "utf8");

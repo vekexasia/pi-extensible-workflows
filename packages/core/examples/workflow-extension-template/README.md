@@ -1,8 +1,8 @@
 # Workflow extension template
 
 This is a small, copyable extension rather than a generator. It shows the usual
-registration shape with one function and one packaged role. Copy the directory
-into a project, rename the metadata and function, then edit the role body.
+registration shape with one function and generic agent hooks. Copy the directory
+into a project, then rename the metadata and function.
 
 
 ## Run it
@@ -14,17 +14,14 @@ node --test packages/core/examples/workflow-extension-template/extension.test.mj
 ```
 
 For a published package, run the same test from this directory after installing
-`pi-extensible-workflows` and `@piewf/pi-ext-roles` in the surrounding project. Copy the directory into a
+`pi-extensible-workflows` in the surrounding project. Copy the directory into a
 trusted Pi extension location; Pi auto-discovers its `index.js` entry point.
 
 
 ## Files
 
-- `index.js` registers `greet` and resolves `roles/` from `import.meta.url`.
-  Roles use the independent `registerRoleContribution(pi, { owner, roleDirectories })` API; relative paths resolve from the owner. Workflow functions still use `registerWorkflowExtension`.
-- `roles/reviewer.md` is a portable packaged role with no provider or tool
-  assumptions.
-- `extension.test.mjs` checks registration, function behavior, role packaging,
+- `index.js` registers `greet`, a model alias, and a setup hook with `registerWorkflowExtension`.
+- `extension.test.mjs` checks registration, function behavior,
   and the advanced examples.
 
 

@@ -163,7 +163,7 @@ export class TestHarness {
       settings: { ...DEFAULT_SETTINGS, ...si.settings },
       models: si.models ?? ["openai/gpt"],
       tools: si.tools ?? ["read"],
-      agentTypes: [],
+      agentConfigurations: {},
       schemas: [],
     });
 

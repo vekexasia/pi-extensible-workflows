@@ -16,7 +16,7 @@ Install the core workflow extension for deterministic orchestration:
 pi install npm:pi-extensible-workflows
 ```
 
-The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, packaged `developer`/`reviewer`/`scout`/`oracle`/`researcher` roles, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Global or project roles with the same name override packaged roles. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
+The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Role behavior requires explicitly installing and enabling the independent `@piewf/pi-ext-roles` Pi extension; core and CLI have no roles dependency. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
 
 ```sh
 pi install npm:@piewf/herdr
@@ -53,10 +53,8 @@ Only load extension code and role files that you trust. Workflow scripts run in 
 
 - Global settings: `<agentDir>/pi-extensible-workflows/settings.json`
 - Trusted project settings: `<cwd>/.pi/pi-extensible-workflows/settings.json`
-- Global roles: `<agentDir>/pi-ext-roles/roles/<name>.md`
-- Trusted project roles: `<cwd>/.pi/pi-ext-roles/roles/<name>.md`
 
-Workflow consumers temporarily accept the old `pi-extensible-workflows/roles` directories with a deprecation warning. New paths take precedence within each scope. Programmatic consumers only see legacy paths contributed by an authorized workflow consumer; the native CLI does not discover dynamic contributions and requires the new paths.
+Core reads only workflow settings. Role discovery, shared settings, and file formats belong to the optional roles package; legacy core role paths and APIs are removed.
 
 Missing settings files use defaults. Settings JSON is strict: unknown keys, invalid JSON, and invalid values fail launch or resume. Project settings are ignored when the project is not trusted.
 
@@ -65,8 +63,7 @@ Effective precedence is:
 1. Built-in defaults (`concurrency` defaults to `8`; `backgroundWidget` defaults to `true`).
 2. Global settings.
 3. Trusted project settings, appended after global selectors.
-4. Role frontmatter.
-5. Per-agent call options.
+4. Per-agent options and generic preparation hooks, within authorized ceilings.
 
 Selectors are concatenated in that order. A later matching rule wins over earlier rules. Every candidate starts enabled; a matching positive pattern enables it and `!pattern` disables it. `!*` clears the current selection before narrower positive patterns are applied. Candidates with no matching rule remain enabled, and selectors cannot create unavailable resources. Trusted project settings are ignored when the project is untrusted.
 
@@ -104,9 +101,9 @@ Trajectory also publishes current-session durable standalone subagents as first-
 
 ### Models and aliases
 
-A model reference is static when it is a literal concrete `provider/model[:thinking]` value or a literal alias. Static references are resolved and checked during launch preflight. A role's `model` frontmatter value follows the same rules.
+A model reference is static when it is a literal concrete `provider/model[:thinking]` value or a literal alias. Concrete model resolution occurs after generic preparation; core shape validation still rejects invalid thinking suffixes.
 
-`modelAliases` is a case-sensitive object. Names must match `[A-Za-z][A-Za-z0-9_-]*`. Values are concrete `provider/model` references or another alias, optionally with a thinking suffix such as `:high`. Unknown targets and cycles fail before execution. An alias-specific suffix overrides the target suffix; an explicit call-level thinking option has higher precedence.
+`modelAliases` is a case-sensitive object. Names must match `[A-Za-z][A-Za-z0-9_-]*`. Values are concrete `provider/model` references or another alias, optionally with a thinking suffix such as `:high`. Unknown targets and cycles fail before execution. An alias-specific suffix overrides the target suffix; a suffix on the call's model reference has higher precedence. Separate `thinking` options are rejected.
 
 Static settings aliases override dynamic aliases with the same name. Use settings for fixed policy and an extension `modelAliases` entry when the target must be resolved from the live model inventory.
 
@@ -114,19 +111,19 @@ Static settings aliases override dynamic aliases with the same name. Use setting
 
 A model is dynamic when its value cannot be determined during preflight, for example when an agent option is computed from runtime data, `args`, a spread, or another non-literal expression. The workflow is still launchable; the model is resolved when that agent starts against the run's captured model and alias inventory. The resolved model must be available or the agent fails with `UNKNOWN_MODEL`. Dynamic model values are not a new model-registration mechanism; use a static alias or an extension resolver when the policy itself must be named and reusable.
 
-Dynamic model aliases are resolved once per launch or resume, then captured for that execution segment. They are not re-resolved on every agent turn. A role can use a static alias or a dynamic alias in its `model` field.
+Dynamic model aliases are resolved once per launch or resume, then captured for that execution segment. They are not re-resolved on every agent turn. Already prepared identities retain their concrete model on retry/resume; new identities use the current resolved alias map.
 
 ### Resource selectors
 
-The direct `skills`, `extensions`, and `tools` fields use ordered Minimatch selectors. Rules are applied global settings, trusted project settings, role frontmatter, then agent-call options. Every discovered candidate starts enabled; a matching positive pattern enables it, `!pattern` disables it, and the last matching rule wins. `!*` clears the current selection before narrower positive patterns are applied. An empty selector array contributes no matches as a selector layer. Use `!*` before positive patterns when a call must restrict the candidate set, or use `!*` alone to select none. Selectors never create unavailable resources or bypass trust filtering. Child capability calls may re-enable discovered skills and extensions through their final overlay, while child tools remain within the parent boundary. Doctor reports `AGENT_RESOURCE_TOOL_SELECTOR_ALLOWLIST` when a positive-only tool selector looks like an ineffective allow-list.
+The direct `skills`, `extensions`, and `tools` fields use ordered Minimatch selectors. Rules are applied global and trusted project defaults, then agent-call options and generic preparation. Every discovered candidate starts enabled; a matching positive pattern enables it, `!pattern` disables it, and the last matching rule wins. `!*` clears the current selection before narrower positive patterns are applied. An empty selector array contributes no matches as a selector layer. Use `!*` before positive patterns when a call must restrict the candidate set, or use `!*` alone to select none. Selectors never create unavailable resources or bypass trust filtering. Child tools, skills, and extensions cannot exceed the parent boundary. Doctor reports `AGENT_RESOURCE_TOOL_SELECTOR_ALLOWLIST` when a positive-only tool selector looks like an ineffective allow-list.
 
 Extension selector normalization is context-specific. In settings, `~` and `~/...` expand from the home directory, `file://` URLs become filesystem paths, and relative paths resolve from the directory containing that settings file. In role frontmatter, the same forms are supported and relative paths resolve from the role file's directory. Existing non-magic paths and the static prefixes of magic paths in settings and role files are canonicalized with `realpath` when possible; `*`, `**`, and `**/...` remain cwd-independent patterns. At call level, those three forms also remain cwd-independent. Other relative selectors resolve from the agent launch cwd: non-magic selectors are canonicalized, while magic patterns are path-resolved without `realpath`. Call-level `~` and `file://` values are not expanded by the runtime.
 
 ## `piewf doctor --json`
 
-When doctor completes its checks, `piewf doctor --json` writes one JSON object. A command-level failure writes an error to stderr, exits `1`, and produces no JSON. The current top-level `DoctorReport` keys are `cwd`, `agentDir`, `settingsPath`, `settings`, `settingsSources`, `trust`, `activeTools`, `piExtensions`, `piSkills`, `roles`, `functions`, `modelAliases`, `resourcePolicy`, optional `roleTarget`, optional `roleInspection`, and `diagnostics`. Diagnostics have `severity`, `code`, `message`, and optional `source` and `hint`. Resource policies expose global/project selectors, effective selected resources, unmatched patterns, and `selectorSources`; role inspection adds role and call selector layers plus model, tools, prompt, final system prompt, setup hooks, and setup diagnostics. Model-alias entries carry `name`, `kind`, `provenance`, and dynamic-alias `version` and `headline`.
+When doctor completes its checks, `piewf doctor --json` writes one JSON object. A command-level failure writes an error to stderr, exits `1`, and produces no JSON. The current top-level `DoctorReport` keys are `cwd`, `agentDir`, `settingsPath`, `settings`, `settingsSources`, `trust`, `activeTools`, `piExtensions`, `piSkills`, `functions`, `modelAliases`, `resourcePolicy`, optional `agentInspection`, and `diagnostics`. Diagnostics have `severity`, `code`, `message`, and optional `source` and `hint`. Resource policies expose global/project selectors, effective selected resources, unmatched patterns, and `selectorSources`; agent inspection adds the prepared selector layers plus model, tools, prompt, final system prompt, setup hooks, and setup diagnostics. Model-alias entries carry `name`, `kind`, `provenance`, and dynamic-alias `version` and `headline`.
 
-Treat `code` and named fields as the machine contract, tolerate omitted optional fields, and ignore unknown fields for forward compatibility. There is no schema-version field; do not parse the human-readable doctor report. For a completed report, the exit status is `0` unless a diagnostic has severity `error`, in which case it is `1`. `settingsSources` gives source paths for represented effective settings. `resourcePolicy.globalSettingsPath` and `projectSettingsPath` identify selector files, and top-level `resourcePolicy.selectorSources` carries only the global and project layers; role and call layers appear under `roleInspection.resources.selectorSources`.
+Treat `code` and named fields as the machine contract, tolerate omitted optional fields, and ignore unknown fields for forward compatibility. There is no schema-version field; do not parse the human-readable doctor report. For a completed report, the exit status is `0` unless a diagnostic has severity `error`, in which case it is `1`. `settingsSources` gives source paths for represented effective settings. `resourcePolicy.globalSettingsPath` and `projectSettingsPath` identify selector files, and top-level `resourcePolicy.selectorSources` carries only the global and project layers; prepared layers appear under `agentInspection.resources.selectorSources`.
 
 ## Standalone Subagents
 
@@ -142,7 +139,7 @@ The model-facing surface is exactly:
 | `subagents_stop` | Stop one run and clean its worktree. |
 | `subagents_retry` | Start a fresh run from a failed or stopped request, with a new ID and the original mode. |
 
-`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is a name string. Concrete models are `provider/model:thinking`. The `worktree` option requires a clean working tree at worktree creation or the run fails with `WORKTREE_FAILED`.
+`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is an optional extension-owned JSON option. Concrete models are `provider/model:thinking`. The `worktree` option requires a clean working tree at worktree creation or the run fails with `WORKTREE_FAILED`.
 
 Background calls return an ID immediately. Foreground calls return a terminal envelope and do not produce a background completion follow-up. Do not poll a running ID; call `subagents_inspect({ id })` only when current state or output is needed. Cross-session retry starts fresh and does not restore the old native conversation.
 ## Herdr integration
@@ -240,7 +237,7 @@ The resolver context has `cwd`, `projectTrusted`, `rootModel`, `knownModels`, `a
 
 ### Agent setup hooks
 
-Hooks run after normal model, tool, cwd, and role resolution but before the agent session is created. They run in ascending `priority` order; equal priorities use the hook name. The default priority is `10`.
+Hooks run after generic preparation and concrete model/tool/cwd resolution but before the agent session is created. They run in ascending `priority` order; equal priorities use the hook name. The default priority is `10`.
 
 Use a custom JSON-compatible agent option as an explicit opt-in instead of changing every agent:
 
@@ -257,68 +254,32 @@ agentSetupHooks: {
 }
 ```
 
-Hooks may mutate the prompt, options, session input, or transport, but the immutable prepared launch remains the capability ceiling. Resource-policy mutation is narrowing-only: adding a selector that widens skills, extensions, or tools fails setup with `INVALID_METADATA`; negated narrowing is accepted. Final resource selector order is global settings, trusted project settings, role frontmatter, call-level selectors, then hook-added narrowing. The runtime preserves hook negations in their original order, including negations interleaved with positive selectors, while applying them as the final overlay. Keep hooks short and cancellation-aware. Hook failures prevent session creation and are not native-session retries. Each agent retry starts from a fresh setup baseline and runs hooks again.
+Hooks may mutate the prompt, options, session input, or transport, but the immutable prepared launch remains the capability ceiling. Resource-policy mutation is narrowing-only: adding a selector that widens skills, extensions, or tools fails setup with `INVALID_METADATA`; negated narrowing is accepted. Final resource selector order is global settings, trusted project settings, generic preparation, call-level selectors, then hook-added narrowing. The runtime preserves hook negations in their original order, including negations interleaved with positive selectors, while applying them as the final overlay. Keep hooks short and cancellation-aware. Hook failures prevent session creation and are not native-session retries. Each agent retry starts from a fresh setup baseline and runs hooks again.
 
-### Packaged roles
+### Generic agent preparation
 
-Register role defaults independently of workflow capabilities:
+Use `agentPreparationHooks` for plugin-owned policy before concrete model resolution:
 
 ```ts
-import { registerRoleContribution } from "@piewf/pi-ext-roles";
-
-export default function extension(pi) {
-  registerRoleContribution(pi, {
-    owner: import.meta.url,
-    roleDirectories: ["./roles"],
-  });
+agentPreparationHooks: {
+  advisor: {
+    optionsSchema: { type: "object", properties: { advisor: { type: "boolean" } }, additionalProperties: true },
+    prepare(configuration, context) {
+      if (context.options.advisor === true) configuration.systemPromptAppend += "\nCall out one risk.";
+    }
+  }
 }
 ```
 
-Relative directories resolve from the owner. `registerWorkflowExtension({ roleDirectories })` is rejected with `INVALID_METADATA` and migration guidance, even when `source` is supplied. `source` remains a workflow registration field for function provenance and portable bundling. See [role migration](roles.html#migration) for the retained legacy imports and paths.
+All loaded schemas validate original options before any hook runs. Hooks run by ascending priority then name. The immutable context supplies options, effective cwd, agentDir, trust, root defaults, authorized tools/skills/extensions, known/available models, signal, and execution/inspection mode. Preparation can set model text, selectors, context scopes, settings, and prompts. An absent `systemPrompt` retains native Pi behavior; `systemPromptAppend` adds policy instructions without replacing it.
 
-Extension roles are defaults. The full precedence order is starter roles < user extension roles < global roles < trusted project roles. Regular extension roles silently override matching starter roles; duplicate role names across regular extension directories are rejected.
+Workflow calls, handles, nested agents, standalone subagents, and CLI inspection use the same preparation flow. Core persists the concrete prepared configuration by operation/handle identity before session creation. Resume and retry reuse it without rerunning plugin resolution, then revalidate current trust and availability. Removed capabilities fail with `RESUME_INCOMPATIBLE`; historical snapshots are rejected. Frozen values include the model, plugin instructions, selectors, context scopes, and settings, not extension code, skill/AGENTS/SYSTEM/APPEND bytes, or external state. Resources are reread under current trust and ceilings; external effects are not guaranteed exactly once.
 
-## Create and modify roles
+### Optional roles
 
-A role is a Markdown file named `<role>.md` with optional YAML frontmatter and a prompt body:
+Core forwards `role` as opaque JSON without interpretation. The independent `@piewf/pi-ext-roles` Pi extension owns its schema, discovery, settings, precedence, and composition through a generic preparation hook. See its own guide for role authoring. There is no core `/roles` export, role catalog, role-specific doctor flag, or role-file tooling.
 
-```md
----
-description: Reviews code for correctness
-model: reviewer-model:high
-tools: ["!*", read, grep]
-skills: ["!*", "review-*"]
-extensions: ["**/*", "!**/unsafe.mjs"]
-contextFiles: [global, project]
----
-
-Focus on correctness, regressions, and concrete next checks.
-```
-Supported core frontmatter fields include direct `tools`, `skills`, and `extensions` selector arrays plus `extensionSettings` JSON. Each selector uses ordered Minimatch rules; positive rules enable, negated rules disable, and the last match wins.
-
-`description`, `model`, `overrideSystemPrompt`, and `contextFiles` retain their existing meanings. Put thinking on `model` as `provider/model:thinking` or `alias:thinking`. The selector fields are composed after global and trusted project settings and before per-call selectors. Role `extensionSettings` replaces declared top-level namespaces while retaining omitted ones.
-
-The role body is prompt guidance. Role files are trusted configuration and can change model, tools, context, resources, extension settings, and system-prompt behavior.
-Role selection is a name string:
-
-```js
-{ role: "reviewer", model: "cheap-model:low", tools: ["!*", "read", "grep"], contextFiles: ["cwd"] }
-```
-
-Role files provide defaults. `model`, `tools`, `skills`, `extensions`, and `contextFiles` belong on `AgentOptions` and override the role file for that call. Concrete models are `provider/model:thinking`. `overrideSystemPrompt` stays on the role file. Use `tools: ["*"]` to re-enable all tools after a role restriction.
-
-### Static and dynamic role references
-
-A role reference is static when the runtime can see a literal role name string. It is dynamic when the role depends on runtime data, such as `args`, a computed property, a spread, or another non-literal expression. Dynamic role references are supported, but preflight cannot validate only one role, so launch validation checks every loaded role policy. At execution, the selected role must still exist.
-
-Dynamic roles do not create inline role definitions. The selected role name must resolve to a discovered role file, and its prompt body always comes from that file. The same precedence applies: packaged extension roles are defaults, global roles override them, and trusted project roles override both.
-
-Use a dynamic role when the choice must be made at runtime. Use a static role when possible because it gives earlier unknown-role, model, and tool errors and produces a smaller launch snapshot.
-
-`piewf doctor --role <name>` or `piewf doctor <name>` is the read-only way to inspect the effective role, model, tools, resources, setup hooks, and prepared system prompt. A role ending in `.md` is read as a role file instead, relative to the current working directory, so `piewf doctor ./roles/reviewer.md` checks a role before it is installed. Add `--prompt <text>` when a prompt-dependent hook must be inspected. With `--json`, either role form adds `roleTarget` and adds `roleInspection` when inspection succeeds.
-
-Role discovery is fail-closed. Invalid frontmatter or the rejected legacy selector in any packaged or global role file, or in any trusted-project role file, prevents the runtime from loading a partial role set. Doctor reports `ROLE_FRONTMATTER` or `AGENT_RESOURCE_SELECTOR_MIGRATION` plus `ROLE_LOAD_BLOCKED`; active role entries in the general report say `unavailable: role loading failed` and doctor exits `1`. See the [doctor reference](developers.html#operations) for exact diagnostics. A focused unavailable role reports `ROLE_NOT_FOUND`; a missing role at runtime fails with `UNKNOWN_AGENT_TYPE`.
-
+Inspect a plugin option with `piewf doctor --agent-options '{"role":"reviewer"}' --prompt "Review this"`. This uses the shared preparation/setup path without persistence or provider contact.
 
 ## Verification checklist
 

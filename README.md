@@ -80,13 +80,13 @@ See the [roles guide](https://vekexasia.github.io/pi-extensible-workflows/roles.
 
 ## Included capabilities
 
-The single core installation provides workflows, the `reviewLoop` starter for developer-and-reviewer implementation cycles, packaged `developer`/`reviewer`/`scout`/`oracle`/`researcher` roles, and durable standalone subagent tools (`subagents_run`, `subagents_inspect`, `subagents_steer`, `subagents_stop`, and `subagents_retry`). Ready-made slash commands launch them: `/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, and `/deep-research`. Roles and aliases are overridable; `reviewLoop` is not. The starter, Subagents, and Trajectory can each be disabled with [Pi package filters](https://vekexasia.github.io/pi-extensible-workflows/extensions.html#bundled-filters).
+The single core installation provides workflows, the `reviewLoop` starter for developer-and-reviewer implementation cycles, durable standalone subagent tools (`subagents_run`, `subagents_inspect`, `subagents_steer`, `subagents_stop`, and `subagents_retry`). Ready-made slash commands launch them: `/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, and `/deep-research`. With the optional roles extension enabled, roles and aliases are overridable; `reviewLoop` is not. The starter, Subagents, and Trajectory can each be disabled with [Pi package filters](https://vekexasia.github.io/pi-extensible-workflows/extensions.html#bundled-filters).
 
 ### Companion packages
 
 - [`@piewf/herdr`](https://github.com/vekexasia/pi-extensible-workflows/tree/main/packages/extensions/herdr) (`pi install npm:@piewf/herdr`): workflow-agent sessions in Herdr panes.
 - [`@piewf/cli`](https://github.com/vekexasia/pi-extensible-workflows/tree/main/packages/cli) (`npm install -g @piewf/cli`): `piewf` for doctor, inspection, headless runs, export, and bundles.
-- [`@piewf/pi-ext-roles`](https://github.com/vekexasia/pi-ext-roles) (`npm install -g @piewf/pi-ext-roles`): `pi-role <role>` to start native Pi with role defaults. Updating core supplies the roles library automatically; a separate plugin install is not required for workflow roles.
+- [`@piewf/pi-ext-roles`](https://github.com/vekexasia/pi-ext-roles) (`npm install -g @piewf/pi-ext-roles`): `pi-role <role>` to start native Pi with role defaults. Install and enable this optional Pi extension explicitly to interpret workflow or subagent role options. Core and CLI work without it.
 
 ## Development
 

@@ -6,15 +6,7 @@ import test from "node:test";
 import starter from "../starter/index.js";
 import { reviewLoop } from "../starter/review-loop.js";
 import { runWorkflow } from "../src/execution.js";
-import {
-  beginWorkflowExtensionLoading,
-  loadingRegistry,
-  parseRoleMarkdown,
-  registeredWorkflowFunctions,
-  resetWorkflowRegistry,
-  type WorkflowFunctionContext,
-  WorkflowRegistry,
-} from "../src/index.js";
+import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistry, type WorkflowFunctionContext, WorkflowRegistry } from "../src/index.js";
 
 void test("starter prompt agent examples execute with a task and role", async () => {
   for (const [name, role] of [["council", "oracle"], ["deep-research", "researcher"], ["parallel-review", "reviewer"], ["parallel-scout", "scout"]] as const) {
@@ -54,25 +46,6 @@ function reviewContext(
   } as unknown as WorkflowFunctionContext;
   return { context, roles };
 }
-
-void test("registers the starter function and aliases without a role registry", async () => {
-  const registry = registerStarter();
-
-  assert.deepEqual(Object.keys(registeredWorkflowFunctions()), ["reviewLoop"]);
-  assert.deepEqual(
-    await registry.resolveModelAliases({
-      cwd: "/project",
-      projectTrusted: true,
-      rootModel: { provider: "example", model: "root" },
-      knownModels: new Set(["example/root"]),
-      availableModels: new Set(["example/root"]),
-      signal: new AbortController().signal,
-    }),
-    { "developer-model": "example/root", "reviewer-model": "example/root", "scout-model": "example/root", "oracle-model": "example/root", "researcher-model": "example/root" },
-  );
-
-  assert.equal("roleDirectories" in registry, false);
-});
 void test("records and validates portable workflow source metadata", () => {
   const workflow = { description: "Portable", input: { type: "object" }, output: { type: "boolean" }, run: () => true };
   const extension = { version: "1.0.0", headline: "Portable extension", source: "file:///portable-extension.mjs", dependencies: ["typebox"], functions: { portable: workflow } };
@@ -108,23 +81,6 @@ void test("reviewLoop fails when the iteration limit is reached", async () => {
   assert.equal(result.iterations, 2);
   assert.deepEqual(result.review.findings, ["Second finding"]);
   assert.deepEqual(roles, ["developer", "reviewer", "developer", "reviewer"]);
-});
-
-void test("packages portable role settings without forbidden overrides", () => {
-  registerStarter();
-  const roles = new URL("../starter/roles/", import.meta.url);
-  const developer = parseRoleMarkdown(readFileSync(new URL("developer.md", roles), "utf8"), true);
-  const reviewer = parseRoleMarkdown(readFileSync(new URL("reviewer.md", roles), "utf8"), true);
-  assert.deepEqual(
-    { description: developer.description, model: developer.model, tools: developer.tools, skills: developer.skills, overrideSystemPrompt: developer.overrideSystemPrompt },
-    { description: "Developer focused agent", model: undefined, tools: undefined, skills: undefined, overrideSystemPrompt: undefined },
-  );
-  assert.deepEqual(
-    { model: reviewer.model, tools: reviewer.tools, skills: reviewer.skills, overrideSystemPrompt: reviewer.overrideSystemPrompt },
-    { model: undefined, tools: ["!*", "read", "grep", "find", "ls"], skills: undefined, overrideSystemPrompt: undefined },
-  );
-  assert.equal(reviewer.tools?.includes("bash"), false);
-  for (const role of ["developer", "reviewer", "scout", "oracle", "researcher"]) assert.equal(parseRoleMarkdown(readFileSync(new URL(`${role}.md`, roles), "utf8"), true).model, undefined);
 });
 
 void test("static settings aliases shadow starter dynamic aliases", async () => {

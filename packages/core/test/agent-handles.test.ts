@@ -10,7 +10,7 @@ import { listRunIds } from "../src/persistence.js";
 import { agentHandleTurnPath } from "../src/execution.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 
-const capabilities = { models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]) };
+const capabilities = { models: new Set(["openai/gpt"]), tools: new Set(["read"]), };
 const script = `const author = agent.create({ name: "author" });
 const first = await author.send("first draft");
 const second = await author.send("apply findings");
@@ -150,7 +150,7 @@ return "accepted";`;
   assert.equal(await runWorkflow(duplicate, null, { agent: async () => "done" }).result, "INVALID_METADATA");
   assert.throws(() => preflight(`const a = agent.create({ name: args.name }); return a.send("x");`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.throws(() => preflight(`const a = agent.create(); return a.send("x");`, capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.deepEqual(preflight(`const a = agent.create({ name: "author", role: "reviewer", model: "openai/gpt:high", tools: ["read"] }); return a.send("x");`, capabilities).referenced, { phases: [], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
+  assert.deepEqual(preflight(`const a = agent.create({ name: "author", role: "reviewer", model: "openai/gpt:high", tools: ["read"] }); return a.send("x");`, capabilities).referenced, { phases: [], models: [], tools: ["read"] });
 });
 
 void test("a provider-recovery attempt on a handle turn reopens a clean per-turn copy", async () => {

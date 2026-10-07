@@ -36,18 +36,7 @@ void test("public agent execution result types remain exported", () => {
   assert.equal(progress.state, "completed");
 });
 
-const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, availableModels: new Set(["openai/gpt", "anthropic/opus", "google/gemini"]), tools: new Set(["read", "grep", "find", "bash"]), agentDefinitions: { reviewer: { prompt: "Review carefully", model: "anthropic/opus", thinking: "high", tools: ["!*", "read"] }, scout: { prompt: "Inspect broadly", model: "google/gemini", thinking: "low", tools: ["!*", "read", "grep"] } } };
-void test("passes effective extension settings to setup hooks and transports", async () => {
-  let setupSettings: unknown;
-  let transportSettings: unknown;
-  const base = testTransport(async () => ({ sessionId: "settings", messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} }));
-  const transport: import("../src/types.js").AgentTransport = { id: "local", async createSession(prepared, context) { transportSettings = context.settings; return base.createSession(prepared, context); } };
-  const executor = new WorkflowAgentExecutor({ ...root, extensionSettings: { acme: { global: true } }, agentDefinitions: { reviewer: { extensionSettings: { acme: { role: true } } } }, agentSetupHooks: [{ name: "capture", priority: 10, setup(agent, context) { setupSettings = context.settings; agent.transport = transport; } }] }, localAgentTransport);
-  assert.equal((await executor.execute("work", { label: "worker", workflowName: "flow", role: "reviewer" })).value, "done");
-  assert.deepEqual(setupSettings, { acme: { role: true } });
-  assert.deepEqual(transportSettings, setupSettings);
-  assert.equal(Object.isFrozen(setupSettings), true);
-});
+const root: AgentExecutionRoot = { cwd: "/repo", model: { provider: "openai", model: "gpt", thinking: "medium" }, availableModels: new Set(["openai/gpt", "anthropic/opus", "google/gemini"]), tools: new Set(["read", "grep", "find", "bash"]) };
 const usage = { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: { total: 0.25 } };
 function assistant(text: string) { return { role: "assistant", content: [{ type: "text", text }], usage }; }
 function terminalAssistant(errorMessage: string) { return { ...assistant(""), stopReason: "error", errorMessage }; }
@@ -403,64 +392,15 @@ void test("rejects transport-reported tools outside the prepared capability ceil
   assert.equal(prompted, false);
   assert.equal(disposed, 1);
 });
-
-void test("resolves explicit capabilities without widening least privilege", () => {
-  const executor = new WorkflowAgentExecutor(root, testTransport(async () => { throw new Error("unused"); }));
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "reviewer" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPromptAppend: "Review carefully" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "scout" }).tools, ["read", "grep"]);
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "reviewer", model: "google/gemini:low", tools: ["!*", "read", "grep"] }), { model: { provider: "google", model: "gemini", thinking: "low" }, tools: ["read", "grep"], systemPromptAppend: "Review carefully" });
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "reviewer", model: "google/gemini" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", model: "google/gemini:medium" }), { model: { provider: "google", model: "gemini", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPromptAppend: "" });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", model: "google/gemini:medium", tools: ["!*"] }).tools, []);
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", tools: ["!*", "read", "grep"] }).tools, ["read", "grep"]);
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", tools: ["read", "write"] }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_TOOL");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", model: "missing/model" }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  assert.throws(() => executor.resolve({ label: "a", workflowName: "w", role: "missing" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "reviewer", tools: ["*"] }).tools, ["read", "grep", "find", "bash"]);
-  const warnings: string[] = [];
-  const broken = new WorkflowAgentExecutor({ ...root, agentDefinitions: { broken: { tools: ["write"] } }, onResourceWarning: (message) => { warnings.push(message); } }, testTransport(async () => { throw new Error("must not launch"); }));
-  assert.deepEqual(broken.resolve({ label: "a", workflowName: "w", role: "broken" }).tools, ["read", "grep", "find", "bash"]);
-  assert.deepEqual(warnings, ["Tool not available in this session for role broken: write. The agent runs without it."]);
-  broken.resolve({ label: "a", workflowName: "w", role: "broken" });
-  assert.equal(warnings.length, 1);
-});
-void test("applies call-level context files over the role file", async () => {
-  const basePolicy: AgentResourcePolicy = { globalSettingsPath: "/g", projectSettingsPath: "/p", projectTrusted: true, global: { skills: [], extensions: [] }, project: { skills: [], extensions: [] }, effective: { skills: ["global"], extensions: ["/global.ts"] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { skills: ["global"], extensions: ["/global.ts"] }, project: {} } };
-  const roleRoot: AgentExecutionRoot = { ...root, agentDefinitions: { ...root.agentDefinitions, scoped: { prompt: "Scoped role", contextFiles: ["global", "project"], overrideSystemPrompt: true, skills: ["role-skill"], extensions: ["/role.ts"] } }, agentResourcePolicy: () => structuredClone(basePolicy) };
-  const executor = new WorkflowAgentExecutor(roleRoot, testTransport(async () => { throw new Error("unused"); }));
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "scoped", contextFiles: ["cwd"] }), { model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPrompt: "Scoped role", systemPromptAppend: "", contextFiles: ["cwd"] });
-  assert.deepEqual(executor.resolve({ label: "a", workflowName: "w", role: "scoped" }), { model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read", "grep", "find", "bash"], systemPrompt: "Scoped role", systemPromptAppend: "", contextFiles: ["global", "project"] });
-  const prepared = await prepareAgentSetupForInspection(roleRoot, "probe", { label: "a", workflowName: "w", role: "scoped", skills: ["extra"], extensions: [] }, localAgentTransport);
-  assert.ok(prepared.setup.sessionInput.resourcePolicy);
-  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy.effective, { skills: ["global", "role-skill", "extra"], extensions: ["/global.ts", "/role.ts"] });
-});
-void test("passes role prompt as system append, not task text", async () => {
+void test("passes preparation prompt as system append, not task text", async () => {
   let input: unknown;
   let prompt = "";
-  const executor = new WorkflowAgentExecutor(root, testTransport(async (sessionInput) => { input = sessionInput; return { transport: "local", session: { transport: "local", sessionId: "role", locator: { sessionFile: "/sessions/role.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: async (text) => { prompt = text; }, dispose() {} }; }));
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "reviewer", effectiveTools: ["read", "grep"] });
+  const executor = new WorkflowAgentExecutor({ ...root, agentPreparationHooks: [{ name: "policy", priority: 0, prepare(configuration) { configuration.systemPromptAppend = "Review carefully"; } }] }, testTransport(async (sessionInput) => { input = sessionInput; return { transport: "local", session: { transport: "local", sessionId: "role", locator: { sessionFile: "/sessions/role.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: async (text) => { prompt = text; }, dispose() {} }; }));
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", agentOptions: { role: "reviewer" }, effectiveTools: ["read", "grep"] });
   assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "Review carefully");
   assert.deepEqual((input as { tools?: readonly string[] }).tools, ["read", "grep"]);
   assert.doesNotMatch(prompt, /Review carefully/);
   assert.match(prompt, /Task:\nDo work/);
-});
-
-void test("carries role context file scope policy into session preparation", async () => {
-  const roleRoot: AgentExecutionRoot = { ...root, agentDefinitions: { ...root.agentDefinitions, scoped: { prompt: "Scoped role", contextFiles: ["global", "project"] } } };
-  let input: SessionInput | undefined;
-  const executor = new WorkflowAgentExecutor(roleRoot, testTransport(async (sessionInput) => { input = sessionInput; return { transport: "local", session: { transport: "local", sessionId: "scoped", locator: { sessionFile: "/sessions/scoped.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: async () => {}, dispose() {} }; }));
-  assert.deepEqual(executor.resolve({ label: "worker", workflowName: "flow", role: "scoped" }).contextFiles, ["global", "project"]);
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "scoped" });
-  assert.deepEqual(input?.contextFiles, ["global", "project"]);
-});
-void test("uses a role body as the full system prompt when requested", async () => {
-  const roleRoot: AgentExecutionRoot = { ...root, agentDefinitions: { ...root.agentDefinitions, override: { prompt: "Replace the system prompt", model: "anthropic/opus", thinking: "high", tools: ["!*", "read"], overrideSystemPrompt: true } } };
-  let input: unknown;
-  const executor = new WorkflowAgentExecutor(roleRoot, testTransport(async (sessionInput) => { input = sessionInput; return { transport: "local", session: { transport: "local", sessionId: "override", locator: { sessionFile: "/sessions/override.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: async () => {}, dispose() {} }; }));
-  assert.deepEqual(executor.resolve({ label: "worker", workflowName: "flow", role: "override" }), { model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read"], systemPrompt: "Replace the system prompt", systemPromptAppend: "" });
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "override" });
-  assert.equal((input as { systemPrompt?: string }).systemPrompt, "Replace the system prompt");
-  assert.equal((input as { systemPromptAppend?: string }).systemPromptAppend, "");
 });
 void test("prepares the resolved workflow system prompt path for external transports", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-system-prompt-path-"));
@@ -486,7 +426,7 @@ void test("prepares the resolved workflow system prompt path for external transp
       };
     },
   };
-  await new WorkflowAgentExecutor({ ...root, cwd, agentDir: join(rootDir, "agent") }, transport).execute("work", { label: "worker", workflowName: "flow" });
+  await new WorkflowAgentExecutor({ ...root, projectTrusted: true, cwd, agentDir: join(rootDir, "agent") }, transport).execute("work", { label: "worker", workflowName: "flow" });
   assert.equal(prepared?.systemPrompt, undefined);
   assert.equal(prepared?.systemPromptPath, systemPromptPath);
   assert.ok(prepared);
@@ -497,18 +437,18 @@ void test("prepares the resolved workflow system prompt path for external transp
   assert.match(runtime.entrypoint, /@earendil-works[\\/]pi-coding-agent[\\/].*cli\.js$/);
 });
 
-void test("persists the effective role system prompt emitted for the native turn", async () => {
+void test("persists the effective preparation system prompt emitted for the native turn", async () => {
   const saved: Array<{ sessionId: string; attempt: number; turn: number; prompt: string }> = [];
   let listener: ((event: TestPiSessionEvent) => void) | undefined;
   const runStore = { ...runStoreDefaults, recordSystemPrompt: async (entry: (typeof saved)[number]) => { saved.push(entry); } } satisfies AgentExecutionRunStore;
-  const executor = new WorkflowAgentExecutor({ ...root, runStore }, testTransport(async (input) => ({
+  const executor = new WorkflowAgentExecutor({ ...root, runStore, agentPreparationHooks: [{ name: "policy", priority: 0, prepare(configuration) { configuration.systemPromptAppend = "Review carefully"; } }] }, testTransport(async (input) => ({
     transport: "local", session: { transport: "local", sessionId: "role", locator: { sessionFile: "/sessions/role.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats,
     systemPrompt: `BASE\n\n${input.systemPromptAppend ?? ""}`,
     subscribe(candidate) { listener = candidate; return () => {}; },
     async prompt() { listener?.({ type: "agent_start" }); },
     dispose() {},
   })));
-  await executor.execute("Do work", { label: "worker", workflowName: "flow", role: "reviewer" });
+  await executor.execute("Do work", { label: "worker", workflowName: "flow", agentOptions: { role: "reviewer" } });
   assert.deepEqual(saved, [{ sessionId: "role", attempt: 1, turn: 1, prompt: "BASE\n\nReview carefully" }]);
 });
 
@@ -544,7 +484,7 @@ void test("runs prioritized setup hooks with fresh retry baselines and safe atte
   const inputs: Array<{ prompt: string; options: Record<string, unknown>; tools: readonly string[]; cwd: string }> = [];
   const hooks = [
     { name: "z-last", priority: 10, async setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:z-last`); agent.prompt += " z"; agent.sessionInput.tools = ["bash"]; } },
-    { name: "a-first", priority: 10, setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:a-first`); assert.equal(Object.hasOwn(agent.options, "transient"), false); agent.prompt += " a"; agent.options.transient = context.attempt === 1 ? "discard" : "fresh"; agent.sessionInput.tools = ["grep"]; agent.sessionInput.cwd = "/hooked"; } },
+    { name: "a-first", priority: 10, setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:a-first`); assert.equal(Object.hasOwn(agent.options, "transient"), false); agent.prompt += " a"; agent.options.transient = context.attempt === 1 ? "discard" : "fresh"; agent.sessionInput.tools = ["grep"]; } },
     { name: "early", priority: 1, setup(agent: { prompt: string; options: Record<string, unknown>; sessionInput: { tools: readonly string[]; cwd: string } }, context: { attempt: number }) { order.push(`${String(context.attempt)}:early`); agent.options.seen = true; } },
   ];
   let created = 0;
@@ -556,7 +496,7 @@ void test("runs prioritized setup hooks with fresh retry baselines and safe atte
   const result = await executor.execute("original", { label: "hooked", workflowName: "flow", retries: 1, timeoutMs: 5, agentOptions: { advisor: true } });
   assert.equal(result.value, "done");
   assert.deepEqual(order, ["1:early", "1:a-first", "1:z-last", "2:early", "2:a-first", "2:z-last"]);
-  assert.deepEqual(inputs.map(({ tools, cwd }) => ({ tools, cwd })), [{ tools: ["bash"], cwd: "/hooked" }, { tools: ["bash"], cwd: "/hooked" }]);
+  assert.deepEqual(inputs.map(({ tools, cwd }) => ({ tools, cwd })), [{ tools: ["bash"], cwd: root.cwd }, { tools: ["bash"], cwd: root.cwd }]);
   assert.deepEqual(result.attempts.map(({ setup }) => setup.hookNames), [["early", "a-first", "z-last"], ["early", "a-first", "z-last"]]);
   assert.equal(result.attempts[1]?.setup.model.provider, "openai");
 });
@@ -577,7 +517,7 @@ void test("returns final text and captures persisted native session accounting",
   assert.equal(result.value, "done");
   assert.equal(prompts.length, 1);
   assert.match(prompts[0] ?? "", /Workflow: flow[\s\S]*Phase: build[\s\S]*Parent: root[\s\S]*Task:\nDo work/);
-  assert.deepEqual(result.attempts[0], { attempt: 1, transport: "local", session: { transport: "local", sessionId: "s1", locator: { sessionFile: "/sessions/s1.jsonl" } }, result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo" } });
+  assert.deepEqual(result.attempts[0], { attempt: 1, transport: "local", session: { transport: "local", sessionId: "s1", locator: { sessionFile: "/sessions/s1.jsonl" } }, result: "done", accounting: { input: 2, output: 3, cacheRead: 4, cacheWrite: 5, cost: 0.25 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo", resourceSelectors: result.attempts[0]?.setup.resourceSelectors } });
 });
 
 void test("exposes native attempt metadata before the prompt completes", async () => {
@@ -588,7 +528,8 @@ void test("exposes native attempt metadata before the prompt completes", async (
   const exposure = new Promise<import("../src/agent-execution.js").AgentAttempt>((resolve) => { exposed = resolve; });
   const executor = new WorkflowAgentExecutor(root, testTransport(async () => ({ transport: "local", session: { transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }, messages: [assistant("done")], getSessionStats: sessionStats, prompt: () => new Promise<void>((resolve) => { finish = resolve; promptStarted(); }), dispose() {} })));
   const running = executor.execute("work", { label: "worker", workflowName: "flow", onAttempt: (attempt) => { exposed(attempt); } });
-  assert.deepEqual(await exposure, { attempt: 1, transport: "local", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo" } });
+  const exposedAttempt = await exposure;
+  assert.deepEqual(exposedAttempt, { attempt: 1, transport: "local", accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, setup: { hookNames: [], model: root.model, tools: ["read", "grep", "find", "bash", "workflow_result"], cwd: "/repo", resourceSelectors: exposedAttempt.setup.resourceSelectors } });
   await started;
   finish();
   await running;
@@ -668,7 +609,7 @@ void test("keeps workflow_result present, validates invalid values, and allows o
       }
     }, dispose() {} };
   }));
-  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", role: "reviewer", schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
+  const result = await executor.execute("structured", { label: "schema", workflowName: "flow", agentOptions: { role: "reviewer" }, schema: { type: "object", properties: { answer: { type: "number" } }, required: ["answer"], additionalProperties: false } });
   assert.deepEqual(result.value, { answer: 9 });
   assert.equal(calls.length, 3);
   assert.equal((toolResults[0] as { isError?: boolean }).isError, true);
@@ -1662,69 +1603,6 @@ void test("executor registers the production native steering handler", async () 
   await registered("redirect");
   assert.deepEqual(steered, ["redirect"]);
 });
-
-void test("scheduler inherits effective extension settings into nested agents", async () => {
-  const seen = new Map<string, unknown>();
-  // eslint-disable-next-line prefer-const
-  let scheduler!: FairAgentScheduler;
-  const executor = new WorkflowAgentExecutor({
-    ...root,
-    extensionSettings: { acme: { root: true } },
-    agentDefinitions: { nested: { extensionSettings: { acme: { nested: true } } } },
-    onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); },
-  }, testTransport(async (input) => {
-    seen.set(input.sessionLabel, input.settings);
-    return { sessionId: input.sessionLabel, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} };
-  }));
-  scheduler = new FairAgentScheduler(async ({ id, options, prompt }) => {
-    const result = await executor.execute(prompt, { label: options.label, workflowName: "flow", agentNodeId: id, ...(options.role === undefined ? {} : { role: options.role }), ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }) });
-    if (prompt === "parent") {
-      const child = scheduler.spawn("run", "child", { label: "child", cwd: options.cwd, tools: [], role: "nested" }, id);
-      const childResult = await scheduler.result(id, child.id);
-      if (!childResult.ok) throw new Error(childResult.error.message);
-    }
-    return result.value;
-  }, 2);
-  scheduler.addRun("run", 2, undefined, { acme: { root: true } });
-  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: [] });
-  assert.equal((await parent.result).ok, true);
-  assert.deepEqual(seen.get("flow:parent:attempt-1"), { acme: { root: true } });
-  assert.deepEqual(seen.get("flow:child:attempt-1"), { acme: { nested: true } });
-});
-void test("concurrent scheduler agents receive isolated extension settings", async () => {
-  const seen = new Map<string, unknown>();
-  let started = 0;
-  let markStarted!: () => void;
-  let release!: () => void;
-  const bothStarted = new Promise<void>((resolve) => { markStarted = resolve; });
-  const continueSessions = new Promise<void>((resolve) => { release = resolve; });
-  // eslint-disable-next-line prefer-const
-  let scheduler!: FairAgentScheduler;
-  const executor = new WorkflowAgentExecutor({
-    ...root,
-    extensionSettings: { acme: { root: true } },
-    agentDefinitions: { alpha: { extensionSettings: { acme: { agent: "alpha" } } }, beta: { extensionSettings: { acme: { agent: "beta" } } } },
-    onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); },
-  }, testTransport(async (input) => {
-    seen.set(input.sessionLabel, input.settings);
-    started += 1;
-    if (started === 2) markStarted();
-    await continueSessions;
-    return { sessionId: input.sessionLabel, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() {}, dispose() {} };
-  }));
-  scheduler = new FairAgentScheduler(async ({ id, options, prompt }) => (await executor.execute(prompt, { label: options.label, workflowName: "flow", agentNodeId: id, ...(options.role === undefined ? {} : { role: options.role }), ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }) })).value, 2);
-  scheduler.addRun("run", 2, undefined, { acme: { root: true } });
-  const alpha = scheduler.spawn("run", "alpha", { label: "alpha", cwd: "/repo", tools: [], role: "alpha" });
-  const beta = scheduler.spawn("run", "beta", { label: "beta", cwd: "/repo", tools: [], role: "beta" });
-  await bothStarted;
-  release();
-  assert.deepEqual(await Promise.all([alpha.result, beta.result]), [
-    { id: alpha.id, ok: true, value: "done" },
-    { id: beta.id, ok: true, value: "done" },
-  ]);
-  assert.deepEqual(seen.get("flow:alpha:attempt-1"), { acme: { agent: "alpha" } });
-  assert.deepEqual(seen.get("flow:beta:attempt-1"), { acme: { agent: "beta" } });
-});
 void test("fair scheduler enforces session/run ceilings and round-robins runs", async () => {
   const order: string[] = [];
   const releases: Array<() => void> = [];
@@ -2102,7 +1980,7 @@ void test("scoped tools honor the root capability boundary and cancel orphan des
   await outsider.result;
 });
 
-void test("nested role model options are accepted as call-level overrides", async () => {
+void test("nested extension options preserve call-level model overrides", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
     await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
     throw new WorkflowError("CANCELLED", "cancelled");
@@ -2111,7 +1989,7 @@ void test("nested role model options are accepted as call-level overrides", asyn
   const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read"] });
   const agentTool = scheduler.toolsFor(parent.id)[0];
   assert.ok(agentTool);
-  await executeTool(agentTool, "call", { prompt: "child", label: "child", role: "reviewer", model: "openai/gpt:low" });
+  await executeTool(agentTool, "call", { prompt: "child", label: "child", agentOptions: { role: "reviewer" }, model: "openai/gpt:low" });
   const child = scheduler.snapshot().find(({ options }) => options.label === "child");
   assert.ok(child);
   assert.equal(child.options.model, "openai/gpt:low");
@@ -2155,36 +2033,37 @@ void test("child agent tools return structured content for codemode scripts", as
   await parent.result;
 });
 
-void test("nested agent roles resolve tools before scheduler spawn", async () => {
+void test("nested agents retain the parent tool ceiling before preparation", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
     await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
     throw new WorkflowError("CANCELLED", "cancelled");
   }, 1);
   scheduler.addRun("run", 1);
   const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read", "bash"] });
-  const agentTool = scheduler.toolsFor(parent.id, (role, tools) => role === "reviewer" && tools === undefined ? ["read"] : tools ?? ["bash"])[0];
+  const agentTool = scheduler.toolsFor(parent.id)[0];
   assert.ok(agentTool);
-  await executeTool(agentTool, "call", { prompt: "child", label: "child", role: "reviewer", retries: 1, timeoutMs: null });
-  assert.deepEqual(scheduler.snapshot().find(({ options }) => options.label === "child")?.options.tools, ["read"]);
+  await executeTool(agentTool, "call", { prompt: "child", label: "child", agentOptions: { role: "reviewer" }, retries: 1, timeoutMs: null });
+  assert.deepEqual(scheduler.snapshot().find(({ options }) => options.label === "child")?.options.tools, ["agent", "read", "bash"]);
   scheduler.cancel(parent.id);
   await parent.result;
 });
-void test("nested child agents reject role objects and accept contextFiles", async () => {
+void test("nested child agents forward opaque options and accept contextFiles", async () => {
   const scheduler = new FairAgentScheduler(async ({ signal }) => {
     await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
     throw new WorkflowError("CANCELLED", "cancelled");
   }, 1);
   scheduler.addRun("run", 1);
   const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: "/repo", tools: ["agent", "read", "bash"] });
-  const agentTool = scheduler.toolsFor(parent.id, (role, tools) => role === "reviewer" ? tools ?? ["read"] : tools ?? ["bash"])[0];
+  const agentTool = scheduler.toolsFor(parent.id)[0];
   assert.ok(agentTool);
   await executeTool(agentTool, "call", { prompt: "child", label: "child", role: "reviewer", model: "openai/gpt:high", contextFiles: ["cwd"] });
   const child = scheduler.snapshot().find(({ options }) => options.label === "child");
   assert.ok(child);
-  assert.equal(child.options.role, "reviewer");
+  assert.equal(child.options.agentOptions?.role, "reviewer");
   assert.equal(child.options.model, "openai/gpt:high");
   assert.deepEqual(child.options.contextFiles, ["cwd"]);
-  await assert.rejects(executeToolUnchecked(agentTool, "call", { prompt: "bad", label: "bad", role: { name: "reviewer" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
+  await executeToolUnchecked(agentTool, "call", { prompt: "opaque", label: "opaque", policy: { name: "reviewer" } });
+  assert.deepEqual(scheduler.snapshot().find(({ options }) => options.label === "opaque")?.options.agentOptions?.policy, { name: "reviewer" });
   scheduler.cancel(parent.id);
   await parent.result;
 });
@@ -2340,9 +2219,12 @@ void test("resource policy preserves explicit selector sources", async () => {
   const policy: AgentResourcePolicy = { globalSettingsPath: "/global/settings.json", projectSettingsPath: "/project/settings.json", projectTrusted: true, global: { skills: ["global-cold"], extensions: [] }, project: { skills: [], extensions: [] }, effective: { skills: ["global-cold"], extensions: [] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { skills: ["global-cold"] }, project: {} } };
   const prepared = await prepareAgentSetupForInspection({ ...root, agentResourcePolicy: () => structuredClone(policy) }, "work", { label: "worker", workflowName: "flow" }, localAgentTransport);
   assert.equal(prepared.failure, undefined);
-  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy?.selectorSources, { global: { skills: ["global-cold"] }, project: {} });
+  assert.deepEqual(prepared.setup.sessionInput.resourcePolicy?.effective.skills, ["global-cold", "!*"]);
+  const capabilities = prepared.setup.sessionInput.resourcePolicy.capabilities;
+  assert.ok(capabilities);
+  assert.deepEqual(capabilities.skills, []);
 });
-void test("refreshes resource selectors for every fresh attempt and inspects the effective policy", async () => {
+void test("freezes prepared resource selectors across retry attempts", async () => {
   let policyCalls = 0;
   let sessions = 0;
   const inputs: Array<NonNullable<SessionInput["resourcePolicy"]>> = [];
@@ -2359,31 +2241,9 @@ void test("refreshes resource selectors for every fresh attempt and inspects the
   }));
   const result = await executor.execute("work", { label: "worker", workflowName: "flow", retries: 1 });
   assert.equal(result.value, "done");
-  assert.equal(policyCalls, 2);
-  assert.deepEqual(inputs.map(({ effective }) => effective), [{ skills: ["skill-1"], extensions: ["/extensions/extension-1.ts"] }, { skills: ["skill-2"], extensions: ["/extensions/extension-2.ts"] }]);
-  assert.deepEqual(result.attempts.map(({ setup }) => setup.resourceSelectors?.selectors.skills), [["skill-1"], ["skill-2"]]);
-});
-void test("composes role resource selectors and reapplies them on retries", async () => {
-  const roleExtension = "/role/extension.ts";
-  const basePolicy = { globalSettingsPath: "/global/settings.json", projectSettingsPath: "/project/settings.json", projectTrusted: true, global: { skills: ["global"], extensions: ["/global.ts"] }, project: { skills: ["project"], extensions: ["/project.ts"] }, effective: { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] }, unmatchedSkills: [], unmatchedExtensions: [], selectorSources: { global: { skills: ["global"], extensions: ["/global.ts"] }, project: { skills: ["project"], extensions: ["/project.ts"] } } };
-  const policies: Array<NonNullable<SessionInput["resourcePolicy"]>> = [];
-  let sessions = 0;
-  const executor = new WorkflowAgentExecutor({ ...root, agentDefinitions: { ...root.agentDefinitions, reviewer: { ...root.agentDefinitions?.reviewer, skills: ["role", "global"], extensions: [roleExtension, "/global.ts"] }, scout: { ...root.agentDefinitions?.scout } }, agentResourcePolicy: () => structuredClone(basePolicy) }, testTransport(async (input) => {
-    assert.ok(input.resourcePolicy);
-    policies.push(input.resourcePolicy);
-    const session = ++sessions;
-    return { sessionId: `role-policy-${String(session)}`, sessionFile: `/sessions/role-policy-${String(session)}.jsonl`, messages: [assistant("done")], getSessionStats: sessionStats, async prompt() { if (session === 1) throw new Error("retry"); }, dispose() {} };
-  }));
-  await executor.execute("role", { label: "role", workflowName: "flow", role: "reviewer", retries: 1 });
-  await executor.execute("other", { label: "other", workflowName: "flow", role: "scout" });
-  await executor.execute("plain", { label: "plain", workflowName: "flow" });
-  assert.deepEqual(policies.map(({ effective }) => effective), [
-    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", roleExtension, "/global.ts"], tools: ["!*", "read"] },
-    { skills: ["global", "project", "role", "global"], extensions: ["/global.ts", "/project.ts", roleExtension, "/global.ts"], tools: ["!*", "read"] },
-    { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"], tools: ["!*", "read", "grep"] },
-    { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] },
-  ]);
-  assert.deepEqual(basePolicy.effective, { skills: ["global", "project"], extensions: ["/global.ts", "/project.ts"] });
+  assert.equal(policyCalls, 3);
+  assert.deepEqual(inputs[0]?.effective, inputs[1]?.effective);
+  assert.deepEqual(result.attempts.map(({ setup }) => setup.resourceSelectors?.selectors.skills), [["skill-1", "!*"], ["skill-1", "!*"]]);
 });
 void test("excludes workflow host entries from another installed package copy", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-host-copy-"));
@@ -2528,7 +2388,7 @@ void test("prompt inspection renders before_agent_start system prompt changes", 
     await session.dispose();
   }
 });
-void test("treats role system prompt bodies as literal content", async () => {
+void test("treats prepared system prompt bodies as literal content", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-literal-system-prompt-"));
   const agentDir = join(rootDir, "agent");
   const cwd = join(rootDir, "project");
@@ -2599,7 +2459,7 @@ void test("applies ordered minimatch resource selectors and records concrete mat
   assert.deepEqual(resourcePolicy.selectedSkills, ["kept-skill"]);
   await session.dispose();
 });
-void test("filters local context files by the role scope policy", async () => {
+void test("filters local context files by the prepared scope policy", async () => {
   const rootDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-context-files-"));
   const agentDir = join(rootDir, "agent");
   const projectRoot = join(rootDir, "project");

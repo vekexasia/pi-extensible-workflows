@@ -18,7 +18,7 @@ Use the built-in subagent tools for focused, independent tasks. Use `pi-extensib
 
 - Five focused tools: run, inspect, steer, stop, and retry.
 - Background fan-out with one durable ID per run, or foreground execution with an inline terminal result.
-- Reuses workflow roles, model aliases, settings including extension-defined namespaces, and agent options: `label`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, `worktree`, `outputSchema`, `retries` (0 through 255), and `timeoutMs`.
+- Reuses generic workflow preparation hooks, model aliases, settings including extension-defined namespaces, and agent options: `label`, `model`, `tools`, `skills`, `extensions`, `contextFiles`, `worktree`, `outputSchema`, `retries` (0 through 255), and `timeoutMs`.
 - Repeatable inspection of progress, token accounting, tool calls, results, failures, and worktrees.
 
 Built-in subagent tools are available when the core extension is installed. Use the core package's Pi extension manifest to enable them.
@@ -44,21 +44,21 @@ subagents_run({ prompt: "Summarize README.md.", mode: "foreground" })
 
 ## Interactive inspection
 
-In Pi's TUI, `/subagents` opens the `/workflow` dashboard layout for the durable standalone runs of the current session: the run list sits beside the selected run's details at 80 columns or wider, and narrower terminals drill down from the list to the details. The details show the run ID and the same activity, stall warning, state, model, role, tools, attempts, duration, cumulative token accounting, cost, and error fields as a `/workflow` agent; a running run shows its live activity, which `subagents_inspect` leaves out. Requests without a role show `Role: (none)`. While a run is active the view refreshes the active runs and the selection every second; runs launched while it is open appear after an action or when it reopens. `a` or `enter` opens registered standalone agent actions, editor controls for the prompt, the live system prompt, and the result, `Steer` and `Stop` while running, `Retry` for failed or stopped runs, and the `/workflow` run actions that apply: `Delete`, `Delete all completed`, `Delete all failed`, `Copy run path`, and `Copy agent ID`. Stop and every deletion ask for confirmation, and a run whose worktree still awaits cleanup cannot be deleted. Outside the TUI, `/subagents` opens a picker with the same run summary and bulk deletions as the `/workflow` picker. Background runs appear below the editor in the workflow widget's frame, one row per run with its model, tokens, cost, elapsed time, and quiet or stalled warning, and each leaves a receipt in the transcript when it settles. Inspection does not launch a new LLM call; lifecycle actions may steer, stop, retry, or delete a run.
+In Pi's TUI, `/subagents` opens the `/workflow` dashboard layout for the durable standalone runs of the current session: the run list sits beside the selected run's details at 80 columns or wider, and narrower terminals drill down from the list to the details. The details show the run ID and the same activity, stall warning, state, model, tools, attempts, duration, cumulative token accounting, cost, and error fields as a `/workflow` agent; a running run shows its live activity, which `subagents_inspect` leaves out. While a run is active the view refreshes the active runs and the selection every second; runs launched while it is open appear after an action or when it reopens. `a` or `enter` opens registered standalone agent actions, editor controls for the prompt, the live system prompt, and the result, `Steer` and `Stop` while running, `Retry` for failed or stopped runs, and the `/workflow` run actions that apply: `Delete`, `Delete all completed`, `Delete all failed`, `Copy run path`, and `Copy agent ID`. Stop and every deletion ask for confirmation, and a run whose worktree still awaits cleanup cannot be deleted. Outside the TUI, `/subagents` opens a picker with the same run summary and bulk deletions as the `/workflow` picker. Background runs appear below the editor in the workflow widget's frame, one row per run with its model, tokens, cost, elapsed time, and quiet or stalled warning, and each leaves a receipt in the transcript when it settles. Inspection does not launch a new LLM call; lifecycle actions may steer, stop, retry, or delete a run.
 
 ## Tools
 
-Every tool schema is a closed object. Unknown properties are rejected. The model-visible standalone surface contains exactly these five names:
+`subagents_run` accepts additional JSON agent options for loaded preparation hooks; unknown options are ignored when no plugin handles them. The other control-tool schemas are closed objects. The model-visible standalone surface contains exactly these five names:
 
 | Tool | Input schema |
 | --- | --- |
-| `subagents_run` | `{ prompt: string, mode?: "background" \| "foreground", label?: string, model?: string, tools?: string[], skills?: string[], extensions?: string[], contextFiles?: string[], role?: string, worktree?: string, outputSchema?: object, retries?: integer 0..255, timeoutMs?: positive integer \| null }` |
+| `subagents_run` | `{ prompt: string, mode?: "background" \| "foreground", label?: string, model?: string, tools?: string[], skills?: string[], extensions?: string[], contextFiles?: string[], worktree?: string, outputSchema?: object, retries?: integer 0..255, timeoutMs?: positive integer \| null }` |
 | `subagents_inspect` | `{ id?: string, scope?: "session" \| "all" }` |
 | `subagents_steer` | `{ id: string, message: string }` |
 | `subagents_stop` | `{ id: string }` |
 | `subagents_retry` | `{ id: string }` |
 
-`prompt` is the only required `subagents_run` property. `mode` defaults to "background". Resource candidates start enabled, so plain positive top-level selector lists are additive and top-level `[]` adds no matches. Use `["!*", "read", "grep"]` to restrict a selector to those resources, or `["!*"]` to select none. A `role` string selects an existing workflow role. Model, tools, skills, extensions, and contextFiles are top-level `AgentOptions` overrides applied after the role file. Concrete models are `provider/model:thinking`. Capability selectors use ordered minimatch rules and are applied after global, trusted-project, and role selectors. Use `tools: ["*"]` to re-enable all tools after a role restriction.
+`prompt` is the only required `subagents_run` property. `mode` defaults to "background". Resource candidates start enabled, so plain positive top-level selector lists are additive and top-level `[]` adds no matches. Use `["!*", "read", "grep"]` to restrict a selector to those resources, or `["!*"]` to select none. Unknown JSON options are forwarded to enabled plugins. `role` has no core meaning. Concrete models are `provider/model:thinking`. Capability selectors cannot exceed root and parent ceilings.
 
 `subagents_inspect({})` returns the current Pi session's run summaries ordered by start time; `subagents_inspect({ scope: "all" })` lists every stored run. `subagents_inspect({ id })` returns the detailed lifecycle record, including state, start and finish timestamps, and the live snapshot under `progress`: `state`, cumulative `accounting`, `toolCalls`, `activity`, and `lastEventAt`. The snapshot state never includes the effective system prompt, and inspection has no `usage` field; token totals are derived from accounting. Materialized worktree path and branch are included when available. For completed runs it also includes `value`; for failed runs it includes `error`. A running run has no terminal value yet. Unknown IDs fail with `RUN_NOT_FOUND`.
 
@@ -82,7 +82,7 @@ Each call owns an independent run, so calls can execute concurrently and settle 
 
 ## IDs, inspection, and terminal values
 
-Run records are stored below the agent directory's private `subagents/<id>/` directory, normally `~/.pi/agent/subagents/<id>/`. The record includes the normalized request, its frozen external settings and role definitions for deterministic retries, and status. A shared storage owner marker uses the process ID, process start, session ID, and token; every running record carries the same manager identity so a live manager does not reconcile another manager's active run.
+Run records are stored below the agent directory's private `subagents/<id>/` directory, normally `~/.pi/agent/subagents/<id>/`. The record includes the normalized request, its frozen concrete prepared configuration for deterministic retries, and status. A shared storage owner marker uses the process ID, process start, session ID, and token; every running record carries the same manager identity so a live manager does not reconcile another manager's active run.
 
 Inspection is repeatable. Use the list form for ordered summaries and the ID form for one detailed status plus its terminal value or failure information. Progress is retained in memory and is persisted when the executor marks a progress update for persistence. The result and failure files remain available after manager restart.
 
@@ -102,13 +102,7 @@ Set `worktree` on `subagents_run` to create a named isolated Git worktree for th
 
 ## Agent options, roles, and settings
 
-`subagents_run` accepts the same execution options as a workflow `agent(...)`: model, thinking level, tool, skill, and extension selectors, named roles or inline role overrides, worktrees, structured output, retries, and timeout. The extension also reuses workflow model aliases, settings, resource selector policy, and role discovery:
-
-- global roles: `<agentDir>/pi-extensible-workflows/roles/<name>.md`, normally `~/.pi/agent/pi-extensible-workflows/roles/`;
-- trusted project roles: `<cwd>/.pi/pi-extensible-workflows/roles/<name>.md`;
-- global and trusted project settings: the normal workflow settings path under the agent directory and `<cwd>/.pi/pi-extensible-workflows/settings.json`.
-
-The current Pi model, thinking level, active tools, project trust, session ID, role definitions, aliases, and resource policy are captured from the extension context for each run. Internal workflow and subagent control tools are not exposed to the child agent.
+`subagents_run` accepts the same execution options as workflow agents, plus JSON extension options. Enable the optional `@piewf/pi-ext-roles` extension in the parent Pi session when role behavior is required; core does not discover role files or read shared role settings. [Generic preparation hooks](https://vekexasia.github.io/pi-extensible-workflows/extensions.html#preparation) receive authorized inventories, effective cwd/agentDir/trust, root defaults, immutable original options, and cancellation. Prepared configurations are persisted before execution and reused on retry without resolving external policies again. Lost capabilities or trust fail closed. Internal workflow and subagent control tools remain excluded from the child agent.
 
 ## Programmatic host integration
 
@@ -142,4 +136,4 @@ The v5.4 release removes the seven-tool surface's redundant `subagents_list`, `s
 | `subagents_stop({ id })` | unchanged |
 | `subagents_retry({ id })` | unchanged; the original launch mode is preserved |
 
-The standalone manager deliberately keeps durable run IDs, repeatable inspection, bounded steering, named worktree cleanup, and workflow role/settings reuse.
+The standalone manager deliberately keeps durable run IDs, repeatable inspection, bounded steering, named worktree cleanup, and generic workflow preparation and settings reuse.

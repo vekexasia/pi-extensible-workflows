@@ -8,7 +8,7 @@ import { Compile } from "typebox/compile";
 import { getAgentDir, parseFrontmatter, SessionManager } from "@earendil-works/pi-coding-agent";
 import { CAPTURE_ERROR_PREFIX, CAPTURE_IDENTITY, resolveWorkflowSkillPath } from "./eval-capture-extension.js";
 export { resolveWorkflowSkillPath } from "./eval-capture-extension.js";
-import { ERROR_CODES, errorText, inspectWorkflowScript, isObject, loadAgentDefinitions, roleNameOf, runWorkflow, WORKFLOW_CALL_KINDS, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "../../src/index.js";
+import { ERROR_CODES, errorText, inspectWorkflowScript, isObject, runWorkflow, WORKFLOW_CALL_KINDS, WorkflowError, type AgentIdentity, type JsonSchema, type JsonValue, type StaticWorkflowCall, type StaticWorkflowExecution, type WorkflowErrorCode } from "../../src/index.js";
 import { isWorkflowErrorCode } from "../../src/utils.js";
 
 export type SignificantAction = { kind: "tool"; name: string } | { kind: "text" } | { kind: "thinking" };
@@ -310,13 +310,13 @@ export function replayExpectationErrors(calls: readonly CapturedWorkflowCall[], 
   const errors: string[] = [];
   const staticCalls = calls.flatMap((call) => { try { return call.script ? inspectWorkflowScript(call.script) : []; } catch { return []; } });
   for (const kind of expectations.requiredOperations ?? []) if (!staticCalls.some((call) => call.kind === kind)) errors.push(`replay had no ${kind} call`);
-  for (const role of expectations.requiredRoles ?? []) if (!staticCalls.some((call) => call.kind === "agent" && call.role === role)) errors.push(`replay had no agent role ${role}`);
+  for (const role of expectations.requiredRoles ?? []) if (!staticCalls.some((call) => call.kind === "agent" && call.options?.role === role)) errors.push(`replay had no agent role ${role}`);
   const agentCalls = reports.flatMap((report) => report.trace?.agentCalls ?? []);
   if (expectations.minimumAgentCalls !== undefined && agentCalls.length < expectations.minimumAgentCalls) errors.push(`replay had ${String(agentCalls.length)} agent calls`);
   for (const policy of expectations.agentPolicies ?? []) {
     const call = agentCalls[policy.callIndex];
     if (!call) { errors.push(`agent policy ${String(policy.callIndex)} had no matching call`); continue; }
-    if (policy.role !== undefined && roleNameOf(call.options.role) !== policy.role) errors.push(`agent ${String(policy.callIndex)} role was ${JSON.stringify(call.options.role)}`);
+    if (policy.role !== undefined && call.options.role !== policy.role) errors.push(`agent ${String(policy.callIndex)} role was ${JSON.stringify(call.options.role)}`);
     if (policy.model !== undefined && call.options.model !== policy.model) errors.push(`agent ${String(policy.callIndex)} model was ${JSON.stringify(call.options.model)}`);
     for (const option of policy.forbidOptions ?? []) if (Object.prototype.hasOwnProperty.call(call.options, option)) errors.push(`agent ${String(policy.callIndex)} unexpectedly specified ${option}`);
     if (policy.tools) {
@@ -358,7 +358,7 @@ function staticCallRows(calls: readonly CapturedWorkflowCall[]): Array<{ call: S
 }
 function matchesAgentExpectation(call: StaticWorkflowCall | undefined, expected: AgentOrderExpectation): boolean {
   if (!call) return false;
-  return (expected.role === undefined || call.role === expected.role) && (expected.model === undefined || call.model === expected.model) && (expected.promptIncludes === undefined || call.prompt?.includes(expected.promptIncludes) === true) && (expected.execution === undefined || (call.execution ?? "sequential") === expected.execution);
+  return (expected.role === undefined || call.options?.role === expected.role) && (expected.model === undefined || call.model === expected.model) && (expected.promptIncludes === undefined || call.prompt?.includes(expected.promptIncludes) === true) && (expected.execution === undefined || (call.execution ?? "sequential") === expected.execution);
 }
 function structureGroupKey(call: StaticWorkflowCall, kind: "parallel" | "pipeline"): string | undefined {
   const scopes = (call.structure ?? []).filter((scope) => scope.kind === kind);
@@ -403,7 +403,7 @@ export function staticExpectationResults(calls: readonly CapturedWorkflowCall[],
   if (calls.some((call) => !call.script)) add("script", false, "A selected workflow had no resolved script.");
   for (const kind of expectations.requiredOperations ?? []) add(`operation:${kind}`, staticCalls.some((call) => call.kind === kind), `Required ${kind} operation.`);
   for (const kind of expectations.forbiddenOperations ?? []) add(`forbidden-operation:${kind}`, !staticCalls.some((call) => call.kind === kind), `Forbidden ${kind} operation.`);
-  for (const role of expectations.requiredRoles ?? []) add(`role:${role}`, agentCalls.some((call) => call.role === role), `Required agent role ${role}.`);
+  for (const role of expectations.requiredRoles ?? []) add(`role:${role}`, agentCalls.some((call) => call.options?.role === role), `Required agent role ${role}.`);
   if (expectations.minimumAgentCalls !== undefined) add("minimum-agent-calls", agentCalls.length >= expectations.minimumAgentCalls, `Found ${String(agentCalls.length)} static agent calls; required ${String(expectations.minimumAgentCalls)}.`);
   for (const policy of expectations.agentPolicies ?? []) {
     const call = agentCalls[policy.callIndex];
@@ -411,7 +411,7 @@ export function staticExpectationResults(calls: readonly CapturedWorkflowCall[],
     const optionKeys = new Set(call?.optionKeys ?? Object.keys(options));
     const failures: string[] = [];
     if (!call) failures.push("missing call");
-    if (call && policy.role !== undefined && call.role !== policy.role) failures.push(`role ${JSON.stringify(call.role)}`);
+    if (call && policy.role !== undefined && call.options?.role !== policy.role) failures.push(`role ${JSON.stringify(call.options?.role)}`);
     if (call && policy.model !== undefined && call.model !== policy.model) failures.push(`model ${JSON.stringify(call.model)}`);
     for (const option of policy.forbidOptions ?? []) if (optionKeys.has(option)) failures.push(`specified ${option}`);
     if (policy.tools) {
@@ -626,18 +626,15 @@ export function parseSemanticJudge(raw: string, criteria: readonly SemanticCrite
 
 interface JudgeProcessResult extends PiRunResult { raw: string; usage: ParentUsage }
 
-function semanticJudgePrompt(evalCase: WorkflowEvalCase, calls: readonly CapturedWorkflowCall[], cwd: string, home: string): string {
-  const roles = loadAgentDefinitions(cwd, join(home, ".pi", "agent"));
-  const usedRoles = new Set(calls.flatMap(({ script }) => { try { return script ? inspectWorkflowScript(script).flatMap((call) => call.kind === "agent" && call.role ? [call.role] : []) : []; } catch { return []; } }));
-  const roleText = [...usedRoles].map((role) => `${role}: ${roles[role]?.description ?? "no description"}`).join("\n") || "none";
+function semanticJudgePrompt(evalCase: WorkflowEvalCase, calls: readonly CapturedWorkflowCall[]): string {
   const docs = "agent(prompt, options) delegates; shell(command, options) runs a deterministic host command and returns exitCode/stdout/stderr; parallel(name, tasks) runs independent tasks concurrently; pipeline(name, items, stages) applies ordered stages; prompt(template, data) carries values into prompts. A role is a name string. Role files provide model/tools/skills/extensions/contextFiles defaults; AgentOptions override those defaults for one call. Concrete models are provider/model:thinking. overrideSystemPrompt stays on the role file.";
-  return `Judge whether the captured workflow design satisfies each criterion. Do not execute it. Return only JSON: {"criteria":[{"id":"criterion id","pass":true,"evidence":"specific script evidence"}]}.\n\nOriginal request:\n${evalCase.prompt}\n\nCriteria:\n${JSON.stringify(evalCase.semanticCriteria ?? [])}\n\nDSL:\n${docs}\n\nRelevant roles:\n${roleText}\n\nCaptured workflow call(s):\n${calls.map((call, index) => `--- ${String(index)} ---\nArguments:\n${JSON.stringify(call.arguments)}\nScript:\n${call.script ?? "<missing>"}`).join("\n")}`;
+  return `Judge whether the captured workflow design satisfies each criterion. Do not execute it. Return only JSON: {"criteria":[{"id":"criterion id","pass":true,"evidence":"specific script evidence"}]}.\n\nOriginal request:\n${evalCase.prompt}\n\nCriteria:\n${JSON.stringify(evalCase.semanticCriteria ?? [])}\n\nDSL:\n${docs}\n\nCaptured workflow call(s):\n${calls.map((call, index) => `--- ${String(index)} ---\nArguments:\n${JSON.stringify(call.arguments)}\nScript:\n${call.script ?? "<missing>"}`).join("\n")}`;
 }
 
 async function runSemanticJudge(input: CaptureCaseInput, calls: readonly CapturedWorkflowCall[], cwd: string, home: string, sessionDir: string, maxCost: number): Promise<JudgeProcessResult> {
   const args = ["--offline", "--no-extensions", "--no-skills", "--no-context-files", "--no-tools", "--mode", "json", "--session-dir", sessionDir, "--session-id", randomUUID()];
   if (input.model.includes("/")) args.push("--model", input.model); else { if (input.provider) args.push("--provider", input.provider); args.push("--model", input.model); }
-  args.push("--thinking", "off", "--print", semanticJudgePrompt(input.case, calls, cwd, home));
+  args.push("--thinking", "off", "--print", semanticJudgePrompt(input.case, calls));
   const controller = new AbortController();
   let timedOut = false; let budgetExceeded = false; let processGroupTerminated = false; let stderr = ""; let spawnError: string | undefined; let killPromise: Promise<boolean> | undefined; let lineBuffer = ""; let raw = ""; let usage = emptyAccounting();
   const child = spawn(input.piCommand ?? process.env.PI_WORKFLOW_EVAL_PI ?? "pi", args, { cwd, env: { ...process.env, HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent"), PI_CODING_AGENT_SESSION_DIR: sessionDir, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"], signal: controller.signal });

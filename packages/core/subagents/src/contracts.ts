@@ -32,12 +32,11 @@ export const SUBAGENTS_RUN_PARAMETERS = Type.Object({
   skills: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered skill selectors; candidates start enabled and !* restricts the set" })),
   extensions: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered extension selectors; candidates start enabled and !* restricts the set" })),
   contextFiles: Type.Optional(Type.Array(Type.String(), { description: "Optional context-file scopes: global, project, cwd" })),
-  role: Type.Optional(Type.String({ description: "Workflow role name" })),
   worktree: Type.Optional(Type.String({ description: "Optional named worktree; requires a clean working tree" })),
   outputSchema: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "Optional JSON schema for the result" })),
   retries: Type.Optional(Type.Integer({ minimum: 0, maximum: SUBAGENT_MAX_RETRIES, description: "Optional retry count; at most 255 retries" })),
   timeoutMs: Type.Optional(Type.Union([Type.Integer({ minimum: 1, description: "Optional execution timeout in milliseconds" }), Type.Null()])),
-}, { additionalProperties: false });
+}, { additionalProperties: true });
 
 export const SUBAGENTS_INSPECT_PARAMETERS = Type.Object({
   id: Type.Optional(Type.String({ description: "Subagent ID; omit to list ordered run summaries" })),
@@ -79,7 +78,7 @@ export const SUBAGENT_STATUS_OUTPUT = Type.Object({
 export const SUBAGENTS_INSPECT_OUTPUT = Type.Union([SUBAGENT_STATUS_OUTPUT, Type.Array(Type.Object({ id: Type.String(), state: Type.String() }))]);
 export const SUBAGENTS_STEER_OUTPUT = Type.Object({ id: Type.String(), accepted: Type.Boolean() });
 
-export type SubagentRunRequest = Static<typeof SUBAGENTS_RUN_PARAMETERS>;
+export type SubagentRunRequest = Static<typeof SUBAGENTS_RUN_PARAMETERS> & { readonly [key: string]: unknown };
 export function normalizeSubagentRunRequest(value: unknown): SubagentRunRequest {
   if (!Value.Check(SUBAGENTS_RUN_PARAMETERS, value)) throw new WorkflowError("INVALID_METADATA", "Invalid subagents_run parameters");
   if (typeof value.worktree === "string" && !value.worktree.trim()) throw new WorkflowError("INVALID_METADATA", "worktree name must be a non-empty string");
@@ -114,7 +113,6 @@ export interface SubagentStatus {
 export interface SubagentNotification {
   readonly id: string;
   readonly label?: string;
-  readonly role?: string;
   readonly state: "completed" | "failed";
   readonly error?: { readonly code: string; readonly message: string };
 }
@@ -156,7 +154,6 @@ export interface SubagentExecutor {
   execute(task: string, options: AgentExecutionOptions, signal?: AbortSignal, setSteer?: (handler: (message: string) => void | Promise<void>) => void): Promise<AgentExecutionResult>;
 }
 export interface SubagentManagerDependencies {
-  readonly roleEvents?: import("@earendil-works/pi-coding-agent").EventBus;
   readonly getActiveTools?: () => readonly string[];
   readonly agentDir?: string;
   readonly storageDir?: string;

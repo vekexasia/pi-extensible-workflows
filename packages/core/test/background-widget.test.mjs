@@ -59,7 +59,6 @@ function runState(overrides = {}) {
     phaseHistory: [{ phase: "shell", afterAgent: 0 }, { phase: "llm", afterAgent: 0 }],
     agents: [{
       name: "scout",
-      role: "scout",
       requestedModel: "scout-model",
       state: "running",
       startedAt: Date.now() - 42_000,
@@ -417,8 +416,8 @@ void test("the receipt stays compact until expanded, then shows full run details
     phases: ["scout", "review"],
     phaseBoundaries: [0, 1],
     agents: [
-      { name: "scout", state: "completed", model: "fixture-model:high", role: "scout", requestedModel: "scout-model", toolCalls: 31, input: 30_000, output: 900, cacheRead: 80_000, costUsd: 0.09, durationMs: 31_000, attempts: 1 },
-      { name: "reviewer", state: "failed", model: "fixture-model:xhigh", role: "reviewer", toolCalls: 1, input: 50_000, output: 200, cacheRead: 120_000, costUsd: 0.31, durationMs: 15_000, attempts: 3 },
+      { name: "scout", state: "completed", model: "fixture-model:high", requestedModel: "scout-model", toolCalls: 31, input: 30_000, output: 900, cacheRead: 80_000, costUsd: 0.09, durationMs: 31_000, attempts: 1 },
+      { name: "reviewer", state: "failed", model: "fixture-model:xhigh", toolCalls: 1, input: 50_000, output: 200, cacheRead: 120_000, costUsd: 0.31, durationMs: 15_000, attempts: 3 },
     ],
     error: "reviewer was interrupted before it answered",
   };
@@ -430,8 +429,8 @@ void test("the receipt stays compact until expanded, then shows full run details
   const body = renderReceipt(receipt, true, theme).join("\n");
   assert.match(body, /scout/);
   assert.match(body, /review/);
-  assert.match(body, /role scout · via scout-model · 31 calls/);
-  assert.match(body, /role reviewer · 1 call/, "one call is not pluralised");
+  assert.match(body, /via scout-model · 31 calls/);
+  assert.match(body, /1 call/, "one call is not pluralised");
   assert.match(body, /in 30kt · out 900t · cache 80kt/);
   assert.match(body, /3 attempts/, "a retried agent says so");
   assert.match(body, /interrupted before it answered/);
@@ -874,7 +873,6 @@ void test("a busy screen still produces a frame Pi will not truncate", () => {
 
   const agent = (name, state) => ({
     name,
-    role: "ops",
     state,
     startedAt: Date.now() - 60_000,
     tools: ["read"],
@@ -934,7 +932,6 @@ void test("a receipt line longer than the terminal is cut, not fatal", () => {
           name: "planner-deep",
           state: "completed",
           model: "claude-opus-5:xhigh",
-          role: "planner-deep",
           requestedModel: "planner-model",
           tools: ["read", "grep", "find", "ls", "symbol_search", "module_report", "read_symbol", "bash"],
           input: 28,

@@ -190,7 +190,6 @@ interface ReceiptAgent {
   name: string;
   state: string;
   model?: string;
-  role?: string;
   requestedModel?: string;
   tools?: readonly string[];
   /** Accepted for rendering older receipt entries; new receipts persist granted tools. */
@@ -283,7 +282,7 @@ function optionalNumber(value: unknown): boolean {
 function renderableAgent(value: unknown): boolean {
   if (!object(value) || typeof value.name !== "string" || typeof value.state !== "string" || !object(value.model) || typeof value.model.model !== "string" || !Array.isArray(value.tools) || !value.tools.every((tool) => typeof tool === "string")) return false;
   if (value.model.thinking !== undefined && typeof value.model.thinking !== "string") return false;
-  for (const key of ["id", "label", "parentId", "role", "requestedModel"] as const) if (value[key] !== undefined && typeof value[key] !== "string") return false;
+  for (const key of ["id", "label", "parentId", "requestedModel"] as const) if (value[key] !== undefined && typeof value[key] !== "string") return false;
   for (const key of ["attempts", "startedAt", "durationMs", "lastEventAt"] as const) if (!optionalNumber(value[key])) return false;
   const accounting = value.accounting;
   if (accounting !== undefined && (!object(accounting) || !["input", "output", "cacheRead", "cacheWrite", "cost"].every((key) => optionalNumber(accounting[key])))) return false;
@@ -695,8 +694,7 @@ function renderFrame(runs: readonly Run[], now: number, width: number, offset = 
               : paint(silent >= STALL_MS ? ROLE.failed : ROLE.warn, "⚠")
           } ${
             // The label is what the workflow called this agent — `reviewer #2`,
-            // `scout (api)` — where the name is the role it was built from. Two
-            // agents of one role are otherwise indistinguishable.
+            // `scout (api)` — preserving an explicit label when supplied.
             agent.label ?? agent.name
           }${
             silent === undefined
@@ -848,18 +846,15 @@ function receiptFor(run: Run, fallback?: { message?: string }): Receipt {
     agents: agents.map((agent) => ({
       id: agent.id,
       ...(agent.parentId === undefined ? {} : { parentId: agent.parentId }),
-      // What the workflow called it, falling back to the role it was built
-      // from. Two agents of one role are otherwise indistinguishable.
+      // Preserve explicit display labels.
       name: agent.label ?? agent.name,
       state: agent.state,
-      // Model and thinking level together: a role picks both, and the model
-      // name alone does not say whether it reasoned cheaply or deeply.
+      // Show both model and thinking level.
       ...(agent.model.model
         ? {
             model: `${agent.model.model}${agent.model.thinking ? `:${agent.model.thinking}` : ""}`,
           }
         : {}),
-      ...(agent.role ? { role: agent.role } : {}),
       ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}),
       tools: [...agent.tools],
       // Cache reads dwarf real input and cost almost nothing, so the split is
@@ -947,7 +942,6 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
 
       const under = `${prefix}${lastAgent ? "  " : "│ "}   `;
       const meta = [
-        agent.role ? `role ${agent.role}` : "",
         agent.requestedModel && agent.requestedModel !== agent.model
           ? `via ${agent.requestedModel}`
           : "",

@@ -12,7 +12,7 @@ function fixture(t: TestContext) {
   const globalSettingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
   const projectPaths = [join(cwd, ".pi", "pi-ext-roles", "settings.json"), join(cwd, ".pi", "pi-extensible-workflows", "settings.json")];
   for (const [path, settings] of [
-    [join(agentDir, "pi-ext-roles", "settings.json"), { modelAliases: { shared: "shared/model", overridden: "shared/model" } }],
+    [join(agentDir, "pi-ext-roles", "settings.json"), { modelAliases: { overridden: "shared/model" } }],
     [globalSettingsPath, { backgroundWidget: false, modelAliases: { overridden: "workflow/model", consumer: "workflow/model" } }],
     ...projectPaths.map((path) => [path, { modelAliases: { project: "project/model" } }] as const),
   ] as const) {
@@ -31,17 +31,17 @@ function fixture(t: TestContext) {
   return { home, agentDir, cwd, globalSettingsPath, projectPaths };
 }
 
-void test("host initialization registers shared global aliases and workflow overrides without project trust", (t) => {
+void test("host initialization registers workflow aliases independently without project trust", (t) => {
   const { home, agentDir, cwd, globalSettingsPath, projectPaths } = fixture(t);
   // Invalid project JSON proves initialization and untrusted routing never read either project file.
   for (const path of projectPaths) writeFileSync(path, "{");
   type Definition = { provider: string; id: string; route: (request: { thinkingLevel: string }, ctx: unknown) => { model: unknown; thinkingLevel: string } };
   const definitions: Definition[] = [];
   workflowExtension(Object.assign(testExtensionApi(), { registerVirtualModel: (definition: Definition) => { definitions.push(definition); } }), home, undefined, undefined, agentDir);
-  assert.deepEqual(definitions.map(({ provider, id }) => `${provider}/${id}`).sort(), ["workflow/consumer", "workflow/overridden", "workflow/shared"]);
+  assert.deepEqual(definitions.map(({ provider, id }) => `${provider}/${id}`).sort(), ["workflow/consumer", "workflow/overridden"]);
   const shared = { provider: "shared", id: "model" }, consumer = { provider: "workflow", id: "model" };
   const ctx = { cwd, isProjectTrusted: () => false, modelRegistry: { getAll: () => [shared, consumer], find: (provider: string, id: string) => [shared, consumer].find((model) => model.provider === provider && model.id === id) } };
-  assert.deepEqual(definitions.find(({ id }) => id === "shared")?.route({ thinkingLevel: "high" }, ctx), { model: shared, thinkingLevel: "high" });
+  assert.equal(definitions.find(({ id }) => id === "shared"), undefined);
   assert.deepEqual(definitions.find(({ id }) => id === "overridden")?.route({ thinkingLevel: "low" }, ctx), { model: consumer, thinkingLevel: "low" });
   assert.equal(resolveWorkflowSettings(cwd, false, globalSettingsPath).effective.backgroundWidget, false);
 });
@@ -54,8 +54,8 @@ void test("context-free public catalogs compose global aliases without project r
   assert.equal(explicitBefore.modelAliases?.project, "project/model");
   for (const path of projectPaths) writeFileSync(path, "{");
   for (const catalog of [workflowCatalog(), workflowCatalogIndex()]) {
-    assert.deepEqual(catalog.modelAliases, { shared: "shared/model", overridden: "workflow/model", consumer: "workflow/model" });
-    assert.deepEqual(catalog.modelAliasEntries?.map(({ name, kind, provenance }) => ({ name, kind, provenance })), ["consumer", "overridden", "shared"].map((name) => ({ name, kind: "static", provenance: "global settings" })));
+    assert.deepEqual(catalog.modelAliases, { overridden: "workflow/model", consumer: "workflow/model" });
+    assert.deepEqual(catalog.modelAliasEntries?.map(({ name, kind, provenance }) => ({ name, kind, provenance })), ["consumer", "overridden"].map((name) => ({ name, kind: "static", provenance: "global settings" })));
     assert.equal(Object.getOwnPropertyDescriptor(catalog, "modelAliases")?.enumerable, false);
     assert.equal(Object.isFrozen(catalog.modelAliases), true);
     assert.deepEqual(Object.keys(catalog).sort(), ["functions", "modelAliasEntries"]);

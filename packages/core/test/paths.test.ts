@@ -43,8 +43,8 @@ void test("canonical paths resolve portable symlink aliases and missing descenda
 void test("physical path identity has one canonicalization owner", async () => {
   const sources = await Promise.all(identitySources.map((path) => readFile(path, "utf8")));
   const pathsSource = sources[0] ?? "";
-  assert.match(pathsSource, /export \{ canonicalPath, extensionIdentity, sameFilesystemPath \} from "@piewf\/pi-ext-roles\/paths";/);
-  assert.doesNotMatch(pathsSource, /realpathSync|export function (?:canonicalPath|sameFilesystemPath)\(/);
+  assert.match(pathsSource, /export function canonicalPath\(/);
+  for (const source of sources.slice(1)) assert.doesNotMatch(source, /realpathSync|export function (?:canonicalPath|sameFilesystemPath)\(/);
   for (const source of sources) assert.doesNotMatch(source, /function\s+(?:canonicalSourcePath|canonicalRoleDirectory|canonical)\s*\(/);
   assert.doesNotMatch(sources[5] ?? "", /realpathSync/);
 });

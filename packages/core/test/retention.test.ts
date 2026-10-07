@@ -9,7 +9,7 @@ import { testExtensionApi } from "./support.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = 1_000_000_000_000;
-const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "retention" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "retention" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
 const roots = new Set<string>();
 
 test.afterEach(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); roots.clear(); });

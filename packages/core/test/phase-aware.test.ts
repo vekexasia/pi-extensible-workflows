@@ -34,7 +34,7 @@ function run(state: PersistedRun["state"], agents: readonly AgentRecord[] = [], 
 }
 
 function snapshot(phases?: readonly string[]) {
-  return createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "phases" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], ...(phases ? { phases } : {}), schemas: [] });
+  return createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "phases" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, ...(phases ? { phases } : {}), schemas: [] });
 }
 
 
@@ -89,7 +89,7 @@ void test("phase agent counts are explicit for every state", () => {
 });
 
 void test("phase launch metadata is optional, immutable, and survives old snapshot reloads", async () => {
-  const checked = preflight("phase('build'); phase('build'); return true;", { models: new Set(["openai/gpt"]), tools: new Set(), agentTypes: new Set() });
+  const checked = preflight("phase('build'); phase('build'); return true;", { models: new Set(["openai/gpt"]), tools: new Set(), });
   assert.deepEqual(checked.referenced.phases, ["build", "build"]);
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-phase-snapshot-"));
   const cwd = join(home, "repo");

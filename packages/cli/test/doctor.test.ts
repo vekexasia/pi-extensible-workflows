@@ -1,26 +1,22 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
-import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { collectRoleContributions, registerRoleContribution } from "@piewf/pi-ext-roles";
 
-function contributedRoles(owner: string, paths: string[], builtin = false) {
-  const bus = createEventBus();
-  registerRoleContribution({ events: bus }, { owner, extension: { version: "1.0.0", headline: "Role package" }, roleDirectories: paths.map(path => ({ path, scope: builtin ? "builtin" : "extension" })) });
-  return collectRoleContributions(bus, [owner]);
-}
+
+
+
 
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorPiState } from "../src/doctor.js";
-import { portableEngineVersion, writePortableWorkflowBundle } from "../src/bundles.js";
-import { formatWorkflowCliHelp, parseDoctorArgs, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
-import { registerWorkflowExtension, resetWorkflowRegistry, resolveWorkflowSettings, workflowProjectSettingsPath, workflowSettingsPath, WorkflowRegistry } from "pi-extensible-workflows";
-import { roleProjectSettingsPath, roleSettingsPath } from "@piewf/pi-ext-roles/settings";
-import { cliTestErrorOutput, isCliTestBundleExtension, isCliTestBundleModule, readCliTestBundleState, readCliTestManifest, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
+import { writePortableWorkflowBundle } from "../src/bundles.js";
+import { formatWorkflowCliHelp, parseDoctorCleanupArgs, parseScriptWorkflowCliArgs, parseWorkflowCliArgs, runCli } from "../src/cli.js";
+import { WorkflowRegistry } from "pi-extensible-workflows";
+
+import { isCliTestBundleExtension, isCliTestBundleModule, readCliTestPackageMetadata, writeCliTestExtensionSource, type CliTestBundleExtension } from "./support.js";
 import { registerCliExtension } from "./fixtures/cli-workflow-extension.js";
 
 function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
@@ -35,12 +31,7 @@ function pi(overrides: Partial<DoctorPiState> = {}): DoctorPiState {
   };
 }
 
-function configureRoleInspection(paths: ReturnType<typeof fixture>): (cwd: string, agentDir: string) => Promise<DoctorPiState> {
-  writeFileSync(join(paths.agentDir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "local-fixture" } }));
-  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
-  writeFileSync(join(paths.agentDir, "trust.json"), JSON.stringify({ [realpathSync(paths.cwd)]: true }));
-  return async () => pi({ knownModels: ["fixture/fixture-model"], availableModels: ["fixture/fixture-model"], model: { provider: "fixture", model: "fixture-model" } });
-}
+
 
 function fixture(): { root: string; cwd: string; agentDir: string; settingsPath: string } {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-doctor-")));
@@ -103,35 +94,32 @@ void test("doctor reports extension validator diagnostics", async () => {
   assert.match(invalid.message, /acme\.enabled/);
   assert.equal(doctorExitCode(report), 1);
 });
-void test("doctor discovers per-file symlinked role files", async () => {
+
+void test("doctor rejects invalid settings introduced by agent preparation", async (t) => {
   const paths = fixture();
-  const target = join(paths.root, "source-role.md");
-  const link = join(paths.agentDir, "pi-extensible-workflows", "roles", "linked.md");
-  writeFileSync(target, "---\ndescription: Linked role\n---\nLinked body");
-  symlinkSync(target, link);
-  symlinkSync(join(paths.root, "missing-role.md"), join(paths.agentDir, "pi-extensible-workflows", "roles", "dangling.md"));
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "sibling.md"), "Sibling role");
-  const report = await withHome(paths.root, () => doctor({ ...paths, role: "linked", discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }));
-  const role = report.roles.find(({ name, scope }) => name === "linked" && scope === "global");
-  assert.ok(role);
-  assert.equal(role.path, link);
-  assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_NOT_FOUND"), false);
-  assert.ok(report.roles.some(({ name, scope }) => name === "sibling" && scope === "global"));
+  t.after(() => { rmSync(paths.root, { recursive: true, force: true }); });
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Guard", validateSettings: (settings) => {
+    if (settings.guard !== undefined) throw new Error("guard.invalid is forbidden");
+  }, agentPreparationHooks: { invalid: { prepare(configuration) { configuration.settings = { ...configuration.settings, guard: { invalid: true } }; } } } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, agentOptions: {}, discoverPi: async () => pi({ model: { provider: "openai-codex", model: "gpt-5.6-sol" }, knownModels: ["openai-codex/gpt-5.6-sol"], availableModels: ["openai-codex/gpt-5.6-sol"] }) }));
+  assert.equal(report.agentInspection, undefined);
+  assert.ok(report.diagnostics.some(({ code, message }) => code === "AGENT_INSPECTION" && /guard.invalid is forbidden/.test(message)));
+  assert.equal(doctorExitCode(report), 1);
 });
-void test("doctor discovers Pi through local auth, models, and trust fixtures", async () => {
+
+void test("doctor keeps unknown JSON options out of internal execution controls", async (t) => {
   const paths = fixture();
-  writeFileSync(join(paths.cwd, ".pi", "settings.json"), "{}");
-  writeFileSync(join(paths.agentDir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "local-fixture" } }));
-  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
-  writeFileSync(join(paths.agentDir, "trust.json"), JSON.stringify({ [realpathSync(paths.cwd)]: true }));
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "local.md"), "---\nmodel: fixture/fixture-model:medium\n---\nLocal role");
-  const before = readdirSync(paths.root, { recursive: true }).map(String).sort();
-  const report = await withHomeAndCwd(paths.root, paths.cwd, () => doctor(paths));
-  const after = readdirSync(paths.root, { recursive: true }).map(String).sort();
-  assert.deepEqual(after, before);
-  assert.deepEqual(report.trust, { required: true, trusted: true, source: "saved Pi trust decision" });
-  assert.deepEqual(report.roles.filter(({ scope }) => scope !== "extension").map(({ name, scope, active }) => ({ name, scope, active })), [{ name: "local", scope: "project", active: true }]);
-  assert.equal(report.diagnostics.some(({ code }) => code === "PI_DISCOVERY" || code.startsWith("MODEL_")), false);
+  t.after(() => { rmSync(paths.root, { recursive: true, force: true }); });
+  const agentOptions = { projectTrusted: false, capabilities: { tools: [], skills: [], extensions: [] }, configuration: { invalid: true } };
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Observe", agentPreparationHooks: { observe: { prepare(_configuration, context) {
+    assert.equal(context.projectTrusted, true);
+    assert.deepEqual(context.options, agentOptions);
+  } } } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, agentOptions, discoverPi: async () => pi({ model: { provider: "openai-codex", model: "gpt-5.6-sol" }, knownModels: ["openai-codex/gpt-5.6-sol"], availableModels: ["openai-codex/gpt-5.6-sol"] }) }));
+  assert.deepEqual(report.diagnostics, []);
+  assert.ok(report.agentInspection);
   assert.equal(doctorExitCode(report), 0);
 });
 
@@ -153,82 +141,6 @@ void test("doctor reports malformed auth and trust discovery diagnostics", async
     assert.match(discovery.message, message, file);
     assert.equal(doctorExitCode(report), 1, file);
   }
-});
-
-void test("doctor reports role errors, warnings, overrides, and extension failures", async () => {
-  const paths = fixture();
-  mkdirSync(join(paths.cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-  writeFileSync(join(paths.cwd, ".pi", "piworkflows", "roles", "old-project.md"), "Ignored old project role");
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "override.md"), "Global role");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"), "Project role");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "tool-typo.md"), "---\ntools: [read, cat]\n---\nCheck tools");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "thinking.md"), "---\nthinking: hihg\n---\nThink");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "malformed-model.md"), "---\nmodel: gpt-5\n---\nModel");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "unavailable-model.md"), "---\nmodel: other/model:high\n---\nModel");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty.md"), "---\ntools: [read]\n---\n");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "placeholder.md"), "Use {{tools}} here");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-frontmatter.md"), "---\n---\nBody");
-
-  const report = await withHome(paths.root, () => doctor({ ...paths, activeTools: ["read"], discoverPi: async () => pi({ activeTools: ["cat"], extensionErrors: [{ path: "/bad-extension.ts", message: "load failed" }] }) }));
-  const codes = report.diagnostics.map(({ code }) => code);
-  assert.ok(codes.includes("ROLE_TOOL_INACTIVE"));
-  assert.equal(report.diagnostics.find(({ code }) => code === "ROLE_TOOL_INACTIVE")?.severity, "warning");
-  assert.ok(codes.includes("ROLE_FRONTMATTER"));
-  assert.ok(codes.includes("MODEL_INVALID"));
-  assert.ok(codes.includes("MODEL_UNAVAILABLE"));
-  assert.ok(codes.includes("ROLE_BODY_EMPTY"));
-  assert.ok(codes.includes("ROLE_PLACEHOLDER"));
-  assert.ok(codes.includes("EXTENSION_LOAD"));
-  assert.ok(!report.diagnostics.some(({ source }) => source?.endsWith("empty-frontmatter.md")));
-  assert.ok(!report.roles.some(({ name }) => name === "old-project"));
-  const project = report.roles.find((role) => role.name === "override" && role.scope === "project");
-  const global = report.roles.find((role) => role.name === "override" && role.scope === "global");
-  assert.ok(project);
-  assert.ok(global);
-  assert.equal(project.overrides, join(paths.agentDir, "pi-extensible-workflows", "roles", "override.md"));
-  assert.equal(global.overriddenBy, join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "override.md"));
-  assert.equal(global.active, false);
-  assert.equal(doctorExitCode(report), 1);
-  assert.match(formatDoctorReport(report), /Fix: Doctor cannot see tools that extensions add when a session starts/);
-});
-
-void test("doctor validates role tool selectors like runtime", async () => {
-  const paths = fixture();
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "selectors.md"), "---\ntools: [\"!*\", \"r*\", read, cat]\n---\nInspect selectors");
-  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ activeTools: ["read"] }) }));
-  assert.deepEqual(report.diagnostics.filter(({ code, source }) => code === "ROLE_TOOL_INACTIVE" && source?.endsWith("selectors.md")).map(({ severity, message }) => `${severity}: ${message}`), ["warning: Tool is not in Pi's headless active tool list: cat"]);
-  assert.equal(doctorExitCode(report), 0);
-});
-
-void test("doctor checks usage only for effective roles but parses overridden files", async () => {
-  const paths = fixture();
-  const overriddenReviewer = join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md");
-  const effectiveReviewer = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md");
-  const overriddenScout = join(paths.agentDir, "pi-extensible-workflows", "roles", "scout.md");
-  const effectiveScout = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "scout.md");
-  writeFileSync(overriddenReviewer, "---\nmodel: gpt-5\ntools: [missing-tool]\nextensionSettings:\n  acme:\n    invalid: true\n---\n");
-  writeFileSync(effectiveReviewer, "---\ntools: [missing-effective-tool]\nextensionSettings:\n  acme:\n    invalid: true\n---\nReview");
-  writeFileSync(overriddenScout, "---\nmodel: [broken\n---\nInvalid overridden frontmatter");
-  writeFileSync(effectiveScout, "Valid effective scout");
-  const registry = new WorkflowRegistry();
-  registry.register({ version: "1.0.0", headline: "Role settings", validateSettings: (_settings, context) => { if (context.source === "role" && context.settingsPath !== undefined && [overriddenReviewer, effectiveReviewer].includes(context.settingsPath)) throw new Error("role settings invalid"); } });
-  const report = await withHome(paths.root, () => doctor({ ...paths, registry, discoverPi: async () => pi({ activeTools: ["read"] }) }));
-  assert.equal(report.diagnostics.some(({ code, source }) => source === overriddenReviewer && ["ROLE_TOOL_INACTIVE", "MODEL_INVALID", "MODEL_UNAVAILABLE", "ROLE_BODY_EMPTY"].includes(code)), false);
-  assert.equal(report.diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === `${overriddenReviewer}.extensionSettings`), false);
-  assert.ok(report.diagnostics.some(({ code, source }) => code === "ROLE_TOOL_INACTIVE" && source === effectiveReviewer));
-  assert.ok(report.diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === `${effectiveReviewer}.extensionSettings`));
-  assert.ok(report.diagnostics.some(({ code, source }) => code === "ROLE_FRONTMATTER" && source === overriddenScout));
-  assert.ok(report.diagnostics.some(({ code }) => code === "ROLE_LOAD_BLOCKED"));
-});
-
-void test("doctor rejects invalid role descriptions", async () => {
-  const paths = fixture();
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-description.md"), "---\ndescription: ''\n---\nRole");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "long-description.md"), `---\ndescription: ${"x".repeat(1025)}\n---\nRole`);
-  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi() }));
-  const sources = report.diagnostics.filter(({ code }) => code === "ROLE_FRONTMATTER").map(({ source }) => source);
-  assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "empty-description.md")));
-  assert.ok(sources.includes(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "long-description.md")));
 });
 void test("doctor reports every registered function", async () => {
   const paths = fixture();
@@ -253,229 +165,11 @@ void test("doctor reports dynamic model alias provenance", async () => {
   assert.deepEqual(report.modelAliases, [{ name: "reviewer", kind: "dynamic", provenance: "extension: Model policy", version: "1.0.0", headline: "Model policy" }]);
   assert.match(formatDoctorReport(report), /\[dynamic\] `reviewer` \(extension: Model policy\)/);
 });
-void test("doctor accepts role files using unshadowed dynamic model aliases without resolving them", async () => {
-  const paths = fixture();
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: policy-model\n---\nReview");
-  const registry = new WorkflowRegistry();
-  let calls = 0;
-  registry.register({ version: "1.0.0", headline: "Model policy", modelAliases: { "policy-model": { resolve: () => { calls += 1; return "openai/gpt"; } } } });
-  const report = await withHome(paths.root, () => doctor({ ...paths, registry, discoverPi: async () => pi() }));
-  assert.equal(calls, 0);
-  assert.equal(report.diagnostics.some(({ code }) => code === "MODEL_INVALID" || code === "MODEL_UNAVAILABLE"), false);
-  assert.equal(doctorExitCode(report), 0);
-});
-void test("doctor leaves static settings aliases shadowing dynamic aliases", async () => {
-  const paths = fixture();
-  writeFileSync(paths.settingsPath, JSON.stringify({ modelAliases: { "policy-model": "other/model" } }));
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: policy-model\n---\nReview");
-  const registry = new WorkflowRegistry();
-  let calls = 0;
-  registry.register({ version: "1.0.0", headline: "Model policy", modelAliases: { "policy-model": { resolve: () => { calls += 1; return "openai/gpt"; } } } });
-  const report = await withHome(paths.root, () => doctor({ ...paths, registry, discoverPi: async () => pi() }));
-  assert.equal(calls, 0);
-  assert.equal(report.diagnostics.some(({ code }) => code === "MODEL_INVALID"), false);
-  assert.ok(report.diagnostics.some(({ code }) => code === "MODEL_UNAVAILABLE"));
-});
 void test("doctor reports registered functions without model availability probes", async () => {
   const paths = fixture();
   const functions: DoctorPiState["functions"] = { unavailable: { description: "unavailable model", input: { type: "object" }, output: { type: "string" }, run: () => "ok" } };
   const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ availableModels: [], functions }) }));
   assert.equal(report.functions.find(({ name }) => name === "unavailable")?.valid, true);
-});
-void test("role-targeted doctor inspects effective resources and prepares hooks without provider execution", async () => {
-  const paths = fixture();
-  writeFileSync(join(paths.cwd, ".pi", "settings.json"), "{}");
-  writeFileSync(join(paths.agentDir, "auth.json"), JSON.stringify({ fixture: { type: "api_key", key: "local-fixture" } }));
-  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", reasoning: true, input: ["text"], contextWindow: 1_024, maxTokens: 128 }, { id: "override-model", name: "Override model", reasoning: true, input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
-  writeFileSync(join(paths.agentDir, "trust.json"), JSON.stringify({ [realpathSync(paths.cwd)]: true }));
-  mkdirSync(join(paths.agentDir, "skills", "review-skill"), { recursive: true });
-  writeFileSync(join(paths.agentDir, "skills", "review-skill", "SKILL.md"), "---\nname: review-skill\ndescription: Review\n---\nReview skill");
-  mkdirSync(join(paths.agentDir, "skills", "invalid_skill"), { recursive: true });
-  writeFileSync(join(paths.agentDir, "skills", "invalid_skill", "SKILL.md"), "---\ndescription: Invalid name fixture\n---\nInvalid skill");
-  mkdirSync(join(paths.agentDir, "extensions"), { recursive: true });
-  const shutdownMarker = join(paths.root, "doctor-shutdown.marker");
-  writeFileSync(join(paths.agentDir, "extensions", "doctor-hook.ts"), `import { appendFileSync } from "node:fs"; export default (pi) => { pi.on('before_agent_start', (event) => ({ systemPrompt: event.systemPrompt + '\\nHOOK:' + event.prompt })); pi.on('session_shutdown', async () => { await new Promise((resolve) => setTimeout(resolve, 25)); appendFileSync(${JSON.stringify(shutdownMarker)}, 'shutdown'); }); };
-`);
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: fixture/fixture-model:high\ntools: [read, grep]\nskills: [\"*\", \"!review-skill\"]\nextensions: [\"**/*\", \"!missing-extension\"]\n---\nReview role");
-  const registry = new WorkflowRegistry();
-  registry.register({ version: "1.0.0", headline: "Doctor setup", agentSetupHooks: { adjust: { setup(agent, context) { assert.equal(context.mode, "inspection"); assert.equal(agent.prepared.model.model, "fixture-model"); assert.equal(agent.prepared.model.thinking, "high"); agent.options.model = "fixture/override-model:low"; agent.options.tools = ["grep"]; } } } });
-  const report = await withHomeAndCwd(paths.root, paths.cwd, () => doctor({ ...paths, role: "reviewer", registry, discoverPi: async () => pi({ activeTools: ["read", "grep"], knownModels: ["fixture/fixture-model", "fixture/override-model"], availableModels: ["fixture/fixture-model", "fixture/override-model"], model: { provider: "fixture", model: "fixture-model", thinking: "medium" } }) }));
-  const inspection = report.roleInspection;
-  assert.ok(inspection);
-  assert.equal(inspection.model.model, "override-model");
-  assert.notEqual(inspection.model.inherited, true);
-  assert.equal(inspection.model.thinking, "low");
-  assert.ok(inspection.resources.skills.includes("invalid_skill"));
-  const invalidSkillDiagnostic = report.diagnostics.find(({ message }) => message.includes("invalid characters"));
-  assert.ok(invalidSkillDiagnostic);
-  assert.equal(invalidSkillDiagnostic.severity, "warning");
-  assert.equal(invalidSkillDiagnostic.source, join(paths.agentDir, "skills", "invalid_skill", "SKILL.md"));
-  assert.equal(inspection.resources.skills.includes("review-skill"), false);
-  assert.deepEqual(inspection.resources.unmatchedExtensions, [`!${join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "missing-extension")}`]);
-  assert.ok(inspection.setup.hooks.includes("adjust"));
-  assert.ok(inspection.setup.diagnostics.every(({ severity }) => severity !== "error"), JSON.stringify(report.diagnostics));
-  assert.ok(inspection.systemPrompt.text.includes("HOOK:"));
-  assert.match(inspection.systemPrompt.text, /Review role/);
-  assert.equal(report.diagnostics.some(({ code, severity }) => code === "ROLE_INSPECTION" && severity === "error"), false);
-  assert.equal(readFileSync(shutdownMarker, "utf8"), "shutdown");
-  assert.equal(doctorExitCode(report), 0);
-  const formatted = formatDoctorReport(report);
-  assert.match(formatted, /## Role inspection/);
-  for (const heading of ["## Environment", "## Trust/resources", "## Workflow agent resource selectors", "## Active tools", "## Roles", "## Model aliases", "## Reusable functions"]) assert.doesNotMatch(formatted, new RegExp(heading));
-  assert.match(formatted, /Role: `reviewer`/);
-  assert.match(formatted, /- Tools:\n[ ]{2}- `grep`/);
-  assert.match(formatted, /- Role skill selectors:\n[ ]{2}- `\*`\n[ ]{2}- `!review-skill`/);
-  assert.match(formatted, /- Effective skills:\n(?:[ ]{2}- .+\n)+/);
-  assert.match(formatted, /- Effective extensions:\n(?:[ ]{2}- .+\n)+/);
-  assert.match(formatted, /- Applied setup hooks:\n[ ]{2}- `adjust`/);
-  assert.match(formatted, /Final system prompt[\s\S]*HOOK:/);
-  let jsonOutput = "";
-  assert.equal(await withHomeAndCwd(paths.root, paths.cwd, () => runCli(["doctor", "--role", "reviewer", "--json"], { ...paths, registry, discoverPi: async () => pi({ activeTools: ["read", "grep"], knownModels: ["fixture/fixture-model", "fixture/override-model"], availableModels: ["fixture/fixture-model", "fixture/override-model"], model: { provider: "fixture", model: "fixture-model", thinking: "medium" } }) }, (text) => { jsonOutput += text; })), 0);
-  const jsonReport = JSON.parse(jsonOutput) as { roleTarget: string; roleInspection: { role: string; model: { model: string } } };
-  assert.equal(jsonReport.roleTarget, "reviewer");
-  assert.equal(jsonReport.roleInspection.role, "reviewer");
-  assert.equal(jsonReport.roleInspection.model.model, "override-model");
-  let positionalOutput = "";
-  assert.equal(await withHomeAndCwd(paths.root, paths.cwd, () => runCli(["doctor", "reviewer", "--json"], { ...paths, registry, discoverPi: async () => pi({ activeTools: ["read", "grep"], knownModels: ["fixture/fixture-model", "fixture/override-model"], availableModels: ["fixture/fixture-model", "fixture/override-model"], model: { provider: "fixture", model: "fixture-model", thinking: "medium" } }) }, (text) => { positionalOutput += text; })), 0);
-  const positionalReport = JSON.parse(positionalOutput) as { roleTarget: string; roleInspection: { path: string } };
-  assert.equal(positionalReport.roleTarget, "reviewer");
-  assert.equal(positionalReport.roleInspection.path, join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"));
-});
-void test("doctor reports a discovered role's diagnostics once when targeted by path", async () => {
-  const paths = fixture();
-  const roleName = "dedupe-path-regression-unique";
-  const rolePath = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", `${roleName}.md`);
-  writeFileSync(rolePath, "---\ntools: [cat]\n---\n");
-  const registry = new WorkflowRegistry();
-  registry.register({ version: "1.0.0", headline: "Role settings", validateSettings: (_settings, context) => { if (context.source === "role" && context.role === roleName) throw new Error("role settings invalid"); } });
-  let output = "";
-  await withHome(paths.root, () => runCli(["doctor", rolePath, "--json"], { ...paths, registry, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; }));
-  const report = JSON.parse(output) as { diagnostics: readonly { code: string; source?: string }[] };
-  for (const code of ["ROLE_TOOL_INACTIVE", "ROLE_BODY_EMPTY"]) {
-    assert.equal(report.diagnostics.filter((item) => item.code === code && item.source === rolePath).length, 1, code);
-  }
-  assert.equal(report.diagnostics.filter(({ code, source }) => code === "SETTINGS_INVALID" && source === `${rolePath}.extensionSettings`).length, 1);
-});
-void test("doctor inspects an external absolute role file before installation", async () => {
-  const paths = fixture();
-  const discoverPi = configureRoleInspection(paths);
-  const rolePath = join(paths.root, "pre-install.md");
-  writeFileSync(rolePath, "---\ndescription: Local role\n---\nInspect this local role");
-  let output = "";
-  let errors = "";
-  const status = await withHome(paths.root, () => runCli(["doctor", rolePath, "--json"], { ...paths, discoverPi, stderr: (text) => { errors += text; } }, (text) => { output += text; }));
-  assert.equal(status, 0, errors);
-  assert.equal(errors, "");
-  const report = JSON.parse(output) as { roleTarget: string; roleInspection: { role: string; path: string; systemPrompt: { text: string } }; diagnostics: readonly { code: string }[] };
-  assert.equal(report.roleTarget, rolePath);
-  assert.equal(report.roleInspection.role, "pre-install");
-  assert.equal(report.roleInspection.path, rolePath);
-  assert.match(report.roleInspection.systemPrompt.text, /Inspect this local role/);
-  assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_NOT_FOUND"), false);
-});
-void test("doctor resolves a relative role file from the selected cwd", async () => {
-  const paths = fixture();
-  const discoverPi = configureRoleInspection(paths);
-  writeFileSync(join(paths.cwd, "pre-install.md"), "---\ndescription: Local role\n---\nRelative local role");
-  let output = "";
-  const status = await withHome(paths.root, () => runCli(["doctor", "pre-install.md"], { ...paths, discoverPi }, (text) => { output += text; }));
-  assert.equal(status, 0);
-  assert.ok(output.includes(`Role: \`pre-install\` - \`${join(paths.cwd, "pre-install.md")}\``));
-  assert.match(output, /Relative local role/);
-});
-void test("doctor reports a symlinked role file by the requested path", async () => {
-  const paths = fixture();
-  const discoverPi = configureRoleInspection(paths);
-  const target = join(paths.root, "source.md");
-  const link = join(paths.root, "reviewer.md");
-  writeFileSync(target, "---\ndescription: Linked role\n---\nLinked body");
-  symlinkSync(target, link);
-  let output = "";
-  const status = await withHome(paths.root, () => runCli(["doctor", link, "--json"], { ...paths, discoverPi }, (text) => { output += text; }));
-  const report = JSON.parse(output) as { roleTarget: string; roleInspection: { role: string; path: string } };
-  assert.equal(status, 0);
-  assert.equal(report.roleTarget, link);
-  assert.equal(report.roleInspection.role, "reviewer");
-  assert.equal(report.roleInspection.path, link);
-});
-void test("doctor reports missing, non-file, and invalid external role paths", async () => {
-  const paths = fixture();
-  const discoverPi = configureRoleInspection(paths);
-  const directory = join(paths.root, "role-directory.md");
-  mkdirSync(directory);
-  const invalid = join(paths.root, "invalid.md");
-  writeFileSync(invalid, "---\ndescription: [broken\n---\nInvalid role");
-  let missingOutput = "";
-  const missingStatus = await withHome(paths.root, () => runCli(["doctor", "./missing.md", "--json"], { ...paths, discoverPi }, (text) => { missingOutput += text; }));
-  const missingReport = JSON.parse(missingOutput) as { roleTarget: string; diagnostics: readonly { code: string; source?: string; message: string }[] };
-  assert.equal(missingStatus, 1);
-  assert.equal(missingReport.roleTarget, "./missing.md");
-  assert.ok(missingReport.diagnostics.some(({ code, source, message }) => code === "ROLE_FILE_NOT_FOUND" && source === join(paths.cwd, "missing.md") && /not found/.test(message)));
-  let directoryOutput = "";
-  const directoryStatus = await withHome(paths.root, () => runCli(["doctor", directory, "--json"], { ...paths, discoverPi }, (text) => { directoryOutput += text; }));
-  const directoryReport = JSON.parse(directoryOutput) as { diagnostics: readonly { code: string }[] };
-  assert.equal(directoryStatus, 1);
-  assert.ok(directoryReport.diagnostics.some(({ code }) => code === "ROLE_FILE_NOT_FOUND"));
-  let invalidOutput = "";
-  const invalidStatus = await withHome(paths.root, () => runCli(["doctor", "--role", invalid, "--json"], { ...paths, discoverPi }, (text) => { invalidOutput += text; }));
-  const invalidReport = JSON.parse(invalidOutput) as { diagnostics: readonly { code: string; source?: string }[] };
-  assert.equal(invalidStatus, 1);
-  assert.ok(invalidReport.diagnostics.some(({ code, source }) => code === "ROLE_FRONTMATTER" && source === invalid));
-});
-void test("role-targeted doctor preserves role-not-found diagnostics in focused output", async () => {
-  const paths = fixture();
-  const report = await withHome(paths.root, () => doctor({ ...paths, role: "missing", discoverPi: async () => pi() }));
-  const formatted = formatDoctorReport(report);
-  assert.equal(report.roleInspection, undefined);
-  assert.match(formatted, /## Role inspection/);
-  assert.match(formatted, /Role: `missing`/);
-  assert.match(formatted, /ROLE_NOT_FOUND/);
-  assert.match(formatted, /1 error\(s\), 0 warning\(s\)/);
-  for (const heading of ["## Environment", "## Trust/resources", "## Active tools", "## Roles", "## Model aliases", "## Reusable functions"]) assert.doesNotMatch(formatted, new RegExp(heading));
-});
-
-void test("doctor respects untrusted projects and does not mutate fixtures", async () => {
-  const paths = fixture();
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "same.md"), "Global");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "same.md"), "---\ntools: [cat]\ndisabledAgentResources: {}\n---\nProject");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ disabledAgentResources: {} }));
-  const before = readdirSync(paths.root, { recursive: true }).map(String).sort();
-  const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ trust: { required: true, trusted: false, source: "saved Pi trust decision" } }) }));
-  const after = readdirSync(paths.root, { recursive: true }).map(String).sort();
-  assert.deepEqual(after, before);
-  assert.ok(report.diagnostics.some(({ code }) => code === "PROJECT_UNTRUSTED"));
-  assert.ok(!report.diagnostics.some(({ code, source }) => code === "ROLE_TOOL_INACTIVE" && source?.startsWith(paths.cwd)));
-  assert.equal(report.roles.find((role) => role.scope === "project")?.active, false);
-  assert.equal(report.diagnostics.some(({ code }) => code === "AGENT_RESOURCE_SELECTOR_MIGRATION"), false);
-  assert.equal(doctorExitCode(report), 0);
-});
-void test("doctor reports errors for legacy agent resource selectors in active settings and roles", async () => {
-  const paths = fixture();
-  const globalSettings = join(paths.agentDir, "pi-extensible-workflows", "settings.json");
-  const projectSettings = join(paths.cwd, ".pi", "pi-extensible-workflows", "settings.json");
-  const globalRole = join(paths.agentDir, "pi-extensible-workflows", "roles", "global.md");
-  const projectRole = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "project.md");
-  const directRole = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "direct.md");
-  writeFileSync(globalSettings, JSON.stringify({ disabledAgentResources: {} }));
-  writeFileSync(projectSettings, JSON.stringify({ disabledAgentResources: { skills: [], extensions: [] } }));
-  writeFileSync(globalRole, "---\ndisabledAgentResources: {}\n---\nGlobal role");
-  writeFileSync(projectRole, "---\ndisabledAgentResources:\n  skills: []\n  extensions: []\n---\nProject role");
-  writeFileSync(directRole, "---\nskills: []\nextensions: []\ntools: [read]\n---\nDirect selectors");
-  const report = await withHome(paths.root, () => doctor({ ...paths, settingsPath: globalSettings, discoverPi: async () => pi() }));
-  const migrations = report.diagnostics.filter(({ code }) => code === "AGENT_RESOURCE_SELECTOR_MIGRATION");
-  assert.deepEqual(migrations.map(({ source }) => source).sort(), [
-    `${globalSettings}.disabledAgentResources`,
-    `${projectSettings}.disabledAgentResources`,
-    globalRole,
-    projectRole,
-  ].sort());
-  assert.ok(migrations.every(({ severity, message, hint }) => severity === "error" && message.includes("#205") && message.includes("pattern") && message.includes("skills") && message.includes("extensions") && message.includes("tools") && hint?.includes("!*")));
-  assert.ok(report.diagnostics.some(({ code, source }) => code === "SETTINGS_INVALID" && source === globalSettings));
-  assert.ok(report.diagnostics.some(({ code }) => code === "ROLE_LOAD_BLOCKED"));
-  assert.doesNotMatch(formatDoctorReport(report), /direct\.md.*AGENT_RESOURCE_SELECTOR_MIGRATION/);
-  assert.match(formatDoctorReport(report), /https:\/\/github\.com\/vekexasia\/pi-extensible-workflows\/issues\/205/);
-  assert.match(formatDoctorReport(report), /unavailable: role loading failed/);
-  assert.equal(doctorExitCode(report), 1);
 });
 void test("doctor warns when a positive-only tool selector cannot form an allow-list", async () => {
   const paths = fixture();
@@ -549,7 +243,7 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   let output = "";
   const exit = await withHome(paths.root, () => runCli(["doctor"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; }));
   assert.equal(exit, 0);
-  for (const heading of ["## Environment", "## Trust/resources", "## Pi active tools", "## Pi active extensions", "## Pi active skills", "## Workflow agent resource selectors", "## Roles", "## Reusable functions", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
+  for (const heading of ["## Environment", "## Trust/resources", "## Pi active tools", "## Pi active extensions", "## Pi active skills", "## Workflow agent resource selectors", "## Reusable functions", "## Diagnostics", "## Summary"]) assert.match(output, new RegExp(heading));
   assert.doesNotMatch(output, /## Role inspection/);
   output = "";
   assert.equal(await withHome(paths.root, () => runCli(["doctor", "--json"], { ...paths, discoverPi: async () => pi({ knownModels: [], availableModels: [] }) }, (text) => { output += text; })), 0);
@@ -562,20 +256,13 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(inspected, "session-a");
   output = "";
   assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  assert.equal(output, "Usage: piewf doctor [--agent-options <json>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   const bin = join(paths.root, "bin", "piewf");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);
   const linkedOutput = execFileSync(bin, ["doctor"], { cwd: paths.cwd, env: { ...process.env, HOME: paths.root }, encoding: "utf8" });
   assert.match(linkedOutput, /^# pi-extensible-workflows doctor/m);
   assert.equal(existsSync(join(paths.root, ".pi", "agent", "auth.json")), false);
-});
-void test("doctor parser accepts role and prompt probes", () => {
-  assert.deepEqual(parseDoctorArgs(["--role", "reviewer", "--prompt=check this", "--json"]), { role: "reviewer", prompt: "check this", json: true });
-  assert.deepEqual(parseDoctorArgs(["--json"]), { json: true });
-  assert.deepEqual(parseDoctorArgs(["reviewer"]), { role: "reviewer" });
-  assert.throws(() => parseDoctorArgs(["--role", "reviewer", "other"]), /Unexpected argument/);
-  assert.throws(() => parseDoctorArgs(["--prompt", "check this"]), /--prompt requires --role/);
 });
 void test("CLI workflow arguments cover schema types, defaults, enums, and missing values", () => {
   const schema = { type: "object", properties: { issue: { type: "integer", description: "Issue number" }, label: { type: "string" }, ratio: { type: "number" }, mode: { type: "string", enum: ["fast", "safe"] }, verbose: { type: "boolean", default: false }, format: { type: "string", default: "plain" }, tags: { type: "array", items: { type: "string", enum: ["one", "two"] } }, scores: { type: "array", items: { type: "number" } } }, required: ["issue"], additionalProperties: false };
@@ -656,6 +343,31 @@ void test("headless CLI runs a file-backed workflow through the existing runtime
   assert.match(result.stderr, /Run ID: [0-9a-f-]+/);
 });
 
+void test("headless CLI preserves inter-extension communication during shutdown on success and failure", () => {
+  for (const [script, status] of [["return true;", 0], ["throw new Error('deliberate failure');", 1]] as const) {
+    const paths = fixture();
+    try {
+      const events = join(paths.root, "lifecycle.log");
+      const listener = join(paths.agentDir, "listener.js");
+      const emitter = join(paths.agentDir, "emitter.js");
+      writeFileSync(listener, `import { appendFileSync } from 'node:fs';
+export default function(pi) { pi.events.on('cleanup-fixture', () => appendFileSync(${JSON.stringify(events)}, 'event-cleanup\\n')); }
+`);
+      writeFileSync(emitter, `import { appendFileSync } from 'node:fs';
+export default function(pi) {
+  pi.on('session_start', () => appendFileSync(${JSON.stringify(events)}, 'start\\n'));
+  pi.on('session_shutdown', () => { appendFileSync(${JSON.stringify(events)}, 'shutdown\\n'); pi.events.emit('cleanup-fixture', {}); });
+}
+`);
+      writeFileSync(join(paths.agentDir, "settings.json"), JSON.stringify({ extensions: [listener, emitter] }));
+      writeFileSync(join(paths.cwd, "workflow.js"), script);
+      const result = runIsolatedCli(paths, 'placeholder: { description: "Placeholder", input: { type: "object" }, output: { type: "boolean" }, run: () => true }', ["run", "--script", "workflow.js"]);
+      assert.equal(result.status, status, result.stderr);
+      assert.equal(readFileSync(events, "utf8"), "start\nshutdown\nevent-cleanup\n");
+    } finally { rmSync(paths.root, { recursive: true, force: true }); }
+  }
+});
+
 void test("exported launchers are executable and delegate unchanged arguments", async () => {
   registerCliExtension();
   const paths = fixture();
@@ -714,46 +426,11 @@ void test("export refuses existing files and replaces them only with --force", a
   assert.equal(await runCli(["export", "cliEcho", "--output", directory, "--force"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 1);
   assert.equal(lstatSync(directory).isDirectory(), true);
 });
-void test("export bundle forwards explicit trust override", async () => {
-  registerCliExtension();
-  const paths = fixture();
-  writeFileSync(join(paths.cwd, ".pi", "settings.json"), "{}");
-  writeFileSync(join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt:medium\n---\nReview the result");
-  const destination = join(paths.root, "bundle");
-  assert.equal(await runCli(["export", "cliEcho", "--bundle", "--approve", "--output", destination, "--role", "reviewer"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }, () => {}), 0);
-  assert.deepEqual(readCliTestManifest(join(destination, "manifest.json")).requirements.roles, ["reviewer"]);
-});
 void test("portable bundle export rejects extensions without source provenance", () => {
   const paths = fixture();
   const result = runIsolatedCli(paths, `cliEcho: { description: "Echo", input: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, output: { type: "object", properties: { issue: { type: "integer" } }, required: ["issue"], additionalProperties: false }, run: (input) => ({ issue: input.issue }) }`, ["bundle", "cliEcho", "--output", join(paths.root, "bundle")]);
   assert.equal(result.status, 1);
   assert.match(result.stderr, /not exportable; add `source: import\.meta\.url`/);
-});
-void test("portable bundle export writes a self-contained payload and external-runtime launcher", async () => {
-  registerCliExtension();
-  const paths = fixture();
-  const destination = join(paths.root, "bundle");
-  let output = "";
-  assert.equal(await runCli(["bundle", "cliEcho", "--output", destination], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }, (text) => { output += text; } ), 0);
-  const manifest = readCliTestManifest(join(destination, "manifest.json"));
-  assert.deepEqual({ format: manifest.format, version: manifest.version, command: manifest.command }, { format: "pi-extensible-workflows-bundle", version: 2, command: "cli-echo" });
-  assert.equal(manifest.workflow.name, "cliEcho");
-  assert.deepEqual(manifest.requirements, { roles: [], aliases: [], tools: [], commands: [], environment: [] });
-  assert.notEqual(manifest.runtime.pi, "");
-  assert.notEqual(manifest.runtime["@piewf/cli"], "unknown");
-  assert.equal(lstatSync(join(destination, "cli-echo")).mode & 0o111, 0o111);
-  assert.match(readFileSync(join(destination, "cli-echo"), "utf8"), /payload\/runner\.mjs/);
-  assert.match(readFileSync(join(destination, "payload", "workflow.mjs"), "utf8"), /registerWorkflowExtension/);
-  assert.match(readFileSync(join(destination, "payload", "runner.mjs"), "utf8"), /@piewf\/cli@/);
-  assert.match(output, /Run .* setup/);
-  writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt:medium\n---\nReview the result");
-  registerCliExtension();
-  const selectedDestination = join(paths.root, "selected-bundle");
-  assert.equal(await runCli(["bundle", "cliEcho", "--output", selectedDestination, "--role", "reviewer", "--command", "git", "--environment", "REVIEW_TOKEN"], { cwd: paths.cwd, agentDir: paths.agentDir, stderr: () => {} }), 0);
-  const selectedManifest = readCliTestManifest(join(selectedDestination, "manifest.json"));
-  assert.deepEqual(selectedManifest.requirements, { roles: ["reviewer"], aliases: [], tools: [], commands: ["git"], environment: ["REVIEW_TOKEN"] });
-  assert.doesNotMatch(readFileSync(join(selectedDestination, "payload", "workflow.mjs"), "utf8"), /roleDirectories:/);
-  assert.match(readFileSync(join(selectedDestination, "payload", "roles", "reviewer.md"), "utf8"), /Review the result/);
 });
 void test("CLI validates registered function output schemas", () => {
   const paths = fixture();
@@ -885,89 +562,6 @@ void test("doctor cleanup parses a positive age and confirmation flag", () => {
   assert.throws(() => parseDoctorCleanupArgs(["--older-than-days", "0"]), /positive integer/);
   assert.throws(() => parseDoctorCleanupArgs(["--older-than-days", "1.5"]), /positive integer/);
 });
-void test("doctor diagnoses extension role directories with extension provenance", async () => {
-  const paths = fixture();
-  const missing = join(paths.root, "missing-roles");
-  const empty = join(paths.root, "empty-roles");
-  const first = join(paths.root, "first-roles");
-  const second = join(paths.root, "second-roles");
-  mkdirSync(empty);
-  mkdirSync(first);
-  mkdirSync(second);
-  writeFileSync(join(first, "same.md"), "First role");
-  writeFileSync(join(first, "unique.md"), "---\ndisabledAgentResources: {}\n---\nUnique role");
-  writeFileSync(join(second, "same.md"), "Second role");
-  writeFileSync(join(second, "broken.md"), "---\ndescription: [broken\n---\nBroken");
-  const roleSources = contributedRoles(join(paths.root, "index.js"), [missing, empty, first, second]);
-  const report = await doctor({ ...paths, discoverPi: async () => pi({ roleSources }) });
-  const codes = report.diagnostics.map(({ code }) => code);
-  assert.ok(codes.includes("ROLE_DIRECTORY"));
-  assert.ok(codes.includes("ROLE_DIRECTORY_EMPTY"));
-  assert.ok(codes.includes("ROLE_DUPLICATE"));
-  assert.ok(codes.includes("ROLE_FRONTMATTER"));
-  assert.ok(report.diagnostics.every(({ message }) => !message.includes("scandir") || message.includes("Role package")));
-  assert.equal(report.roles.find(({ name, scope }) => name === "unique" && scope === "extension")?.extension?.headline, "Role package");
-  assert.ok(report.diagnostics.some(({ code, source }) => code === "AGENT_RESOURCE_SELECTOR_MIGRATION" && source === join(first, "unique.md")));
-  assert.equal(doctorExitCode(report), 1);
-  const formatted = formatDoctorReport({ ...report, diagnostics: [] });
-  assert.ok(formatted.includes(`Extension "Role package" (1.0.0) role directory "${first}"`));
-});
-void test("doctor reports regular extension roles overriding bundled starter roles", async () => {
-  const paths = fixture();
-  const regular = join(paths.root, "regular-roles");
-  const starter = join(process.cwd(), "../core/dist/starter/roles");
-  mkdirSync(regular);
-  writeFileSync(join(regular, "developer.md"), "User developer role");
-  resetWorkflowRegistry();
-  registerWorkflowExtension({
-    version: "1.0.0",
-    headline: "User roles",
-    modelAliases: Object.fromEntries(["developer", "reviewer", "scout", "oracle", "researcher"].map((name) => [`${name}-model`, { resolve: () => "openai/gpt" }])),
-  });
-  try {
-    const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi({ activeTools: ["read", "grep", "find", "ls", "bash"], roleSources: [...contributedRoles(join(paths.root, "starter.js"), [starter], true), ...contributedRoles(join(paths.root, "user.js"), [regular])] }) }));
-    const starterRole = report.roles.find(({ name, scope, path }) => name === "developer" && scope === "extension" && path.startsWith(starter));
-    const userRole = report.roles.find(({ name, scope, path }) => name === "developer" && scope === "extension" && path === join(regular, "developer.md"));
-    assert.ok(starterRole);
-    assert.ok(userRole);
-    assert.equal(starterRole.active, false);
-    assert.equal(starterRole.overriddenBy, userRole.path);
-    assert.equal(userRole.active, true);
-    assert.equal(userRole.overrides, starterRole.path);
-    assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_DUPLICATE"), false);
-  } finally {
-    resetWorkflowRegistry();
-  }
-});
-void test("doctor recognizes starter roles from Pi's package installation", async () => {
-  const paths = fixture();
-  const packageRoot = join(paths.root, "pi-install", "node_modules", "pi-extensible-workflows");
-  const starter = join(packageRoot, "dist", "starter", "roles");
-  const regular = join(paths.root, "regular-roles");
-  mkdirSync(starter, { recursive: true });
-  mkdirSync(regular);
-  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "pi-extensible-workflows" }));
-  writeFileSync(join(starter, "developer.md"), "Bundled developer role");
-  writeFileSync(join(regular, "developer.md"), "User developer role");
-  writeFileSync(join(paths.agentDir, "models.json"), JSON.stringify({ providers: { openai: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", apiKey: "fixture", models: [{ id: "gpt", name: "GPT", input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
-  resetWorkflowRegistry();
-  const roleSources = [...contributedRoles(join(packageRoot, "index.js"), [starter], true), ...contributedRoles(join(paths.root, "user.js"), [regular])];
-  try {
-    const report = await withHome(paths.root, () => doctor({ ...paths, role: "developer", discoverPi: async () => pi({ roleSources }) }));
-    const starterRole = report.roles.find(({ name, path }) => name === "developer" && path === join(starter, "developer.md"));
-    const userRole = report.roles.find(({ name, path }) => name === "developer" && path === join(regular, "developer.md"));
-    assert.ok(starterRole);
-    assert.ok(userRole);
-    assert.equal(starterRole.active, false);
-    assert.equal(starterRole.overriddenBy, userRole.path);
-    assert.equal(userRole.active, true);
-    assert.equal(userRole.overrides, starterRole.path);
-    assert.equal(report.roleInspection?.path, userRole.path);
-    assert.equal(report.diagnostics.some(({ code }) => code === "ROLE_DUPLICATE" || code === "ROLE_NOT_FOUND"), false);
-  } finally {
-    resetWorkflowRegistry();
-  }
-});
 void test("portable bundles load method shorthand functions and selected payload resources", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-payload-"));
   const resource = join(root, "resource.txt");
@@ -1008,159 +602,6 @@ void test("portable bundles name dependency packages and entry points by their p
   assert.equal(readFileSync(join(destination, "payload", "node_modules", "@scope", "example", "index.js"), "utf8"), "export const dependency = true;\n");
   assert.equal(readFileSync(join(destination, "payload", "node_modules", "entry-point.mjs"), "utf8"), "export const entryPoint = true;\n");
 });
-void test("portable bundle setup resolves an external runtime, launches, and fails closed on requirements", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-e2e-"));
-  const agentDir = join(root, "agent");
-  const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
-  mkdirSync(join(agentDir, "npm", "node_modules", "@piewf"), { recursive: true });
-  mkdirSync(join(piRoot, "dist", "core", "tools"), { recursive: true });
-  symlinkSync(process.cwd(), join(agentDir, "npm", "node_modules", "@piewf/cli"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"), join(piRoot, "dist", "index.js"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "tools", "index.js"), join(piRoot, "dist", "core", "tools", "index.js"));
-  writeFileSync(join(piRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.80.9" }));
-  const piExecutable = join(piRoot, "dist", "pi");
-  writeFileSync(piExecutable, "#!/usr/bin/env node\nif (process.argv[2] === \"--version\") console.log(\"0.82.0\");\n", { mode: 0o755 });
-  chmodSync(piExecutable, 0o755);
-  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:@piewf/cli"] }));
-  const workflow = { name: "e2e", version: "1.0.0", headline: "Bundle", description: "Bundle e2e", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
-  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" };
-  const sourcePath = join(root, "e2e-extension.mjs");
-  writeFileSync(sourcePath, [
-    'import { registerWorkflowExtension } from "pi-extensible-workflows";',
-    'import { Type } from "typebox";',
-    "const increment = 1;",
-    "function normalize(value) { return value + increment - 1; }",
-    "export default function extension() {",
-    '  registerWorkflowExtension({ version: "1.0.0", headline: "Bundle e2e", functions: { e2e: { description: "Bundle e2e", input: Type.Object({ value: Type.Integer() }, { additionalProperties: false }), output: Type.Integer(), run(input) { return normalize(input.value); } } } });',
-    "}",
-    "",
-  ].join("\n"));
-  const source = { module: pathToFileURL(sourcePath).href, export: "default" };
-  const create = async (name: string, requirements: Record<string, readonly string[]>, piVersion = ">=0.82.0 <0.83.0", aliasTargets?: Readonly<Record<string, string>>): Promise<string> => { const destination = join(root, name); await writePortableWorkflowBundle({ destination, command: name, workflow, source, dependencies: ["typebox"], requirements, ...(aliasTargets ? { aliasTargets } : {}), piVersion, engineVersion: portableEngineVersion() }); return destination; };
-  const runFailure = (bundle: string): string => { try { execFileSync(bundle, ["setup", "--yes"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
-  const launchFailure = (bundle: string): string => { try { execFileSync(bundle, ["7"], { env: environment, encoding: "utf8", stdio: "pipe" }); return ""; } catch (error) { return cliTestErrorOutput(error); } };
-  const setupResult = (bundle: string): ReturnType<typeof spawnSync> => spawnSync(join(bundle, basename(bundle)), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  const bundle = await create("e2e", { roles: [], aliases: [], tools: [], commands: [], environment: [] });
-  assert.equal(readCliTestManifest(join(bundle, "manifest.json")).version, 2);
-  execFileSync(join(bundle, "e2e"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  assert.ok(existsSync(join(bundle, "bundle-state.json")));
-  assert.equal(execFileSync(join(bundle, "e2e"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
-  // Hand-written version 1 fixture (stringified run, no bundled extension) on the current launcher scaffolding.
-  const v1Bundle = await create("v1-e2e", { roles: [], aliases: [], tools: [], commands: [], environment: [] });
-  rmSync(join(v1Bundle, "payload", "extension.mjs"));
-  rmSync(join(v1Bundle, "payload", "node_modules"), { recursive: true });
-  writeFileSync(join(v1Bundle, "manifest.json"), JSON.stringify({ format: "pi-extensible-workflows-bundle", version: 1, command: "v1-e2e", workflow, runtime: { pi: ">=0.82.0 <0.83.0", "@piewf/cli": portableEngineVersion() }, requirements: { roles: [], aliases: [], tools: [], commands: [], environment: [] } }, null, 2));
-  writeFileSync(join(v1Bundle, "payload", "workflow.mjs"), [
-    "const run = async function run(input) { return input.value; };",
-    "export async function register(registerWorkflowExtension) {",
-    `  registerWorkflowExtension({ version: "1.0.0", headline: "Portable workflow bundle", functions: { e2e: { description: ${JSON.stringify(workflow.description)}, input: ${JSON.stringify(workflow.input)}, output: ${JSON.stringify(workflow.output)}, run } } });`,
-    "}",
-    "",
-  ].join("\n"));
-  execFileSync(join(v1Bundle, "v1-e2e"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  assert.equal(readCliTestBundleState(join(v1Bundle, "bundle-state.json")).version, 1);
-  assert.equal(execFileSync(join(v1Bundle, "v1-e2e"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
-  const legacyPayloadPath = join(v1Bundle, "payload", "workflow.mjs");
-  writeFileSync(legacyPayloadPath, readFileSync(legacyPayloadPath, "utf8").replace('headline: "Portable workflow bundle",', 'headline: "Portable workflow bundle", roleDirectories: [],'));
-  assert.match(runFailure(join(v1Bundle, "v1-e2e")), /roleDirectories.*registerRoleContribution/);
-  const statePath = join(bundle, "bundle-state.json");
-  const state = readCliTestBundleState(statePath);
-  state.engine = "0.0.0";
-  writeFileSync(statePath, JSON.stringify(state));
-  assert.match(launchFailure(join(bundle, "e2e")), /Bundle setup is missing or stale/);
-  const piMismatch = await create("pi-mismatch", { roles: [], aliases: [], tools: [], commands: [], environment: [] }, ">=0.81.0 <0.82.0");
-  assert.match(launchFailure(join(piMismatch, "pi-mismatch")), /Bundle requires Pi >=0\.81\.0 <0\.82\.0; found 0\.82\.0/);
-  const builtinTools = await create("builtin-tools", { roles: [], aliases: [], tools: ["grep", "find", "ls"], commands: [], environment: [] });
-  execFileSync(join(builtinTools, "builtin-tools"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  const skillSource = join(root, "selected-skill");
-  mkdirSync(skillSource);
-  writeFileSync(join(skillSource, "SKILL.md"), "---\nname: selected-skill\ndescription: Selected bundle skill\n---\nSelected skill instructions");
-  const skillBundle = join(root, "skill-bundle");
-  await writePortableWorkflowBundle({ destination: skillBundle, command: "skill-bundle", workflow, source, dependencies: ["typebox"], resources: { skills: [skillSource] }, piVersion: ">=0.82.0 <0.83.0", engineVersion: portableEngineVersion() });
-  const skillManifest = readCliTestManifest(join(skillBundle, "manifest.json"));
-  assert.deepEqual(skillManifest.payload?.skills, ["selected-skill"]);
-  execFileSync(join(skillBundle, "skill-bundle"), ["setup", "--yes"], { env: environment, encoding: "utf8" });
-  assert.equal(execFileSync(join(skillBundle, "skill-bundle"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
-  const missingCommand = await create("missing-command", { roles: [], aliases: [], tools: [], commands: ["bundle-command-that-is-not-installed"], environment: [] });
-  assert.match(runFailure(join(missingCommand, "missing-command")), /Missing required external command/);
-  const missingAlias = await create("missing-alias", { roles: [], aliases: ["missing-model"], tools: [], commands: [], environment: [] });
-  assert.match(runFailure(join(missingAlias, "missing-alias")), /Required model alias is unknown/);
-  const missingEnvironment = await create("missing-environment", { roles: [], aliases: [], tools: [], commands: [], environment: ["BUNDLE_REQUIRED_ENV"] });
-  const environmentFailure = setupResult(missingEnvironment);
-  assert.notEqual(environmentFailure.status, 0);
-  assert.match(String(environmentFailure.stderr), /Missing required environment variable: BUNDLE_REQUIRED_ENV/);
-  assert.equal(existsSync(join(missingEnvironment, "bundle-state.json")), false);
-  const unavailableTool = await create("unavailable-tool", { roles: [], aliases: [], tools: ["not-a-pi-tool"], commands: [], environment: [] });
-  const toolFailure = setupResult(unavailableTool);
-  assert.notEqual(toolFailure.status, 0);
-  assert.match(String(toolFailure.stderr), /Required Pi tool is unavailable: not-a-pi-tool/);
-  assert.equal(existsSync(join(unavailableTool, "bundle-state.json")), false);
-  writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { unavailable: { baseUrl: "http://127.0.0.1:1/v1", api: "openai-completions", models: [{ id: "offline-model" }] } } }));
-  const unavailableAlias = await create("unavailable-alias", { roles: [], aliases: ["offline"], tools: [], commands: [], environment: [] }, ">=0.82.0 <0.83.0", { offline: "unavailable/offline-model" });
-  const aliasFailure = setupResult(unavailableAlias);
-  assert.notEqual(aliasFailure.status, 0);
-  assert.match(String(aliasFailure.stderr), /Required model alias is unavailable: offline -> unavailable\/offline-model/);
-  assert.equal(existsSync(join(unavailableAlias, "bundle-state.json")), false);
-});
-void test("portable bundle setup installs a missing compatible engine and fails closed for install errors or incompatible versions", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-install-"));
-  const agentDir = join(root, "agent");
-  const piRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
-  mkdirSync(join(piRoot, "dist", "core", "tools"), { recursive: true });
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "index.js"), join(piRoot, "dist", "index.js"));
-  symlinkSync(join(process.cwd(), "../../node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "tools", "index.js"), join(piRoot, "dist", "core", "tools", "index.js"));
-  writeFileSync(join(piRoot, "package.json"), JSON.stringify({ name: "@earendil-works/pi-coding-agent", version: "0.80.9" }));
-  const piExecutable = join(piRoot, "dist", "pi");
-  writeFileSync(piExecutable, `#!/usr/bin/env node
-import { cpSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-const args = process.argv.slice(2);
-if (args[0] === "--version") console.log("0.82.0");
-else if (args[0] !== "install") process.exit(2);
-else if (process.env.BUNDLE_INSTALL_MODE === "fail") { console.error("fake install failed"); process.exit(23); }
-else {
-  const target = join(process.env.PI_CODING_AGENT_DIR, "npm", "node_modules", "@piewf", "cli");
-  rmSync(target, { recursive: true, force: true });
-  cpSync(process.env.BUNDLE_ENGINE_SOURCE, target, { recursive: true });
-  rmSync(join(target, "node_modules"), { recursive: true, force: true }); // fixture builds its own node_modules; drop whatever the engine source copied
-  mkdirSync(join(target, "node_modules"), { recursive: true });
-  symlinkSync(process.env.BUNDLE_CORE_SOURCE, join(target, "node_modules", "pi-extensible-workflows"));
-  mkdirSync(join(target, "node_modules", "@piewf"), { recursive: true });
-  symlinkSync(process.env.BUNDLE_ROLES_SOURCE, join(target, "node_modules", "@piewf", "pi-ext-roles"));
-  mkdirSync(join(target, "node_modules", "@earendil-works"), { recursive: true });
-  symlinkSync(process.env.BUNDLE_AGENT_SOURCE, join(target, "node_modules", "@earendil-works", "pi-coding-agent"));
-  symlinkSync(process.env.BUNDLE_TYPEBOX_SOURCE, join(target, "node_modules", "typebox"));
-  symlinkSync(process.env.BUNDLE_PI_AI_SOURCE, join(target, "node_modules", "@earendil-works", "pi-ai"));
-  if (process.env.BUNDLE_INSTALL_MODE === "incompatible") writeFileSync(join(target, "package.json"), JSON.stringify({ name: "@piewf/cli", version: "3.0.0" }));
-}` , { mode: 0o755 });
-  chmodSync(piExecutable, 0o755);
-  const workflow = { name: "install", version: "1.0.0", headline: "Bundle", description: "Bundle install", input: { type: "object", properties: { value: { type: "integer" } }, required: ["value"], additionalProperties: false }, output: { type: "integer" } };
-  const typeboxSource = dirname(dirname(createRequire(import.meta.url).resolve("typebox")));
-  const environment = { ...process.env, PATH: `${join(piRoot, "dist")}:${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", BUNDLE_ENGINE_SOURCE: process.cwd(), BUNDLE_ROLES_SOURCE: join(process.cwd(), "../../node_modules/@piewf/pi-ext-roles"), BUNDLE_CORE_SOURCE: join(process.cwd(), "../core"), BUNDLE_AGENT_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-coding-agent"), BUNDLE_TYPEBOX_SOURCE: typeboxSource, BUNDLE_PI_AI_SOURCE: join(process.cwd(), "../../node_modules/@earendil-works/pi-ai") };
-  const source = writeCliTestExtensionSource(join(root, "install-extension.mjs"), workflow, "async run(input) { return input.value; }");
-  const create = async (name: string): Promise<string> => { const destination = join(root, name); await writePortableWorkflowBundle({ destination, command: name, workflow, source, piVersion: ">=0.82.0 <0.83.0", engineVersion: portableEngineVersion() }); return destination; };
-  const runSetup = (bundle: string, mode: string): ReturnType<typeof spawnSync> => spawnSync(join(bundle, basename(bundle)), ["setup", "--yes"], { env: { ...environment, BUNDLE_INSTALL_MODE: mode }, encoding: "utf8" });
-  const installed = await create("installed");
-  const success = runSetup(installed, "success");
-  assert.equal(success.status, 0, String(success.stderr));
-  const installedPackage = readCliTestPackageMetadata(join(agentDir, "npm", "node_modules", "@piewf", "cli", "package.json"));
-  const packageMetadata = readCliTestPackageMetadata(join(process.cwd(), "package.json"));
-   assert.equal(installedPackage.version, packageMetadata.version);
-  assert.ok(existsSync(join(installed, "bundle-state.json")));
-  assert.equal(execFileSync(join(installed, "installed"), ["7"], { env: environment, encoding: "utf8" }).trim(), "7");
-  rmSync(join(agentDir, "npm"), { recursive: true, force: true });
-  const failed = await create("failed");
-  const failure = runSetup(failed, "fail");
-  assert.notEqual(failure.status, 0);
-  assert.match(String(failure.stderr), /fake install failed/);
-  assert.equal(existsSync(join(failed, "bundle-state.json")), false);
-  rmSync(join(agentDir, "npm"), { recursive: true, force: true });
-  const incompatible = await create("incompatible");
-  const mismatch = runSetup(incompatible, "incompatible");
-  assert.notEqual(mismatch.status, 0);
-  assert.match(String(mismatch.stderr), /installed an incompatible/);
-  assert.equal(existsSync(join(incompatible, "bundle-state.json")), false);
-});
 void test("portable bundles can load a selected workflow extension with its module state", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-bundle-extension-"));
   const extension = join(root, "workflow.mjs");
@@ -1188,113 +629,20 @@ void test("portable bundles can load a selected workflow extension with its modu
   assert.equal(workflow.run({}), "workflow");
 });
 
-void test("doctor reports shared and consumer layers, new-over-legacy precedence and every invalid source", async () => {
+void test("doctor uses generic preparation for opaque options without contacting a provider", async () => {
   const paths = fixture();
-  try {
-    const sharedGlobal = join(paths.agentDir, "pi-ext-roles");
-    const sharedProject = join(paths.cwd, ".pi", "pi-ext-roles");
-    mkdirSync(join(sharedGlobal, "roles"), { recursive: true });
-    mkdirSync(join(sharedProject, "roles"), { recursive: true });
-    writeFileSync(join(sharedGlobal, "settings.json"), JSON.stringify({ tools: ["!*", "read"], modelAliases: { shared: "openai/gpt" } }));
-    writeFileSync(join(sharedProject, "settings.json"), JSON.stringify({ tools: ["grep"], modelAliases: {} }));
-    writeFileSync(paths.settingsPath, JSON.stringify({ tools: ["!read"] }));
-    const legacy = join(paths.agentDir, "pi-extensible-workflows", "roles", "priority.md");
-    const global = join(sharedGlobal, "roles", "priority.md");
-    const projectLegacy = join(paths.cwd, ".pi", "pi-extensible-workflows", "roles", "priority.md");
-    const project = join(sharedProject, "roles", "priority.md");
-    for (const path of [legacy, global, projectLegacy, project]) writeFileSync(path, "Role body");
-    const report = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi() }));
-    assert.deepEqual(report.roles.filter(({ name, active }) => name === "priority" && active).map(({ path }) => path), [project]);
-    assert.equal(report.roles.find(({ path }) => path === global)?.overrides, legacy);
-    assert.equal(report.roles.find(({ path }) => path === project)?.overrides, projectLegacy);
-    assert.deepEqual(report.settings.modelAliases, {});
-    assert.deepEqual(report.resourcePolicy.selectedTools, ["grep"]);
-    assert.deepEqual(report.resourcePolicy.selectorSources.defaults?.global.tools, ["!*", "read"]);
-    assert.deepEqual(report.resourcePolicy.selectorSources.global.tools, ["!read"]);
-    assert.match(formatDoctorReport(report), /Shared global role settings/);
-    writeFileSync(global, "---\ntools: [broken\n---\n");
-    writeFileSync(project, "---\ntools: [broken\n---\n");
-    const invalid = await withHome(paths.root, () => doctor({ ...paths, discoverPi: async () => pi() }));
-    assert.deepEqual(invalid.diagnostics.filter(({ code }) => code === "ROLE_FRONTMATTER").map(({ source }) => source).sort(), [global, project].sort());
-  } finally { rmSync(paths.root, { recursive: true, force: true }); }
-});
-
-void test("doctor collects independent contributors from the actual enabled Pi extension set", async () => {
-  const paths = fixture();
-  try {
-    const directory = join(paths.agentDir, "extensions", "contributor");
-    mkdirSync(join(directory, "roles"), { recursive: true });
-    const entry = new URL("../../../../node_modules/@piewf/pi-ext-roles/dist/index.js", import.meta.url).href;
-    writeFileSync(join(directory, "index.js"), `import { registerRoleContribution } from ${JSON.stringify(entry)}; export default pi => registerRoleContribution(pi, { owner: import.meta.url, roleDirectories: ['./roles'], extension: { headline: 'Independent fixture', version: '1.0.0' } });`);
-    writeFileSync(join(directory, "roles", "independent.md"), "Contributed role");
-    const report = await withHome(paths.root, () => doctor(paths));
-    assert.equal(report.roles.find(({ name }) => name === "independent")?.extension?.headline, "Independent fixture", JSON.stringify(report.diagnostics));
-    assert.equal(report.roles.find(({ name }) => name === "independent")?.provenance?.owner, join(directory, "index.js"));
-    const script = join(paths.cwd, "contributed-role.js");
-    writeFileSync(script, 'if (false) await wf.agent("Inspect", { role: "independent" }); return "ok";');
-    let output = "";
-    let errors = "";
-    const exit = await withHome(paths.root, () => runCli(["run", "--script", script], { ...paths, stderr: text => { errors += text; } }, text => { output += text; }));
-    assert.equal(exit, 0, errors);
-    assert.equal(output, '"ok"\n');
-    writeFileSync(join(paths.agentDir, "settings.json"), JSON.stringify({ extensions: [`!${join(directory, "index.js")}`] }));
-    const disabled = await withHome(paths.root, () => doctor(paths));
-    assert.equal(disabled.roles.some(({ name }) => name === "independent"), false);
-  } finally { rmSync(paths.root, { recursive: true, force: true }); }
-});
-
-void test("role-targeted doctor never reads or applies denied shared project configuration", async () => {
-  const paths = fixture();
-  try {
-    const discover = configureRoleInspection(paths);
-    writeFileSync(join(paths.agentDir, "trust.json"), JSON.stringify({ [realpathSync(paths.cwd)]: false }));
-    const global = join(paths.agentDir, "pi-ext-roles");
-    const project = join(paths.cwd, ".pi", "pi-ext-roles");
-    mkdirSync(join(global, "roles"), { recursive: true });
-    mkdirSync(project, { recursive: true });
-    writeFileSync(join(global, "settings.json"), JSON.stringify({ tools: ["!*", "read"], modelAliases: { safe: "fixture/fixture-model" } }));
-    writeFileSync(join(global, "roles", "denied.md"), "---\nmodel: safe\n---\nGlobal role");
-    const deniedPi = async () => ({ ...await discover(paths.cwd, paths.agentDir), trust: { required: true, trusted: false, source: "saved Pi trust decision" } });
-    for (const contents of ["invalid JSON", JSON.stringify({ tools: ["!*", "bash"], skills: ["denied-skill"], extensions: ["denied-extension"], modelAliases: { safe: "fixture/denied-model" } })]) {
-      writeFileSync(join(project, "settings.json"), contents);
-      const report = await withHomeAndCwd(paths.root, paths.cwd, () => doctor({ ...paths, role: "denied", discoverPi: deniedPi }));
-      assert.ok(report.roleInspection, JSON.stringify(report.diagnostics));
-      assert.equal(report.roleInspection.model.model, "fixture-model");
-      assert.deepEqual(report.roleInspection.tools, ["read"]);
-      assert.deepEqual(report.roleInspection.resources.selectorSources?.defaults?.project, {});
-      assert.equal(report.diagnostics.some(({ severity }) => severity === "error"), false, JSON.stringify(report.diagnostics));
-    }
-  } finally { rmSync(paths.root, { recursive: true, force: true }); }
-});
-
-void test("doctor extensionSettings and prepared role view match runtime whole-map project replacement and shared overlays", async () => {
-  type Case = { name: string; trusted: boolean; global?: object; project?: object; sharedGlobal?: object; sharedProject?: object; expected?: object };
-  const cases: Case[] = [
-    { name: "empty project map replaces global", trusted: true, global: { globalOnly: true }, project: {}, expected: {} },
-    { name: "nonempty project map replaces global", trusted: true, global: { globalOnly: true, acme: { a: 1 } }, project: { projectOnly: { b: 2 } }, expected: { projectOnly: { b: 2 } } },
-    { name: "untrusted project is ignored", trusted: false, global: { globalOnly: true }, project: {}, expected: { globalOnly: true } },
-    { name: "shared defaults compose once", trusted: true, sharedGlobal: { shared: { a: 1 }, both: { shared: true } }, sharedProject: { projectShared: { b: 2 } }, global: { consumer: { c: 3 }, both: { consumer: true } } },
-  ];
-  for (const item of cases) {
-    const paths = fixture();
-    const discoverPi = configureRoleInspection(paths);
-    writeFileSync(join(paths.agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\ndescription: Reviewer\n---\nReview role");
-    const write = (path: string, extensionSettings: object | undefined) => { if (extensionSettings === undefined) return; mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, JSON.stringify({ extensionSettings })); };
-    const settingsPath = workflowSettingsPath(paths.agentDir);
-    write(settingsPath, item.global);
-    write(workflowProjectSettingsPath(paths.cwd), item.project);
-    write(roleSettingsPath(paths.agentDir), item.sharedGlobal);
-    write(roleProjectSettingsPath(paths.cwd), item.sharedProject);
-    const seen: unknown[] = [];
-    const registry = new WorkflowRegistry();
-    registry.register({ version: "1.0.0", headline: "Settings probe", agentSetupHooks: { probe: { setup(_agent, context) { seen.push(context.settings); } } } });
-    const runtime = resolveWorkflowSettings(paths.cwd, item.trusted, settingsPath).effective.extensionSettings;
-    if (item.expected !== undefined) assert.deepEqual(runtime, item.expected, item.name);
-    const report = await withHomeAndCwd(paths.root, paths.cwd, () => doctor({ ...paths, settingsPath, role: "reviewer", registry, discoverPi: async (cwd, agentDir) => ({ ...(await discoverPi(cwd, agentDir)), trust: { required: true, trusted: item.trusted, source: "test trust" } }) }));
-    assert.deepEqual(report.settings.extensionSettings, runtime, item.name);
-    assert.ok(seen.length > 0, item.name);
-    assert.deepEqual(seen.at(-1), runtime ?? {}, item.name);
-    if (item.name === "shared defaults compose once") assert.deepEqual(runtime, { shared: { a: 1 }, both: { consumer: true }, projectShared: { b: 2 }, consumer: { c: 3 } });
-    rmSync(paths.root, { recursive: true, force: true });
-  }
+  const registry = new WorkflowRegistry();
+  let calls = 0;
+  registry.register({ version: "1.0.0", headline: "Inspection policy", agentPreparationHooks: { policy: { prepare(configuration, context) {
+    calls += 1;
+    assert.equal(context.mode, "inspection");
+    assert.deepEqual(context.options, { policy: "read" });
+    configuration.tools = ["!*", "read"];
+    configuration.systemPromptAppend = "GENERIC_POLICY_APPEND";
+  } } } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, agentOptions: { policy: "read" }, prompt: "inspect this", discoverPi: async () => pi({ model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "off" }, knownModels: ["openai-codex/gpt-5.6-sol"], availableModels: ["openai-codex/gpt-5.6-sol"] }) }));
+  assert.equal(calls, 1);
+  assert.deepEqual(report.agentInspection?.tools, ["read"]);
+  assert.match(report.agentInspection.systemPrompt.text, /GENERIC_POLICY_APPEND/);
+  assert.deepEqual(report.diagnostics.filter(({ severity }) => severity === "error"), []);
 });

@@ -11,7 +11,7 @@ import { runCli } from "../src/cli.js";
 import { readCliTestPersistedRun, readCliTestSessionOwner } from "./support.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const snapshot = createLaunchSnapshot({ script: "export const meta={name:'cleanup'}", args: {}, metadata: { name: "cleanup" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+const snapshot = createLaunchSnapshot({ script: "export const meta={name:'cleanup'}", args: {}, metadata: { name: "cleanup" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
 
 const temporaryTrees = new Set<string>();
 function fixture(): { home: string; cwd: string } { const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-cleanup-")); const cwd = join(home, "project"); mkdirSync(cwd, { recursive: true }); temporaryTrees.add(home); return { home, cwd }; }
@@ -259,7 +259,6 @@ void test("doctor cleanup fails closed for unsafe run mutations", async () => {
     { name: "symlinked state.json", message: /Run unsafe is corrupt or incomplete: Run artifact is not a regular file: .*state\.json/, mutate: (paths: { home: string; cwd: string }, store: RunStore) => { const state = join(store.directory, "state.json"); const target = join(paths.home, "state-target.json"); const contents = readFileSync(state, "utf8"); rmSync(state); writeFileSync(target, contents); symlinkSync(target, state); } },
     { name: "rewritten workflow.js", message: /Run unsafe is corrupt or incomplete: Persisted workflow source does not match its launch snapshot/, mutate: (_paths: { home: string; cwd: string }, store: RunStore) => { writeFileSync(join(store.directory, "workflow.js"), "rewritten workflow"); } },
     { name: "dangling ownership parent", message: /Run unsafe is corrupt or incomplete: Persisted ownership parent is missing/, mutate: (paths: { home: string; cwd: string }, store: RunStore) => { writeFileSync(join(store.directory, "ownership.json"), JSON.stringify([{ id: "owner", label: "owner", state: "completed", parentId: "missing", options: { label: "owner", cwd: paths.cwd, tools: [] } }])); } },
-    { name: "legacy role override object", message: /ownership\[0\]\.options\.role is invalid/, mutate: (paths: { home: string; cwd: string }, store: RunStore) => { writeFileSync(join(store.directory, "ownership.json"), JSON.stringify([{ id: "owner", label: "owner", state: "completed", options: { label: "owner", cwd: paths.cwd, tools: [], role: { name: "reviewer", contextFiles: ["cwd"] } } }])); } },
     { name: "self parentRunId", message: /Run unsafe is corrupt or incomplete: Borrowed worktree source run is invalid/, mutate: (_paths: { home: string; cwd: string }, store: RunStore) => { const statePath = join(store.directory, "state.json"); const state = readCliTestPersistedRun(statePath); state.parentRunId = "unsafe"; writeFileSync(statePath, JSON.stringify(state)); } },
   ] as const;
   for (const mutation of mutations) {

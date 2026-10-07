@@ -1,7 +1,3 @@
-import { notifyRoleDeprecation } from "./role-deprecation.js";
-import { registerRoleContribution } from "@piewf/pi-ext-roles";
-import type { RoleDirectoryRegistration } from "@piewf/pi-ext-roles/types";
-import { legacyRoleSources } from "./roles.js";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
@@ -9,7 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
 import { copyToClipboard, getAgentDir, ModelSelectorComponent, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentDefinition, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
+import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
 import { RunLifecycle, WorkflowEventPublisher, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
 import { registerWorkflowNavigator, uiHostCapabilities } from "./host-navigator.js";
@@ -17,9 +13,8 @@ import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunId
 import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
 import { validateBudget, WorkflowBudgetRuntime } from "./budget.js";
-import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, mergeWorkflowExtensionSettings, modelAliasErrorName, modelCapability, object, parseModelReference, positiveInteger, reachableTools, resolveModelReference, VIRTUAL_MODEL_PROVIDER, sanitizeDisplayText, validateModelAliases } from "./utils.js";
+import { SerialLane, asWorkflowError, createLaunchSnapshot, errorCode, errorText, fail, isNodeError, jsonValue, modelAliasErrorName, object, parseModelReference, positiveInteger, reachableTools, resolveModelReference, VIRTUAL_MODEL_PROVIDER, sanitizeDisplayText, validateModelAliases } from "./utils.js";
 import { loadCodemodeToolsSetting, preflight, resolveAgentResourcePolicy, resolveWorkflowSettings, validateCheckpoint, validateModelAliasAvailability, validateWorkflowLaunchWithRegistry, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./validation.js";
-import { activeRoleDirectories, loadAgentDefinitions } from "./roles.js";
 import { beginWorkflowExtensionLoading, loadingRegistry, resetWorkflowRegistryIfIdle, retainWorkflowRegistry, type WorkflowRegistryApi } from "./registry.js";
 import { agentHandleTurnPath, agentIdentityPath, agentWorktree, encoded, executeShellCommand, persistActiveAgentAttempt, persistAgentAttempts, readShellResult, runWorkflow, shellIdentityPath, toolIdentityPath } from "./execution.js";
 import { prepareScriptToolLoadout, scriptTool, scriptToolContext, scriptToolValue, validateScriptToolReferences } from "./script-tools.js";
@@ -28,41 +23,10 @@ import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, roleNameOf, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
-import {
-  SETTLED_AGENT_STATES,
-  catalogResultValue,
-  formatWorkflowCatalog,
-  styledTextBlock,
-  textBlock,
-  workflowCatalogBlock,
-  workflowControlCall,
-  workflowControlResult,
-  workflowProgressBlock,
-  type WorkflowProgressRenderState,
-} from "./host-view.js";
-import {
-  DELIVERY_LIMIT_BYTES,
-  ForegroundDeliveryController,
-  markWorkflowFailureDiagnostics,
-  WORKFLOW_LOG_ENTRY,
-  completionDescriptor,
-  completionDeliveryFromStore,
-  createWorkflowFailureDiagnostics,
-  failureDiagnosticsFrom,
-  formatWorkflowFailure,
-  formatWorkflowFailureDelivery,
-  formatWorkflowFailureDeliveryFallback,
-  formatWorkflowFailureDiagnostics,
-  isWorkflowFailureDiagnostics,
-  serializeWorkflowFailureDiagnostics,
-  utf8Prefix,
-  type CompletionDeliveryContext,
-  type ForegroundDelivery,
-  type ForegroundDetachResult,
-  type WorkflowLogEntry,
-} from "./host-delivery.js";
+import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
+import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
 
 export type WorkflowExtensionAPI = Pick<ExtensionAPI, "appendEntry" | "getActiveTools" | "getThinkingLevel" | "on" | "registerCommand" | "registerTool" | "sendMessage"> & Partial<Pick<ExtensionAPI, "getAllTools">> & Pick<BackgroundWidgetAPI, "events" | "registerEntryRenderer" | "registerShortcut">;
 
@@ -144,26 +108,6 @@ function completionControlContent(result: unknown, controlRunId?: string): strin
   delete record.completion;
   delete record.run;
   return JSON.stringify({ ...record, value });
-}
-type RoleCapture = { readonly snapshot: Readonly<LaunchSnapshot>; capture(role: string, model: ModelSpec): Promise<void> };
-/** Persists a role definition (and its model) into the launch snapshot the first time an agent uses it, so later replays and retries see the definition the run actually ran with. */
-function roleCapture(store: RunStore, initial: Readonly<LaunchSnapshot>, definitions: Readonly<Record<string, AgentDefinition>>, projectDefinitions: Readonly<Record<string, AgentDefinition>>): RoleCapture {
-  let persisted = initial;
-  return {
-    get snapshot() { return persisted; },
-    async capture(role, model) {
-      const definition = definitions[role];
-      if (!definition) return;
-      const modelName = `${model.provider}/${model.model}`;
-      const hasProjectRole = projectDefinitions[role] !== undefined;
-      if (persisted.roles?.[role] !== undefined && (!hasProjectRole || persisted.projectRoles?.includes(role)) && persisted.models.includes(modelName)) return;
-      const roles = { ...(persisted.roles ?? {}), [role]: definition };
-      const projectRoles = hasProjectRole ? [...new Set([...(persisted.projectRoles ?? []), role])] : persisted.projectRoles ?? [];
-      const models = [...new Set([...persisted.models, modelName])];
-      persisted = createLaunchSnapshot({ ...persisted, models, roles, projectRoles });
-      await store.saveSnapshot(persisted);
-    },
-  };
 }
 export function formatWorkflowPreview(args: { script?: unknown; scriptPath?: unknown; name?: unknown; description?: unknown }): string {
   const name = typeof args.name === "string" && args.name.trim() ? args.name.trim() : "workflow";
@@ -340,16 +284,10 @@ async function resolveLaunchAliases(registry: WorkflowRegistryApi, staticAliases
   }
 }
 
-export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = [], roleSources?: readonly RoleDirectoryRegistration[]) {
+export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = []) {
   beginWorkflowExtensionLoading();
   const registry = loadingRegistry();
   const extensionAgentDir = agentDir ?? getAgentDir();
-  const currentRoleSources = () => roleSources ?? activeRoleDirectories(pi.events);
-  if (pi.events?.on && pi.events.emit) {
-    const events = { on: pi.events.on, emit: pi.events.emit };
-    const unsubscribeSources = registerRoleContribution({ events, on: pi.on.bind(pi) }, { owner: new URL(import.meta.url.endsWith(".ts") ? "./index.ts" : "./index.js", import.meta.url), roleDirectories: legacyRoleSources(process.cwd(), extensionAgentDir) });
-    pi.on("session_shutdown", () => { unsubscribeSources(); });
-  }
   const registerEntryRenderer = piHostCapabilities(pi).registerEntryRenderer;
   registerEntryRenderer?.<WorkflowLogEntry>(WORKFLOW_LOG_ENTRY, (entry) => {
     const data = entry.data;
@@ -768,7 +706,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         const persisted = await persistRunState(run.store, run.metadata, (current) => ({ ...current, ...run.budget.snapshot(), agents: current.agents.map((agent) => agent.id === id ? { ...agent, lastEventAt } : agent) }));
         run.update?.(workflowToolUpdate(withLiveActivities(persisted)));
       };
-      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, tuiIndex, tuiLabel: options.requestedLabel ?? options.label, agentNodeId: id, ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }), onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.role ? { role: options.role } : {}), ...(options.contextFiles ? { contextFiles: options.contextFiles } : {}), tools: options.tools, ...(options.skills ? { skills: options.skills } : {}), ...(options.extensions ? { extensions: options.extensions } : {}), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.sessionPath ? { sessionPath: options.sessionPath } : {}), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}) }, signal, scheduler.toolsFor(id, (role, tools, model, inheritedTools, skills, extensions) => run.executor.resolve({ label: "child", workflowName: run.metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(tools !== undefined ? { tools } : {}), ...(skills !== undefined ? { skills } : {}), ...(extensions !== undefined ? { extensions } : {}) }, inheritedTools).tools), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
+      const result = await run.executor.execute(prompt, { label: options.label, workflowName: run.metadata.name, tuiIndex, tuiLabel: options.requestedLabel ?? options.label, agentNodeId: id, ...(options.extensionSettings === undefined ? {} : { inheritedExtensionSettings: options.extensionSettings }), onProgress, onAttempt, budget, ...(run.providerErrorRecovery ? { providerErrorRecovery: run.providerErrorRecovery } : {}), ...(parentId ? { parent: parentId, cwd: options.cwd, ...(options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}) } : options.worktreeOwner ? { worktreeOwner: options.worktreeOwner } : {}), ...(options.model ? { model: options.model } : {}), ...(options.contextFiles ? { contextFiles: options.contextFiles } : {}), tools: options.tools, ...(options.skills ? { skills: options.skills } : {}), ...(options.extensions ? { extensions: options.extensions } : {}), effectiveTools: options.tools, ...(options.schema ? { schema: options.schema } : {}), ...(options.retries === undefined ? {} : { retries: options.retries }), ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.sessionPath ? { sessionPath: options.sessionPath } : {}), ...(options.agentOptions ? { agentOptions: options.agentOptions } : {}), ...(options.agentIdentity ? { agentIdentity: options.agentIdentity } : {}), ...(options.configuration ? { configuration: options.configuration } : {}), ...(options.capabilities ? { capabilities: options.capabilities } : {}), ...(options.projectTrusted === undefined ? {} : { projectTrusted: options.projectTrusted }), onConfiguration: (configuration) => scheduler.setConfiguration(id, configuration) }, signal, scheduler.toolsFor(id), setSteer, () => { scheduler.cancelChildren(id); scheduler.retry(id); });
       cancelDeferredProgress();
       const before = (await run.store.load()).run;
       await persistAgentAttempts(run.store, id, result.attempts);
@@ -804,17 +742,16 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const existing = new Map(current.agents.map((agent) => [agent.id, agent]));
       const agents = ownership.map((node) => {
         const previous = existing.get(node.id);
-        const requested = { label: node.options.label, workflowName: run.metadata.name, ...(node.options.skills ? { skills: node.options.skills } : {}), ...(node.options.extensions ? { extensions: node.options.extensions } : {}), ...(node.options.model ? { model: node.options.model } : {}), ...(node.options.role ? { role: node.options.role } : {}), ...(node.options.contextFiles ? { contextFiles: node.options.contextFiles } : {}) };
+        const requested = { label: node.options.label, workflowName: run.metadata.name, ...(node.options.skills ? { skills: node.options.skills } : {}), ...(node.options.extensions ? { extensions: node.options.extensions } : {}), ...(node.options.model ? { model: node.options.model } : {}), ...(node.options.contextFiles ? { contextFiles: node.options.contextFiles } : {}), ...(node.options.configuration ? { configuration: node.options.configuration } : {}) };
         let effective: { model: ModelSpec; requestedModel?: string; tools: readonly string[] };
         try { effective = { ...run.executor.resolve({ ...requested, effectiveTools: node.options.tools }), tools: node.options.tools }; }
         catch { effective = previous ? { model: previous.model, ...(previous.requestedModel ? { requestedModel: previous.requestedModel } : {}), tools: previous.tools } : { model: node.options.model ? modelSpec(node.options.model, run.model) : run.model, ...(node.options.model ? { requestedModel: node.options.model } : {}), tools: node.options.tools }; }
         const resultPath = !node.parentId && node.options.agentIdentity ? agentIdentityPath(node.options.agentIdentity) : undefined;
-        const nodeRole = roleNameOf(node.options.role);
         const now = Date.now();
         const lastEventAt = node.state === "running" ? previous?.state === "running" && previous.lastEventAt !== undefined ? previous.lastEventAt : now : previous?.lastEventAt;
         const startedAt = previous?.startedAt ?? (node.state === "running" ? now : undefined);
         const durationMs = previous?.durationMs ?? (SETTLED_AGENT_STATES.has(node.state) && startedAt !== undefined ? Math.max(0, now - startedAt) : undefined);
-        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.agentIdentity?.handle === undefined ? {} : { handle: node.options.agentIdentity.handle, ...(node.options.agentIdentity.turn === undefined ? {} : { turn: node.options.agentIdentity.turn }), ...(node.options.continuity ? { continuity: node.options.continuity } : {}) }), ...(nodeRole ? { role: nodeRole } : {}), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
+        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.agentIdentity?.handle === undefined ? {} : { handle: node.options.agentIdentity.handle, ...(node.options.agentIdentity.turn === undefined ? {} : { turn: node.options.agentIdentity.turn }), ...(node.options.continuity ? { continuity: node.options.continuity } : {}) }), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
       });
       return { ...current, agents };
     });
@@ -1038,20 +975,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     });
     catalogRegistered = true;
   };
-  const createAgentExecutor = (root: Omit<AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentSetupHooks: registry.agentSetupHooks(), validateExtensionSettings: registry.validateExtensionSettings, onResourceWarning: (message) => { deliverWarning(pi, message); }, onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); } }, transport);
-  // Resumed runs keep the role definitions frozen in their snapshot and fall back to the current definitions for roles a
-  // registered function reaches for the first time after the restart; those are captured into the snapshot like at launch.
-  const resumeRoles = (store: RunStore, snapshot: Readonly<LaunchSnapshot>, cwd: string, trustedProject: boolean) => {
-    let current: Readonly<Record<string, AgentDefinition>> = {};
-    let project: Readonly<Record<string, AgentDefinition>> = {};
-    try {
-      current = loadAgentDefinitions(cwd, extensionAgentDir, trustedProject, currentRoleSources());
-      project = Object.fromEntries(Object.entries(current).filter(([, definition]) => definition.provenance?.scope === "project"));
-    } catch { /* Unreadable current roles leave the resume with the snapshot roles, as before. */ }
-    const definitions = { ...current, ...(snapshot.roles ?? {}) };
-    const captured = roleCapture(store, snapshot, definitions, project);
-    return { definitions, capture: (role: string, model: ModelSpec) => captured.capture(role, model) };
-  };
+  const createAgentExecutor = (root: Omit<AgentExecutionRoot, "agentDir" | "agentSetupHooks">) => new WorkflowAgentExecutor({ ...root, agentDir: extensionAgentDir, ...(additionalSkillPaths.length ? { additionalSkillPaths } : {}), agentPreparationHooks: registry.agentPreparationHooks(), agentSetupHooks: registry.agentSetupHooks(), validateExtensionSettings: registry.validateExtensionSettings, onResourceWarning: (message) => { deliverWarning(pi, message); }, onAgentSettings: (agentId, settings) => { scheduler.setExtensionSettings(agentId, settings); }, onAgentCapabilities: (agentId, capabilities, projectTrusted) => { scheduler.setAttemptCapabilities(agentId, capabilities, projectTrusted); } }, transport);
   const activeSnapshotTools = (tools: readonly string[], active: ReadonlySet<string> | "session") => active === "session"
     ? new Set(tools.filter((tool) => reachableTools(pi).includes(tool) && tool !== "workflow_catalog"))
     : new Set(tools.filter((tool) => active.has(tool) || tool === "workflow_catalog"));
@@ -1075,7 +999,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const extensionSettings = input.snapshot.settings.extensionSettings;
     const extensionSettingsPath = input.snapshot.settingsSources?.extensionSettings ?? input.snapshot.settingsPath ?? settingsPath;
     registry.validateExtensionSettings(extensionSettings, { source: "effective", cwd: input.cwd, projectTrusted: input.trustedProject, settingsPath: extensionSettingsPath });
-    for (const [role, definition] of Object.entries(input.snapshot.roles ?? {})) registry.validateExtensionSettings(mergeWorkflowExtensionSettings(extensionSettings, definition.extensionSettings), { source: "role", cwd: input.cwd, projectTrusted: input.trustedProject, settingsPath: extensionSettingsPath, role });
     const currentPolicy = resolveAgentResourcePolicy(input.cwd, input.trustedProject, settingsPath);
     const staticAliases = resolution.effective.modelAliases ?? {};
     const previousAliases = input.snapshot.modelAliases ?? input.snapshot.settings.modelAliases ?? {};
@@ -1088,13 +1011,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const script = input.withPreflight ? input.snapshot.script : undefined;
     if (script !== undefined) {
       const resumeAliases = { ...previousAliases, ...currentAliases };
-      preflight(script, { models: availableModels, tools: active, agentTypes: new Set(input.snapshot.agentTypes), modelAliases: resumeAliases, knownModels, settingsPath, skipModelAvailability: true }, input.snapshot.schemas, input.snapshot.metadata, true);
+      preflight(script, { models: availableModels, tools: active, modelAliases: resumeAliases, knownModels, settingsPath, skipModelAvailability: true }, input.snapshot.schemas, input.snapshot.metadata, true);
     }
     const refreshed = resumedSnapshotSettings(input.snapshot, resolution, currentAliases);
     const snapshot = createLaunchSnapshot({ ...input.snapshot, settingsPath, ...refreshed, modelAliases: currentAliases });
     return { active, settingsPath, resolution, currentPolicy, previousAliases, knownModels, availableModels, currentAliases, blockedAliases, blockedAliasTargets, snapshot, script };
   };
-  const workflowAgentHandler = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string, captureRole?: (role: string, model: ModelSpec) => Promise<void>) => {
+  const workflowAgentHandler = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, executor: WorkflowAgentExecutor, cwd: string, runId: string) => {
     // Replay lookup and spawn are serialised per run so concurrent agent(...) calls reach the scheduler in call order.
     const admission = new SerialLane();
     return async (prompt: string, options: Readonly<Record<string, JsonValue>>, agentSignal: AbortSignal, identity: AgentIdentity) => {
@@ -1106,20 +1029,19 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           if (replayed) return { replayed };
           const worktree = agentWorktree(identity);
           const agentCwd = worktree.worktreeOwner ? (await persistWorktree(store, metadata, worktree.worktreeOwner)).cwd : cwd;
-          const role = typeof options.role === "string" ? options.role : undefined;
           const model = typeof options.model === "string" ? options.model : undefined;
           const requestedLabel = typeof options.label === "string" ? options.label : undefined;
           const skills = Array.isArray(options.skills) ? options.skills as string[] : undefined;
           const extensions = Array.isArray(options.extensions) ? options.extensions as string[] : undefined;
           const contextFiles = Array.isArray(options.contextFiles) && options.contextFiles.every(isContextFileScope) ? options.contextFiles : undefined;
-          const resolved = executor.resolve({ label: requestedLabel ?? role ?? "agent", workflowName: metadata.name, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(Array.isArray(options.tools) ? { tools: options.tools as string[] } : {}), ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}) });
-          if (role) await captureRole?.(role, resolved.model);
-          const label = displayAgentName(requestedLabel, role, resolved.model);
+          const configuration = await executor.prepare({ label: requestedLabel ?? "agent", workflowName: metadata.name, agentOptions: options, agentIdentity: identity, ...(worktree.worktreeOwner ? { worktreeOwner: worktree.worktreeOwner } : {}) }, agentCwd, agentSignal);
+          const resolved = configuration;
+          const label = requestedLabel ?? configuration.label ?? resolved.model.model;
           const tools = resolved.tools;
           const schema = object(options.outputSchema) ? options.outputSchema : undefined;
           const sessionPath = identity.handle !== undefined && identity.turn !== undefined ? await handleTurnInput(store, identity.handle, identity.turn) : undefined;
           const continuity = identity.handle === undefined ? undefined : sessionPath ? "continued" as const : "fresh" as const;
-          return { spawned: scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(role ? { role } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(sessionPath ? { sessionPath } : {}), ...(continuity ? { continuity } : {}), agentOptions: options, agentIdentity: identity }) };
+          return { spawned: scheduler.spawn(runId, prompt, { label, ...(requestedLabel ? { requestedLabel } : {}), ...(identity.parentBreadcrumb ? { parentBreadcrumb: identity.parentBreadcrumb } : {}), cwd: agentCwd, tools, ...(skills ? { skills } : {}), ...(extensions ? { extensions } : {}), ...worktree, ...(model ? { model } : {}), ...(contextFiles ? { contextFiles } : {}), ...(schema ? { schema } : {}), ...(typeof options.retries === "number" ? { retries: options.retries } : {}), ...(positiveInteger(options.timeoutMs) || options.timeoutMs === null ? { timeoutMs: options.timeoutMs } : {}), ...(sessionPath ? { sessionPath } : {}), ...(continuity ? { continuity } : {}), agentOptions: options, agentIdentity: identity, configuration }) };
         });
         if ("replayed" in admitted) return admitted.replayed.value;
         const { spawned } = admitted;
@@ -1134,7 +1056,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     };
   };
   const recovery = createWorkflowRecovery({
-    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, resumeRoles, workflowAgentHandler, shellForRun, toolForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
+    pi, home, runs, scheduler, eventPublisher, persistRunState, projectTrusted, resumeHostContext, ensureSessionLease, coordinateRunMutation, createAgentExecutor, activeSnapshotTools, frozenResourcePolicy, resolveLaunchPrologue: resumeLaunchPrologue, workflowAgentHandler, shellForRun, toolForRun, resolveWorktree, checkpointBridge, phaseBridge, logBridge, lifecycleFor, createProviderErrorRecovery, cleanupTerminalRun, deliver: (content) => { deliver(pi, content); }, deliverTerminal: deliveryController.deliverTerminal, workflowToolUpdate, registry, modelSpec,
   });
   const resumeSelectedWorkflow = async (runId: string, foreground: boolean, context: unknown, budgetPatch?: unknown): Promise<{ workflowName: string; state: "running" | "completed" | "awaiting_approval"; attached: boolean; value?: JsonValue }> => {
     const run = runs.get(runId);
@@ -1153,9 +1075,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       if (!foreground && wasAttached) await deliveryController.moveForegroundToBackground(runId);
       if (foreground && !wasAttached) {
         run.foreground = true;
-        const loaded = await run.store.load();
         await persistRunState(run.store, run.metadata, (current) => ({ ...current, delivery: { ...(current.delivery ?? {}), mode: "foreground", state: "attached" } }));
-        await run.store.saveSnapshot(createLaunchSnapshot({ ...loaded.snapshot, launchMode: "foreground" }));
+        await run.store.setLaunchMode("foreground");
       } else if (!foreground) run.foreground = false;
       else run.foreground = true;
       await recovery.refreshPausedRunAliases(run, { ...recoveryContext, projectTrusted: projectTrusted(context) });
@@ -1221,7 +1142,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     await deliveryController.deliverTerminal(store, formatWorkflowFailureDeliveryFallback(run.workflowName, run.id, store.directory, error, run.state === "failed"), true);
   };
   pi.on("session_start", async (_event, ctx) => {
-    notifyRoleDeprecation(ctx, extensionAgentDir);
     if (sessionStarted) return;
     sessionStarted = true;
     try {
@@ -1262,10 +1182,9 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const budgetRuntime = new WorkflowBudgetRuntime(budget, loaded.run.budgetVersion ?? 1, loaded.run.usage, loaded.run.budgetEvents, { active: loaded.run.state === "running" });
       const lifecycle = lifecycleFor(store, loaded.run.state, loaded.snapshot.metadata);
       const providerPause = async () => { deliver(pi, `Workflow ${loaded.snapshot.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
-      const roleDefinitions = loaded.snapshot.roles ?? {};
       const abortController = new AbortController();
       const providerErrorRecovery = createProviderErrorRecovery(ctx, new Set(loaded.snapshot.models), () => { abortController.abort(); });
-      runs.set(runId, { executor: createAgentExecutor({ cwd: ctx.cwd, projectTrusted: projectTrusted(ctx), model, tools: activeSnapshotTools(loaded.snapshot.tools, "session"), resourceSelectors: snapshotResourcePolicy(loaded.snapshot, store.cwd, projectTrusted(ctx), workflowSettingsPath(extensionAgentDir)).effective, extensionSettings: loaded.snapshot.settings.extensionSettings, availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsSources?.modelAliases ? { settingsPath: loaded.snapshot.settingsSources.modelAliases } : loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), agentDefinitions: roleDefinitions, runStore: store, providerPause, agentResourcePolicy: frozenResourcePolicy(snapshotResourcePolicy(loaded.snapshot, store.cwd, projectTrusted(ctx), workflowSettingsPath(extensionAgentDir))) }), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) });
+      runs.set(runId, { executor: createAgentExecutor({ cwd: ctx.cwd, projectTrusted: projectTrusted(ctx), model, tools: activeSnapshotTools(loaded.snapshot.tools, "session"), resourceSelectors: snapshotResourcePolicy(loaded.snapshot, store.cwd, projectTrusted(ctx), workflowSettingsPath(extensionAgentDir)).effective, extensionSettings: loaded.snapshot.settings.extensionSettings, availableModels: new Set(loaded.snapshot.models), knownModels: new Set(loaded.snapshot.models), ...(loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases ? { modelAliases: loaded.snapshot.modelAliases ?? loaded.snapshot.settings.modelAliases } : {}), ...(loaded.snapshot.settingsSources?.modelAliases ? { settingsPath: loaded.snapshot.settingsSources.modelAliases } : loaded.snapshot.settingsPath ? { settingsPath: loaded.snapshot.settingsPath } : {}), runStore: store, providerPause, agentResourcePolicy: frozenResourcePolicy(snapshotResourcePolicy(loaded.snapshot, store.cwd, projectTrusted(ctx), workflowSettingsPath(extensionAgentDir))) }), store, metadata: loaded.snapshot.metadata, model, lifecycle, budget: budgetRuntime, abortController, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}) });
       for (const checkpoint of await store.awaitingCheckpoints()) deliver(pi, `Workflow ${loaded.snapshot.metadata.name} checkpoint ${checkpoint.name}: ${checkpoint.prompt}\nContext: ${JSON.stringify(checkpoint.context)}\nRespond with workflow_respond.`);
       for (const decision of await store.pendingWorkflowDecisions()) deliver(pi, recovery.budgetDecisionDelivery(loaded.snapshot.metadata, decision));
       scheduler.restoreRun(runId, loaded.snapshot.settings.concurrency, loaded.snapshot.identityVersion === LAUNCH_SNAPSHOT_IDENTITY_VERSION ? await store.loadOwnership() : [], () => runs.get(runId)?.budget.checkAgentLaunch(), loaded.snapshot.settings.extensionSettings);
@@ -1293,14 +1212,6 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       await releaseSessionResources();
       throw error;
     }
-  });
-  pi.on("before_agent_start", (event, ctx) => {
-    if (!pi.getActiveTools().includes("workflow")) return;
-    const roles = Object.entries(loadAgentDefinitions(ctx.cwd, extensionAgentDir, projectTrusted(ctx), currentRoleSources())).filter(([, definition]) => definition.description);
-    if (!roles.length) return;
-    const content = `Workflow role descriptions:\n${roles.map(([name, definition]) => `- \`${name}\`: ${String(definition.description)}`).join("\n")}`;
-    const { appendSystemPrompt } = event.systemPromptOptions;
-    event.systemPromptOptions.appendSystemPrompt = appendSystemPrompt ? `${appendSystemPrompt}\n\n${content}` : content;
   });
   const workflowTool: ToolDefinition<typeof WORKFLOW_TOOL_PARAMETERS, WorkflowToolResult, WorkflowProgressRenderState> = {
     name: "workflow",
@@ -1343,8 +1254,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const settings = Object.freeze({ ...launch.settings, ...(Object.keys(modelAliases).length ? { modelAliases } : {}) });
       if (launch.resolution.global.extensionSettings !== undefined) registry.validateExtensionSettings(launch.resolution.global.extensionSettings, { source: "global", cwd: ctx.cwd, projectTrusted: trustedProject, settingsPath: launch.resolution.globalSettingsPath });
       if (trustedProject && launch.resolution.project.extensionSettings !== undefined) registry.validateExtensionSettings(launch.resolution.project.extensionSettings, { source: "project", cwd: ctx.cwd, projectTrusted: true, settingsPath: launch.resolution.projectSettingsPath });
-      const validated = validateWorkflowLaunchWithRegistry(params, { cwd: ctx.cwd, agentDir: extensionAgentDir, extensionRoleDirectories: currentRoleSources(), projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases, knownModels, settingsPath, ...(settings.extensionSettings === undefined ? {} : { extensionSettings: settings.extensionSettings }) }, registry);
-      const { script, checked, agentDefinitions, projectAgentDefinitions, roleNames } = validated;
+      const validated = validateWorkflowLaunchWithRegistry(params, { cwd: ctx.cwd, agentDir: extensionAgentDir, projectTrusted: trustedProject, availableModels, rootTools: new Set(rootTools), modelAliases, knownModels, settingsPath, ...(settings.extensionSettings === undefined ? {} : { extensionSettings: settings.extensionSettings }) }, registry);
+      const { script, checked } = validated;
       const toolContext = scriptToolContext(ctx);
       validateScriptToolReferences(script, toolContext);
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
@@ -1354,12 +1265,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const runContext = workflowRunContext(ctx.cwd, ctx.sessionManager.getSessionId(), runId, checked.metadata, args, runController.signal);
       const store = new RunStore(ctx.cwd, ctx.sessionManager.getSessionId(), runId, home);
       const parentRunId = params.parentRunId;
-      const roles = Object.fromEntries(roleNames.map((role) => [role, agentDefinitions[role]])) as Record<string, AgentDefinition>;
-      const projectRoles = roleNames.filter((role) => projectAgentDefinitions[role] !== undefined);
-      const roleModels = roleNames.flatMap((role) => { const model = agentDefinitions[role]?.model; return model ? [modelCapability(model, modelAliases, knownModels, settingsPath)] : []; });
-      const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models, ...roleModels])];
-      const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, launchMode: params.foreground ? "foreground" : "background", settings, settingsPath, settingsSources: { ...launch.resolution.sources, concurrency: params.concurrency === undefined ? launch.resolution.sources.concurrency : "per-run options" }, ...(Object.keys(modelAliases).length ? { modelAliases } : {}), ...(budget ? { budget } : {}), ...(checked.referenced.phases.length ? { phases: checked.referenced.phases } : {}), models: snapshotModels, tools: rootTools, agentTypes: checked.referenced.agentTypes, roles, projectRoles, schemas: checked.schemas });
-      const capturedRoles = roleCapture(store, snapshot, agentDefinitions, projectAgentDefinitions);
+      const snapshotModels = [...new Set([rootModelName, ...checked.referenced.models])];
+      const snapshot = createLaunchSnapshot({ script, args, metadata: checked.metadata, launchMode: params.foreground ? "foreground" : "background", settings, settingsPath, settingsSources: { ...launch.resolution.sources, concurrency: params.concurrency === undefined ? launch.resolution.sources.concurrency : "per-run options" }, ...(Object.keys(modelAliases).length ? { modelAliases } : {}), ...(budget ? { budget } : {}), ...(checked.referenced.phases.length ? { phases: checked.referenced.phases } : {}), models: snapshotModels, tools: rootTools, agentConfigurations: {}, schemas: checked.schemas });
       const budgetRuntime = new WorkflowBudgetRuntime(budget);
       const initialBudget = budgetRuntime.snapshot();
       const createRun = () => store.create({ id: runId, workflowName: checked.metadata.name, cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId(), state: "running", ...(parentRunId !== undefined ? { parentRunId } : {}), agents: [], agentSessions: [], delivery: params.foreground ? { mode: "foreground", state: "attached", toolCallId } : { mode: "background", state: "pending" }, ...(budget ? { budget } : {}), budgetVersion: 1, ...initialBudget }, snapshot);
@@ -1383,7 +1290,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             delivery.detached = true;
             const activeRun = runs.get(runId);
             if (activeRun) { activeRun.foreground = false; delete activeRun.update; }
-            await store.saveSnapshot(createLaunchSnapshot({ ...capturedRoles.snapshot, launchMode: "background" }));
+            await store.setLaunchMode("background");
             for (const checkpoint of await store.awaitingCheckpoints()) deliverBackgroundCheckpoint(checked.metadata.name, runId, checkpoint);
             signal?.removeEventListener("abort", onForegroundAbort);
             const run = (await store.load()).run;
@@ -1398,12 +1305,12 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const backgroundLaunch = !params.foreground;
       const providerPause = async () => { if (!foregroundAttached) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`); await lifecycle.providerPause(); };
       const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
-      const executor = createAgentExecutor({ cwd: ctx.cwd, projectTrusted: launch.resourcePolicy.projectTrusted, model: rootModel, tools: new Set(rootTools), resourceSelectors: launch.resourcePolicy.effective, extensionSettings: settings.extensionSettings, availableModels, knownModels, modelAliases, settingsPath, agentDefinitions, runStore: store, providerPause, agentResourcePolicy: frozenResourcePolicy(launch.resourcePolicy), runContext });
+      const executor = createAgentExecutor({ cwd: ctx.cwd, projectTrusted: launch.resourcePolicy.projectTrusted, model: rootModel, tools: new Set(rootTools), resourceSelectors: launch.resourcePolicy.effective, extensionSettings: settings.extensionSettings, availableModels, knownModels, modelAliases, settingsPath, runStore: store, providerPause, agentResourcePolicy: frozenResourcePolicy(launch.resourcePolicy), runContext });
       const runRecord: WorkflowRunRecord = { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, foreground: foregroundAttached, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) };
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch(), settings.extensionSettings);
-      const execution = runWorkflow(script, args, withWorkflowFunctions({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId, (role, model) => capturedRoles.capture(role, model)), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry, settings.extensionSettings), runController.signal);
+      const execution = runWorkflow(script, args, withWorkflowFunctions({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name) }, store, runContext, registry, settings.extensionSettings), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {
@@ -1665,9 +1572,7 @@ async function handleTurnInput(store: RunStore, handle: string, turn: number): P
   return target;
 }
 
-function displayAgentName(label: string | undefined, role: string | undefined, model: ModelSpec): string {
-  return label ?? role ?? model.model;
-}
+
 
 function modelSpec(value: string, fallback: ModelSpec): ModelSpec {
   try {

@@ -57,7 +57,7 @@ void test("completion delivery falls back when worktree inspection fails", async
 void test("RunStore persists pretty UTF-8 result bytes", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-completion-artifact-"));
   const store = new RunStore(home, "session", "run", home);
-  await store.create({ id: "run", workflowName: "artifact", cwd: home, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "artifact" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  await store.create({ id: "run", workflowName: "artifact", cwd: home, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "artifact" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const path = await store.saveResult({ answer: "😀" });
   assert.equal(await readFile(path, "utf8"), '{\n  "answer": "😀"\n}\n');
   assert.equal(await store.resultBytes(), Buffer.byteLength('{\n  "answer": "😀"\n}\n', "utf8"));

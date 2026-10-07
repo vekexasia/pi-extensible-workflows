@@ -1,6 +1,14 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- Roles are now interpreted only by the explicitly enabled optional `@piewf/pi-ext-roles` extension. Core and CLI have no roles dependency, discovery, typed role fields, `/roles` export, `pi-role` bridge or legacy role paths. Without the plugin, unknown agent options are opaque JSON and ignored. The five fallback roles belong to the independent package.
+- Generic `agentPreparationHooks` optionally validate original options with a schema, then prepare concrete configuration before model/resource validation. Workflow agents, handles, nested agents, standalone subagents and doctor share preparation and root/parent capability enforcement. Consumer selectors remain ordered defaults, not extra authorization ceilings.
+- New runs freeze generic prepared configurations before dispatch. Workflow identity version 6 and standalone configuration version 1 reject previous formats without migration. Retry/resume reuse configuration; new identities resolve current settings. Extension code and skill/AGENTS/SYSTEM/APPEND bytes are reread, not frozen.
+- Doctor uses `--agent-options <json>` and `agentInspection`, not role targets or `--role`. Bundles require explicit plugin resources/dependencies instead of role inference. Obsolete compatibility upgrade/warning checks are removed; generic and extension-owned regressions plus the local paired SDK/CLI harness replace their still-relevant coverage.
+- Role descriptions append to Pi's structured prompt channel, preserving existing append instructions and dynamic provider/tool prefixes (#311); they never force the entire system prompt.
+
 ## [6.0.0] - 2026-10-07
 
 ### Breaking changes

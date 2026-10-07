@@ -5,45 +5,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, inspectWorkflowScript, preflight, RPC_LIMIT_BYTES, RunStore, runWorkflow, WorkflowError, type JsonValue } from "../src/index.js";
+import workflowExtension, { FairAgentScheduler, inspectWorkflowScript, preflight, RPC_LIMIT_BYTES, RunStore, runWorkflow, WorkflowError, type JsonValue } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
 import { decodeOwnershipRecords } from "../src/decoders.js";
 
 const capabilities = {
-  models: new Set(["openai/gpt"]), tools: new Set(["read"]), agentTypes: new Set(["reviewer"]),
+  models: new Set(["openai/gpt"]), tools: new Set(["read"]),
 };
-const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt:high", tools: ["read"] });`;
-void test("rejects legacy persisted role override fields", () => {
-  assert.equal(decodeOwnershipRecords([{ id: "owner", label: "owner", state: "completed", options: { label: "owner", cwd: "/repo", tools: [], role: { name: "reviewer", model: "old/model" } } }]), undefined);
-});
-void test("preflight accepts the complete static contract", () => {
-  const metadata = { name: "review", description: "Review code" };
-  const result = preflight(valid, capabilities, [{ type: "object", properties: { value: { type: "string" } } }], metadata);
-  assert.equal(result.metadata.name, "review");
-  assert.equal(result.dynamicAgentRoles, false);
-  assert.equal(preflight(`agent("x", { role: args.role })`, capabilities).dynamicAgentRoles, true);
-  assert.deepEqual(result.referenced, { phases: ["check"], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
-  assert.deepEqual(preflight(valid.replace("openai/gpt:high", "openai/gpt:high"), capabilities, [], metadata).referenced.models, ["openai/gpt"]);
-  assert.ok(Object.isFrozen(result.metadata));
-  const staticSchema = { type: "object", properties: { answer: { type: "number" } } };
-  assert.deepEqual(preflight(`agent("x",{outputSchema:${JSON.stringify(staticSchema)}})`, capabilities).schemas, [staticSchema]);
-  preflight(`agent("x",{timeoutMs:0,timeoutMs:10})`, capabilities);
-  preflight(`agent("x",{timeoutMs:0,...{timeoutMs:10}})`, capabilities);
-});
-void test("preflight accepts role names with call-level overrides", () => {
-  const script = `agent("x", { role: "reviewer", model: "openai/gpt:high", tools: ["read"], contextFiles: ["cwd"] })`;
-  const result = preflight(script, capabilities);
-  assert.equal(result.dynamicAgentRoles, false);
-  assert.deepEqual(result.referenced, { phases: [], models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"] });
-  assert.equal(preflight(`agent("x",{role: args.role})`, capabilities).dynamicAgentRoles, true);
-  assert.equal(preflight(`agent("x",{role:"reviewer"})`, capabilities).dynamicAgentRoles, false);
-  const inspected = inspectWorkflowScript(script);
-  const inspectedCall = inspected[0];
-  assert.ok(inspectedCall);
-  assert.equal(inspectedCall.kind, "agent");
-  assert.equal(inspectedCall.role, "reviewer");
-  assert.equal(inspectedCall.model, "openai/gpt:high");
-  assert.deepEqual(inspectedCall.options, { role: "reviewer", model: "openai/gpt:high", tools: ["read"], contextFiles: ["cwd"] });
+
+void test("persisted opaque role options remain extension-owned JSON", () => {
+  const entries = decodeOwnershipRecords([{ id: "owner", label: "owner", state: "completed", options: { label: "owner", cwd: "/repo", tools: [], agentOptions: { role: { name: "reviewer" } } } }]);
+  assert.deepEqual(entries?.[0]?.options.agentOptions, { role: { name: "reviewer" } });
 });
 
 void test("preflight rejects every static boundary before run creation", () => {
@@ -51,12 +23,7 @@ void test("preflight rejects every static boundary before run creation", () => {
   const createRun = (script: string) => { preflight(script, capabilities, [], { name: "test" }); created += 1; };
   const cases: Array<[string, string]> = [
     ["const x = ;", "INVALID_SYNTAX"],
-    [`agent('a',{model:'missing'})`, "UNKNOWN_MODEL"],
     [`agent('a',{model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
-    [`agent('a',{tools:['bash']})`, "UNKNOWN_TOOL"],
-    [`agent('a',{role:'writer'})`, "UNKNOWN_AGENT_TYPE"],
-    [`agent('a',{role:{name:'reviewer'}})`, "INVALID_METADATA"],
-    [`agent('a',{role:'reviewer',tools:['bash']})`, "UNKNOWN_TOOL"],
     [`agent('a',{outputSchema:[]})`, "INVALID_SCHEMA"],
     [`agent('a',{label:' '})`, "INVALID_METADATA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
@@ -71,7 +38,7 @@ void test("preflight rejects every static boundary before run creation", () => {
 
 void test("host rejects malformed dynamic agent options before launching", async () => {
   let launched = false;
-  for (const options of ["null", "{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}", "{role:{}}", "{role:{name:'reviewer'}}"]) {
+  for (const options of ["null", "{label:' '}", "{tools:1}", "{timeoutMs:0}", "{retries:-1}"]) {
     await assert.rejects(runWorkflow(`return agent('a',${options});`, null, { agent: async () => { launched = true; return null; } }).result, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
   assert.equal(launched, false);
@@ -108,7 +75,7 @@ void test("AST preflight ignores DSL-looking non-executable text and member call
     const unrelated = {model:'missing', tools:['bash'], role:'writer'};
     phase('real');
     agent("Explain agent() Promise behavior; name: 'fake'; model: 'missing'; tools: ['bash']; role: 'writer'", {model:'openai/gpt:high',tools:['read']});`;
-  assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: ["openai/gpt"], tools: ["read"], agentTypes: [] });
+  assert.deepEqual(preflight(script, capabilities).referenced, { phases: ["real"], models: [], tools: ["read"] });
 });
 
 void test("AST preflight distinguishes executable calls from prompt text", () => {
@@ -123,20 +90,6 @@ void test("AST preflight validates combinator signatures", () => {
   assert.throws(() => preflight(`${base} parallel({task:()=>1}, 'batch')`, capabilities), /parallel requires/);
   assert.throws(() => preflight(`${base} pipeline('pipe', {item:1})`, capabilities), /pipeline requires/);
   preflight(`${base} agent('x', options); checkpoint(input); parallel(...batch); pipeline(...pipe);`, capabilities);
-});
-
-void test("launch snapshots are detached and deeply immutable", () => {
-  const input = { script: `return withWorktree("snapshot", async () => true);`, args: { nested: [1] }, metadata: { name: "x", description: "x" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: ["read"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "original", skills: ["role-skill"], extensions: ["/role-extension.ts"] } }, projectRoles: ["reviewer"], schemas: [{ type: "object" }] };
-  const snapshot = createLaunchSnapshot(input);
-  input.args.nested.push(2);
-  input.roles.reviewer.prompt = "mutated";
-  input.roles.reviewer.skills.push("mutated");
-  assert.deepEqual(snapshot.args, { nested: [1] });
-  assert.equal(snapshot.identityVersion, 5);
-  assert.equal(snapshot.roles?.reviewer?.prompt, "original");
-  assert.deepEqual(snapshot.roles.reviewer.skills, ["role-skill"]);
-  assert.ok(Object.isFrozen(snapshot.args));
-  assert.ok(Object.isFrozen(snapshot.schemas[0]));
 });
 
 void test("worker exposes deterministic core globals and JSON RPC only", async () => {

@@ -71,16 +71,10 @@ async function inspectEntry(manager: SubagentManager, storageDirectory: string, 
   };
 }
 
-function requestRole(request: SubagentRunRequest | undefined): string {
-  const role: unknown = request?.role;
-  if (typeof role === "string" && role.trim()) return role.trim();
-  const override = objectValue(role);
-  return typeof override?.name === "string" && override.name.trim() ? override.name.trim() : "none";
-}
+
 function shortId(id: string): string { return id.length > 12 ? id.slice(0, 8) : id; }
 function entryName(entry: NavigatorEntry): string {
-  const role = requestRole(entry.request);
-  return boundedText(entry.request?.label?.trim() || (role === "none" ? shortId(entry.status.id) : role), 256);
+  return boundedText(entry.request?.label?.trim() || shortId(entry.status.id), 256);
 }
 /** Names for a list of runs; a repeated name carries its short ID, as in the `/workflow` picker, so every row stays unique. */
 function listNames(entries: readonly NavigatorEntry[]): string[] {
@@ -113,7 +107,7 @@ function usageAccounting(status: SubagentStatus): SubagentProgress["accounting"]
   return status.progress?.accounting;
 }
 function detailPresentation(inspection: Inspection): AgentDetailPresentation {
-  const { status, request } = inspection.entry;
+  const { status } = inspection.entry;
   const attempt = latestAttempt(status);
   const state = status.progress?.state;
   const activity = status.progress?.activity;
@@ -122,14 +116,12 @@ function detailPresentation(inspection: Inspection): AgentDetailPresentation {
   const lastEventAt = status.progress?.lastEventAt;
   const attempts = status.attempts ?? attempt?.attempt;
   const accounting = usageAccounting(status);
-  const role = requestRole(request);
   const error = status.error ?? attempt?.error;
   return {
     state: status.state,
     ...(activity === undefined ? {} : { activity: { kind: activity.kind, text: boundedText(activity.text) } }),
     ...(lastEventAt === undefined ? {} : { lastEventAt }),
     ...(model === undefined ? {} : { model: { provider: boundedText(model.provider, 256), model: boundedText(model.model, 256), ...(model.thinking === undefined ? {} : { thinking: model.thinking }) } }),
-    ...(role === "none" ? {} : { role: boundedText(role, 256) }),
     ...(tools === undefined ? {} : { tools: tools.slice(0, 256).map((tool) => boundedText(tool, 256)) }),
     ...(attempts === undefined ? {} : { attempts }),
     ...(status.startedAt === undefined ? {} : { startedAt: status.startedAt }),
@@ -186,8 +178,7 @@ function standaloneActionContext(manager: SubagentManager, inspection: Inspectio
   const session = attempt.session;
   const live = liveData?.liveSession && session && liveData.liveSession.reference.transport === session.transport && liveData.liveSession.reference.sessionId === session.sessionId ? liveData.liveSession : undefined;
   const label = request?.label?.trim();
-  const role = requestRole(request);
-  const name = label || (role === "none" ? "subagent" : role);
+  const name = label || "subagent";
   const ui = {
     notify: (message: string, level: "info" | "warning" | "error" = "info") => { context.ui.notify(message, level); },
     confirm: (title: string, message: string) => context.ui.confirm(title, message),

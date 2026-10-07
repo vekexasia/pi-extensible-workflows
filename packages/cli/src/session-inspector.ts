@@ -9,7 +9,7 @@ import { listPersistedSessionIds, listRunIds, RunStore, type PersistedRun, type 
 
 export interface ModelUsage { model: string; cost: number }
 export interface AttemptReport { attempt: number; prompt: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; models: readonly ModelUsage[]; error?: string; setup?: AgentSetupSummary }
-export interface AgentReport { name: string; label?: string; state: string; role?: string; requestedModel?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[]; setup?: AgentSetupSummary }
+export interface AgentReport { name: string; label?: string; state: string; requestedModel?: string; model: string; thinking?: ModelSpec["thinking"]; cost: number; attempts: readonly AttemptReport[]; setup?: AgentSetupSummary }
 export interface WorkflowReport { name: string; description?: string; status: string; runId?: string; script?: string; calls: readonly StaticWorkflowCall[]; parseError?: string; cost: number; models: readonly ModelUsage[]; agents: readonly AgentReport[]; budget?: PersistedRun["budget"]; budgetVersion?: number; usage?: PersistedRun["usage"]; budgetEvents?: PersistedRun["budgetEvents"]; events?: readonly { type: string; message: string }[] }
 export interface SessionReport { id: string; cwd: string; path: string; cost: number; models: readonly ModelUsage[]; workflows: readonly WorkflowReport[]; totalCost: number; totalModels: readonly ModelUsage[] }
 export interface InspectorViewState { view: "list" | "detail" | "script"; selected: number; scroll: number }
@@ -187,7 +187,7 @@ function agentReport(agent: PersistedRun["agents"][number]): AgentReport {
     attempts.push({ attempt: 1, prompt: "(transcript unavailable)", model: fallbackModel, ...(fallbackThinking !== undefined ? { thinking: fallbackThinking } : {}), cost, models: [{ model: fallbackModel, cost }] });
   }
   const latest = attempts[attempts.length - 1];
-  return { name: agent.name, ...(agent.label ? { label: agent.label } : {}), state: agent.state, ...(agent.role ? { role: agent.role } : {}), ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts, ...(latest?.setup ? { setup: latest.setup } : {}) };
+  return { name: agent.name, ...(agent.label ? { label: agent.label } : {}), state: agent.state, ...(agent.requestedModel ? { requestedModel: agent.requestedModel } : {}), model: latest?.model ?? fallbackModel, ...(latest?.thinking !== undefined ? { thinking: latest.thinking } : {}), cost: attempts.reduce((sum, attempt) => sum + attempt.cost, 0), attempts, ...(latest?.setup ? { setup: latest.setup } : {}) };
 }
 
 export function matchSession(query: string, sessions: readonly SessionInfo[]): SessionInfo {
@@ -271,7 +271,7 @@ function detailLines(workflow: WorkflowReport): string[] {
     "",
     style(ansi.bold, "Static workflow calls"),
     ...(workflow.parseError ? [style(ansi.red, `Parse error: ${workflow.parseError}`)] : workflow.calls.length ? workflow.calls.map((call, index) => {
-      const fields = [call.name ? `name=${JSON.stringify(call.name)}` : "", call.prompt ? `prompt=${JSON.stringify(call.prompt)}` : call.kind === "agent" || call.kind === "checkpoint" ? "prompt=<dynamic>" : "", call.label ? `label=${call.label}` : "", call.role ? `role=${call.role}` : "", call.model ? `model=${call.model}` : ""].filter(Boolean);
+      const fields = [call.name ? `name=${JSON.stringify(call.name)}` : "", call.prompt ? `prompt=${JSON.stringify(call.prompt)}` : call.kind === "agent" || call.kind === "checkpoint" ? "prompt=<dynamic>" : "", call.label ? `label=${call.label}` : "", call.model ? `model=${call.model}` : ""].filter(Boolean);
       return `${String(index + 1)}. ${call.kind}${fields.length ? ` · ${fields.join(" · ")}` : ""}`;
     }) : ["(none)"]),
     "",
@@ -279,13 +279,13 @@ function detailLines(workflow: WorkflowReport): string[] {
   ];
   if (!workflow.agents.length) lines.push("(no agent run was persisted)");
   for (const agent of workflow.agents) {
-    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.role ? `role=${agent.role} · ` : ""}${agent.requestedModel ? `requested=${agent.requestedModel} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
+    lines.push("", style(agent.state === "completed" ? ansi.green : agent.state === "failed" ? ansi.red : ansi.yellow, `${agent.label ?? agent.name} [${agent.state}]`), `${agent.requestedModel ? `requested=${agent.requestedModel} · ` : ""}${agent.model}${agent.thinking !== undefined ? `:${agent.thinking}` : ""} · ${money(agent.cost)}`);
     for (const attempt of agent.attempts) {
       lines.push(`Attempt ${String(attempt.attempt)} · ${attempt.model}${attempt.thinking !== undefined ? `:${attempt.thinking}` : ""} · ${money(attempt.cost)}${attempt.error ? ` · ${attempt.error}` : ""}`, `Prompt: ${attempt.prompt}`, ...(attempt.setup ? [
         `Hooks: ${attempt.setup.hookNames.join(", ") || "(none)"}`,
         `Effective: model=${attempt.setup.model.provider}/${attempt.setup.model.model}${attempt.setup.model.thinking ? `:${attempt.setup.model.thinking}` : ""} tools=${attempt.setup.tools.join(",") || "(none)"} cwd=${attempt.setup.cwd}`,
         ...(attempt.setup.resourceSelectors ? [
-          `Selector sources: global/project/role/call are persisted with the attempt`,
+          `Selector sources: prepared policy layers are persisted with the attempt`,
           `Configured skill patterns: ${attempt.setup.resourceSelectors.selectors.skills.join(", ") || "(none)"}`,
           `Effective skills: ${attempt.setup.resourceSelectors.skills.join(", ") || "(none)"}`,
           `Configured extension patterns: ${attempt.setup.resourceSelectors.selectors.extensions.join(", ") || "(none)"}`,

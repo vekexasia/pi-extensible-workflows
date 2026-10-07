@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -7,7 +9,9 @@ import { isNodeError } from "./utils.js";
 
 export function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
-export { canonicalPath, extensionIdentity, sameFilesystemPath } from "@piewf/pi-ext-roles/paths";
+export function canonicalPath(path: string): string { const absolute = resolve(path); try { return realpathSync(absolute); } catch { return absolute; } }
+export function extensionIdentity(path: string): string { return path.startsWith("builtin:") ? path : canonicalPath(path.startsWith("file:") ? fileURLToPath(path) : path); }
+export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
 
 export function projectStorageKey(cwd: string): string {
   const exact = resolve(cwd);

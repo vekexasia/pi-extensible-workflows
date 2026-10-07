@@ -2,67 +2,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import {
-  addAccounting,
-  deepFreeze,
-  errorCode,
-  errorText,
-  finiteNumber,
-  isNodeError,
-  isThinkingLevel,
-  jsonValue,
-  object,
-  loadingRegistry,
-  localAgentTransport,
-  resolveAgentResourcePolicy,
-  resolveWorkflowSettings,
-  roleNameOf,
-  sanitizeDisplayText,
-  sumAccounting,
-  structuralPath,
-  validateModelAliasAvailability,
-  WorkflowAgentExecutor,
-  WorkflowError,
-  workflowProjectSettingsPath,
-  workflowSettingsPath,
-  type AgentAccounting,
-  type AgentAttempt,
-  type AgentAttemptSummary,
-  type AgentDefinition,
-  type AgentExecutionOptions,
-  type AgentExecutionRoot,
-  type AgentProgress,
-  type AgentToolCallProgress,
-  type JsonSchema,
-  type JsonValue,
-  type ModelSpec,
-  type WorkflowAgentSessionState,
-  type WorkflowExtensionSettings,
-  type WorkflowRunContext,
-  SerialLane,
-} from "../../src/index.js";
-import { decodeAgentDefinition, decodeWorkflowExtensions } from "../../src/decoders.js";
-import { activeRoleDirectories, loadAgentDefinitions } from "../../src/roles.js";
+import { addAccounting, errorCode, errorText, finiteNumber, isNodeError, isThinkingLevel, jsonValue, object, loadingRegistry, localAgentTransport, resolveAgentResourcePolicy, resolveWorkflowSettings, sanitizeDisplayText, sumAccounting, structuralPath, validateModelAliasAvailability, WorkflowAgentExecutor, WorkflowError, workflowSettingsPath, type AgentAccounting, type AgentAttempt, type AgentAttemptSummary, type PreparedAgentConfiguration, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type AgentToolCallProgress, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowAgentSessionState, type WorkflowRunContext, SerialLane } from "../../src/index.js";
+import { decodePreparedAgentConfiguration } from "../../src/decoders.js";
 import { atomicJson, json as readJson, processAlive } from "../../src/persistence.js";
 import { accountingValue, activityValue, legacyAccountingValue, worktreeValue } from "./decode.js";
-import {
-  SUBAGENT_ATTEMPT_DETAILS_LIMIT,
-  SUBAGENT_MAX_RETRIES,
-  SUBAGENT_SYSTEM_PROMPT_LIMIT,
-  SUBAGENTS_TOOL_NAMES,
-  normalizeSubagentRunRequest,
-  type SubagentInspectRequest,
-  type SubagentLiveness,
-  type SubagentAttemptActionData,
-  type SubagentManager,
-  type SubagentManagerContext,
-  type SubagentManagerDependencies,
-  type SubagentNotification,
-  type SubagentOwnerMarker,
-  type SubagentProgress,
-  type SubagentRunRequest,
-  type SubagentStatus,
-} from "./contracts.js";
+import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, SUBAGENT_MAX_RETRIES, SUBAGENT_SYSTEM_PROMPT_LIMIT, SUBAGENTS_TOOL_NAMES, normalizeSubagentRunRequest, type SubagentInspectRequest, type SubagentLiveness, type SubagentAttemptActionData, type SubagentManager, type SubagentManagerContext, type SubagentManagerDependencies, type SubagentNotification, type SubagentOwnerMarker, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
 import { createRunStoreWorktreeAdapter, defaultWorktreeHome, type SubagentWorktreeContext, type SubagentWorktreeHandle } from "./worktree.js";
 
 const WORKFLOW_NAME = "subagents";
@@ -77,12 +21,7 @@ const MAX_PERSISTED_ATTEMPT_ARRAY_ITEMS = SUBAGENT_MAX_RETRIES + 1;
 const MAX_PERSISTED_ATTEMPT_STRING_CHARS = 4096;
 const MAX_PERSISTED_ATTEMPT_LOCATOR_CHARS = 16 * 1024;
 const SUBAGENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-type StandaloneExternalConfiguration = Readonly<{
-  projectTrusted: boolean;
-  globalExtensionSettings?: Readonly<WorkflowExtensionSettings>;
-  projectExtensionSettings?: Readonly<WorkflowExtensionSettings>;
-  agentDefinitions: Readonly<Record<string, AgentDefinition>>;
-}>;
+type StandaloneExternalConfiguration = Readonly<PreparedAgentConfiguration>;
 class InvalidPersistedSubagentStatusError extends WorkflowError {
   constructor() { super("INTERNAL_ERROR", "Persisted subagent status is invalid"); }
 }
@@ -169,22 +108,11 @@ function rootModel(context: Readonly<SubagentManagerContext>): ModelSpec {
   const thinking = context.extensionContext.thinkingLevel;
   return { provider: model.provider, model: model.id, ...(thinking === undefined ? {} : { thinking }) };
 }
-function standaloneExtensionSettingsPath(cwd: string, agentDir: string, trustedProject: boolean, external: StandaloneExternalConfiguration): string {
-  return trustedProject && external.projectExtensionSettings !== undefined ? workflowProjectSettingsPath(cwd) : workflowSettingsPath(agentDir);
-}
-function validateStandaloneExtensionSources(context: Readonly<SubagentManagerContext>, external: StandaloneExternalConfiguration, registry: ReturnType<typeof loadingRegistry>, agentDir: string): void {
-  const cwd = context.extensionContext.cwd;
-  const globalSettingsPath = workflowSettingsPath(agentDir);
-  const trustedProject = context.extensionContext.isProjectTrusted();
-  if (external.globalExtensionSettings !== undefined) registry.validateExtensionSettings(external.globalExtensionSettings, { source: "global", cwd, projectTrusted: trustedProject, settingsPath: globalSettingsPath });
-  if (trustedProject && external.projectExtensionSettings !== undefined) registry.validateExtensionSettings(external.projectExtensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: workflowProjectSettingsPath(cwd) });
-}
-function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>, signal: AbortSignal, runId: string, worktree: SubagentWorktreeHandle | undefined, external: StandaloneExternalConfiguration): AgentExecutionRoot {
+function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>, signal: AbortSignal, runId: string, worktree: SubagentWorktreeHandle | undefined): AgentExecutionRoot {
   const extensionContext = context.extensionContext;
   const model = rootModel(context);
   const agentDir = dependencies.agentDir ?? getAgentDir();
   const currentTrustedProject = extensionContext.isProjectTrusted();
-  if (external.projectTrusted && !currentTrustedProject) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot retry standalone configuration from an untrusted project");
   const trustedProject = currentTrustedProject;
   const settingsPath = workflowSettingsPath(agentDir);
   const settings = resolveWorkflowSettings(extensionContext.cwd, trustedProject, settingsPath);
@@ -207,9 +135,10 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     signal,
   };
   const registry = loadingRegistry();
-  validateStandaloneExtensionSources(context, external, registry, agentDir);
-  const extensionSettings = trustedProject && external.projectExtensionSettings !== undefined ? external.projectExtensionSettings : external.globalExtensionSettings;
-  const extensionSettingsPath = standaloneExtensionSettingsPath(extensionContext.cwd, agentDir, trustedProject, external);
+  if (settings.global.extensionSettings !== undefined) registry.validateExtensionSettings(settings.global.extensionSettings, { source: "global", cwd: extensionContext.cwd, projectTrusted: trustedProject, settingsPath: settings.globalSettingsPath });
+  if (trustedProject && settings.project.extensionSettings !== undefined) registry.validateExtensionSettings(settings.project.extensionSettings, { source: "project", cwd: extensionContext.cwd, projectTrusted: true, settingsPath: settings.projectSettingsPath });
+  const extensionSettings = settings.effective.extensionSettings;
+  const extensionSettingsPath = settings.sources.extensionSettings ?? settingsPath;
   return {
     cwd: extensionContext.cwd,
     projectTrusted: trustedProject,
@@ -224,7 +153,7 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     ...(Object.keys(staticAliases).length ? { modelAliases: staticAliases } : {}),
     settingsPath: settings.sources.modelAliases,
     extensionSettingsPath,
-    agentDefinitions: external.agentDefinitions,
+    agentPreparationHooks: registry.agentPreparationHooks(),
     agentSetupHooks: registry.agentSetupHooks(),
     validateExtensionSettings: registry.validateExtensionSettings,
     agentResourcePolicy: () => structuredClone(resourcePolicy),
@@ -245,8 +174,7 @@ async function addDynamicAliases(context: Readonly<SubagentManagerContext>, sign
 }
 
 function executionOptions(request: Readonly<SubagentRunRequest>, onAttempt: NonNullable<AgentExecutionOptions["onAttempt"]>, onProgress: NonNullable<AgentExecutionOptions["onProgress"]>): AgentExecutionOptions {
-  const role = request.role;
-  const label = request.label ?? roleNameOf(role) ?? "subagent";
+  const label = request.label ?? "subagent";
   return {
     label,
     workflowName: WORKFLOW_NAME,
@@ -255,11 +183,11 @@ function executionOptions(request: Readonly<SubagentRunRequest>, onAttempt: NonN
     ...(request.skills === undefined ? {} : { skills: request.skills }),
     ...(request.extensions === undefined ? {} : { extensions: request.extensions }),
     ...(request.contextFiles === undefined ? {} : { contextFiles: request.contextFiles as NonNullable<AgentExecutionOptions["contextFiles"]> }),
-    ...(role === undefined ? {} : { role }),
     ...(request.worktree === undefined ? {} : { worktreeOwner: structuralPath("worktree", "named", request.worktree) }),
     ...(request.outputSchema === undefined ? {} : { schema: request.outputSchema as JsonSchema }),
     ...(request.retries === undefined ? {} : { retries: request.retries }),
     ...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
+    agentOptions: Object.fromEntries(Object.entries(request).filter(([key]) => !["prompt", "mode", "worktree"].includes(key))) as Record<string, JsonValue>,
     onAttempt,
     onProgress,
   };
@@ -403,32 +331,8 @@ function checkedRequest(request: unknown): SubagentRunRequest {
   return normalizeSubagentRunRequest(request);
 }
 function decodePersistedStandaloneExternalConfiguration(value: unknown): StandaloneExternalConfiguration | undefined {
-  if (!object(value) || !jsonValue(value) || typeof value.projectTrusted !== "boolean") return undefined;
-  const globalExtensionSettings = value.globalExtensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.globalExtensionSettings);
-  const projectExtensionSettings = value.projectExtensionSettings === undefined ? undefined : decodeWorkflowExtensions(value.projectExtensionSettings);
-  if (value.globalExtensionSettings !== undefined && globalExtensionSettings === undefined || value.projectExtensionSettings !== undefined && projectExtensionSettings === undefined) return undefined;
-  if (!object(value.agentDefinitions)) return undefined;
-  const agentDefinitions = Object.create(null) as Record<string, AgentDefinition>;
-  for (const [name, definition] of Object.entries(value.agentDefinitions)) {
-    const decoded = decodeAgentDefinition(definition);
-    if (decoded === undefined) return undefined;
-    agentDefinitions[name] = decoded;
-  }
-  return deepFreeze({ projectTrusted: value.projectTrusted, ...(globalExtensionSettings === undefined ? {} : { globalExtensionSettings }), ...(projectExtensionSettings === undefined ? {} : { projectExtensionSettings }), agentDefinitions });
-}
-function standaloneExternalConfiguration(context: Readonly<SubagentManagerContext>, dependencies: Readonly<SubagentManagerDependencies>): StandaloneExternalConfiguration {
-  const cwd = context.extensionContext.cwd;
-  const trustedProject = context.extensionContext.isProjectTrusted();
-  const agentDir = dependencies.agentDir ?? getAgentDir();
-  const resolution = resolveWorkflowSettings(cwd, trustedProject, workflowSettingsPath(agentDir));
-  const globalExtensionSettings = resolution.global.extensionSettings;
-  const projectExtensionSettings = resolution.project.extensionSettings;
-  return deepFreeze({
-    projectTrusted: trustedProject,
-    ...(globalExtensionSettings === undefined ? {} : { globalExtensionSettings: structuredClone(globalExtensionSettings) }),
-    ...(projectExtensionSettings === undefined ? {} : { projectExtensionSettings: structuredClone(projectExtensionSettings) }),
-    agentDefinitions: structuredClone(loadAgentDefinitions(cwd, agentDir, trustedProject, activeRoleDirectories(dependencies.roleEvents))),
-  });
+  if (!object(value) || value.version !== 1) return undefined;
+  return decodePreparedAgentConfiguration(value.configuration);
 }
 
 function checkedId(request: Readonly<{ id: string }>): string {
@@ -722,7 +626,7 @@ function emitUpdate(run: LiveRun): void {
   try { run.observe?.(publicStatus(live, true, true)); } catch { /* A widget failure is display-only. */ }
 }
 
-async function createRunStorage(root: string, id: string, request: Readonly<SubagentRunRequest>, status: PersistedSubagentStatus, external: StandaloneExternalConfiguration): Promise<string> {
+async function createRunStorage(root: string, id: string, request: Readonly<SubagentRunRequest>, status: PersistedSubagentStatus, external: StandaloneExternalConfiguration | undefined): Promise<string> {
   await secureDirectory(root);
   const directory = runDirectory(root, id);
   let created = false;
@@ -731,7 +635,7 @@ async function createRunStorage(root: string, id: string, request: Readonly<Suba
     created = true;
     await chmod(directory, 0o700);
     await atomicJson(requestPath(directory), request);
-    await atomicJson(configurationPath(directory), external);
+    if (external !== undefined) await atomicJson(configurationPath(directory), { version: 1, configuration: external });
     await atomicJson(statusPath(directory), status);
     return directory;
   } catch (error) {
@@ -972,8 +876,8 @@ class PersistentSubagentManager implements SubagentManager {
     await this.ensureInitialized();
     if (this.disposed) throw new WorkflowError("CANCELLED", "Subagent manager is disposed");
     if (context.signal?.aborted) throw new WorkflowError("CANCELLED", "Subagent cancelled");
-    const external = frozenExternal ?? standaloneExternalConfiguration(context, this.dependencies);
-    if (external.projectTrusted && !context.extensionContext.isProjectTrusted()) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot retry standalone configuration from an untrusted project");
+    const external = frozenExternal;
+    if (external?.projectTrusted && !context.extensionContext.isProjectTrusted()) throw new WorkflowError("RESUME_INCOMPATIBLE", "Cannot retry standalone configuration from an untrusted project");
     const id = randomUUID();
     const startedAt = Date.now();
     const sessionId = context.extensionContext.sessionManager.getSessionId();
@@ -1030,12 +934,9 @@ class PersistentSubagentManager implements SubagentManager {
           throw new WorkflowError("CANCELLED", "Subagent cancelled");
         }
       }
-      const baseRoot = executionRoot(context, this.dependencies, controller.signal, id, worktree, external);
-      const root = loadingRegistry().modelAliases().length === 0 ? baseRoot : await addDynamicAliases(context, controller.signal, baseRoot);
+      const baseRoot = executionRoot(context, this.dependencies, controller.signal, id, worktree);
+      const root = external !== undefined || loadingRegistry().modelAliases().length === 0 ? baseRoot : await addDynamicAliases(context, controller.signal, baseRoot);
       const transport = this.dependencies.transport ?? localAgentTransport;
-      const injectedExecutor = this.dependencies.createExecutor?.(root, transport);
-      executorOwnership.default = injectedExecutor === undefined;
-      if (current.run) current.run.executorOwnsSession = executorOwnership.default;
       const setSteer = (handler: SteerHandler): void => {
         const run = current.run;
         if (run) this.registerSteerHandler(run, handler);
@@ -1077,6 +978,13 @@ class PersistentSubagentManager implements SubagentManager {
         if (run.state !== "running") return;
         emitUpdate(run);
       }, (progress) => this.recordProgress(current.run, progress));
+      if (external !== undefined) options.configuration = structuredClone(external);
+      options.onConfiguration = (configuration) => atomicJson(configurationPath(directory), { version: 1, configuration });
+      const cwd = worktree?.cwd ?? root.cwd;
+      options.configuration = await new WorkflowAgentExecutor(root, transport).prepare(options, cwd, controller.signal);
+      const injectedExecutor = this.dependencies.createExecutor?.({ ...root, extensionSettings: options.configuration.settings }, transport);
+      executorOwnership.default = injectedExecutor === undefined;
+      if (current.run) current.run.executorOwnsSession = executorOwnership.default;
       if (injectedExecutor) return injectedExecutor.execute(snapshot.prompt, options, controller.signal, setSteer);
       return new WorkflowAgentExecutor(root, transport).execute(snapshot.prompt, options, controller.signal, [], setSteer);
     });
@@ -1544,9 +1452,8 @@ class PersistentSubagentManager implements SubagentManager {
     const notify = this.dependencies.notify;
     if (!notify || run.notificationSent || run.disposed) return;
     run.notificationSent = true;
-    const role = roleNameOf(run.request.role) ?? "none";
-    const label = run.request.label?.trim() || (role === "none" ? "subagent" : role);
-    const notification: SubagentNotification = { id: run.id, label, role, state: run.state as "completed" | "failed", ...(run.error === undefined ? {} : { error: run.error }) };
+    const label = run.request.label?.trim() || "subagent";
+    const notification: SubagentNotification = { id: run.id, label, state: run.state as "completed" | "failed", ...(run.error === undefined ? {} : { error: run.error }) };
     const pending = Promise.resolve().then(() => notify(notification));
     this.notificationPromises.add(pending);
     void pending.then(() => { this.notificationPromises.delete(pending); }, () => { this.notificationPromises.delete(pending); });

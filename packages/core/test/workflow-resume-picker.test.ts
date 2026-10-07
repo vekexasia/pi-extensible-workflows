@@ -13,7 +13,7 @@ type TestSetup = { start: ((event: unknown, context: unknown) => Promise<void>) 
 
 async function createRun(home: string, cwd: string, id: string, state: RunState, extra: Partial<PersistedRun> = {}, script = `return ${JSON.stringify(id)};`): Promise<RunStore> {
   const store = new RunStore(cwd, "session", id, home);
-  await store.create({ id, workflowName: id, cwd, sessionId: "session", state, agents: [], agentSessions: [], ...extra }, createLaunchSnapshot({ script, args: null, metadata: { name: id }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id, workflowName: id, cwd, sessionId: "session", state, agents: [], agentSessions: [], ...extra }, createLaunchSnapshot({ script, args: null, metadata: { name: id }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   return store;
 }
 

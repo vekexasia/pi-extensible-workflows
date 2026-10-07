@@ -142,7 +142,7 @@ async function withChrome(url: string, callback: (page: Devtools) => Promise<voi
 }
 
 function makeState(output: Record<string, unknown>, state: "running" | "completed"): Record<string, unknown> {
-  const agent = { id: "agent", name: "fixture-agent", label: "fixture-agent", state, attempts: 1, startedAt: 1, durationMs: state === "completed" ? 10 : undefined, model: { provider: "fixture", model: "model" }, requestedModel: "fixture/request", role: "reviewer", tools: ["read"], skills: ["review"], extensions: ["fixture"], prompt: "Inspect the fixture", systemPrompt: "System prompt", output, attemptDetails: [{ attempt: 1, transport: "local", setup: { cwd: "/project", model: { provider: "fixture", model: "model" }, tools: ["read"] } }] };
+  const agent = { id: "agent", name: "fixture-agent", label: "fixture-agent", state, attempts: 1, startedAt: 1, durationMs: state === "completed" ? 10 : undefined, model: { provider: "fixture", model: "model" }, requestedModel: "fixture/request", tools: ["read"], skills: ["review"], extensions: ["fixture"], prompt: "Inspect the fixture", systemPrompt: "System prompt", output, attemptDetails: [{ attempt: 1, transport: "local", setup: { cwd: "/project", model: { provider: "fixture", model: "model" }, tools: ["read"] } }] };
   const run = { id: "run", workflowName: "fixture", cwd: "/project", sessionId: "session", state, agents: [agent], transcripts: { agent: [{ type: "message", timestamp: "2025-01-01T00:00:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "transcript" }] } }] }, snapshot: { script: "return true;" } };
   return { type: "state", publishers: [{ id: "publisher", title: "fixture", cwd: "/project", sessionId: "session", connected: true, runs: [{ run }], subagents: [] }], updatedAt: 1 };
 }
@@ -160,15 +160,17 @@ void test("Trajectory static export opens Agent details and its Output tab in Ch
   writeFileSync(sessionFile, `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "transcript" }] } })}\n`);
   const store = new RunStore(cwd, "session", "run", home);
   const model = { provider: "fixture", model: "model" };
-  const run = { id: "run", workflowName: "fixture", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "fixture-agent", path: "agent", state: "completed", resultPath: "agent/call:1", attempts: 1, model, requestedModel: "fixture/request", role: "reviewer", tools: ["read"], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: ["read"] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
+  const run = { id: "run", workflowName: "fixture", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "fixture-agent", path: "agent", state: "completed", resultPath: "agent/call:1", attempts: 1, model, requestedModel: "fixture/request", tools: ["read"], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: ["read"] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "fixture" }, settings: { concurrency: 1 }, models: ["fixture/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "fixture" }, settings: { concurrency: 1 }, models: ["fixture/model"], tools: [], agentConfigurations: {}, schemas: [] }));
     await store.complete("agent/call:1", { answer: false });
     const html = await exportTrajectoryRunHtml({ cwd, sessionId: "session", runId: "run", home });
     const server = await serve(new Map([["/report.html", html]]));
     try {
       await withChrome(`${server.url}/report.html`, async (page) => {
         await waitFor(page, "Boolean(document.querySelector('.agent-grid-row'))");
+        assert.doesNotMatch(String(await page.evaluate("document.querySelector('.agent-grid-head').textContent")), /ROLE/);
+        assert.equal(await page.evaluate("document.querySelector('.agent-grid-row').children.length"), 6);
         await page.evaluate(clickExpression(".agent-grid-row"));
         assert.equal(await page.evaluate("Boolean(document.querySelector('[data-agent-details]'))"), true);
         await page.evaluate(clickExpression("[data-agent-details]"));
@@ -287,7 +289,7 @@ void test("Trajectory keeps a subagent transcript when a refresh races a newer r
   const publisher = new WebSocket(`ws://127.0.0.1:${String(port)}/ws`);
   await new Promise((resolve) => { publisher.addEventListener("open", resolve, { once: true }); });
   publisher.send(JSON.stringify({ type: "publisher:attach", publisherId }));
-  const publish = () => { publisher.send(JSON.stringify({ type: "publisher:state", publisher: { id: publisherId, title: "stale", cwd: "/project", sessionId: "session", connected: true }, runs: [], subagents: [{ id: subagentId, label: "live-sub", state: "running", role: "scout", startedAt: 1_000, model: { provider: "fixture", model: "model" }, request: { prompt: "go", model: "fixture/model" }, attempts: 1, transcript: { revision, status: "available", timing: [] } }] })); };
+  const publish = () => { publisher.send(JSON.stringify({ type: "publisher:state", publisher: { id: publisherId, title: "stale", cwd: "/project", sessionId: "session", connected: true }, runs: [], subagents: [{ id: subagentId, label: "live-sub", state: "running", startedAt: 1_000, model: { provider: "fixture", model: "model" }, request: { prompt: "go", model: "fixture/model" }, attempts: 1, transcript: { revision, status: "available", timing: [] } }] })); };
   // Revision 2 is answered as stale, as a publisher does when the session file grew between its state poll and the read.
   publisher.addEventListener("message", (event) => {
     const message = JSON.parse(String(event.data)) as { type?: string; requestId?: string; revision?: number };

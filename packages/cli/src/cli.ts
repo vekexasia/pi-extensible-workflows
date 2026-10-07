@@ -1,24 +1,21 @@
 #!/usr/bin/env node
-export * as roleContributionApi from "@piewf/pi-ext-roles";
-import { collectRoleContributions, type RoleDirectoryRegistration } from "@piewf/pi-ext-roles";
 import { randomUUID } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createEventBus, ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type ExtensionAPI, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import { createEventBus, ProjectTrustStore, SessionManager, SettingsManager, createAgentSessionFromServices, createAgentSessionServices, getAgentDir, hasTrustRequiringProjectResources, type LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
-import { discoverRoles } from "pi-extensible-workflows/roles";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowExtensionAPI, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
 import { shareTrajectoryRun } from "pi-extensible-workflows/trajectory";
 import type { WorkflowCatalogFunction } from "pi-extensible-workflows";
 
-export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string, mode?: InspectMode, failedOnly?: boolean) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean; isTTY?: boolean; skillPaths?: readonly string[]; roleSources?: readonly RoleDirectoryRegistration[] }
+export interface CliOptions extends DoctorOptions { inspect?: (sessionId?: string, mode?: InspectMode, failedOnly?: boolean) => Promise<void>; transcript?: (sessionFile: string) => Promise<void>; stderr?: (text: string) => void; signal?: AbortSignal; trustOverride?: boolean; isTTY?: boolean; skillPaths?: readonly string[] }
 
 type CliScalar = "string" | "integer" | "number" | "boolean";
 type CliField = { name: string; option: string; schema: Record<string, unknown>; type: CliScalar | "array"; itemType?: CliScalar; required: boolean };
@@ -220,7 +217,7 @@ export function parseScriptWorkflowCliArgs(rawArgs: readonly string[]): ScriptWo
   return { help: false, scriptPath, name: workflowName, args: input ?? null };
 }
 function exportUsage(): string { return [`Usage: piewf export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]`, "", "Launcher options:", ...launcherHelpLines()].join("\n") + "\n"; }
-function bundleUsage(): string { return [`Usage: piewf bundle <workflow-name> [--name <command>] [--output <directory>] [--force]`, "", "The bundle contains a launcher, manifest, workflow payload, and external-runtime setup instructions.", "Repeat --role, --alias, --tool, --command, or --environment to declare recipient requirements.", "Use --extension, --skill, --resource, and --dependency to copy selected payload resources."].join("\n") + "\n"; }
+function bundleUsage(): string { return [`Usage: piewf bundle <workflow-name> [--name <command>] [--output <directory>] [--force]`, "", "The bundle contains a launcher, manifest, workflow payload, and external-runtime setup instructions.", "Repeat --alias, --tool, --command, or --environment to declare recipient requirements.", "Use --extension, --skill, --resource, and --dependency to copy selected payload resources."].join("\n") + "\n"; }
 function parseInspectArgs(rawArgs: readonly string[]): { sessionId?: string; mode: InspectMode; failedOnly: boolean } {
   let sessionId: string | undefined;
   let mode: InspectMode = "tui";
@@ -237,8 +234,8 @@ function parseInspectArgs(rawArgs: readonly string[]): { sessionId?: string; mod
   }
   return { ...(sessionId ? { sessionId } : {}), mode: failedOnly && mode === "tui" ? "summary" : mode, failedOnly };
 }
-export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; prompt?: string; json?: boolean } {
-  let role: string | undefined;
+export function parseDoctorArgs(rawArgs: readonly string[]): { agentOptions?: Readonly<Record<string, JsonValue>>; prompt?: string; json?: boolean } {
+  let agentOptions: Readonly<Record<string, JsonValue>> | undefined;
   let prompt: string | undefined;
   let json = false;
   for (let index = 0; index < rawArgs.length; index += 1) {
@@ -246,20 +243,21 @@ export function parseDoctorArgs(rawArgs: readonly string[]): { role?: string; pr
     const equals = token.indexOf("=");
     const option = equals >= 0 ? token.slice(0, equals) : token;
     if (option === "--json" && equals < 0) { json = true; continue; }
-    if (option === "--role" || option === "--prompt") {
+    if (option === "--agent-options" || option === "--prompt") {
       const value = equals >= 0 ? token.slice(equals + 1) : rawArgs[++index];
       if (!value) throw new Error(`Missing value for ${option}`);
-      if (option === "--role") { if (role !== undefined) throw new Error("--role may only be provided once"); role = value; }
-      else { if (prompt !== undefined) throw new Error("--prompt may only be provided once"); prompt = value; }
+      if (option === "--agent-options") {
+        if (agentOptions !== undefined) throw new Error("--agent-options may only be provided once");
+        const parsed: unknown = JSON.parse(value);
+        if (!object(parsed) || !jsonValue(parsed)) throw new Error("--agent-options must be a JSON object");
+        agentOptions = parsed;
+      } else { if (prompt !== undefined) throw new Error("--prompt may only be provided once"); prompt = value; }
       continue;
     }
-    if (token === "--help" || token === "-h") throw new Error("help");
-    if (token.startsWith("--")) throw new Error(`Unknown doctor option: ${token}`);
-    if (role !== undefined) throw new Error(`Unexpected argument: ${token}`);
-    role = token;
+    throw new Error(`Unknown doctor option: ${token}`);
   }
-  if (prompt !== undefined && role === undefined) throw new Error("--prompt requires --role");
-  return { ...(role === undefined ? {} : { role }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
+  if (prompt !== undefined && agentOptions === undefined) throw new Error("--prompt requires --agent-options");
+  return { ...(agentOptions === undefined ? {} : { agentOptions }), ...(prompt === undefined ? {} : { prompt }), ...(json ? { json: true } : {}) };
 }
 
 export function parseDoctorCleanupArgs(rawArgs: readonly string[]): Required<Pick<DoctorCleanupOptions, "olderThanDays" | "yes">> {
@@ -296,15 +294,14 @@ function stripTrustOptions(rawArgs: readonly string[]): { args: string[]; trustO
   }
   return { args, ...(trustOverride !== undefined ? { trustOverride } : {}) };
 }
-type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => void; cwd?: string; agentDir?: string; trustOverride?: boolean; isTTY?: boolean; signal?: AbortSignal; skillPaths?: readonly string[]; roleSources?: readonly RoleDirectoryRegistration[] };
+type WorkflowIo = { write: (text: string) => void; stderr: (text: string) => void; cwd?: string; agentDir?: string; trustOverride?: boolean; isTTY?: boolean; signal?: AbortSignal; skillPaths?: readonly string[] };
 
-type HeadlessExtensionAPI = WorkflowExtensionAPI & { events: Pick<ExtensionAPI["events"], "emit"> };
 type HeadlessWorkflowResult = { content: Array<{ type: string; text: string }>; details?: unknown };
 type HeadlessWorkflowTool = { name: "workflow"; execute: (toolCallId: string, params: Record<string, JsonValue>, signal: AbortSignal | undefined, onUpdate: ((update: unknown) => void) | undefined, context: unknown) => Promise<HeadlessWorkflowResult> };
 function isHeadlessWorkflowResult(value: unknown): value is HeadlessWorkflowResult { return object(value) && Array.isArray(value.content) && value.content.every((entry) => object(entry) && typeof entry.type === "string" && typeof entry.text === "string"); }
 function isHeadlessWorkflowTool(value: unknown): value is HeadlessWorkflowTool { return object(value) && value.name === "workflow" && typeof value.execute === "function"; }
 type ShutdownHandler = (event: unknown, context: unknown) => Promise<void> | void;
-type WorkflowRuntime = { roleSources: readonly RoleDirectoryRegistration[]; catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
+type WorkflowRuntime = { session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]; catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
 
 async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: ShutdownHandler[] = []): Promise<WorkflowRuntime> {
   const cwd = options.cwd ?? process.cwd();
@@ -342,45 +339,30 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
   const bus = createEventBus();
   shutdownHandlers.push(() => { bus.clear(); });
   const services = await createAgentSessionServices({
-    cwd,
-    agentDir,
-    settingsManager,
-    resourceLoaderOptions: { eventBus: bus, ...(options.skillPaths?.length ? { additionalSkillPaths: [...options.skillPaths] } : {}) },
+    cwd, agentDir, settingsManager,
+    resourceLoaderOptions: {
+      eventBus: bus,
+      ...(options.skillPaths?.length ? { additionalSkillPaths: [...options.skillPaths] } : {}),
+      extensionFactories: [{ name: "workflows-cli", replaceable: true, factory(pi) {
+        workflowExtension(pi, homedir(), undefined, undefined, agentDir, options.skillPaths);
+      } }],
+    },
     resourceLoaderReloadOptions: { resolveProjectTrust },
   });
   const extensions = services.resourceLoader.getExtensions();
-  const tools: unknown[] = [];
-  const activeTools = [...new Set(["read", "bash", "edit", "write"].concat(extensions.extensions.flatMap((extension) => [...extension.tools.keys()]), ["workflow"]))];
-  const headlessPi = {
-    registerTool(tool: unknown) { tools.push(tool); },
-    registerCommand() {},
-    getThinkingLevel: () => services.settingsManager.getDefaultThinkingLevel() ?? "medium",
-    getActiveTools: () => activeTools,
-    on(name: string, handler: unknown) { if (name === "session_shutdown" && typeof handler === "function") shutdownHandlers.push(handler as ShutdownHandler); return () => {}; },
-    appendEntry() {},
-    sendMessage() {},
-    events: bus,
-  } satisfies HeadlessExtensionAPI;
-  const roleSources = [...collectRoleContributions(bus, extensions), ...(options.roleSources ?? [])];
-  workflowExtension(headlessPi, homedir(), undefined, undefined, agentDir, options.skillPaths, roleSources);
-  const workflowTool = tools.find(isHeadlessWorkflowTool);
+  if (extensions.errors.length) throw new Error(extensions.errors.map(({ path, error }) => `${path}: ${error}`).join("\n"));
+  const candidates: unknown[] = extensions.extensions.flatMap((extension) => [...extension.tools.values()].map(({ definition }) => definition));
+  const workflowTool = candidates.find(isHeadlessWorkflowTool);
   if (!workflowTool) throw new Error("The workflow runtime could not be initialized");
-  return { roleSources, catalog: workflowCatalog({ cwd, projectTrusted: settingsManager.isProjectTrusted(), globalSettingsPath: workflowSettingsPath(agentDir) }), services, workflowTool, shutdownHandlers };
+  const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory() });
+  shutdownHandlers.unshift(async () => { try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); } finally { session.dispose(); } });
+  await session.bindExtensions({ mode: "print" });
+  return { session, catalog: workflowCatalog({ cwd, projectTrusted: settingsManager.isProjectTrusted(), globalSettingsPath: workflowSettingsPath(agentDir) }), services, workflowTool, shutdownHandlers };
 }
 
 function availableModelInfo(services: WorkflowRuntime["services"], available = false): { provider: string; id: string }[] {
   const models = available ? services.modelRuntime.getAvailableSnapshot() : services.modelRuntime.getModels();
   return models.map(({ provider, id }) => ({ provider, id }));
-}
-
-async function selectedModel(services: WorkflowRuntime["services"]): Promise<{ provider: string; id: string } | undefined> {
-  const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory(), noTools: "all" });
-  try {
-    const model = session.model;
-    return model ? { provider: model.provider, id: model.id } : undefined;
-  } finally {
-    session.dispose();
-  }
 }
 
 function commandName(value: string): string { return value.trim() && !value.includes("/") && !value.includes("\\") ? value.trim() : ""; }
@@ -503,10 +485,11 @@ async function invokeWorkflow(launch: CliWorkflowLaunch, runtime: WorkflowRuntim
 }
 
 async function createWorkflowContext(runtime: WorkflowRuntime, options: WorkflowIo): Promise<unknown> {
-  const model = await selectedModel(runtime.services);
-  const sessionManager = SessionManager.inMemory();
+  const native = runtime.session.extensionRunner.createContext();
+  const model = runtime.session.model;
+  const sessionManager = runtime.session.sessionManager;
   const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
-  return { cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
+  return { ...native, cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
 }
 
 async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], context: unknown): Promise<void> {
@@ -604,14 +587,14 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
     let name: string | undefined;
     let output: string | undefined;
     let force = false;
-    const requirements = { roles: [] as string[], aliases: [] as string[], tools: [] as string[], commands: [] as string[], environment: [] as string[] };
+    const requirements = { aliases: [] as string[], tools: [] as string[], commands: [] as string[], environment: [] as string[] };
     const resources = { extensions: [] as string[], skills: [] as string[], static: [] as string[], dependencies: [] as string[] };
     for (let index = 1; index < args.length; index += 1) {
       const arg = requiredArg(args, index);
       if (arg === "--force") { force = true; continue; }
       const equals = arg.indexOf("=");
       const option = equals >= 0 ? arg.slice(0, equals) : arg;
-      const requirementOptions = { "--role": "roles", "--alias": "aliases", "--tool": "tools", "--command": "commands", "--environment": "environment" } as const;
+      const requirementOptions = { "--alias": "aliases", "--tool": "tools", "--command": "commands", "--environment": "environment" } as const;
       const resourceOptions = { "--extension": "extensions", "--skill": "skills", "--resource": "static", "--dependency": "dependencies" } as const;
       if (option === "--name" || option === "--output" || typedOptionKey(requirementOptions, option) || typedOptionKey(resourceOptions, option)) {
         const value = equals >= 0 ? arg.slice(equals + 1) : args[++index];
@@ -629,13 +612,6 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
     if (!fn) throw new Error(`Unknown workflow function: ${workflowName}`);
     const source = registeredWorkflowFunctionSources()[workflowName];
     if (!source) throw new Error(`Workflow ${workflowName} is not exportable; add \`source: import.meta.url\` to extension ${fn.headline}`);
-    const definitions = requirements.roles.length ? discoverRoles({ cwd: options.cwd ?? process.cwd(), agentDir: options.agentDir ?? getAgentDir(), projectTrusted: runtime.services.settingsManager.isProjectTrusted(), additionalRoleSources: runtime.roleSources }) : {};
-    const roles = Object.fromEntries(requirements.roles.map((role) => {
-      if (!role || role === "." || role === ".." || role.includes("/") || role.includes("\\")) throw new Error(`Invalid role name for bundle: ${role}`);
-      const definition = definitions[role];
-      if (!definition) throw new Error(`Unknown role for bundle: ${role}`);
-      return [role, definition];
-    }));
     const command = commandName(name ?? kebabCase(workflowName));
     if (!command) throw new Error("Command name must be a non-empty name without path separators");
     const destination = output ?? join(homedir(), ".local", "share", "pi-extensible-workflows", "bundles", command);
@@ -644,7 +620,7 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
       return typeof target === "string" ? [[name, target]] : [];
     }));
     const selectedResources = Object.values(resources).some((entries) => entries.length) ? resources : undefined;
-    await writePortableWorkflowBundle({ destination, command, workflow: fn, source: { module: source.module, export: source.export }, dependencies: source.dependencies, requirements, aliasTargets, roles, ...(selectedResources ? { resources: selectedResources } : {}), piVersion: portablePiVersion(), engineVersion: portableEngineVersion(), force });
+    await writePortableWorkflowBundle({ destination, command, workflow: fn, source: { module: source.module, export: source.export }, dependencies: source.dependencies, requirements, aliasTargets, ...(selectedResources ? { resources: selectedResources } : {}), piVersion: portablePiVersion(), engineVersion: portableEngineVersion(), force });
     options.write(`Bundled ${workflowName} at ${destination}\n`);
     options.write(`Run ${join(destination, command)} setup before launching the workflow.\n`);
     return 0;
@@ -654,7 +630,7 @@ async function bundleWorkflowCli(rawArgs: readonly string[], options: WorkflowIo
 export async function runCli(args: readonly string[], options: CliOptions = {}, write: (text: string) => void = (text) => { process.stdout.write(text); }): Promise<number> {
   const stderr = options.stderr ?? ((text: string) => { process.stderr.write(text); });
   if (args[0] === "doctor" && args[1] !== "cleanup") {
-    if (args.slice(1).some((arg) => arg === "--help" || arg === "-h")) { write("Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json]\n"); return 0; }
+    if (args.slice(1).some((arg) => arg === "--help" || arg === "-h")) { write("Usage: piewf doctor [--agent-options <json>] [--prompt <text>] [--json]\n"); return 0; }
     try {
       const { json, ...parsed } = parseDoctorArgs(args.slice(1));
       const report = await doctor({ ...options, ...parsed });
@@ -709,12 +685,12 @@ export async function runCli(args: readonly string[], options: CliOptions = {}, 
   }
   if (args[0] === "bundle" || args[0] === "run" || args[0] === "export") {
     try {
-      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}), ...(options.isTTY !== undefined ? { isTTY: options.isTTY } : {}), ...(options.skillPaths?.length ? { skillPaths: [...options.skillPaths] } : {}), ...(options.roleSources ? { roleSources: options.roleSources } : {}) };
+      const workflowOptions: WorkflowIo = { write, stderr, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}), ...(options.agentDir !== undefined ? { agentDir: options.agentDir } : {}), ...(options.signal ? { signal: options.signal } : {}), ...(options.trustOverride !== undefined ? { trustOverride: options.trustOverride } : {}), ...(options.isTTY !== undefined ? { isTTY: options.isTTY } : {}), ...(options.skillPaths?.length ? { skillPaths: [...options.skillPaths] } : {}) };
       if (args[0] === "bundle") return await bundleWorkflowCli(args.slice(1), workflowOptions);
       return args[0] === "run" ? await runWorkflowCli(args.slice(1), workflowOptions) : await exportWorkflowCli(args.slice(1), workflowOptions);
     } catch (error) { stderr(`Error: ${errorText(error)}\n`); return 1; }
   }
-  write("Usage: piewf doctor [role|role-file] [--role <role>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  write("Usage: piewf doctor [--agent-options <json>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
   return 1;
 }
 

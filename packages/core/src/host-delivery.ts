@@ -95,9 +95,9 @@ const WORKFLOW_ERROR_PROSE: Record<WorkflowErrorCode, (detail: string) => string
   REGISTRY_FROZEN: (detail) => `Workflow extension registration is closed: ${detail}.`,
   GLOBAL_COLLISION: (detail) => `The workflow global name is already in use: ${detail}.`,
   MISSING_WORKFLOW: (detail) => `The registered workflow function is unavailable: ${detail}.`,
-  UNKNOWN_MODEL: (detail) => `The workflow requested the unavailable model ${detail.replace(/^(?:Unknown model(?: for role [^:]+)?|Invalid model spec):\s*/, "")}.`,
+  UNKNOWN_MODEL: (detail) => `The workflow requested the unavailable model ${detail.replace(/^(?:Unknown model|Invalid model spec):\s*/, "")}.`,
   UNKNOWN_TOOL: (detail) => `The workflow requested the unavailable tool ${detail.replace(/^Unknown tool:\s*/, "")}.`,
-  UNKNOWN_AGENT_TYPE: (detail) => `The workflow requested the unavailable agent role ${detail.replace(/^Unknown agent role:\s*/, "")}.`,
+  UNKNOWN_AGENT: (detail) => `The workflow requested an unavailable owned agent: ${detail}.`,
   RUN_OWNED: (detail) => /already owned|active ownership/.test(detail) ? "The workflow session is already in use." : `The workflow session is already in use: ${detail}.`,
   RUN_NOT_FOUND: (detail) => /^Unknown workflow run\b/.test(detail) ? "The workflow run was not found." : `The workflow run was not found: ${detail}.`,
   RPC_LIMIT_EXCEEDED: (detail) => `The workflow communication data exceeded its size limit: ${detail}.`,
@@ -213,7 +213,6 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
     ...(value.failedAgent ? { failedAgent: {
       id: utf8Prefix(value.failedAgent.id, 128),
       ...(value.failedAgent.label ? { label: utf8Prefix(value.failedAgent.label, 128) } : {}),
-      ...(value.failedAgent.role ? { role: utf8Prefix(value.failedAgent.role, 128) } : {}),
       structuralPath: value.failedAgent.structuralPath.slice(0, 8).map((part) => utf8Prefix(part, 128)),
       attempt: value.failedAgent.attempt,
       ...(value.failedAgent.transport ? { transport: utf8Prefix(value.failedAgent.transport, 128) } : {}),
@@ -222,7 +221,6 @@ function boundedWorkflowFailureDiagnostics(value: WorkflowFailureDiagnostics): W
     completedSiblingAgents: (value.completedSiblingAgents ?? []).slice(0, 16).map((agent) => ({
       id: utf8Prefix(agent.id, 128),
       ...(agent.label ? { label: utf8Prefix(agent.label, 128) } : {}),
-      ...(agent.role ? { role: utf8Prefix(agent.role, 128) } : {}),
       structuralPath: agent.structuralPath.slice(0, 8).map((part) => utf8Prefix(part, 128)),
     })),
     completedSiblingPaths: value.completedSiblingPaths.slice(0, 16).map((path) => path.slice(0, 8).map((part) => utf8Prefix(part, 128))),
@@ -278,7 +276,6 @@ export async function createWorkflowFailureDiagnostics(store: RunStore, metadata
   const failedAgent = failedAgentRecord ? {
     id: failedAgentRecord.id,
     ...(failedAgentRecord.label ?? failedAgentRecord.name ? { label: failedAgentRecord.label ?? failedAgentRecord.name } : {}),
-    ...(failedAgentRecord.role ? { role: failedAgentRecord.role } : {}),
     structuralPath: [...(failedAgentRecord.structuralPath ?? [])],
     attempt: Math.max(1, failedAttempt?.attempt ?? failedAgentRecord.attempts),
     ...(failedAttempt?.transport ? { transport: failedAttempt.transport } : {}),
@@ -290,7 +287,6 @@ export async function createWorkflowFailureDiagnostics(store: RunStore, metadata
   }).map((agent) => ({
     id: agent.id,
     ...(agent.label ?? agent.name ? { label: agent.label ?? agent.name } : {}),
-    ...(agent.role ? { role: agent.role } : {}),
     structuralPath: [...(agent.structuralPath ?? [])],
   } satisfies WorkflowSiblingAgent));
   const completedSiblingPaths = completedSiblingAgents.map((agent) => [...agent.structuralPath]);
@@ -316,9 +312,9 @@ export async function createWorkflowFailureDiagnostics(store: RunStore, metadata
 }
 
 export function formatWorkflowFailureDiagnostics(diagnostic: WorkflowFailureDiagnostics): string {
-  const failedAgent = diagnostic.failedAgent ? `${diagnostic.failedAgent.label ?? diagnostic.failedAgent.id}${diagnostic.failedAgent.role ? ` role=${diagnostic.failedAgent.role}` : ""} attempt=${String(diagnostic.failedAgent.attempt)} path=${diagnostic.failedAgent.structuralPath.join(" > ") || "(root)"}${diagnostic.failedAgent.session ? ` session=${diagnostic.failedAgent.session.transport}/${diagnostic.failedAgent.session.sessionId}` : ""}` : "(not persisted)";
+  const failedAgent = diagnostic.failedAgent ? `${diagnostic.failedAgent.label ?? diagnostic.failedAgent.id} attempt=${String(diagnostic.failedAgent.attempt)} path=${diagnostic.failedAgent.structuralPath.join(" > ") || "(root)"}${diagnostic.failedAgent.session ? ` session=${diagnostic.failedAgent.session.transport}/${diagnostic.failedAgent.session.sessionId}` : ""}` : "(not persisted)";
   const siblingAgents = diagnostic.completedSiblingAgents;
-  const siblings = siblingAgents ? siblingAgents.map((agent) => `${agent.label ?? agent.id}${agent.role ? ` role=${agent.role}` : ""} path=${agent.structuralPath.join(" > ") || "(root)"}`).join(", ") || "(none)" : diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
+  const siblings = siblingAgents ? siblingAgents.map((agent) => `${agent.label ?? agent.id} path=${agent.structuralPath.join(" > ") || "(root)"}`).join(", ") || "(none)" : diagnostic.completedSiblingPaths.map((path) => path.join(" > ") || "(root)").join(", ") || "(none)";
   const retry = diagnostic.retry ? [`  Retry: ${diagnostic.retry.action}`, `  Replayable completed paths: ${diagnostic.retry.completedPaths.join(", ") || "(none)"}`, `  Incomplete paths: ${diagnostic.retry.incompletePaths.join(", ") || "(unknown)"}`, `  Named worktrees: ${diagnostic.retry.namedWorktrees.join(", ") || "(none)"}`, `  Warning: ${diagnostic.retry.warning}`] : [];
   return [`✗ Workflow: ${diagnostic.workflowName}`, `  Run: ${diagnostic.runId}`, `  State: ${diagnostic.state}`, `  Error: ${diagnostic.error.code}: ${diagnostic.error.message}`, `  Failed at: ${diagnostic.failedAt ?? "(unknown)"}`, `  Failed agent: ${failedAgent}`, `  Completed sibling ${siblingAgents ? "agents" : "paths"}: ${siblings}`, ...retry, `  Artifacts: state=${diagnostic.artifacts.statePath} journal=${diagnostic.artifacts.journalPath}`].join("\n");
 }

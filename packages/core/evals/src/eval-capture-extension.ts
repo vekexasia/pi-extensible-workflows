@@ -36,7 +36,7 @@ export default function evalCaptureExtension(pi: Pick<ExtensionAPI, "getActiveTo
         const validated = validateWorkflowLaunch(params, { cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted(), availableModels, rootTools });
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ captured: true, validated: true, launchBudget: 0, name: validated.checked.metadata.name }) }],
-          details: { captured: true, captureIdentity: CAPTURE_IDENTITY, realWorkflowAgentsLaunched: 0, launchBudget: 0, validation: { valid: true, script: validated.script, metadata: validated.checked.metadata, roles: validated.roleNames } },
+          details: { captured: true, captureIdentity: CAPTURE_IDENTITY, realWorkflowAgentsLaunched: 0, launchBudget: 0, validation: { valid: true, script: validated.script, metadata: validated.checked.metadata } },
         };
       } catch (error) {
         if (error instanceof WorkflowError) throw new WorkflowError(error.code, `${CAPTURE_ERROR_PREFIX}${error.code}: ${error.message}`);

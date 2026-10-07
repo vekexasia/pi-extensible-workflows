@@ -20,12 +20,7 @@ export type SubagentRenderState = {
   subagentProgressFrozenAt?: number;
 };
 
-function roleName(value: unknown): string | undefined {
-  if (typeof value === "string") return value.trim() || undefined;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const name = (value as Record<string, unknown>).name;
-  return typeof name === "string" ? name.trim() || undefined : undefined;
-}
+
 
 function modeName(value: unknown): "background" | "foreground" | undefined {
   return value === "background" || value === "foreground" ? value : undefined;
@@ -33,14 +28,11 @@ function modeName(value: unknown): "background" | "foreground" | undefined {
 
 function requestMetadata(args: SubagentRenderArgs, metadataAvailable: boolean): string {
   const mode = modeName(args.mode) ?? (metadataAvailable ? "background" : undefined);
-  const role = metadataAvailable ? roleName(args.role) ?? "none" : undefined;
-  return [mode === undefined ? undefined : `mode=${mode}`, role === undefined ? undefined : `role=${role}`].filter((value): value is string => value !== undefined).join(" ");
+  return [mode === undefined ? undefined : `mode=${mode}`].filter((value): value is string => value !== undefined).join(" ");
 }
 
 function label(args: SubagentRenderArgs): string {
   if (typeof args.label === "string" && args.label.trim()) return args.label.trim();
-  const role = roleName(args.role);
-  if (role) return role;
   if (typeof args.id === "string" && args.id) return args.id.slice(0, 8);
   return "subagent";
 }
@@ -243,19 +235,17 @@ function widgetRow({ status, request }: WidgetRun, now: number, paint: Paint): {
 }
 
 const RECEIPT_ENTRY_TYPE = "piewf-subagent-receipt";
-type SubagentReceipt = { readonly id: string; readonly label: string; readonly state: string; readonly model?: string; readonly role?: string; readonly tools?: readonly string[]; readonly input: number; readonly output: number; readonly cacheRead: number; readonly costUsd: number; readonly durationMs: number; readonly attempts: number; readonly error?: string };
+type SubagentReceipt = { readonly id: string; readonly label: string; readonly state: string; readonly model?: string; readonly tools?: readonly string[]; readonly input: number; readonly output: number; readonly cacheRead: number; readonly costUsd: number; readonly durationMs: number; readonly attempts: number; readonly error?: string };
 
 function receiptFor(status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>): SubagentReceipt {
   const accounting = status.progress?.accounting;
   const model = modelName(status);
-  const role = roleName(request.role);
   const tools = status.progress?.state?.tools ?? status.attemptDetails?.at(-1)?.setup.tools;
   return {
     id: status.id,
     label: label({ ...request, id: status.id }),
     state: status.state,
     ...(model ? { model } : {}),
-    ...(role === undefined ? {} : { role }),
     ...(tools === undefined ? {} : { tools: [...tools] }),
     input: accounting?.input ?? 0,
     output: accounting?.output ?? 0,
@@ -273,7 +263,7 @@ export function renderSubagentReceipt(data: SubagentReceipt, expanded: boolean, 
   const headline = [formatTokens(data.input + data.output), formatCost(data.costUsd) || "$0.00", formatElapsed(data.durationMs), data.state].filter(Boolean).join(" · ");
   const lines = [`${glyph} ${theme.bold(sanitizeDisplayText(data.label))} ${theme.fg("muted", headline)}`];
   if (!expanded) return lines;
-  const meta = [data.model ?? "", data.role ? `role ${data.role}` : "", data.attempts > 1 ? `${String(data.attempts)} attempts` : "", data.tools?.join(" ") ?? ""].filter(Boolean);
+  const meta = [data.model ?? "", data.attempts > 1 ? `${String(data.attempts)} attempts` : "", data.tools?.join(" ") ?? ""].filter(Boolean);
   if (meta.length > 0) lines.push(theme.fg("muted", `   ${meta.join(" · ")}`));
   const split = [data.input ? `in ${formatTokens(data.input)}` : "", data.output ? `out ${formatTokens(data.output)}` : "", data.cacheRead ? `cache ${formatTokens(data.cacheRead)}` : ""].filter(Boolean);
   if (split.length > 0) lines.push(theme.fg("muted", `   ${split.join(" · ")}`));

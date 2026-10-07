@@ -1,178 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { pathToFileURL } from "node:url";
-import { decodeLaunchSnapshot } from "../src/decoders.js";
+
+
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatNavigatorDashboard, formatNavigatorRun, loadAgentDefinitions, loadSettings, mergeWorkflowExtensionSettings, parseRoleMarkdown, preflight, registerWorkflowExtension, resourcePatternMatches, resolveAgentResourcePolicy, resolveModelReference, resolveWorkflowSettings, RunStore, runWorkflow, saveModelAliases, selectResourcesByLayers, structuralPath, validateModelAliases, WorkflowAgentExecutor, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WorkflowError, WorkflowRegistry } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, formatNavigatorDashboard, formatNavigatorRun, loadSettings, registerWorkflowExtension, resourcePatternMatches, resolveAgentResourcePolicy, resolveWorkflowSettings, RunStore, runWorkflow, saveModelAliases, selectResourcesByLayers, structuralPath, validateModelAliases, WorkflowAgentExecutor, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WorkflowError, WorkflowRegistry } from "../src/index.js";
 import type { SessionInput } from "../src/agent-execution.js";
-import { listRunIds } from "../src/persistence.js";
+
 import { testTransport, type TestPiSession } from "./test-transport.js";
 
-void test("loads markdown agent roles only from canonical global and project directories", () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-roles-"));
-  const cwd = join(home, "project");
-  const defaultAgentDir = join(home, ".pi", "agent");
-  const customAgentDir = join(home, "custom-agent");
-  const previousHome = process.env.HOME;
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.HOME = home;
-  delete process.env.PI_CODING_AGENT_DIR;
-  try {
-    mkdirSync(join(defaultAgentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-    mkdirSync(join(home, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-    mkdirSync(join(home, ".pi", "piworkflows", "roles"), { recursive: true });
-    mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-    mkdirSync(join(cwd, ".pi", "piworkflows", "roles"), { recursive: true });
-    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "global.md"), "---\ndescription: Global review\nmodel: openai/gpt:high\ntools: [read, grep]\n---\nGlobal role");
-    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "collision.md"), "Canonical collision");
-    writeFileSync(join(defaultAgentDir, "pi-extensible-workflows", "roles", "multiline.md"), "---\ntools:\n  - read\n  - grep\n---\nMultiline role");
-    writeFileSync(join(home, ".pi", "pi-extensible-workflows", "roles", "old-global.md"), "Ignored old global role");
-    writeFileSync(join(home, ".pi", "piworkflows", "roles", "old-legacy.md"), "Ignored legacy role");
-    writeFileSync(join(cwd, ".pi", "piworkflows", "roles", "old-project.md"), "Ignored old project role");
-    writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "Review role");
-    writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), "Project shadowed role");
-    const roles = loadAgentDefinitions(cwd);
-    assert.deepEqual(roles.global, { provenance: { path: join(defaultAgentDir, "pi-extensible-workflows", "roles", "global.md"), scope: "global", priority: 0 }, prompt: "Global role", description: "Global review", model: "openai/gpt:high", tools: ["read", "grep"] });
-    assert.equal(roles.reviewer?.prompt, "Review role");
-    assert.deepEqual(roles.collision, { provenance: { path: join(defaultAgentDir, "pi-extensible-workflows", "roles", "collision.md"), scope: "global", priority: 0 }, prompt: "Canonical collision" });
-    assert.deepEqual(roles.shadowed, { provenance: { path: join(cwd, ".pi", "pi-extensible-workflows", "roles", "shadowed.md"), scope: "project", priority: 0 }, prompt: "Project shadowed role" });
-    assert.deepEqual(roles.multiline, { provenance: { path: join(defaultAgentDir, "pi-extensible-workflows", "roles", "multiline.md"), scope: "global", priority: 0 }, prompt: "Multiline role", tools: ["read", "grep"] });
-    assert.equal(roles["old-global"], undefined);
-    assert.equal(roles["old-legacy"], undefined);
-    assert.equal(roles["old-project"], undefined);
-    const untrusted = loadAgentDefinitions(cwd, undefined, false);
-    assert.equal(untrusted.reviewer?.provenance?.scope, "builtin");
-    assert.deepEqual(untrusted.collision, { provenance: { path: join(defaultAgentDir, "pi-extensible-workflows", "roles", "collision.md"), scope: "global", priority: 0 }, prompt: "Canonical collision" });
-    process.env.PI_CODING_AGENT_DIR = customAgentDir;
-    mkdirSync(join(customAgentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "roles", "custom.md"), "Custom role");
-    writeFileSync(join(customAgentDir, "pi-extensible-workflows", "roles", "collision.md"), "Custom collision");
-    const customRoles = loadAgentDefinitions(cwd);
-    assert.deepEqual(customRoles.custom, { provenance: { path: join(customAgentDir, "pi-extensible-workflows", "roles", "custom.md"), scope: "global", priority: 0 }, prompt: "Custom role" });
-    assert.deepEqual(customRoles.collision, { provenance: { path: join(customAgentDir, "pi-extensible-workflows", "roles", "collision.md"), scope: "global", priority: 0 }, prompt: "Custom collision" });
-  } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
-    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
-  }
-});
-void test("loads markdown agent roles deployed as per-file symlinks", () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-symlinked-roles-")));
-  const cwd = join(root, "project");
-  const agentDir = join(root, "agent");
-  const roleDirectory = join(agentDir, "pi-extensible-workflows", "roles");
-  const target = join(root, "source-role.md");
-  mkdirSync(roleDirectory, { recursive: true });
-  writeFileSync(target, "---\ndescription: Linked role\n---\nLinked body");
-  symlinkSync(target, join(roleDirectory, "linked.md"));
-  symlinkSync(join(root, "missing-role.md"), join(roleDirectory, "dangling.md"));
-  writeFileSync(join(roleDirectory, "sibling.md"), "Sibling role");
-  const roles = loadAgentDefinitions(cwd, agentDir, true, []);
-  assert.deepEqual(roles.linked, { provenance: { path: join(root, "source-role.md"), scope: "global", priority: 0 }, prompt: "Linked body", description: "Linked role" });
-  assert.deepEqual(roles.sibling, { provenance: { path: join(roleDirectory, "sibling.md"), scope: "global", priority: 0 }, prompt: "Sibling role" });
-});
 
-void test("strict role frontmatter rejects malformed metadata", () => {
-  const invalid = [
-    "---\ntools: read\n---\nbody",
-    "---\ntools: [read, 2]\n---\nbody",
-    "---\ntools: [read, '']\n---\nbody",
-    "---\ndescription: |\n  line one\n  line two\n---\nbody",
-  ];
-  for (const content of invalid) assert.throws(() => parseRoleMarkdown(content, true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
-
-void test("strips single and double quotes from loose role metadata even when unpaired", () => {
-  assert.deepEqual(parseRoleMarkdown("---\nmodel: 'openai/gpt:high\"\ntools: ['read\", \"grep']\nskills: ['role-skill\", \"other-skill']\nextensions: ['role.ts\", \"other.ts']\ndescription: 'Review role\"\ncontextFiles: ['global\", \"project']\n---\nbody", false), {
-    prompt: "body",
-    model: "openai/gpt:high",
-    tools: ["read", "grep"],
-    skills: ["role-skill", "other-skill"],
-    extensions: ["role.ts", "other.ts"],
-    description: "Review role",
-    contextFiles: ["global", "project"],
-  });
-  assert.throws(() => parseRoleMarkdown("---\nmodel: openai/gpt\nthinking: high\n---\nbody", false), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
-
-void test("accepts role system prompt override metadata", () => {
-  for (const key of ["overrideSystemPrompt", "override_system_prompt", "is_system_prompt"]) {
-    assert.deepEqual(parseRoleMarkdown(`---\n${key}: true\n---\nbody`, true), { prompt: "body", overrideSystemPrompt: true });
-  }
-  assert.deepEqual(parseRoleMarkdown("---\noverrideSystemPrompt: false\n---\nbody", true), { prompt: "body", overrideSystemPrompt: false });
-  assert.throws(() => parseRoleMarkdown("---\noverrideSystemPrompt: yes\n---\nbody", true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
-void test("parses and validates role context file scopes", () => {
-  assert.deepEqual(parseRoleMarkdown("---\ncontextFiles: [global, project, cwd]\n---\nbody", true), { prompt: "body", contextFiles: ["global", "project", "cwd"] });
-  assert.deepEqual(parseRoleMarkdown("---\ncontextFiles: []\n---\nbody", true), { prompt: "body", contextFiles: [] });
-  for (const content of ["---\ncontextFiles: global\n---\nbody", "---\ncontextFiles: [global, repository]\n---\nbody", "---\ncontextFiles: [2]\n---\nbody"]) assert.throws(() => parseRoleMarkdown(content, true), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-});
-void test("strict role selectors normalize relative and portable extension paths", () => {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-resources-")));
-  const rolePath = join(root, "roles", "reviewer.md");
-  const extension = join(root, "role-extension.ts");
-  mkdirSync(join(root, "roles"), { recursive: true });
-  writeFileSync(extension, "");
-  const previousHome = process.env.HOME;
-  process.env.HOME = root;
-  try {
-    const definition = parseRoleMarkdown(`---\nskills: [role-skill, role-skill]\nextensions:\n  - "../role-extension.ts"\n  - "~/role-extension.ts"\n  - "${pathToFileURL(extension).href}"\n---\nbody`, true, rolePath);
-    assert.deepEqual(definition, { provenance: { path: rolePath }, prompt: "body", skills: ["role-skill", "role-skill"], extensions: [extension, extension, extension] });
-    for (const content of [
-      "---\nskills: role-skill\n---\nbody",
-      "---\nskills: [role-skill, 2]\n---\nbody",
-      "---\nskills: [role-skill, '']\n---\nbody",
-      "---\nextensions: [2]\n---\nbody",
-    ]) assert.throws(() => parseRoleMarkdown(content, true, rolePath), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
-  } finally {
-    if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
-  }
-});
-
-void test("rejects invalid role policy before persisting a run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-policy-"));
-  const cwd = join(home, "project");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "broken.md"), "---\nmodel: missing/model:low\n---\nBroken role");
-  const tools: Array<{ name: string; execute: (id?: unknown, params?: unknown, signal?: unknown, update?: unknown, ctx?: unknown) => Promise<unknown> }> = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "workflow"] }), home);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  await assert.rejects(workflow.execute("id", { name: "invalid-role", script: `return agent("inspect", { role: "broken" });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
-  assert.deepEqual(await listRunIds(cwd, "session", home), []);
-  await assert.rejects(workflow.execute("id", { name: "invalid-schema", script: `return agent("inspect", { outputSchema: [] });` }, new AbortController().signal, undefined, { cwd, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SCHEMA");
-  assert.deepEqual(await listRunIds(cwd, "session", home), []);
-});
-
-void test("production role policy uses role defaults with call-level overrides", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-execution-"));
-  const cwd = join(home, "project");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: openai/gpt:high\ntools: [\"!*\", read]\n---\nReview role");
-  for (const role of Object.keys(loadAgentDefinitions(cwd, undefined, false))) {
-    if (role !== "reviewer") writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", `${role}.md`), "---\nmodel: openai/gpt:high\ntools: [\"!*\", read]\n---\nTest role");
-  }
-  const inputs: SessionInput[] = [];
-  const createSession = async (input: SessionInput): Promise<TestPiSession> => {
-    inputs.push(input);
-    return { sessionId: `session-${String(inputs.length)}`, sessionFile: `/sessions/${String(inputs.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
-  };
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "agent", "workflow"] }), home, async () => {}, testTransport(createSession));
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } };
-  const staticResult = await workflow.execute("id", { name: "static-overrides", script: "return agent(\"inspect\", { role: \"reviewer\", model: \"openai/gpt:low\" });", foreground: true }, new AbortController().signal, undefined, context) as { content: Array<{ text?: string }> };
-  assert.equal(JSON.parse(staticResult.content[0]?.text ?? "null"), "done");
-  assert.ok(inputs.some(({ model }) => model.provider === "openai" && model.model === "gpt" && model.thinking === "low"));
-  const dynamicResult = await workflow.execute("id", { name: "dynamic-overrides", script: "const options = { role: args.role }; options.model = args.value; return agent(\"inspect\", options);", args: { role: "reviewer", value: "openai/gpt:low" }, foreground: true }, new AbortController().signal, undefined, context) as { content: Array<{ text?: string }> };
-  assert.equal(JSON.parse(dynamicResult.content[0]?.text ?? "null"), "done");
-  const result = await workflow.execute("id", { name: "role-only", script: "return agent(\"inspect\", { role: \"reviewer\", retries: 1, timeoutMs: 100 });", foreground: true }, new AbortController().signal, undefined, context) as { content: Array<{ text?: string }> };
-  assert.equal(JSON.parse(result.content[0]?.text ?? "null"), "done");
-  assert.deepEqual(inputs.at(-1) && { model: inputs.at(-1)?.model, thinking: inputs.at(-1)?.model.thinking, tools: inputs.at(-1)?.tools, systemPromptAppend: inputs.at(-1)?.systemPromptAppend }, { model: { provider: "openai", model: "gpt", thinking: "high" }, thinking: "high", tools: ["read"], systemPromptAppend: "Review role" });
-});
 
 void test("default settings follow the effective agent directory", () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-settings-"));
@@ -230,50 +69,6 @@ void test("strict settings use defaults and reject unknown or unsafe values", ()
   assert.throws(() => loadSettings(path), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_SETTINGS");
   writeFileSync(path, JSON.stringify({ surprise: true }));
   assert.throws(() => loadSettings(path), /Unknown workflow setting/);
-});
-void test("decodes persisted built-in extension settings with value validation", () => {
-  const snapshot = (settings: unknown, roles?: unknown) => decodeLaunchSnapshot({ script: "return null;", args: null, metadata: { name: "decoded" }, settings, models: [], tools: [], agentTypes: [], ...(roles === undefined ? {} : { roles }), schemas: [] });
-  for (const extensionSettings of [{ trajectory: { port: 0 } }, { trajectory: { themes: "yes" } }, { herdr: { enableFullyInspectableMode: "yes" } }]) {
-    assert.equal(snapshot({ concurrency: 1, extensionSettings }), undefined);
-  }
-  assert.equal(snapshot({ concurrency: 1, extensions: { trajectory: { port: 0 } } }), undefined);
-  assert.equal(snapshot({ concurrency: 1 }, { reviewer: { extensionSettings: { herdr: { enableFullyInspectableMode: "yes" } } } }), undefined);
-  assert.deepEqual(snapshot({ concurrency: 1, extensionSettings: { trajectory: { port: 7432, themes: false } } })?.settings.extensionSettings?.trajectory, { port: 7432 });
-  const valid = snapshot({ concurrency: 1, extensionSettings: { acme: { nested: [true, "value"] }, trajectory: { port: 7432 } } }, { reviewer: { prompt: "Review", extensionSettings: { acme: { role: true } } } });
-  assert.ok(valid);
-  assert.deepEqual(valid.settings.extensionSettings, { acme: { nested: [true, "value"] }, trajectory: { port: 7432 } });
-  assert.deepEqual(valid.roles?.reviewer?.extensionSettings, { acme: { role: true } });
-});
-void test("replaces extension settings by source and role key", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-settings-"));
-  const cwd = join(root, "project");
-  const agentDir = join(root, "agent");
-  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify({ extensionSettings: { acme: { global: true, nested: { global: true }, rules: ["global"] }, globalOnly: true } }));
-  writeFileSync(projectSettingsPath, JSON.stringify({ extensionSettings: { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true } }));
-  const resolution = resolveWorkflowSettings(cwd, true, settingsPath);
-  assert.deepEqual(resolution.effective.extensionSettings, { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true });
-  assert.equal(resolution.sources.extensionSettings, projectSettingsPath);
-  const role = parseRoleMarkdown("---\nextensionSettings:\n  acme:\n    role: true\n    nested:\n      role: true\n    rules: [role]\n  roleOnly: true\n---\nRole", true, join(cwd, "role.md"));
-  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { acme: { role: true, nested: { role: true }, rules: ["role"] }, projectOnly: true, roleOnly: true });
-  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, {}), resolution.effective.extensionSettings);
-  assert.deepEqual(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, { acme: {} }), { acme: {}, projectOnly: true });
-  const registry = new WorkflowRegistry();
-  const seen: Array<{ value: unknown; source: string; role?: string }> = [];
-  registry.register({ version: "1.0.0", headline: "Acme settings", validateSettings: (value, context) => { seen.push({ value, source: context.source, ...(context.role === undefined ? {} : { role: context.role }) }); } });
-  registry.validateExtensionSettings(resolution.global.extensionSettings, { source: "global", cwd, projectTrusted: true, settingsPath });
-  registry.validateExtensionSettings(resolution.project.extensionSettings, { source: "project", cwd, projectTrusted: true, settingsPath: projectSettingsPath });
-  registry.validateExtensionSettings(mergeWorkflowExtensionSettings(resolution.effective.extensionSettings, role.extensionSettings), { source: "role", role: "reviewer", cwd, projectTrusted: true, settingsPath });
-  assert.deepEqual(seen, [
-    { value: { acme: { global: true, nested: { global: true }, rules: ["global"] }, globalOnly: true }, source: "global" },
-    { value: { acme: { project: true, nested: { project: true }, rules: ["project"] }, projectOnly: true }, source: "project" },
-    { value: { acme: { role: true, nested: { role: true }, rules: ["role"] }, projectOnly: true, roleOnly: true }, source: "role", role: "reviewer" },
-  ]);
-  writeFileSync(projectSettingsPath, JSON.stringify({ extensionSettings: {} }));
-  assert.deepEqual(resolveWorkflowSettings(cwd, true, settingsPath).effective.extensionSettings, {});
 });
 
 void test("workflow extension wires the background widget from global settings", () => {
@@ -374,40 +169,6 @@ void test("accepts Minimatch character class forms", () => {
 });
 void test("preserves ordered duplicate resource selectors", () => {
   assert.deepEqual(selectResourcesByLayers([["*", "!*", "*"]], ["resource"]), ["resource"]);
-});
-void test("validates and resolves portable model aliases", () => {
-  const dir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-aliases-"));
-  const path = join(dir, "settings.json");
-  const aliases = { "reviewer-model": "anthropic/opus:high", "cheap-model": "reviewer-model:low", "inherited-model": "reviewer-model", opus: "openai/gpt" };
-  writeFileSync(path, JSON.stringify({ concurrency: 4, modelAliases: aliases }));
-  assert.deepEqual(loadSettings(path).modelAliases, aliases);
-  assert.deepEqual(resolveModelReference("reviewer-model", aliases, new Set(["anthropic/opus"])), { provider: "anthropic", model: "opus", thinking: "high" });
-  assert.deepEqual(resolveModelReference("reviewer-model:low", aliases, new Set(["anthropic/opus"])), { provider: "anthropic", model: "opus", thinking: "low" });
-  assert.deepEqual(resolveModelReference("cheap-model", aliases, new Set(["anthropic/opus"])), { provider: "anthropic", model: "opus", thinking: "low" });
-  assert.deepEqual(resolveModelReference("cheap-model:xhigh", aliases, new Set(["anthropic/opus"])), { provider: "anthropic", model: "opus", thinking: "xhigh" });
-  assert.deepEqual(resolveModelReference("inherited-model", aliases, new Set(["anthropic/opus"])), { provider: "anthropic", model: "opus", thinking: "high" });
-  assert.deepEqual(resolveModelReference("opus", aliases, new Set(["openai/opus", "anthropic/opus"])), { provider: "openai", model: "gpt" });
-  assert.throws(() => validateModelAliases({ "bad/name": "p/m" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
-  assert.throws(() => validateModelAliases({ chained: "missing-alias" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR" && error.message.includes("missing-alias") && error.message.includes(path));
-  assert.throws(() => validateModelAliases({ first: "second", second: "first" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR" && error.message.includes("Circular model alias") && error.message.includes(path));
-  assert.throws(() => validateModelAliases({ invalidTarget: "provider/model:turbo" }, path), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
-  const checked = preflight('agent("x", { model: "cheap-model:xhigh" })', { models: new Set(["anthropic/opus"]), knownModels: new Set(["anthropic/opus"]), tools: new Set(), agentTypes: new Set(), modelAliases: aliases, settingsPath: path });
-  assert.deepEqual(checked.referenced.models, ["anthropic/opus"]);
-  assert.throws(() => preflight('agent("x", { model: "reviewer-model" })', { models: new Set(["openai/gpt"]), knownModels: new Set(["openai/gpt"]), tools: new Set(), agentTypes: new Set(), modelAliases: { "reviewer-model": "anthropic/opus" }, settingsPath: path }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("reviewer-model") && error.message.includes("anthropic/opus") && error.message.includes(path));
-  const executor = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: aliases, agentDefinitions: { reviewer: { model: "cheap-model:xhigh" } }, settingsPath: path });
-  const direct = executor.resolve({ label: "direct", workflowName: "test", model: "cheap-model:minimal" });
-  assert.equal(direct.model.thinking, "minimal");
-  assert.equal(direct.requestedModel, "cheap-model:minimal");
-  assert.equal(executor.resolve({ label: "role", workflowName: "test", role: "reviewer" }).model.thinking, "xhigh");
-  assert.throws(() => executor.resolve({ label: "missing", workflowName: "test", model: "missing-model" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL");
-  const blocked = new WorkflowAgentExecutor({ cwd: dir, model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: new Set(), knownModels: new Set(["openai/gpt", "anthropic/opus"]), modelAliases: {}, blockedAliases: new Set(["reviewer-model"]), blockedAliasTargets: { "reviewer-model": "anthropic/opus:high" }, settingsPath: path });
-  assert.throws(() => blocked.resolve({ label: "deleted", workflowName: "test", model: "reviewer-model:low" }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("reviewer-model:low") && error.message.includes("anthropic/opus:high") && error.message.includes(path));
-  saveModelAliases(path, { "reviewer-model": "anthropic/opus:high" });
-  assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), { concurrency: 4, modelAliases: { "reviewer-model": "anthropic/opus:high" } });
-  const malformed = "{\n  \"concurrency\": 4,";
-  writeFileSync(path, malformed);
-  assert.throws(() => { saveModelAliases(path, { "reviewer-model": "anthropic/opus:high" }); }, (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR");
-  assert.equal(readFileSync(path, "utf8"), malformed);
 });
 void test("global model aliases are selectable virtual models", () => {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-virtual-"));
@@ -515,7 +276,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
   const replayPaths: string[] = [];
   await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPaths.push(structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`)); return "original"; } }).result;
   const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "alias-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "alias-resume" }, settings: { concurrency: 2, modelAliases: oldAliases, extensionSettings: { acme: { value: "old" } } }, modelAliases: oldAliases, models: ["root/model", "old/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "alias-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "alias-resume" }, settings: { concurrency: 2, modelAliases: oldAliases, extensionSettings: { acme: { value: "old" } } }, modelAliases: oldAliases, models: ["root/model", "old/model"], tools: [], agentConfigurations: {}, schemas: [] }));
   await store.complete(replayPaths[0] as string, "replayed");
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -564,7 +325,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
     assert.deepEqual(inputs.map(({ model }) => ({ provider: model.provider, model: model.model })), [{ provider: "new", model: "model" }, { provider: "new", model: "model" }, { provider: "new", model: "model" }]);
     assert.deepEqual(inputs.map(({ settings }) => settings), [{ acme: { value: "old" } }, { acme: { value: "old" } }, { acme: { value: "old" } }]);
     assert.deepEqual(loaded.snapshot.settings.extensionSettings, { acme: { value: "old" } });
-    assert.deepEqual(inputs.map(({ resourcePolicy }) => resourcePolicy?.effective), [{ skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }, { skills: ["new-skill"], extensions: [join(agentDir, "new.ts")] }]);
+    assert.deepEqual(inputs.map(({ resourcePolicy }) => resourcePolicy?.effective.skills), [["new-skill", "!*"], ["new-skill", "!*"], ["new-skill", "!*"]]);
     assert.deepEqual(loaded.snapshot.modelAliases, newAliases);
     assert.deepEqual(loaded.run.events, [{ type: "warning", message: "Model alias mappings changed on resume: reviewer: old/model -> new/model" }]);
     assert.match(formatNavigatorRun(loaded, [], []), /Model alias mappings changed on resume/);
@@ -580,7 +341,7 @@ void test("persists resume snapshots and warning events", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resume-snapshot-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const initial = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "resume" }, settings: { ...DEFAULT_SETTINGS, modelAliases: { reviewer: "openai/gpt" } }, modelAliases: { reviewer: "openai/gpt" }, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const initial = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "resume" }, settings: { ...DEFAULT_SETTINGS, modelAliases: { reviewer: "openai/gpt" } }, modelAliases: { reviewer: "openai/gpt" }, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, initial);
   const next = createLaunchSnapshot({ ...initial, settings: { ...initial.settings, modelAliases: { reviewer: "anthropic/opus" } }, modelAliases: { reviewer: "anthropic/opus" } });
   await store.saveSnapshot(next);
@@ -686,4 +447,21 @@ void test("workflow_catalog reports effective project settings without registere
     await shutdown?.();
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   }
+});
+
+void test("trusted project extension settings replace the entire consumer global map", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "workflow-settings-replacement-"));
+  t.after(() => { rmSync(root, { recursive: true, force: true }); });
+  const globalPath = join(root, "global.json");
+  const projectPath = join(root, ".pi", "pi-extensible-workflows", "settings.json");
+  mkdirSync(dirname(projectPath), { recursive: true });
+  const global = { herdr: { enableFullyInspectableMode: true }, custom: { enabled: true } };
+  writeFileSync(globalPath, JSON.stringify({ extensionSettings: global }));
+  for (const project of [{}, { custom: { enabled: false } }]) {
+    writeFileSync(projectPath, JSON.stringify({ extensionSettings: project }));
+    assert.deepEqual(resolveWorkflowSettings(root, true, globalPath).effective.extensionSettings, project);
+    assert.deepEqual(resolveWorkflowSettings(root, false, globalPath).effective.extensionSettings, global);
+  }
+  writeFileSync(projectPath, "{}");
+  assert.deepEqual(resolveWorkflowSettings(root, true, globalPath).effective.extensionSettings, global);
 });

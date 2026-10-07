@@ -12,7 +12,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-review-"));
   const cwd = join(home, "project");
   const runId = "checkpoint-review";
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'review',description:'review'}", args: null, metadata: { name: "review", description: "review" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'review',description:'review'}", args: null, metadata: { name: "review", description: "review" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const store = new RunStore(cwd, "session", runId, home);
   await store.create({ id: runId, workflowName: "review", cwd, sessionId: "session", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
   await store.awaitCheckpoint({ path: "checkpoint/first", name: "first", prompt: "Review the first artifact?", context: { artifact: "object", entries: Array.from({ length: 80 }, (_, index) => `entry-${String(index)}`), marker: "OBJECT_CONTEXT_END" } });
@@ -125,7 +125,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
 
 void test("session start delivers stale terminal runs once", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stale-terminal-delivery-"));
-  const snapshot = (name: string, launchMode: "foreground" | "background" = "foreground") => createLaunchSnapshot({ script: "return true;", args: null, metadata: { name }, launchMode, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = (name: string, launchMode: "foreground" | "background" = "foreground") => createLaunchSnapshot({ script: "return true;", args: null, metadata: { name }, launchMode, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const completed = new RunStore(home, "session", "stale-completed", home);
   const failed = new RunStore(home, "session", "stale-failed", home);
   const stopped = new RunStore(home, "session", "stale-stopped", home);
@@ -181,7 +181,7 @@ void test("session start delivers stale terminal runs once", async () => {
 void test("session start omits resultPath for stale completed runs without a result artifact", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stale-missing-result-"));
   const store = new RunStore(home, "session", "stale-missing-result", home);
-  await store.create({ id: store.runId, workflowName: "stale-missing-result", cwd: home, sessionId: "session", state: "completed", agents: [], agentSessions: [], delivery: { mode: "foreground", state: "attached", toolCallId: "missing-result-call" } }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "stale-missing-result" }, launchMode: "foreground", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: store.runId, workflowName: "stale-missing-result", cwd: home, sessionId: "session", state: "completed", agents: [], agentSessions: [], delivery: { mode: "foreground", state: "attached", toolCallId: "missing-result-call" } }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "stale-missing-result" }, launchMode: "foreground", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const messages: string[] = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
@@ -466,7 +466,7 @@ void test("does not undo a competing terminal failure delivery during stale supp
 void test("delivers a later cold-resume failure after an earlier failure follow-up", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resumed-failure-delivery-"));
   const store = new RunStore(home, "session", "run", home);
-  await store.create({ id: "run", workflowName: "resumed-failure", cwd: home, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [], delivery: { mode: "background", state: "delivered" } }, createLaunchSnapshot({ script: `throw new Error("resumed failure");`, args: null, metadata: { name: "resumed-failure" }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "resumed-failure", cwd: home, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [], delivery: { mode: "background", state: "delivered" } }, createLaunchSnapshot({ script: `throw new Error("resumed failure");`, args: null, metadata: { name: "resumed-failure" }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const messages: string[] = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -488,7 +488,7 @@ void test("delivers a later cold-resume failure after an earlier failure follow-
 void test("human interrupted-run resume delivers a later failure", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-human-resume-failure-delivery-"));
   const store = new RunStore(home, "session", "run", home);
-  await store.create({ id: "run", workflowName: "human-resume-failure", cwd: home, sessionId: "session", state: "interrupted", agents: [], agentSessions: [], delivery: { mode: "background", state: "delivered" } }, createLaunchSnapshot({ script: `throw new Error("human resumed failure");`, args: null, metadata: { name: "human-resume-failure" }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "human-resume-failure", cwd: home, sessionId: "session", state: "interrupted", agents: [], agentSessions: [], delivery: { mode: "background", state: "delivered" } }, createLaunchSnapshot({ script: `throw new Error("human resumed failure");`, args: null, metadata: { name: "human-resume-failure" }, launchMode: "background", settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const messages: string[] = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
   let shutdown: (() => Promise<void>) | undefined;
