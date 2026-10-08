@@ -83,7 +83,7 @@ Supported settings shape:
   "retention": { "olderThanDays": 30, "maxTerminalRuns": 200 }
 }
 ```
-The supported resource fields are direct `skills`, `extensions`, and `tools` arrays. `skills` matches discovered skill names, `extensions` matches discovered normalized extension paths, and `tools` matches only the current root or parent tool boundary. Selectors never create unavailable resources. The legacy `disabledAgentResources` field is rejected; it is not an alias for these fields. `extensionSettings` is an arbitrary map of safe extension-owned JSON values; the core validates only its structure and built-in settings. A trusted project `extensionSettings` field replaces the complete global map, including `{}`. Roles retain inherited top-level keys they omit and replace each declared key in full; nested objects and arrays are never merged. A role `{}` inherits, while a declared empty value such as `{ "acme": {} }` replaces that top-level value. Registered extension validators receive the complete effective map plus source context. The obsolete `extensions.herdr` object is rejected.
+The supported resource fields are direct `skills`, `extensions`, and `tools` arrays. `skills` matches discovered skill names, `extensions` matches discovered normalized extension paths, and `tools` matches only the current root or parent tool boundary. Selectors never create unavailable resources. The legacy `disabledAgentResources` field is rejected; it is not an alias for these fields. `extensionSettings` is an arbitrary map of safe extension-owned JSON values; the core validates only its structure and built-in settings. A trusted project `extensionSettings` field replaces the complete global map, including `{}`. Registered extension validators receive the complete effective map plus source context. The obsolete `extensions.herdr` object is rejected.
 The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` is accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
 
 ### Trajectory
@@ -117,7 +117,7 @@ Dynamic model aliases are resolved once per launch or resume, then captured for 
 
 The direct `skills`, `extensions`, and `tools` fields use ordered Minimatch selectors. Rules are applied global and trusted project defaults, then agent-call options and generic preparation. Every discovered candidate starts enabled; a matching positive pattern enables it, `!pattern` disables it, and the last matching rule wins. `!*` clears the current selection before narrower positive patterns are applied. An empty selector array contributes no matches as a selector layer. Use `!*` before positive patterns when a call must restrict the candidate set, or use `!*` alone to select none. Selectors never create unavailable resources or bypass trust filtering. Child tools, skills, and extensions cannot exceed the parent boundary. Doctor reports `AGENT_RESOURCE_TOOL_SELECTOR_ALLOWLIST` when a positive-only tool selector looks like an ineffective allow-list.
 
-Extension selector normalization is context-specific. In settings, `~` and `~/...` expand from the home directory, `file://` URLs become filesystem paths, and relative paths resolve from the directory containing that settings file. In role frontmatter, the same forms are supported and relative paths resolve from the role file's directory. Existing non-magic paths and the static prefixes of magic paths in settings and role files are canonicalized with `realpath` when possible; `*`, `**`, and `**/...` remain cwd-independent patterns. At call level, those three forms also remain cwd-independent. Other relative selectors resolve from the agent launch cwd: non-magic selectors are canonicalized, while magic patterns are path-resolved without `realpath`. Call-level `~` and `file://` values are not expanded by the runtime.
+Extension selector normalization is context-specific. In settings, `~` and `~/...` expand from the home directory, `file://` URLs become filesystem paths, and relative paths resolve from the directory containing that settings file. Existing non-magic paths and the static prefixes of magic paths in settings are canonicalized with `realpath` when possible; `*`, `**`, and `**/...` remain cwd-independent patterns. At call level, those three forms also remain cwd-independent. Other relative selectors resolve from the agent launch cwd: non-magic selectors are canonicalized, while magic patterns are path-resolved without `realpath`. Call-level `~` and `file://` values are not expanded by the runtime.
 
 ## `piewf doctor --json`
 
@@ -139,7 +139,7 @@ The model-facing surface is exactly:
 | `subagents_stop` | Stop one run and clean its worktree. |
 | `subagents_retry` | Start a fresh run from a failed or stopped request, with a new ID and the original mode. |
 
-`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is an optional extension-owned JSON option. Concrete models are `provider/model:thinking`. The `worktree` option requires a clean working tree at worktree creation or the run fails with `WORKTREE_FAILED`.
+`subagents_run` accepts the same `label`, `model`, `skills`, `extensions`, `tools`, `excludeTools`, `contextFiles`, `role`, `worktree`, `outputSchema`, `retries`, and `timeoutMs` options as workflow agents. `role` is an optional extension-owned JSON option. Concrete models are `provider/model:thinking`. The `worktree` option requires a clean working tree at worktree creation or the run fails with `WORKTREE_FAILED`.
 
 Background calls return an ID immediately. Foreground calls return a terminal envelope and do not produce a background completion follow-up. Do not poll a running ID; call `subagents_inspect({ id })` only when current state or output is needed. Cross-session retry starts fresh and does not restore the old native conversation.
 ## Herdr integration
@@ -290,13 +290,11 @@ When creating or changing an extension or role:
 3. Use strict JSON schemas and JSON-compatible values.
 4. Check names for global collisions and reserved names.
 5. Keep trusted hooks opt-in, short, and cancellation-aware.
-6. Test registration, role discovery, schema validation, replay-sensitive behavior, and invalid configuration.
+6. Test registration, schema validation, replay-sensitive behavior, and invalid configuration.
 7. Run `npm run check` from the repository root.
 
 The workflow DSL, workflow invocation examples, checkpoint handling, budgets, worktrees, and recovery are intentionally outside this file. Read the bundled workflow skill for those tasks.
 
-### Native role CLI versus programmatic consumers
+### Native role CLI
 
-`pi-role` composes static roles/settings and spawns native `pi` from PATH without an upfront SDK session or extension factories. Metadata selectors remove selected-out factories before spawn; dynamic contributor discovery is not a CLI feature. Role/shared tool selectors restrict the model-declared loadout, not deferred/codemode capabilities. Native `--tools` overrides the loadout inside its registry allowlist; `--exclude`, `--no-tools` and `--no-builtin-tools` are hard ceilings across reload and later turns.
-
-The binary ignores shared/per-role `extensionSettings`. Partial `contextFiles` scopes fail explicitly unless native `--no-context-files` suppresses context; only all scopes or `[]` are expressible. Explicit models, help and session handling are native, without catalog validation or role-model fallback. Independent `discoverRoles`, `resolveRole` and `composeRoleConfiguration` return definitions/configuration/resolved options, not SDK sessions or a special settings event channel. Workflow agents and subagents apply those options and own provider loading, partial contexts, recovery snapshots and disposal. Workflow transports `extensionSettings` itself via its existing consumer session/start/hook seam (`session_start` `event.settings`). See [roles](roles.html#pi-role).
+`pi-role` belongs to the independent `@piewf/pi-ext-roles` package, not core or `@piewf/cli`. Its behavior, limits, and role-file format are documented there. Workflow agents and subagents apply roles only through the generic preparation hook; see [roles](roles.html).

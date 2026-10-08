@@ -74,11 +74,11 @@ For a failed run, call `workflow_status({ runId })` first: a compact authoritati
 export interface AgentOptions {
   label?: string; // display name
   model?: string; // provider/model:thinking, or alias[:thinking]
-  role?: string; // role file name
   contextFiles?: Array<"global" | "project" | "cwd">; // which Pi context files to load
-  skills?: string[]; // minimatch overlay after the role list
-  extensions?: string[]; // minimatch overlay after the role list
-  tools?: string[]; // minimatch overlay after the role list
+  skills?: string[]; // minimatch selector, ordered defaults then call options
+  extensions?: string[]; // minimatch selector, ordered defaults then call options
+  tools?: string[]; // minimatch selector, ordered defaults then call options
+  excludeTools?: string[]; // exact tool names removed after preparation; no patterns or workflow_result; never widens the parent ceiling
   outputSchema?: JsonSchema; // structured result for a later phase
   retries?: number; // extra same-run retries for this agent
   timeoutMs?: number | null; // attempt timeout; null = none
@@ -86,9 +86,9 @@ export interface AgentOptions {
 }
 ```
 
-A `role` already sets model, tools, skills, extensions, and context files; call-level options silently override them. Pass `{ role }` alone unless an override is indispensable for that call. When overriding, selectors overlay the role list: restrict with `["!*", "read", "grep"]`; `["*"]` turns everything back on.
+`role` is not a core field: it is an extra JSON key (`[key: string]: JsonValue`) read only by the optional roles extension. With that extension enabled, a `role` supplies model, tools, skills, extensions, and context files during preparation; without it, `role` is ignored. Pass `{ role }` alone unless an override is indispensable. Restrict selectors with `["!*", "read", "grep"]`; `["*"]` turns everything back on.
 
-Extensions may add JSON-compatible agent options such as `advisor: true`; core keys retain validation and role constraints. Extension options go to setup hooks/native setup and are not inherited by child agents.
+Extensions may add JSON-compatible agent options such as `advisor: true`; core keys retain validation and parent ceilings. Extension options go to setup hooks/native setup and are not inherited by child agents.
 
 Agent calls are unnamed. Direct calls receive hidden source call-site identity; aliases are unsupported, and calls from one source site must not race outside `parallel` or `pipeline`, whose structural keys make replay deterministic.
 

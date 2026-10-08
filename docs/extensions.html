@@ -40,7 +40,7 @@
     <article class="prose">
       <p class="eyebrow">Extension paths</p>
       <h1>Use and build trusted workflow extensions</h1>
-      <p class="lead">Install the core workflow package with its review starter and Subagents tools, add the Herdr integration when needed, or author reusable workflow functions, dynamic model aliases, setup hooks, attempt actions, and packaged roles.</p>
+      <p class="lead">Install the core workflow package with its review starter and Subagents tools, add the Herdr integration when needed, or author reusable workflow functions, dynamic model aliases, setup hooks, and attempt actions.</p>
       <section id="shipped">
         <h2>Shipped extensions</h2>
         <div class="table-wrap"><table>
@@ -125,7 +125,7 @@
       </section>
       <section id="registration">
         <h2>Registration contract</h2>
-        <p>Register roles separately with <code>registerRoleContribution(pi, { owner: import.meta.url, roleDirectories: ["./roles"], extension: { headline: "My extension", version: "1.0.0" } })</code> from <code>@piewf/pi-ext-roles</code>. This independent contribution API belongs to the optional roles package, not the workflow template. The native <code>pi-role</code> CLI does not discover dynamic contributions or apply role/shared <code>extensionSettings</code>; see <a href="roles.html#pi-role">CLI boundaries</a>.</p>
+        <p>Register roles separately with <code>registerRoleContribution(pi, { owner: import.meta.url, roleDirectories: ["./roles"], extension: { headline: "My extension", version: "1.0.0" } })</code> from <code>@piewf/pi-ext-roles</code>. This independent contribution API belongs to the optional roles package, not the workflow template. The <code>@piewf/pi-ext-roles</code> package documents its own CLI and discovery boundaries.</p>
         <p><code>WorkflowExtension</code> is the workflow capability registration object. Its own keys are strict, and at least one capability such as <code>functions</code>, <code>modelAliases</code>, <code>validateSettings</code>, <code>agentPreparationHooks</code>, <code>agentSetupHooks</code>, or <code>agentAttemptActions</code> must be registered. The accepted fields are:</p>
         <div class="table-wrap"><table>
           <thead><tr><th>Field</th><th>Type</th><th>Contract</th></tr></thead>
@@ -404,7 +404,7 @@
       </section>
       <section class="callout">
         <h2>Related references</h2>
-        <p>Use the <a href="developers.html#extensions">developer-page compatibility section</a> for the short extension overview, <a href="developers.html#lifecycle-events">lifecycle events</a>, the <a href="roles.html">roles guide</a> for role files and call customization, and the <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/packages/core/skills/pi-extensible-workflows/SKILL.md">bundled workflow skill</a> for workflow authoring and recovery.</p>
+        <p>Use the <a href="developers.html#extensions">developer-page compatibility section</a> for the short extension overview, <a href="developers.html#lifecycle-events">lifecycle events</a>, the <a href="roles.html">roles page</a> for the optional roles integration, and the <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/packages/core/skills/pi-extensible-workflows/SKILL.md">bundled workflow skill</a> for workflow authoring and recovery.</p>
       </section>
       <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
     </article>

@@ -68,7 +68,7 @@ return agent(prompt("Summarize these reports:\n\n{reports}", { reports }));
 
 Runs are backgrounded by default; set `foreground: true` to wait for the final value. Use `pipeline()` for staged work, `withWorktree()` for isolation, `checkpoint()` for approval, and `agent.create({ name })` with `handle.send()` when one agent must keep its transcript across turns.
 
-The same roles that workflows use can also start a plain Pi session, without a workflow:
+The optional roles extension can also start a plain Pi session with a role, without a workflow:
 
 ```sh
 npm install -g @piewf/pi-ext-roles
@@ -76,7 +76,7 @@ pi-role reviewer                 # Pi with the reviewer role's model, tools, ski
 pi-role scout -p "Where is the retry logic?"
 ```
 
-See the [roles guide](https://vekexasia.github.io/pi-extensible-workflows/roles.html#pi-role).
+See the [optional roles integration](https://vekexasia.github.io/pi-extensible-workflows/roles.html).
 
 ## Included capabilities
 
