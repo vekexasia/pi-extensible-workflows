@@ -12,7 +12,23 @@ each publishable workspace version equal, then create the matching `vX.Y.Z`
 tag. The publish workflow verifies every package version, runs the root checks,
 packs every publishable workspace, then publishes core, CLI, and Herdr.
 
-## Independent roles prerequisite and release gate
+## Current optional roles verification gate
+
+Core and CLI must install and work without roles. Run `npm run check` and
+`npm run test:packages` here; check/package/terminal verification for roles stays
+in its independent repository. For paired verification, build and pack current
+core, CLI and roles locally, then run
+`PI_OFFLINE=1 node scripts/verify-local-roles-adapter.mjs <local-tarball-directory>`.
+Never substitute registry roles/workflows artifacts for this paired check.
+The current breaking contract removes compatibility paths, APIs and old run
+snapshots; users must enable the roles plugin explicitly and start new runs.
+Future publication still requires explicit approval. No verification command
+constitutes approval to publish.
+
+## Historical independent roles prerequisite (released 6.0.0)
+
+The following sections record the already-published extraction and its approvals,
+not the current dependency or compatibility contract.
 
 `@piewf/pi-ext-roles` is a separate sibling repository with its own version and
 sole ownership of the `pi-role` binary. It is not a workflow workspace.
@@ -41,7 +57,7 @@ context scopes unless suppressed by native `--no-context-files`.
 Native no-tools/wildcard capability regressions are owned by the sibling
 local-provider transport suite; do not replace them with argv-only assertions.
 
-## Roles extraction: agreed upgrade plan
+## Historical roles extraction: agreed upgrade plan
 
 Ship the extraction in the next workflow **major release**. The removed
 `registerWorkflowExtension({ roleDirectories })` contract is a breaking change,
@@ -94,7 +110,7 @@ still require explicit publication approval.
 Documentation ownership: the independent package roles guide, linked from its
 concise README and included in its tarball, owns role authoring, shared
 configuration, contribution/resolution APIs and native CLI contracts.
-`docs/roles.html` remains the workflow/subagent consumer and compatibility guide.
+`docs/roles.html` is the workflow/subagent optional integration guide.
 The README is included in the independent tarball; registry docs must be usable
 without access to the workflow repository.
 
@@ -106,19 +122,17 @@ npm run check
 npm pack --dry-run --json --workspace=packages/core
 npm pack --dry-run --json --workspace=packages/cli
 npm pack --dry-run --json --workspace=packages/extensions/herdr
-npm run test:packages -- "$PWD/.tmp/roles-release/tarballs"
-python3 scripts/verify-role-upgrade.py .tmp/roles-release/tarballs
+npm run test:packages
+# After packing core, CLI and roles locally into the same directory:
+PI_OFFLINE=1 node scripts/verify-local-roles-adapter.mjs <local-tarball-directory>
+PI_OFFLINE=1 node scripts/verify-pre6-parity.mjs <local-tarball-directory>
 ```
 
-The Python upgrade check creates a temporary HOME, Pi agent directory and npm
-prefix with a minimal environment, installs the actual registry versions, and
-upgrades to the candidate tarballs. It uses a local HTTP model provider for real
-model/tool/result flows, inspects regular/fullscreen TUI and reload, checks legacy
-file bytes remain unchanged, then removes the temporary installation. Logs are in
-`.tmp/roles-release/logs/`. Python 3 and a Unix PTY are required. This pre-release upgrade check does not cover external paid providers, MCP
-servers, Windows PTY or registry installation of the then-unpublished workflow
-candidate. Published managed installs and hosted models were subsequently checked
-in the post-release E2E report. Core runtime trust remains Pi-owned: a
+The obsolete compatibility upgrade script has been removed. The paired harness
+uses temporary HOME, agent and install directories, local product tarballs and a
+synthetic local provider; it removes the fixture afterward. It does not prove
+remote cache hits, paid providers, MCP or Pi 1.0.3. Historical registry/TUI evidence
+remains in the post-release report. Core runtime trust remains Pi-owned: a
 role-only project directory does not by itself trigger Pi's native trust prompt;
 explicit `--no-approve` excludes it.
 

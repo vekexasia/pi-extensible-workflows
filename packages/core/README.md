@@ -11,7 +11,7 @@ The repository [README](https://github.com/vekexasia/pi-extensible-workflows#rea
 ## Install
 
 Requires Node.js 22.19 or newer. This is trusted Pi host code with the same filesystem and process access as Pi.
-The core installation includes workflow orchestration, the `reviewLoop` starter for implementation-and-review cycles, packaged `developer`/`reviewer`/`scout`/`oracle`/`researcher` roles with ready-made slash commands (`/scout`, `/oracle`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`, and more), and durable standalone subagent tools. See the [Subagents guide](https://vekexasia.github.io/pi-extensible-workflows/subagents.html) for the bundled tools.
+The core installation includes workflow orchestration, the `reviewLoop` starter for implementation-and-review cycles, ready-made slash commands (`/scout`, `/oracle`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`, and more), and durable standalone subagent tools. Role options in starters and slash commands require the separately enabled `@piewf/pi-ext-roles` Pi extension; core does not ship or interpret roles. See the [Subagents guide](https://vekexasia.github.io/pi-extensible-workflows/subagents.html) for the bundled tools.
 Trajectory live monitoring is included in the package. Restart existing Pi processes after upgrading the package so their publisher protocol matches the detached Trajectory server.
 
 ```sh
@@ -35,7 +35,7 @@ Launch with a non-empty `name` and exactly one of `script` or `scriptPath`. Regi
 
 ## Programmatic integration
 
-The package exports the workflow registry, runtime, persistence, validation, settings, role, lifecycle, and local Pi session APIs used by trusted hosts and extensions.
+The package exports the workflow registry, runtime, persistence, validation, settings, generic agent preparation, lifecycle, and local Pi session APIs used by trusted hosts and extensions.
 
 Direct consumers of `createLocalPiSession()` receive a session with extensions already bound. Always `await session.dispose()` so `session_shutdown` runs before the native session is released; disposal is idempotent.
 

@@ -72,7 +72,7 @@ void test("script call privacy holds for transcript runs, live metadata, and HTM
     { kind: "tool", name: "read", path: "tool/failed", input: {}, startedAt: 1, finishedAt: 2, error: { code: "TOOL_FAILED", message: "private-error" } },
     { kind: "shell", name: "shell", path: "shell/done", input: { command: "echo public-shell" }, startedAt: 1 },
   ] };
-  await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "privacy" }, settings: { concurrency: 1 }, models: [], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "privacy" }, settings: { concurrency: 1 }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
   await store.complete("tool/done", "private-result");
   await store.complete("shell/done", "public-shell-output");
   const loaded = await createTrajectoryRunLoader(home, "session", home)();
@@ -141,7 +141,7 @@ void test("trajectory keeps runs with unavailable retry lineage visible", async 
     agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [] }],
   } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentConfigurations: {}, schemas: [] }));
     const loaded = await createTrajectoryRunLoader(cwd, "session", home)();
     assert.equal(loaded.length, 1);
     assert.deepEqual(loaded[0]?.run.agents[0]?.output, { status: "unavailable" });
@@ -751,7 +751,7 @@ void test("trajectory transcript retention stays bounded with timing entries", a
     agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: [] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }],
   } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentConfigurations: {}, schemas: [] }));
     const [loaded] = await createTrajectoryRunLoader(cwd, "session", home)();
     const entries = loaded?.transcripts.agent ?? [];
     assert.equal(entries.length, 800);
@@ -774,7 +774,7 @@ void test("trajectory metadata keeps large transcripts available through bounded
   const model = { provider: "fixture", model: "fixture-model" };
   const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: [] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentConfigurations: {}, schemas: [] }));
     assert.ok(readFileSync(sessionFile).byteLength > TRAJECTORY_MAX_TRANSCRIPT_BYTES);
     const metadataRun = (await createTrajectoryRunMetadataLoader(cwd, "session", home)())[0];
     assert.ok(metadataRun);
@@ -802,7 +802,7 @@ void test("trajectory reports a single oversized JSONL record instead of an empt
   const model = { provider: "fixture", model: "fixture-model" };
   const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "completed", agentSessions: [], agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { cwd, hookNames: [], model, tools: [] }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentConfigurations: {}, schemas: [] }));
     const metadataRun = (await createTrajectoryRunMetadataLoader(cwd, "session", home)())[0];
     assert.ok(metadataRun);
     const agentMetadata = metadataRun.transcripts.agent;
@@ -1227,7 +1227,7 @@ void test("trajectory run loaders serve cached runs until state, journal, or tra
   const model = { provider: "fixture", model: "fixture-model" };
   const run = { id: "run", workflowName: "trajectory", cwd, sessionId: "session", state: "running", agentSessions: [], phase: "first", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", attempts: 1, model, tools: [], attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native", locator: { sessionFile } }, setup: { hookNames: [], model, tools: [], cwd }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }] } as unknown as PersistedRun;
   try {
-    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+    await store.create(run, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory" }, settings: { concurrency: 1 }, models: ["fixture/fixture-model"], tools: [], agentConfigurations: {}, schemas: [] }));
     const loadRuns = createTrajectoryRunLoader(cwd, "session", home);
     const loadMetadata = createTrajectoryRunMetadataLoader(cwd, "session", home);
     const [first] = await loadRuns();

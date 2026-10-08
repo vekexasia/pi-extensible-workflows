@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { ERROR_CODES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, WorkflowError, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowErrorCode, type WorkflowExtensionSettings } from "./types.js";
-import * as roleUtils from "@piewf/pi-ext-roles/utils";
-import { RoleError } from "@piewf/pi-ext-roles/types";
+import { Minimatch } from "minimatch";
+import { THINKING_LEVELS, type ThinkingLevel } from "./types.js";
 export class SerialLane {
   #tail: Promise<void> = Promise.resolve();
   run<T>(task: () => Promise<T>): Promise<T> {
@@ -43,7 +43,16 @@ export function jsonValue(value: unknown, seen = new Set<object>()): value is Js
   return valid;
 }
 export function jsonObject(value: unknown): value is Record<string, JsonValue> { return jsonValue(value) && object(value); }
-export function mergeWorkflowExtensionSettings(...layers: readonly (Readonly<WorkflowExtensionSettings> | undefined)[]): Readonly<WorkflowExtensionSettings> | undefined { return roleUtils.mergeExtensionSettings(...layers); }
+export function mergeWorkflowExtensionSettings(...layers: readonly (Readonly<WorkflowExtensionSettings> | undefined)[]): Readonly<WorkflowExtensionSettings> | undefined {
+  const merged: Record<string, JsonValue> = {};
+  let present = false;
+  for (const layer of layers) {
+    if (layer === undefined) continue;
+    present = true;
+    for (const [namespace, value] of Object.entries(layer)) Object.defineProperty(merged, namespace, { value: structuredClone(value), enumerable: true, configurable: true, writable: true });
+  }
+  return present ? deepFreeze(merged as WorkflowExtensionSettings) : undefined;
+}
 export function positiveInteger(value: unknown): value is number { return typeof value === "number" && Number.isInteger(value) && value > 0; }
 export function finiteNumber(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
 export function deepFreeze<T>(value: T): T {
@@ -78,31 +87,87 @@ export function fail(code: WorkflowErrorCode, message: string): never { throw ne
 /** Sort order for agent setup hooks: lower priority first, ties broken by name so registration order never matters. */
 export function byPriorityThenName(left: { priority: number; name: string }, right: { priority: number; name: string }): number { return left.priority - right.priority || (left.name < right.name ? -1 : left.name > right.name ? 1 : 0); }
 
-export function roleApi<T>(operation: () => T): T {
-  try { return operation(); }
-  catch (error) {
-    if (!(error instanceof RoleError) && !(error instanceof Error && error.name === "RoleError")) throw error;
-    const translated = new WorkflowError(errorCode(error) ?? "INTERNAL_ERROR", errorText(error).replace("Standard roles role directory", "Standard workflow role directory"));
-    const alias = roleUtils.modelAliasErrorName(error);
-    if (alias) annotateModelAliasError(translated, alias);
-    throw translated;
-  }
+export function isThinkingLevel(value: unknown): value is ThinkingLevel { return THINKING_LEVELS.some((level) => level === value); }
+export const MODEL_ALIAS_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export const WORKFLOW_EXTENSION_NAMESPACE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+export function validWorkflowExtensionNamespace(value: string): boolean { return WORKFLOW_EXTENSION_NAMESPACE.test(value) && value !== "__proto__" && value !== "constructor" && value !== "prototype"; }
+export function parseThinking(value: unknown): ModelSpec["thinking"] | undefined { return isThinkingLevel(value) ? value : undefined; }
+export function parseModelReference(value: string): ModelSpec {
+  const match = /^([^/:\s]+)\/([^:\s]+)(?::([^:\s]+))?$/.exec(value);
+  if (!match?.[1] || !match[2]) fail("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
+  const thinking = match[3];
+  if (thinking !== undefined && !isThinkingLevel(thinking)) fail("UNKNOWN_MODEL", `Invalid thinking level: ${thinking}`);
+  return { provider: match[1], model: match[2], ...(thinking !== undefined ? { thinking } : {}) };
 }
-export { isThinkingLevel, MODEL_ALIAS_NAME, EXTENSION_NAMESPACE as WORKFLOW_EXTENSION_NAMESPACE, validExtensionNamespace as validWorkflowExtensionNamespace, parseThinking, modelAliasName } from "@piewf/pi-ext-roles/utils";
-import { modelAliasName } from "@piewf/pi-ext-roles/utils";
-const MODEL_ALIAS_ERROR_NAME = Symbol.for("pi-extensible-workflows.modelAliasErrorName");
+export function assertModelThinking(value: string, path = "model"): void {
+  if (value.includes("/") && parseModelReference(value).thinking === undefined) fail("INVALID_METADATA", `${path} must be provider/model:thinking`);
+}
+const MODEL_ALIAS_ERROR_NAME = Symbol("modelAliasErrorName");
+type ModelAliasError = WorkflowError & { [MODEL_ALIAS_ERROR_NAME]?: string };
+function aliasError(message: string, settingsPath: string, name?: string): never {
+  const error = new WorkflowError("CONFIG_ERROR", `${message} (settings: ${settingsPath})`);
+  if (name) Object.defineProperty(error, MODEL_ALIAS_ERROR_NAME, { value: name, configurable: true });
+  throw error;
+}
 export function annotateModelAliasError(error: unknown, name: string): unknown {
   if (error instanceof WorkflowError) Object.defineProperty(error, MODEL_ALIAS_ERROR_NAME, { value: name, configurable: true });
   return error;
 }
 export function modelAliasErrorName(error: unknown): string | undefined {
-  return error instanceof WorkflowError ? (error as WorkflowError & { [MODEL_ALIAS_ERROR_NAME]?: string })[MODEL_ALIAS_ERROR_NAME] : roleUtils.modelAliasErrorName(error);
+  return error instanceof WorkflowError ? (error as ModelAliasError)[MODEL_ALIAS_ERROR_NAME] : undefined;
 }
-export function parseModelReference(...args: Parameters<typeof roleUtils.parseModelReference>): ReturnType<typeof roleUtils.parseModelReference> { return roleApi(() => roleUtils.parseModelReference(...args)); }
-export function assertModelThinking(...args: Parameters<typeof roleUtils.assertModelThinking>): ReturnType<typeof roleUtils.assertModelThinking> { roleApi(() => { roleUtils.assertModelThinking(...args); }); }
-export function validateModelAliases(...args: Parameters<typeof roleUtils.validateModelAliases>): ReturnType<typeof roleUtils.validateModelAliases> { return roleApi(() => roleUtils.validateModelAliases(...args)); }
-export function unknownModel(...args: Parameters<typeof roleUtils.unknownModel>): ReturnType<typeof roleUtils.unknownModel> { return roleApi(() => roleUtils.unknownModel(...args)); }
-export function resolveModelReference(...args: Parameters<typeof roleUtils.resolveModelReference>): ReturnType<typeof roleUtils.resolveModelReference> { return roleApi(() => roleUtils.resolveModelReference(...args)); }
+export function modelAliasName(value: string, aliases: Readonly<Record<string, string>>): string | undefined {
+  const name = /^([^/:\s]+)(?::[^:\s]+)?$/.exec(value)?.[1];
+  return name && Object.prototype.hasOwnProperty.call(aliases, name) ? name : undefined;
+}
+export function validateModelAliases(value: unknown, settingsPath = "workflow settings"): Readonly<Record<string, string>> {
+  if (!object(value)) aliasError("modelAliases must be an object", settingsPath);
+  const aliases: Record<string, string> = {};
+  for (const [name, target] of Object.entries(value)) {
+    if (!MODEL_ALIAS_NAME.test(name)) aliasError(`Invalid model alias name: ${name}`, settingsPath, name);
+    if (typeof target !== "string" || !target.trim()) aliasError(`Invalid model alias target for ${name}`, settingsPath, name);
+    aliases[name] = target;
+  }
+  for (const name of Object.keys(aliases)) {
+    try { resolveModelReference(name, aliases); } catch (error) { aliasError(`Invalid model alias target for ${name}: ${errorText(error)}`, settingsPath, name); }
+  }
+  return Object.freeze(aliases);
+}
+export function unknownModel(value: string, target: string | undefined, settingsPath?: string): never {
+  const resolved = target ? ` resolved to ${target}` : "";
+  const path = settingsPath ? ` (settings: ${settingsPath})` : "";
+  fail("UNKNOWN_MODEL", `Unknown model${target ? " alias" : ""} ${value}${resolved}${path}`);
+}
+export function resolveModelReference(value: string, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): ModelSpec {
+  const resolveReference = (reference: string, chain: readonly string[]): ModelSpec => {
+    if (reference.includes("/")) return parseModelReference(reference);
+    const match = /^([^:\s]+)(?::([^:\s]+))?$/.exec(reference);
+    const thinking = match?.[2];
+    if (!match?.[1] || thinking !== undefined && !isThinkingLevel(thinking)) unknownModel(reference, undefined, settingsPath);
+    const alias = modelAliasName(reference, aliases);
+    if (alias) {
+      if (chain.includes(alias)) fail("UNKNOWN_MODEL", `Circular model alias: ${[...chain, alias].join(" -> ")}${settingsPath ? ` (settings: ${settingsPath})` : ""}`);
+      const { [alias]: target } = aliases;
+      if (typeof target !== "string") unknownModel(reference, undefined, settingsPath);
+      const parsed = resolveReference(target, [...chain, alias]);
+      return thinking !== undefined ? { ...parsed, thinking } : parsed;
+    }
+    const candidates = [...(knownModels ?? [])].filter((model) => model.slice(model.indexOf("/") + 1) === match[1]);
+    if (candidates.length === 1) {
+      const [candidate] = candidates;
+      if (candidate !== undefined) {
+        const parsed = parseModelReference(candidate);
+        return thinking !== undefined ? { ...parsed, thinking } : parsed;
+      }
+    }
+    unknownModel(reference, undefined, settingsPath);
+  };
+  return resolveReference(value, []);
+}
+export function modelCapability(value: string | ModelSpec, aliases?: Readonly<Record<string, string>>, knownModels?: ReadonlySet<string>, settingsPath?: string): string {
+  const parsed = typeof value === "string" ? resolveModelReference(value, aliases, knownModels, settingsPath) : value;
+  return `${parsed.provider}/${parsed.model}`;
+}
 type ToolSource = { getActiveTools(): string[]; getAllTools?(): readonly { name: string; exposure?: string }[] };
 /**
  * Tools a session can reach, and so the ceiling for its agents: the declared tools plus the ones
@@ -121,11 +186,37 @@ export function physicalModel(spec: ModelSpec, aliases: Readonly<Record<string, 
   const target = resolveModelReference(spec.model, aliases, knownModels, settingsPath);
   return spec.thinking === undefined ? target : { ...target, thinking: spec.thinking };
 }
-export function modelCapability(...args: Parameters<typeof roleUtils.modelCapability>): string { return roleApi(() => roleUtils.modelCapability(...args)); }
 export function aliasDrift(previous: Readonly<Record<string, string>>, current: Readonly<Record<string, string>>): string[] {
   return [...new Set([...Object.keys(previous), ...Object.keys(current)])].sort().flatMap((name) => previous[name] === current[name] ? [] : [`${name}: ${previous[name] ?? "(missing)"} -> ${current[name] ?? "(missing)"}`]);
 }
-export { validateResourcePattern, resourcePatternMatches, selectResourcesByLayers, resourcePatternHasMagic, unmatchedResourcePatterns } from "@piewf/pi-ext-roles/utils";
+const RESOURCE_PATTERN_OPTIONS = { dot: true, nonegate: true, nocomment: true } as const;
+function resourcePatternBody(pattern: string): string { return pattern.startsWith("!") ? pattern.slice(1) : pattern; }
+function resourcePatternPath(value: string): string { return value.replaceAll("\\", "/"); }
+export function validateResourcePattern(pattern: string): void {
+  const body = resourcePatternBody(pattern);
+  if (!body) throw new Error(`Empty minimatch pattern ${JSON.stringify(pattern)}`);
+  const matcher = new Minimatch(resourcePatternPath(body), RESOURCE_PATTERN_OPTIONS);
+  if (matcher.makeRe() === false) throw new Error(`Invalid minimatch pattern ${JSON.stringify(pattern)}`);
+}
+export function resourcePatternMatches(resource: string, pattern: string): boolean {
+  const body = resourcePatternBody(pattern);
+  if (body === "*") return true;
+  return new Minimatch(resourcePatternPath(body), RESOURCE_PATTERN_OPTIONS).match(resourcePatternPath(resource));
+}
+export function selectResourcesByLayers(layers: readonly (readonly string[] | undefined)[], resources: readonly string[]): string[] {
+  const enabled = new Set(resources);
+  for (const layer of layers) {
+    if (layer === undefined) continue;
+    for (const resource of resources) {
+      for (const pattern of layer) if (resourcePatternMatches(resource, pattern)) {
+        if (pattern.startsWith("!")) enabled.delete(resource); else enabled.add(resource);
+      }
+    }
+  }
+  return resources.filter((resource) => enabled.has(resource));
+}
+export function resourcePatternHasMagic(pattern: string): boolean { return /[*?\x5b\x5d{}()]/.test(resourcePatternBody(pattern)); }
+export function unmatchedResourcePatterns(patterns: readonly string[], resources: readonly string[]): string[] { return patterns.filter((pattern) => !resources.some((resource) => resourcePatternMatches(resource, pattern))); }
 export function createLaunchSnapshot(input: Omit<import("./types.js").LaunchSnapshot, "identityVersion"> & { identityVersion?: number }): Readonly<import("./types.js").LaunchSnapshot> { return deepFreeze(structuredClone({ ...input, identityVersion: input.identityVersion ?? LAUNCH_SNAPSHOT_IDENTITY_VERSION })); }
 export function loadLaunchSnapshot(input: import("./types.js").LaunchSnapshot): Readonly<import("./types.js").LaunchSnapshot> { return deepFreeze(structuredClone(input)); }
 

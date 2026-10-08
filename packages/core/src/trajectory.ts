@@ -66,7 +66,6 @@ export type TrajectorySubagent = {
   sessionId: string;
   cwd: string;
   label?: string;
-  role?: string;
   mode: "background" | "foreground";
   state: SubagentStatus["state"];
   startedAt?: number;
@@ -282,8 +281,8 @@ async function resolveResourceInspection(inspection: ResourceInspection | undefi
   let discovered: DiscoveredResources;
   try { discovered = await discoveredResources(cwd); } catch { return inspection; }
   const sources = inspection.selectorSources ?? { global: inspection.selectors, project: {} };
-  const skills = inspection.skills.length ? inspection.skills : selectResourcesByLayers([sources.global.skills, sources.project.skills, sources.role?.skills, sources.call?.skills], discovered.skills);
-  const extensions = inspection.extensions.length ? inspection.extensions : selectResourcesByLayers([sources.global.extensions, sources.project.extensions, sources.role?.extensions, sources.call?.extensions].map((layer) => layer?.map((selector) => canonicalExtensionSelector(selector, selectorCwd))), discovered.extensions);
+  const skills = inspection.skills.length ? inspection.skills : selectResourcesByLayers([sources.global.skills, sources.project.skills, sources.call?.skills], discovered.skills);
+  const extensions = inspection.extensions.length ? inspection.extensions : selectResourcesByLayers([sources.global.extensions, sources.project.extensions, sources.call?.extensions].map((layer) => layer?.map((selector) => canonicalExtensionSelector(selector, selectorCwd))), discovered.extensions);
   return skills === inspection.skills && extensions === inspection.extensions ? inspection : { ...inspection, skills, extensions };
 }
 export async function withResolvedAttemptResources(attempt: AgentAttemptSummary, cwd: string): Promise<AgentAttemptSummary> {
@@ -565,7 +564,6 @@ async function loadTrajectorySubagent(directory: string, cwd: string, sessionId:
     return {
       id, sessionId, cwd, mode: request.mode ?? "background", state: status.state, request, tools, transcript,
       ...(request.label === undefined ? {} : { label: request.label }),
-      ...(request.role === undefined ? {} : { role: request.role }),
       ...(status.startedAt === undefined ? {} : { startedAt: status.startedAt }),
       ...(status.finishedAt === undefined ? {} : { finishedAt: status.finishedAt }),
       ...(status.attempts === undefined ? {} : { attempts: status.attempts }),

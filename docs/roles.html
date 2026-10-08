@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Role files and per-call role customization for pi-extensible-workflows.">
+  <meta name="description" content="Optional roles integration for pi-extensible-workflows.">
   <title>Roles | pi-extensible-workflows</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -34,121 +34,23 @@
       <a href="#doctor">Inspect a role</a>
     </aside>
     <article class="prose">
-      <p class="eyebrow">Role author path</p>
-      <h1>Define and customize agent roles</h1>
-      <p class="lead">Roles package a reusable agent policy: model, thinking level, tools, skills, extensions, prompt instructions, and context-file scope. Use a role file for stable defaults, then use per-call <code>AgentOptions</code> to override model, thinking, capabilities, and context files.</p>
-      <p>This is the workflow/subagent consumer guide. The standalone <code>@piewf/pi-ext-roles</code> roles guide, linked from its README and shipped with the package, owns role authoring, shared configuration, contribution/resolution APIs and native CLI behavior. No workflow installation is required to use those independent features.</p>
-      <section id="overview">
-        <h2>Overview</h2>
-        <p>A workflow agent selects a role by name. The role body always comes from the named file. Per-call <code>AgentOptions</code> override the role-file defaults.</p>
-        <pre><code class="language-javascript"><span class="tok-keyword">const</span> plan <span class="tok-punctuation">=</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span><span class="tok-punctuation">(</span><span class="tok-string">"Plan the implementation"</span><span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span>
-  <span class="tok-property">role</span><span class="tok-punctuation">:</span> <span class="tok-string">"planner"</span>
-<span class="tok-punctuation">}</span><span class="tok-punctuation">);</span>
-
-<span class="tok-keyword">const</span> fastReview <span class="tok-punctuation">=</span> <span class="tok-keyword">await</span> <span class="tok-function">agent</span><span class="tok-punctuation">(</span><span class="tok-string">"Review this change"</span><span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span>
-  <span class="tok-property">role</span><span class="tok-punctuation">:</span> <span class="tok-string">"reviewer"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"cheap-model"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">contextFiles</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"cwd"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span>
-<span class="tok-punctuation">}</span><span class="tok-punctuation">);</span></code></pre>
-        <p>Per-call <code>model</code>, <code>thinking</code>, <code>tools</code>, <code>skills</code>, <code>extensions</code>, and <code>contextFiles</code> override role-file defaults. Role <code>extensionSettings</code> replaces declared top-level namespaces while retaining omitted ones. Built-in subagent tools discover these same role files and apply the same validation to standalone agent runs.</p>
+      <p class="eyebrow">Optional role integration</p>
+      <h1>Extension-owned roles</h1>
+      <p class="lead">Workflows and standalone subagents do not implement roles. Install and enable the independent <code>@piewf/pi-ext-roles</code> Pi extension to interpret role options.</p>
+      <section id="overview"><h2>Overview</h2>
+        <p>Core forwards unknown JSON agent options unchanged. Without the roles extension, <code>role</code> is opaque data and has no effect. With it enabled in the parent Pi session, its generic preparation hook owns validation, discovery, precedence, model defaults, resource selectors, and role prompt append.</p>
+        <pre><code class="language-javascript"><span class="tok-keyword">const</span> report = <span class="tok-keyword">await</span> <span class="tok-function">agent</span>(<span class="tok-string">"Review the change"</span>, { role: <span class="tok-string">"reviewer"</span> });</code></pre>
+        <p>For built-in behavior without plugins, use <code>model</code>, <code>tools</code>, <code>skills</code>, <code>extensions</code>, and <code>contextFiles</code> directly. Thinking is expressed by the model suffix, for example <code>provider/model:high</code>.</p>
       </section>
-      <section id="pi-role">
-        <h2>Launch Pi with a role</h2>
-        <p><code>pi-role</code> belongs to <code>@piewf/pi-ext-roles</code>. It composes role arguments and launches the native <code>pi</code> executable from <code>PATH</code>, without requiring workflows or creating an SDK session first. The independent package is published as <code>@piewf/pi-ext-roles@0.1.2</code>; workflow major publication remains subject to the <a href="../RELEASING.md">release gate</a>.</p>
-        <pre><code class="language-shell"><span class="tok-command">npm</span> install -g @piewf/pi-ext-roles
-pi-role --list
-pi-role reviewer
-pi-role scout -p "Where is the retry logic?"
-pi-role reviewer --approve
-pi-role --version # no role: stock Pi</code></pre>
-        <p>Selected sessions use native Pi interactive, print/JSON, RPC, help, model and session behavior. Explicit models are passed to Pi without launcher catalog validation or role fallback; known providers may accept custom model IDs. Role/shared aliases are composed before spawn. Dynamic contributor discovery is not a CLI feature: list and launch use static role files. Extension and skill selectors filter metadata before spawn, so selected-out factories never load; help also suppresses factories.</p>
-        <p>Role/shared tool selectors set the model-declared loadout through a tiny explicitly loaded tools bridge. They do not revoke deferred or codemode capabilities. Native <code>--tools</code> overrides that loadout within its registry allowlist; <code>--exclude</code>, <code>--no-tools</code> and <code>--no-builtin-tools</code> remain hard ceilings, including after reload and attempted re-enablement. Wildcards are native registry selectors, not factory discovery.</p>
-        <p>The native CLI supports only all context scopes or <code>[]</code>. Partial <code>contextFiles</code> scopes fail explicitly unless native <code>--no-context-files</code> suppresses context. Empty <code>--system-prompt</code> retains native default-prefix semantics. Shared and role <code>extensionSettings</code> are deliberately not applied by the binary.</p>
-        <p>The independent <code>discoverRoles</code>, <code>resolveRole</code> and <code>composeRoleConfiguration</code> APIs return definitions and resolved options only. They do not create SDK sessions, load extension factories, own snapshots or disposal, or deliver a special settings event channel. Workflow and subagent consumers apply model, tools, prompt, context scopes, skills and extensions through their existing runtime. Workflow itself transports <code>extensionSettings</code> through its consumer session/start/hook seam, including <code>session_start</code> <code>event.settings</code>. Session creation, provider loading, recovery snapshots and lifecycle remain workflow responsibilities.</p>
-      </section>
-      <section id="migration">
-        <h2>Migrate roles</h2>
-        <p>The extraction shipped in workflow <code>6.0.0</code> because the contributor registration contract changes. Updating workflows supplies the independent roles library through its dependency: workflow/subagent users do not need a separately installed or enabled roles plugin. Both packages are published; the isolated upgrade from <code>5.19.1</code> and live-model workflow-only/workflow-plus-roles installations are verified. See the <a href="../RELEASING.md">agreed release and upgrade checklist</a>.</p>
-        <p>The independent fallback roles do not select a model or provide workflow-specific aliases. If you relied on an old fallback model, set an explicit per-call model or create a global/project role with the same name, preserving its prompt body and adding the desired <code>model</code>; define any shared alias in the new roles settings. Existing consumer settings remain overrides, but they do not restore a removed fallback role's model field automatically.</p>
-        <p>Move global role files from <code>~/.pi/agent/pi-extensible-workflows/roles/</code> to <code>~/.pi/agent/pi-ext-roles/roles/</code>, and project roles from <code>.pi/pi-extensible-workflows/roles/</code> to <code>.pi/pi-ext-roles/roles/</code>. Move shared aliases, <code>tools</code>, <code>skills</code>, <code>extensions</code> and <code>extensionSettings</code> to the corresponding <code>pi-ext-roles/settings.json</code>. Workflow settings remain explicit consumer overrides; the independent package never reads them. Project aliases replace the entire shared global alias map, including <code>{}</code>. Selector order is shared global/project, consumer global/project, role, call, bounded by consumer resources and parent tool ceilings.</p>
-        <p>No files are rewritten automatically. Workflows temporarily retain old role parser/resolver imports and legacy filesystem paths, not role registration. <code>registerWorkflowExtension({ roleDirectories })</code> fails with <code>INVALID_METADATA</code> and migration guidance, with or without <code>source</code>. Remove that field and register roles separately with <code>registerRoleContribution(pi, { owner: import.meta.url, roleDirectories: ["./roles"] })</code> from <code>@piewf/pi-ext-roles</code>. <code>registerWorkflowExtension</code> takes one argument; <code>source</code> remains supported for workflow function provenance and portable bundling. Re-export portable bundles that used the removed registration field.</p>
-        <p>Legacy directories are visible to programmatic role consumers only when an authorized workflow consumer contributes those paths; the native CLI does not collect dynamic contributions and requires migration to the new paths; the independent package does not discover workflow paths on its own. The workflow integration emits one migration warning per TUI session when actual legacy role files or shared role settings fields are present, even without a selected role. Empty directories and non-TUI modes do not produce warnings; protected project sources are inspected only after explicit trust. Warnings and legacy path contributions require loading the workflow integration, which the independent package never loads on its own. No removal date for the remaining import/path compatibility or automatic migration is scheduled.</p>
-        <p>Upgrade a global <code>@piewf/cli</code> installation before installing the independent package so the old CLI no longer claims <code>pi-role</code>: <code>npm install -g @piewf/cli</code>, then <code>npm install -g @piewf/pi-ext-roles</code> after publication approval. Do not force-overwrite a conflicting binary from an older CLI. <code>@piewf/cli/pi-role</code> still forwards <code>runPiRole</code>; the deprecated <code>piArguments</code>/<code>resolvePiArguments</code> imports remain isolated legacy argv projections. They do not execute extension factories or discover contributor SDK startup state; tool enumeration is limited to Pi builtins. Partial context scopes, effective <code>extensionSettings</code>, and unavailable extension tool projection throw instead of being silently ignored. Models are validated without alias fallback. Use <code>runPiRole</code> for native CLI startup; it never calls these helpers. Use the independent option-producing APIs with a consumer runtime, such as workflow or subagents, when settings delivery or partial context scopes are required.</p>
-      </section>
-      <section id="api">
-        <h2>Standalone roles API</h2>
-        <p>The independent <code>@piewf/pi-ext-roles/roles</code> subpath (with the old <code>pi-extensible-workflows/roles</code> entrypoint retained as a workflow compatibility adapter) exposes role discovery without creating a workflow or host. Use <code>discoverRoles({ cwd, agentDir, projectTrusted, extensionRoleDirectories })</code> to load the active definitions, <code>loadRole(name, options)</code> to load one validated role, and <code>resolveRole(name, options)</code> to obtain its effective model, prompt mode, context scopes, selector layers, selected resources, and unmatched selectors. Optional <code>resources</code>, <code>rootTools</code>, <code>knownModels</code>, <code>availableModels</code>, and <code>modelAliases</code> provide the runtime boundaries needed for matching and model resolution; without them, selector layers are returned, while selected resources and tools remain unknown rather than being inferred.</p>
-      </section>
-      <section id="files">
-        <h2>Role files</h2>
-        <p>Global roles live under <code>&lt;agentDir&gt;/pi-ext-roles/roles/&lt;name&gt;.md</code>, normally <code>~/.pi/agent/pi-ext-roles/roles/&lt;name&gt;.md</code>. Set <code>PI_CODING_AGENT_DIR</code> to change the agent directory.</p>
-        <p>Trusted project roles live under <code>&lt;cwd&gt;/.pi/pi-ext-roles/roles/&lt;name&gt;.md</code>. A trusted extension contributes packaged roles with <code>registerRoleContribution(pi, { owner: import.meta.url, roleDirectories: ["./roles"] })</code> from <code>@piewf/pi-ext-roles</code>. Relative directories resolve from the owner. Role precedence is <code>fallback roles &lt; contributors &lt; global &lt; authorized project</code>; within one scope, new paths override legacy paths. Starter roles are low-precedence fallbacks, so a regular extension role silently overrides a starter role with the same name; duplicate names among regular extension roles are rejected. The bundled starter roles follow that rule; see <a href="extensions.html#starter">Bundled starter</a> for aliases, <code>reviewLoop</code>, and how to disable the factory.</p>
-        <pre><code class="language-markdown"><span class="tok-punctuation">---</span>
-<span class="tok-property">description</span><span class="tok-punctuation">:</span> Reviews code for correctness
-<span class="tok-property">model</span><span class="tok-punctuation">:</span> anthropic/claude-fable-5:high
-<span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> read<span class="tok-punctuation">,</span> grep<span class="tok-punctuation">]</span>
-<span class="tok-property">skills</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"review-*"</span><span class="tok-punctuation">]</span>
-<span class="tok-property">extensions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!**/unsafe.mjs"</span><span class="tok-punctuation">]</span>
-<span class="tok-punctuation">---</span>
-Focus on correctness and regressions.</code></pre>
-        <p>The body is prompt guidance. It is appended to the native Pi system prompt unless <code>overrideSystemPrompt: true</code> is set. Role files are trusted configuration and can affect model, tools, resource selectors, extension settings, and the system prompt.</p>
-      </section>
-      <section id="frontmatter">
-        <h2>Frontmatter fields</h2>
-        <div class="table-wrap"><table>
-          <thead><tr><th>Field</th><th>Purpose</th></tr></thead>
-          <tbody>
-            <tr><td><code>description</code></td><td>Role description shown in role discovery and Pi guidance.</td></tr>
-            <tr><td><code>model</code></td><td>Configured alias or concrete <code>provider/model:thinking</code>.</td></tr>
-            <tr><td><code>tools</code>, <code>skills</code>, <code>extensions</code></td><td>Ordered Minimatch selectors. Positive patterns enable discovered candidates, <code>!pattern</code> disables them, later layers override earlier layers, and <code>!*</code> clears the current selection before narrower additions.</td></tr>
-            <tr><td><code>extensionSettings</code></td><td>JSON object of extension-owned namespace values. Declared top-level namespaces replace inherited values; omitted namespaces remain inherited.</td></tr>
-            <tr><td><code>overrideSystemPrompt</code></td><td>When true, use the role body instead of appending it to the native system prompt.</td></tr>
-            <tr><td><code>contextFiles</code></td><td>Choose which Pi context-file scopes reach the role.</td></tr>
-          </tbody>
-        </table></div>
-        <p>Relative extension selectors in role frontmatter resolve from the role file's directory; call-level selectors resolve from the agent launch cwd. See the <a href="developers.html#settings">settings reference</a> for <code>~</code>, <code>file://</code>, glob, and canonicalization rules.</p>
-      </section>
-      <section id="calls">
-        <h2>Customize calls</h2>
-        <p><code>role</code> is a name string. Per-call <code>model</code>, <code>tools</code>, <code>skills</code>, <code>extensions</code>, and <code>contextFiles</code> override the role file. Concrete models are <code>provider/model:thinking</code>. <code>overrideSystemPrompt</code> stays on the role file.</p>
-        <pre><code class="language-javascript"><span class="tok-keyword">await</span> <span class="tok-function">agent</span><span class="tok-punctuation">(</span><span class="tok-string">"Inspect the API"</span><span class="tok-punctuation">,</span> <span class="tok-punctuation">{</span>
-  <span class="tok-property">role</span><span class="tok-punctuation">:</span> <span class="tok-string">"reviewer"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">contextFiles</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"cwd"</span><span class="tok-punctuation">]</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">model</span><span class="tok-punctuation">:</span> <span class="tok-string">"cheap-model:low"</span><span class="tok-punctuation">,</span>
-  <span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"read"</span><span class="tok-punctuation">,</span> <span class="tok-string">"grep"</span><span class="tok-punctuation">]</span>
-<span class="tok-punctuation">}</span><span class="tok-punctuation">);</span></code></pre>
-        <p>Use <code>tools: ["*"]</code> to re-enable all tools after a role restriction.</p>
-      </section>
-      <section id="context">
-        <h2>Context and resources</h2>
-        <p><code>contextFiles</code> controls Pi context discovery for that role. <code>global</code> selects the Pi agent-directory file, <code>cwd</code> selects the exact working-directory file, and <code>project</code> selects discovered project and ancestor files excluding those two. Omit the field for normal discovery or use <code>[]</code> to load none. Scopes can be combined.</p>
-        <pre><code class="language-yaml"><span class="tok-punctuation">---</span>
-<span class="tok-property">contextFiles</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span>global<span class="tok-punctuation">,</span> project<span class="tok-punctuation">]</span>
-<span class="tok-property">skills</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"review-*"</span><span class="tok-punctuation">]</span>
-<span class="tok-property">extensions</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> <span class="tok-string">"**/review-tools/**"</span><span class="tok-punctuation">]</span>
-<span class="tok-property">tools</span><span class="tok-punctuation">:</span> <span class="tok-punctuation">[</span><span class="tok-string">"!*"</span><span class="tok-punctuation">,</span> read<span class="tok-punctuation">]</span>
-<span class="tok-punctuation">---</span></code></pre>
-        <p>Selectors affect only agents using the role and compose after global and trusted-project selectors. Use <code>piewf doctor --role &lt;name&gt;</code> to inspect selector sources and effective skills, extensions, and tools without contacting a provider.</p>
-      </section>
-      <section id="doctor">
-        <h2>Inspect a role</h2>
-        <pre><code class="language-shell"><span class="tok-command">npx</span> -p @piewf/cli piewf doctor --role reviewer
-<span class="tok-command">npx</span> -p @piewf/cli piewf doctor --role reviewer --prompt <span class="tok-string">"Review the current change"</span>
-<span class="tok-command">npx</span> -p @piewf/cli piewf doctor --role reviewer --json
-<span class="tok-command">npx</span> -p @piewf/cli piewf doctor ./roles/reviewer.md</code></pre>
-        <p>The role inspection is read-only. The positional form <code>piewf doctor reviewer</code> is equivalent to <code>--role reviewer</code>. Both resolve the active role and report its effective resources and prepared prompt. A role ending in <code>.md</code> is read as a role file instead, relative to the current working directory, so you can check a role before installing it. The optional probe prompt is useful when prompt hooks depend on the agent request. Add <code>--json</code> to emit the structured report for machine consumers; either role form includes <code>roleTarget</code> and includes <code>roleInspection</code> when inspection succeeds.</p>
-        <p>Role discovery is fail-closed: invalid frontmatter or the rejected legacy selector in any packaged or global role file, or in any trusted-project role file, blocks the complete role set. See the <a href="developers.html#operations">doctor reference</a> for diagnostics and exit behavior. At runtime, a missing named role fails with <code>UNKNOWN_AGENT_TYPE</code> and <code>Unknown agent role: &lt;name&gt;</code>.</p>
-        <p>See <a href="developers.html#tool-api">workflow tool usage</a>, <a href="developers.html#settings">settings</a> for model aliases and global selectors, and <a href="extensions.html#resources">extension resources</a> for packaged role directories.</p>
-      </section>
-      <p class="back-link"><a href="index.html">&lt; Back to documentation home</a></p>
+      <section id="pi-role"><h2>Independent launcher</h2><p><code>pi-role</code> is supplied only by <code>@piewf/pi-ext-roles</code>. Core and <code>@piewf/cli</code> do not depend on it or export a role launcher.</p></section>
+      <section id="api"><h2>Integration API</h2><p>Role contributors register with the independent package. Workflow plugins use <a href="extensions.html#preparation"><code>agentPreparationHooks</code></a>. There is no <code>pi-extensible-workflows/roles</code> export and no core role catalog.</p></section>
+      <section id="files"><h2>Role files</h2><p>The independent roles package owns file locations, parsing, discovery, and trust-aware precedence. Consult its shipped guide rather than adding workflow-specific role directories.</p></section>
+      <section id="frontmatter"><h2>Frontmatter</h2><p>Frontmatter validation and role settings are extension-owned. Core validates only the resulting concrete model, tools, resource policy, settings, context scopes, and prompt configuration.</p></section>
+      <section id="calls"><h2>Call options</h2><p>Workflow <code>agent()</code>, named agent handles, nested child agents, standalone <code>subagents_run</code>, and generic CLI inspection share preparation. Every loaded plugin schema is checked against the original call before any preparation hook runs.</p></section>
+      <section id="context"><h2>Context and capabilities</h2><p>Preparation receives the effective cwd, agent directory, project trust, defaults, original options, cancellation signal, model catalogs, and authorized tool/skill/extension inventories. Root and parent ceilings remain authoritative. Excluded factories are filtered before loading; setup hooks cannot widen prepared tools or restore untrusted project resources.</p></section>
+      <section id="doctor"><h2>Inspect generic options</h2><p>Use <code>piewf doctor --agent-options '{"role":"reviewer"}' --prompt "Review this"</code>. Doctor loads the same preparation and setup hooks, then inspects the local native prompt and resources without contacting a model. No role-specific doctor command remains.</p></section>
+      <section id="migration"><h2>Migration and replay</h2><p>Install roles explicitly if your workflows need them. Core no longer reads shared role settings, imports role APIs, or ships role files. Prepared configurations are persisted by operation or handle identity and reused after restart and retry without rerunning role resolution. Removed capabilities or lost trust fail with <code>RESUME_INCOMPATIBLE</code>. Historical role snapshots are intentionally rejected; launch a new run.</p></section>
     </article>
   </main>
-  <footer class="site-footer">
-    <div class="container footer-inner">
-      <span>pi-extensible-workflows</span>
-      <a href="https://github.com/vekexasia/pi-extensible-workflows">GitHub repository</a>
-    </div>
-  </footer>
 </body>
 </html>

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { HARD_TERMINAL_RUN_STATES, WorkflowError, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowRunEvent } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
 import {
@@ -27,7 +27,7 @@ function summaryFromRun(run: PersistedRun, directory: string, journal: Journal, 
   const failedAt = run.failedAt ?? run.error?.failedAt;
   const replayablePaths = [...new Set([...(run.retry?.completedPaths ?? []), ...Object.keys(journal.completed)])];
   const incompletePaths = [...new Set([...(run.retry?.incompletePaths ?? []), ...(failedAt ? [failedAt] : [])])];
-  return { schemaVersion: 1, runId: run.id, sessionId: run.sessionId, workflowName: run.workflowName, state: run.state, createdAt, updatedAt: now, ...(previous?.terminalAt || HARD_TERMINAL_RUN_STATES.has(run.state) ? { terminalAt: previous?.terminalAt ?? now } : {}), usage: budgetUsage(run.usage), agents: run.agents.map(({ id, name, label, state, role, attempts }) => ({ id, name, ...(label ? { label } : {}), state, ...(role ? { role } : {}), attempts })), ...(run.error ? { error: run.error } : {}), ...(failedAt ? { failedAt } : {}), replayablePaths, incompletePaths, artifacts: summaryArtifacts(directory) };
+  return { schemaVersion: 1, runId: run.id, sessionId: run.sessionId, workflowName: run.workflowName, state: run.state, createdAt, updatedAt: now, ...(previous?.terminalAt || HARD_TERMINAL_RUN_STATES.has(run.state) ? { terminalAt: previous?.terminalAt ?? now } : {}), usage: budgetUsage(run.usage), agents: run.agents.map(({ id, name, label, state, attempts }) => ({ id, name, ...(label ? { label } : {}), state, attempts })), ...(run.error ? { error: run.error } : {}), ...(failedAt ? { failedAt } : {}), replayablePaths, incompletePaths, artifacts: summaryArtifacts(directory) };
 }
 function systemPromptStoragePath(directory: string): string { return join(directory, SYSTEM_PROMPT_STORAGE); }
 function systemPromptRecordsPath(directory: string): string { return join(systemPromptStoragePath(directory), SYSTEM_PROMPT_RECORDS); }
@@ -156,6 +156,22 @@ export class RunStore {
       return result;
     });
     return write;
+  }
+
+  async saveAgentConfiguration(key: string, configuration: PreparedAgentConfiguration): Promise<void> {
+    await this.launchSnapshotLane.run(async () => {
+      const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
+      if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
+      await atomicJson(join(this.directory, "snapshot.json"), { ...snapshot, agentConfigurations: { ...snapshot.agentConfigurations, [key]: configuration } });
+    });
+  }
+
+  async setLaunchMode(launchMode: WorkflowLaunchMode): Promise<void> {
+    await this.launchSnapshotLane.run(async () => {
+      const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
+      if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
+      await atomicJson(join(this.directory, "snapshot.json"), { ...snapshot, launchMode });
+    });
   }
 
   async saveSnapshot(snapshot: Readonly<LaunchSnapshot>): Promise<void> {

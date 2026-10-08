@@ -44,7 +44,7 @@ void test("workflow progress warns after ten minutes of agent silence and resets
   const reset = makeRun({ ...stalled, agents: [{ ...stalledAgent, lastEventAt: now }] });
   assert.doesNotMatch(formatWorkflowProgress(reset, "◇", undefined, now), /stalled\?/);
   assert.match(formatNavigatorDashboard(stalled, [], [], now), /responding - stalled\? 12m/);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "stalling" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "stalling" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   assert.match(formatWorkflowPhaseDashboard(stalled, snapshot, 120, { agentId: "run:1" }, undefined, now).join("\n"), /stalled\? 12m/);
 });
 void test("workflow progress sanitizes streamed activity before terminal rendering", () => {
@@ -84,7 +84,7 @@ void test("foreground progress shows compact usage and expanded agent details", 
 void test("workflow TUI cost views preserve shared sub-cent formatting", () => {
   const cheap = makeAgent({ accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.001 } });
   const run = makeRun({ workflowName: "cheap", agents: [cheap] });
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "cheap" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "cheap" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const store = new RunStore("/repo", "session", "run", "/tmp");
   assert.equal(formatCost(0.001), "$0.001");
   assert.match(navigatorRunLabels([{ store, loaded: { run } }])[0] ?? "", /\$0\.001/);
@@ -100,7 +100,7 @@ void test("phase tree uses compact state glyphs while details keep activity", ()
     { id: "run:3", name: "failed", path: "run:3", state: "failed" as const, model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 },
   ];
   const run = { id: "run", workflowName: "glyphs", cwd: "/repo", sessionId: "session", state: "running" as const, agents, agentSessions: [] };
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "glyphs" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "glyphs" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const lines = formatWorkflowPhaseDashboard(run, snapshot, 120, { agentId: "run:1" });
   const tree = lines.map((line) => line.split(" | ")[0]).join("\n");
   assert.match(tree, /running · ⠦/);
@@ -215,7 +215,7 @@ void test("workflow progress shows active shell operations with start and elapse
   assert.doesNotMatch(progress, /command-secret/);
   const scoped = { ...run, activeShellsByPhase: [{ phaseIndex: 0, active: 2, startedAt: 0 }] };
   assert.match(formatNavigatorDashboard(scoped, [], [], now), /shell \[running\] \(2 active\)/);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "shell-progress" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "shell-progress" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   assert.match(formatNavigatorRun({ run: scoped, snapshot }, [], [], now), /shell \[running\] \(2 active\)/);
   const legacy = { ...run };
   delete legacy.activeShells;
@@ -229,14 +229,14 @@ void test("workflow progress nests active shell under its phase occurrence", () 
   assert.doesNotMatch(progress, /\n\s{2}◇ shell \[running\]/);
 });
 void test("navigator keeps agent rows compact while preserving identity and state", () => {
-  const run = makeRun({ workflowName: "policy", agents: [makeAgent({ id: "run:1", name: "review", path: "run:1", role: "reviewer", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"] })] });
+  const run = makeRun({ workflowName: "policy", agents: [makeAgent({ id: "run:1", name: "review", path: "run:1", model: { provider: "anthropic", model: "opus", thinking: "high" }, tools: ["read", "grep"] })] });
   const dashboard = formatNavigatorDashboard(run, [], []);
   assert.match(dashboard, /⠦ review · running/);
   assert.doesNotMatch(dashboard, /model=|requested=|tools=|role=/);
   assert.doesNotMatch(dashboard, /Launch models/);
 });
 void test("compact TUI hides budgets without effective limits", () => {
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "render" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "render" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const render = (budget: PersistedRun["budget"]): string => {
     const run = makeRun({ workflowName: "render", ...(budget === undefined ? {} : { budget }) });
     return [formatWorkflowProgress(run), formatNavigatorDashboard(run, [], []), formatNavigatorRun({ run, snapshot }, [], [])].join("\n");
@@ -260,7 +260,7 @@ void test("navigator uses persisted labels and model fallbacks across views", ()
   ] });
   const dashboard = formatNavigatorDashboard(run, [], []);
   const progress = formatWorkflowProgress(run);
-  const detail = formatNavigatorRun({ run, snapshot: createLaunchSnapshot({ script: "return 1;", args: null, metadata: { name: "labels" }, settings: DEFAULT_SETTINGS, models: ["provider/worker"], tools: [], agentTypes: [], schemas: [] }) }, [], []);
+  const detail = formatNavigatorRun({ run, snapshot: createLaunchSnapshot({ script: "return 1;", args: null, metadata: { name: "labels" }, settings: DEFAULT_SETTINGS, models: ["provider/worker"], tools: [], agentConfigurations: {}, schemas: [] }) }, [], []);
   assert.match(dashboard, /explicit label > worker/);
   assert.match(progress, /explicit label/);
   assert.match(detail, /explicit label .*model=provider\/worker/);
@@ -323,7 +323,7 @@ void test("host persists neutral live tool and state progress while preserving c
   const liveAgent = live.agents[0];
   assert.ok(liveAgent);
   assert.match(formatWorkflowProgress(live), /#1 .* gpt .*read/);
-  assert.match(formatWorkflowPhaseDashboard(live, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "neutral-host-progress" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] }), 120, { agentId: liveAgent.id }).join("\n"), /Model: changed\/model[\s\S]*Tools: read/);
+  assert.match(formatWorkflowPhaseDashboard(live, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "neutral-host-progress" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] }), 120, { agentId: liveAgent.id }).join("\n"), /Model: changed\/model[\s\S]*Tools: read/);
   release();
   await running;
   const ids = await listRunIds(home, "session", home);
@@ -340,7 +340,7 @@ void test("host persists neutral live tool and state progress while preserving c
 void test("host restart recovers persisted neutral state with the declared ownership policy", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-host-restart-recovery-"));
   const store = new RunStore(home, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "host-restart" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent", "read"], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "host-restart" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent", "read"], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "host-restart", cwd: home, sessionId: "session", state: "interrupted", agents: [{ id: "run:1", name: "work", path: "run:1", state: "cancelled", systemPrompt: "persisted prompt", model: { provider: "stale", model: "stale", thinking: "high" }, tools: ["agent", "read", "injected"], attempts: 1 }], agentSessions: [] }, snapshot);
   await store.saveOwnership([]);
   const createSession = async (): Promise<TestPiSession> => ({
@@ -373,7 +373,7 @@ void test("host restart recovers persisted neutral state with the declared owner
 void test("host restart restores declared ownership over stale live session policy", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-host-restart-policy-"));
   const store = new RunStore(home, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "host-restart-policy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent", "read"], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "host-restart-policy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent", "read"], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "host-restart-policy", cwd: home, sessionId: "session", state: "interrupted", agents: [{ id: "run:1", name: "work", path: "run:1", state: "running", model: { provider: "stale", model: "stale", thinking: "high" }, tools: ["agent", "read", "injected"], attempts: 1 }], agentSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "work", state: "running", options: { label: "work", cwd: home, model: "openai/gpt:medium", tools: ["agent", "read"] } }]);
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
@@ -398,7 +398,7 @@ void test("inline workflow progress refreshes persisted state for stalled agents
   const staleAt = Date.now() - WORKFLOW_AGENT_STALL_THRESHOLD_MS - 1;
   const agent = makeAgent({ activity: { kind: "text", text: "responding" }, lastEventAt: staleAt });
   const persistedRun = makeRun({ workflowName: "inline-stall", cwd: home, agents: [agent] });
-  await store.create(persistedRun, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "inline-stall" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] }));
+  await store.create(persistedRun, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "inline-stall" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const visibleRun = { ...persistedRun, agents: [{ ...agent, lastEventAt: Date.now() }] };
   const tools: WorkflowTool[] = [];
   workflowExtension(testExtensionApi({ registerTool(tool: WorkflowTool) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);

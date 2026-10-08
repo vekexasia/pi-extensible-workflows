@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { canonicalPath, sameFilesystemPath } from "../src/paths.js";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { canonicalPath, piResourceContains, piResourcePath, sameFilesystemPath } from "../src/paths.js";
 
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../src");
 const identitySources = [
@@ -43,8 +44,31 @@ void test("canonical paths resolve portable symlink aliases and missing descenda
 void test("physical path identity has one canonicalization owner", async () => {
   const sources = await Promise.all(identitySources.map((path) => readFile(path, "utf8")));
   const pathsSource = sources[0] ?? "";
-  assert.match(pathsSource, /export \{ canonicalPath, extensionIdentity, sameFilesystemPath \} from "@piewf\/pi-ext-roles\/paths";/);
-  assert.doesNotMatch(pathsSource, /realpathSync|export function (?:canonicalPath|sameFilesystemPath)\(/);
+  assert.match(pathsSource, /export function canonicalPath\(/);
+  for (const source of sources.slice(1)) assert.doesNotMatch(source, /realpathSync|export function (?:canonicalPath|sameFilesystemPath)\(/);
   for (const source of sources) assert.doesNotMatch(source, /function\s+(?:canonicalSourcePath|canonicalRoleDirectory|canonical)\s*\(/);
   assert.doesNotMatch(sources[5] ?? "", /realpathSync/);
+});
+
+void test("contributed resource paths are normalized and contained exactly as Pi's resource loader attributes them", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "workflow-containment-"));
+  const home = process.env.HOME;
+  t.after(() => { rmSync(directory, { recursive: true, force: true }); process.env.HOME = home; });
+  process.env.HOME = join(directory, "home");
+  const cwd = join(directory, "project");
+  assert.equal(piResourcePath("~", cwd), join(directory, "home"));
+  assert.equal(piResourcePath("~/generated", cwd), join(directory, "home", "generated"));
+  assert.equal(piResourcePath(pathToFileURL(join(directory, "url skill")).href, cwd), join(directory, "url skill"));
+  assert.equal(piResourcePath("../relative", cwd), join(directory, "relative"));
+  assert.equal(piResourcePath(`  ${join(directory, "padded")}  `, cwd), join(directory, "padded"));
+  assert.equal(piResourcePath("<inline:tool>", cwd), "<inline:tool>");
+  assert.equal(piResourcePath("builtin:skills", cwd), "builtin:skills");
+  // Lexical, like Pi's source attribution: a symlinked contribution owns what is walked under it, not its target's siblings.
+  mkdirSync(join(directory, "skills", "one"), { recursive: true });
+  symlinkSync(join(directory, "skills"), join(directory, "alias"));
+  assert.equal(piResourceContains(join(directory, "alias"), join(directory, "alias", "one", "SKILL.md")), true);
+  assert.equal(piResourceContains(join(directory, "alias"), join(directory, "skills", "one", "SKILL.md")), false);
+  assert.equal(piResourceContains(join(directory, "skills"), join(directory, "skills")), true);
+  assert.equal(piResourceContains(join(directory, "skills"), join(directory, "skills-other", "SKILL.md")), false);
+  assert.equal(piResourceContains(join(directory, "skills"), directory), false);
 });

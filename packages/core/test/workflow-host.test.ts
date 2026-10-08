@@ -96,6 +96,7 @@ const typeCheckAgentSetupHook: WorkflowExtension = {
         const model: string | undefined = agent.options.model;
         const tools: string[] | undefined = agent.options.tools;
         const extension: InlineExtension = () => {};
+        // @ts-expect-error Setup hooks cannot move an agent: Pi derives trust, settings and .pi resources from cwd.
         agent.sessionInput.cwd = "/tmp";
         agent.sessionInput.tools.push("read");
         agent.sessionInput.extensionFactories ??= [];
@@ -137,7 +138,7 @@ void test("resolves dynamic model aliases against a launch inventory", async () 
   assert.equal(calls, 1);
 });
 void test("validates Promise.all agent fan-out and allows explicit parallel or shell fan-out", () => {
-  const capabilities = { models: new Set<string>(), tools: new Set<string>(), agentTypes: new Set<string>() };
+  const capabilities = { models: new Set<string>(), tools: new Set<string>() };
   assert.throws(() => preflight("return Promise.all(items.map(() => agent('work')));", capabilities), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.doesNotThrow(() => preflight("return parallel('items', { first: () => agent('one'), second: () => agent('two') });", capabilities));
   assert.doesNotThrow(() => preflight("return Promise.all(items.map(() => shell('printf ok')));", capabilities));
@@ -202,34 +203,7 @@ void test("attributes dynamic alias cycles to the registering extension", async 
   await assert.rejects(execute("id", { name: "cycle", script: "return true;", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "CONFIG_ERROR" && error.message.includes("Cycle policy"));
   loadingRegistry().freeze();
 });
-void test("keeps unavailable role tool warnings out of model context", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-warning-entry-"));
-  const agentDir = join(home, "agent");
-  const roleDirectory = join(agentDir, "pi-extensible-workflows", "roles");
-  mkdirSync(roleDirectory, { recursive: true });
-  writeFileSync(join(roleDirectory, "developer.md"), `---\ntools: ["!*", missing_tool]\n---\n`);
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  const messages: string[] = [];
-  const entries: Array<{ type: string; data: unknown }> = [];
-  const pi = testExtensionApi({
-    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
-    getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read"],
-    registerEntryRenderer() {},
-    sendMessage(message) { messages.push(message.content); },
-  });
-  workflowExtension({ ...pi, appendEntry(type, data) { entries.push({ type, data }); } }, home, async () => {}, testTransport(async (): Promise<TestPiSession> => ({
-    sessionId: "warning-entry-agent", sessionFile: "/sessions/warning-entry-agent.jsonl",
-    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
-    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
-    prompt: async () => {}, steer: async () => {}, dispose() {},
-  })), agentDir);
-  const execute = tools.find(({ name }) => name === "workflow")?.execute;
-  assert.ok(execute);
-  await execute("warning-entry", { name: "warning-entry", script: `return await agent("work", { role: "developer" });`, foreground: true }, new AbortController().signal, undefined, { cwd: home, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }], getAvailable: () => [{ provider: "openai", id: "gpt" }] }, sessionManager: { getSessionId: () => "session" } });
-  assert.deepEqual(messages, []);
-  assert.deepEqual(entries, [{ type: "workflow-warning", data: { message: "Tool not available in this session for role developer: missing_tool. The agent runs without it." } }]);
-  loadingRegistry().freeze();
-});
+
 const valid = `phase("check"); agent("review", { role: "reviewer" }); agent("custom", { model: "openai/gpt:medium", tools: ["read"] });`;
 void test("workflow call preview summarizes inline scripts safely", () => {
   const preview = formatWorkflowPreview({ script: valid, name: "review", description: "Review code" });
@@ -272,11 +246,12 @@ void test("registers the workflow tool, command, and conditional skill", async (
   assert.ok(skillPath);
   assert.ok(existsSync(join(skillPath, "pi-extensible-workflows", "SKILL.md")));
   const skillSource = readFileSync(join(skillPath, "pi-extensible-workflows", "SKILL.md"), "utf8");
+  assert.doesNotMatch(skillSource, /\broles?\b/i, "The workflow skill must not describe extension-owned roles");
   assert.match(skillSource, /Call `workflow_catalog` once to list functions and model aliases before the first workflow for a task/);
   const shellExample = /Example use of `shell`:[\s\S]*?```js\n([\s\S]*?)\n```/.exec(skillSource)?.[1];
   assert.ok(shellExample);
   assert.match(skillSource, /return \{ ok: true \};/);
-  assert.doesNotThrow(() => preflight(shellExample, { models: new Set(), tools: new Set(), agentTypes: new Set() }));
+  assert.doesNotThrow(() => preflight(shellExample, { models: new Set(), tools: new Set(), }));
   await assert.rejects(tool.execute("id", { script: "return true" }, new AbortController().signal, undefined, { model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   assert.equal("workflow" in WORKFLOW_TOOL_PARAMETERS.properties, false);
   assert.deepEqual(WORKFLOW_TOOL_PARAMETERS.required, ["name"]);
@@ -371,7 +346,7 @@ void test("failed retry children retain inherited and newly created named worktr
   execFileSync("git", ["-C", cwd, "add", "."]);
   execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
   const script = `return parallel("named", { inherited: () => withWorktree("inherited", async () => agent("inherited")), fresh: () => withWorktree("fresh", async () => agent("fresh")) });`;
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "named-retry", description: "named retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent"], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "named-retry", description: "named retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent"], agentConfigurations: {}, schemas: [] });
   const root = new RunStore(cwd, "session", "root", home);
   await root.create({ id: "root", workflowName: "named-retry", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   const inheritedOwner = structuralPath("worktree", "named", "inherited");
@@ -402,7 +377,7 @@ void test("failed retry children retain inherited and newly created named worktr
 });
 void test("launch with parentRunId is serialised with manual deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-parent-launch-deletion-"));
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "parent-launch" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "parent-launch" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(home, "session", "source", home);
   await source.create({ id: source.runId, workflowName: "parent-launch", cwd: home, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
@@ -437,7 +412,7 @@ void test("launch with parentRunId is serialised with manual deletion", async ()
 });
 void test("manual deletion is not blocked by a foreground retry execution", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-deletion-liveness-"));
-  const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "retry-liveness" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: `return await agent("work");`, args: null, metadata: { name: "retry-liveness" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(home, "session", "source", home);
   await source.create({ id: source.runId, workflowName: "retry-liveness", cwd: home, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   let releasePrompt!: () => void;
@@ -526,7 +501,7 @@ void test("workflow_retry blocks removed dynamic aliases from native bare-model 
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-removed-alias-"));
   const script = `return await agent("retry", { model: "gpt" });`;
   const aliases = { gpt: "openai/gpt" };
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "removed-alias" }, settings: { concurrency: 1, modelAliases: aliases }, modelAliases: aliases, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "removed-alias" }, settings: { concurrency: 1, modelAliases: aliases }, modelAliases: aliases, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(home, "session", "source", home);
   await source.create({ id: "source", workflowName: "removed-alias", cwd: home, sessionId: "session", state: "failed", agents: [], agentSessions: [], error: { code: "AGENT_FAILED", message: "source failure" } }, snapshot);
   let sessions = 0;
@@ -556,7 +531,7 @@ void test("workflow_retry blocks removed dynamic aliases from native bare-model 
 });
 void test("workflow_retry rejects unsupported states, routes cross-wired recovery tools, and rejects incompatible snapshots", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-compatibility-"));
-  const launch = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "retry-compatibility" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const launch = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "retry-compatibility" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const createRun = async (id: string, state: PersistedRun["state"], cwd = home, sessionId = "session") => {
     mkdirSync(cwd, { recursive: true });
     const store = new RunStore(cwd, sessionId, id, home);

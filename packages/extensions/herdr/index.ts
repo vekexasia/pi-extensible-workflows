@@ -687,6 +687,8 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
   return {
     version: "1.0.0",
     headline: "Herdr workflow integration",
+    // The Pi entry's own URL lets a headless host prove this registration came from a loaded extension.
+    source: import.meta.url,
     validateSettings,
     agentAttemptActions: {
       openSession: {

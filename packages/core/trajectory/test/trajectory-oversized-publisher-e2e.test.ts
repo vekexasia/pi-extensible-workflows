@@ -215,7 +215,7 @@ async function createFixture(root: string): Promise<{ cwd: string; home: string;
     stores.push({ store: new RunStore(cwd, SESSION_ID, run.id, home), run });
   }
   assert.equal(paths.length, AGENT_COUNT);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory-oversized" }, settings: { concurrency: 4 }, models: ["fixture/fixture-model"], tools: ["bash"], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trajectory-oversized" }, settings: { concurrency: 4 }, models: ["fixture/fixture-model"], tools: ["bash"], agentConfigurations: {}, schemas: [] });
   await Promise.all(stores.map(({ store, run }) => store.create(run, snapshot)));
   const loadRuns = createTrajectoryRunLoader(cwd, SESSION_ID, home);
   const loadRunMetadata = createTrajectoryRunMetadataLoader(cwd, SESSION_ID, home);

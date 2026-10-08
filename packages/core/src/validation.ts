@@ -2,14 +2,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as acorn from "acorn";
 import { Script } from "node:vm";
-import type { AgentDefinition, CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
+import type { CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
 import type { WorkflowRegistryApi } from "./registry.js";
-import { assertModelThinking, validateSchema, deepFreeze, errorText, fail, jsonObject, jsonValue, mergeWorkflowExtensionSettings, modelAliasName, modelCapability, object, positiveInteger, resolveModelReference, resourcePatternHasMagic, unknownModel } from "./utils.js";
+import { assertModelThinking, validateSchema, deepFreeze, errorText, fail, jsonObject, jsonValue, object, positiveInteger, resourcePatternHasMagic } from "./utils.js";
 import { WORKFLOW_CALL_KINDS } from "./types.js";
 export { validateSchema } from "./utils.js";
-import { loadAgentDefinitions } from "./roles.js";
-export { loadAgentDefinitions, loadProjectAgentDefinitions, parseRoleMarkdown, workflowRoleDirectories } from "./roles.js";
-export type { WorkflowRoleDirectoryInput } from "./roles.js";
 
 import { validateContextFileScopes, validateSelectorList } from "./settings.js";
 export { DEFAULT_SETTINGS, loadCodemodeToolsSetting, loadSettings, loadSettingsOverrides, resolveAgentResourcePolicy, resolveWorkflowSettings, saveModelAliases, validateContextFileScopes, validateModelAliasAvailability, validateSelectorList, validateWorkflowExtensionSettings, workflowProjectSettingsPath, workflowSettingsPath, workflowToolExposure } from "./settings.js";
@@ -19,22 +16,6 @@ export function validateCheckpoint(value: unknown): CheckpointInput {
   if (Buffer.byteLength(value.prompt) > 1024) fail("INVALID_METADATA", "checkpoint prompt exceeds 1024 UTF-8 bytes");
   if (Buffer.byteLength(JSON.stringify(value.context)) > 4096) fail("INVALID_METADATA", "checkpoint context exceeds 4096 UTF-8 bytes");
   return { name: value.name, prompt: value.prompt, context: value.context };
-}
-
-function validateRolePolicies(definitions: Readonly<Record<string, AgentDefinition>>, roles: readonly string[], availableModels: ReadonlySet<string>, aliases: Readonly<Record<string, string>> = {}, knownModels = availableModels, settingsPath?: string): void {
-  for (const role of roles) {
-    const definition = definitions[role];
-    if (!definition) continue;
-    if (definition.model !== undefined) {
-      const resolved = modelCapability(definition.model, aliases, knownModels, settingsPath);
-      if (!availableModels.has(resolved)) {
-        if (modelAliasName(definition.model, aliases)) unknownModel(definition.model, resolved, settingsPath);
-        fail("UNKNOWN_MODEL", `Unknown model for role ${role}: ${resolved}`);
-      }
-    }
-    // Role tools absent from the session are tolerated at launch: the runtime resolve emits a
-    // warning and the agent runs without them. Doctor still reports unmatched patterns.
-  }
 }
 
 function validateWorkflowMetadata(value: unknown): WorkflowMetadata {
@@ -309,8 +290,9 @@ export function workflowPrompt(template: string, values: Readonly<Record<string,
   });
 }
 
-const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "skills", "extensions", "contextFiles", "role", "outputSchema", "retries", "timeoutMs"]);
-function validateAgentOption(key: string, value: unknown, aliases?: Readonly<Record<string, string>>, knownModels?: ReadonlySet<string>, settingsPath?: string): void {
+const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "outputSchema", "retries", "timeoutMs"]);
+export function isCoreAgentOption(key: string): boolean { return AGENT_OPTION_KEYS.has(key); }
+function validateAgentOption(key: string, value: unknown): void {
   switch (key) {
     case "label":
       if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent label must be a non-empty string");
@@ -318,18 +300,18 @@ function validateAgentOption(key: string, value: unknown, aliases?: Readonly<Rec
     case "model":
       if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent model must be a non-empty string");
       assertModelThinking(value, "agent model");
-      if (aliases !== undefined) resolveModelReference(value, aliases, knownModels, settingsPath);
       break;
     case "tools":
     case "skills":
     case "extensions":
       validateSelectorList(value, "agent options", key, "INVALID_METADATA", key !== "extensions");
       break;
+    case "excludeTools":
+      if (!Array.isArray(value) || value.some((tool) => typeof tool !== "string" || !tool.trim() || tool !== tool.trim() || tool.startsWith("!") || resourcePatternHasMagic(tool))) fail("INVALID_METADATA", "agent excludeTools must be an array of exact tool names");
+      if (value.includes("workflow_result")) fail("INVALID_METADATA", "agent excludeTools cannot remove workflow_result");
+      break;
     case "contextFiles":
       validateContextFileScopes(value, "agent options");
-      break;
-    case "role":
-      if (typeof value !== "string" || !value.trim()) fail("INVALID_METADATA", "agent role must be a non-empty string");
       break;
     case "outputSchema":
       validateSchema(value, "agent outputSchema");
@@ -429,36 +411,77 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
         if (value.known && jsonValue(value.value)) knownOptionEntries.push([key, value.value]);
       }
       const knownOptions: Record<string, JsonValue> = Object.fromEntries(knownOptionEntries);
-      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")), role: staticString(propertyNode(options, "role")) };
+      const base = { ...placement, kind, start: call.start, end: call.end, name: null, prompt: staticString(first), model: staticString(propertyNode(options, "model")), label: staticString(propertyNode(options, "label")) };
       return { ...base, ...(retries.known && typeof retries.value === "number" ? { retries: retries.value } : {}), ...(staticOutputSchema === undefined ? {} : { outputSchema: staticOutputSchema }), ...(optionKeys.length ? { options: knownOptions, optionKeys } : {}) };
     }
-    if (kind === "checkpoint") return { ...placement, kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null, role: null };
-    if (kind === "shell") return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null, role: null };
-    return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null, role: null };
+    if (kind === "checkpoint") return { ...placement, kind, start: call.start, end: call.end, name: staticString(propertyNode(first, "name")), prompt: staticString(propertyNode(first, "prompt")), model: null };
+    if (kind === "shell") return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null };
+    return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null };
   });
 }
 
-function validateStaticAgentOptions(node: acorn.AnyNode | undefined, aliases: Readonly<Record<string, string>> = {}, knownModels?: ReadonlySet<string>, settingsPath?: string): void {
+/** Every option is a preparation input, because any hook may read it; one dynamic value leaves the whole call to runtime. */
+function staticPreparationOptions(node: acorn.AnyNode | undefined, omitted?: string): Record<string, JsonValue> | undefined {
+  if (node?.type !== "ObjectExpression") return undefined;
+  const options = new Map<string, JsonValue>();
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement" || property.computed) return undefined;
+    const key = propertyKeyName(property);
+    if (key === undefined) return undefined;
+    if (key === omitted) continue;
+    const value = staticValue(property.value);
+    if (!value.known || !jsonValue(value.value)) return undefined;
+    options.set(key, value.value);
+  }
+  return Object.fromEntries(options);
+}
+/**
+ * A handle prepares its first turn with the create options merged with that send's options, so create options are complete
+ * only when every use of the handle provably passes no send options: `agent.create(...).send(prompt)` directly, or a
+ * `const` handle whose every reference is `handle.send(prompt)`. Computed access, destructuring, aliases or any other
+ * use leave the handle to runtime.
+ */
+function handlesWithCompleteOptions(program: acorn.Program): acorn.CallExpression[] {
+  const parents = new Map<acorn.AnyNode, acorn.AnyNode>();
+  const references = new Map<string, acorn.AnyNode[]>();
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "Identifier") references.set(node.name, [...(references.get(node.name) ?? []), node]);
+    for (const child of astChildren(node)) { parents.set(child, node); visit(child); }
+  };
+  visit(program);
+  const plainSend = (member: acorn.AnyNode | undefined): boolean => {
+    const call = member ? parents.get(member) : undefined;
+    return member?.type === "MemberExpression" && !member.computed && member.property.type === "Identifier" && member.property.name === "send"
+      && call?.type === "CallExpression" && call.callee === member && call.arguments.length <= 1 && call.arguments.every((argument) => argument.type !== "SpreadElement");
+  };
+  return agentCreateCalls(program).filter((create) => {
+    const parent = parents.get(create);
+    if (parent?.type === "MemberExpression" && parent.object === create) return plainSend(parent);
+    const declaration = parent ? parents.get(parent) : undefined;
+    if (parent?.type !== "VariableDeclarator" || parent.init !== create || parent.id.type !== "Identifier" || declaration?.type !== "VariableDeclaration" || declaration.kind !== "const") return false;
+    const name = parent.id.name;
+    return (references.get(name) ?? []).every((reference) => reference === parent.id || (parents.get(reference)?.type === "MemberExpression" && (parents.get(reference) as acorn.MemberExpression).object === reference && plainSend(parents.get(reference))));
+  });
+}
+/**
+ * Distinct, completely static option objects of agent(...) and agent.create(...) calls, so launch can inspect them
+ * before any effect. Calls with any dynamic option stay runtime-checked, and so do handles whose sends may add options.
+ */
+export function staticAgentPreparationOptions(script: string): Array<Readonly<Record<string, JsonValue>>> {
+  const program = parseWorkflow(script);
+  const calls = workflowCalls(program).filter((call) => call.callee.name === "agent").map((call) => call.arguments.some((argument) => argument.type === "SpreadElement") ? undefined : call.arguments.length < 2 ? {} : staticPreparationOptions(callArgument(call, 1)));
+  const handles = handlesWithCompleteOptions(program).map((call) => staticPreparationOptions(callArgument(call, 0), "name"));
+  const distinct = new Map<string, Readonly<Record<string, JsonValue>>>();
+  for (const options of [...calls, ...handles]) if (options) distinct.set(JSON.stringify(options), deepFreeze(options));
+  return [...distinct.values()];
+}
+
+function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {
   if (node?.type !== "ObjectExpression") return;
   for (const key of AGENT_OPTION_KEYS) {
     const value = staticValue(propertyNode(node, key));
-    if (value.known) validateAgentOption(key, value.value, aliases, knownModels, settingsPath);
+    if (value.known) validateAgentOption(key, value.value);
   }
-}
-function hasDynamicAgentRole(node: acorn.AnyNode | undefined): boolean {
-  if (!node) return false;
-  if (node.type !== "ObjectExpression") return true;
-  for (let index = node.properties.length - 1; index >= 0; index -= 1) {
-    const property = node.properties[index];
-    if (!property || property.type === "SpreadElement" || property.computed) return true;
-    const key = propertyKeyName(property);
-    if (key === "role") {
-      const roleValue = staticValue(property.value);
-      if (roleValue.known && typeof roleValue.value === "string") return false;
-      return true;
-    }
-  }
-  return false;
 }
 function validateStaticShellOptions(call: WorkflowCall): void {
   if (call.arguments.some((argument) => argument.type === "SpreadElement")) return;
@@ -495,7 +518,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const phases = calls.filter((call) => call.callee.name === "phase").map((call) => literalString(call.arguments[0])).filter((phase): phase is string => phase !== undefined);
   for (const call of calls) {
     const operation = call.callee.name;
-    if (operation === "agent") validateStaticAgentOptions(call.arguments[1], capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
+    if (operation === "agent") validateStaticAgentOptions(call.arguments[1]);
     if (operation === "withWorktree") validateStaticWithWorktree(call, compatibility);
     if (operation === "shell") validateStaticShellOptions(call);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
@@ -506,11 +529,10 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const handleOptions = agentCreateCalls(program).map((call) => {
     const options = call.arguments.length === 1 ? callArgument(call, 0) : undefined;
     if (options?.type !== "ObjectExpression" || !literalString(propertyNode(options, "name"))?.trim()) fail("INVALID_METADATA", "agent.create requires an options object with a stable explicit name");
-    validateStaticAgentOptions(options, capabilities.modelAliases ?? {}, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath);
+    validateStaticAgentOptions(options);
     return options;
   });
   const agentOptions = [...calls.filter((call) => call.callee.name === "agent").map((call) => callArgument(call, 1)), ...handleOptions];
-  const dynamicAgentRoles = agentOptions.some((options) => hasDynamicAgentRole(options));
   const staticSchemas: JsonSchema[] = [];
   for (const options of agentOptions) {
     const value = staticValue(propertyNode(options, "outputSchema"));
@@ -520,25 +542,16 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     staticSchemas.push(schema);
   }
   checkedSchemas.push(...staticSchemas);
-  const modelRefs = agentOptions.flatMap((options) => { const requested = literalString(propertyNode(options, "model")); return requested === undefined ? [] : [{ requested, resolved: modelCapability(requested, capabilities.modelAliases, capabilities.knownModels ?? capabilities.models, capabilities.settingsPath) }]; });
-  const models = modelRefs.map(({ resolved }) => resolved);
+  const models: string[] = [];
   const tools = agentOptions.flatMap((options) => {
     const value = propertyNode(options, "tools");
     return value?.type === "ArrayExpression" ? value.elements.flatMap((element) => { const tool = element && element.type !== "SpreadElement" ? literalString(element) : undefined; return tool === undefined ? [] : [tool]; }) : [];
   });
-  const agentTypes = agentOptions.flatMap((options) => { const value = staticString(propertyNode(options, "role")); return value === null ? [] : [value]; });
   for (const pattern of tools) {
     const body = pattern.startsWith("!") ? pattern.slice(1) : pattern;
     if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !capabilities.tools.has(body)) fail("UNKNOWN_TOOL", `Unknown tool: ${body}`);
   }
-  const missingModel = capabilities.skipModelAvailability ? undefined : modelRefs.find(({ resolved }) => !capabilities.models.has(resolved));
-  if (missingModel) {
-    if (modelAliasName(missingModel.requested, capabilities.modelAliases ?? {})) unknownModel(missingModel.requested, missingModel.resolved, capabilities.settingsPath);
-    fail("UNKNOWN_MODEL", `Unknown model: ${missingModel.resolved}`);
-  }
-  const missingType = agentTypes.find((type) => !capabilities.agentTypes.has(type));
-  if (missingType) fail("UNKNOWN_AGENT_TYPE", `Unknown agent type: ${missingType}`);
-  return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools, agentTypes }), schemas: deepFreeze(checkedSchemas), dynamicAgentRoles });
+  return Object.freeze({ metadata: deepFreeze(checkedMetadata), referenced: deepFreeze({ phases, models, tools }), schemas: deepFreeze(checkedSchemas) });
 }
 
 export function validateWorkflowLaunch(params: WorkflowValidationParameters, context: WorkflowValidationContext, registry?: WorkflowRegistryApi): ValidatedWorkflowLaunch {
@@ -562,22 +575,9 @@ export function validateWorkflowLaunchWithRegistry(params: WorkflowValidationPar
   const script = typeof params.script === "string" && params.script.trim() ? params.script : fileScript ?? "";
   if (!script) fail("INVALID_SYNTAX", "Provide script or scriptPath");
   const metadata = validateWorkflowMetadata({ name: explicitName, ...(typeof params.description === "string" ? { description: params.description } : {}) });
-  const agentDefinitions = loadAgentDefinitions(context.cwd, context.agentDir, context.projectTrusted, context.extensionRoleDirectories);
-  const projectAgentDefinitions = deepFreeze(Object.fromEntries(Object.entries(agentDefinitions).filter(([, definition]) => definition.provenance?.scope === "project")));
-  const aliases = context.modelAliases ?? {};
-  const knownModels = context.knownModels ?? context.availableModels;
-  const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, agentTypes: new Set(Object.keys(agentDefinitions)), modelAliases: aliases, knownModels, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) }, [], metadata);
-  const roleNames = checked.dynamicAgentRoles ? Object.keys(agentDefinitions) : checked.referenced.agentTypes;
-  validateRolePolicies(agentDefinitions, roleNames, context.availableModels, aliases, knownModels, context.settingsPath);
-  if (registry?.validateExtensionSettings) {
-    const validate = registry.validateExtensionSettings.bind(registry);
-    const validatorContext = (source: "effective" | "role", role?: string) => ({ source, cwd: context.cwd, projectTrusted: context.projectTrusted, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}), ...(role === undefined ? {} : { role }) });
-    validate(context.extensionSettings, validatorContext("effective"));
-    for (const role of roleNames) {
-      validate(mergeWorkflowExtensionSettings(context.extensionSettings, agentDefinitions[role]?.extensionSettings), validatorContext("role", role));
-    }
-  }
-  return { script, checked, agentDefinitions, projectAgentDefinitions, roleNames };
+  const checked = preflight(script, { models: context.availableModels, tools: context.rootTools, modelAliases: context.modelAliases ?? {}, knownModels: context.knownModels ?? context.availableModels, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) }, [], metadata);
+  registry?.validateExtensionSettings(context.extensionSettings, { source: "effective", cwd: context.cwd, projectTrusted: context.projectTrusted, ...(context.settingsPath ? { settingsPath: context.settingsPath } : {}) });
+  return { script, checked };
 }
 
 export { createLaunchSnapshot, loadLaunchSnapshot } from "./utils.js";

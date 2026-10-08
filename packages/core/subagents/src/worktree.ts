@@ -51,7 +51,7 @@ function syntheticSnapshot(): LaunchSnapshot {
     settings: { concurrency: 1 },
     models: [],
     tools: [],
-    agentTypes: [],
+    agentConfigurations: {},
     schemas: [],
   };
 }

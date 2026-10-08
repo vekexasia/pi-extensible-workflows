@@ -65,7 +65,7 @@ function runMetadata(tick, runIndex = 0) {
       budget: { tokens: { hard: 10_000_000 }, costUsd: { hard: 100 } },
       phaseHistory: [{ phase: "plan", afterAgent: 0 }, { phase: "work", afterAgent: 2 }],
     },
-    snapshot: { script: "return await parallel('batch', {});\n".repeat(30), args: null, metadata: { name: "bench-workflow" }, models: ["anthropic/claude-sonnet-4-5"], tools: ["read"], agentTypes: [], schemas: [] },
+    snapshot: { script: "return await parallel('batch', {});\n".repeat(30), args: null, metadata: { name: "bench-workflow" }, models: ["anthropic/claude-sonnet-4-5"], tools: ["read"], agentConfigurations: {}, schemas: [] },
     awaiting: [],
     createdAt: new Date(startedAt).toISOString(),
     transcripts,

@@ -5,50 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { testExtensionApi } from "./support.js";
-import workflowExtension, { RPC_LIMIT_BYTES, RunStore, WorkflowAgentExecutor, createLaunchSnapshot, loadAgentDefinitions, resolveAgentResourcePolicy, resolveWorkflowSettings, runWorkflow, validateWorkflowLaunch, WorkflowError } from "../src/index.js";
+import workflowExtension, { RPC_LIMIT_BYTES, RunStore, createLaunchSnapshot, runWorkflow, WorkflowError } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
-import type { SessionInput } from "../src/agent-execution.js";
-import { testTransport, type TestPiSession } from "./test-transport.js";
+
+
 import { executeShellCommand } from "../src/execution.js";
 
-type WorkflowCommand = (args: string, context: unknown) => Promise<void>;
-async function resumeFromDashboard(command: WorkflowCommand, source: Record<string, unknown>, runId: string): Promise<void> {
-  let picked = false;
-  let used = false;
-  const baseUi = source.ui as { notify: (message: string) => void };
-  await command("", { ...source, hasUI: true, mode: "rpc", ui: { ...baseUi, select: async (prompt: string, options: string[]) => {
-    if (options.includes("Skip")) return "Skip";
-    if (prompt === "Workflows\n") { if (picked) return "Close"; picked = true; return options.find((option) => option.includes(runId)) ?? options[0] ?? "Close"; }
-    if (prompt.startsWith("Resume ")) return "Foreground";
-    if (options.includes("Resume")) { if (used) return "Back"; used = true; return "Resume"; }
-    return "Back";
-  } } });
-}
-void test("untrusted project policy cannot influence launch validation", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-launch-"));
-  const cwd = join(root, "project");
-  const agentDir = join(root, "agent");
-  const globalSettingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  const projectSettingsPath = join(cwd, ".pi", "pi-extensible-workflows", "settings.json");
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "safe.md"), "Global role");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "project-only.md"), "Untrusted project role");
-  writeFileSync(globalSettingsPath, JSON.stringify({ concurrency: 3, skills: ["global-only"], extensions: ["/global-only.ts"] }));
-  writeFileSync(projectSettingsPath, JSON.stringify({ concurrency: 1, modelAliases: { reviewer: "evil/provider" }, skills: ["project-only"], extensions: ["/project-only.ts"] }));
 
-  const resolution = resolveWorkflowSettings(cwd, false, globalSettingsPath);
-  assert.equal(resolution.projectTrusted, false);
-  assert.deepEqual(resolution.project, {});
-  assert.deepEqual(resolution.effective, resolution.global);
-  assert.deepEqual(resolution.effective.skills, ["global-only"]);
-  const roles = loadAgentDefinitions(cwd, agentDir, false);
-  assert.equal(roles["project-only"], undefined);
-  assert.deepEqual(roles.safe, { prompt: "Global role", provenance: { path: join(agentDir, "pi-extensible-workflows", "roles", "safe.md"), scope: "global", priority: 0 } });
 
-  assert.throws(() => validateWorkflowLaunch({ name: "untrusted", script: `return agent("review", { role: "project-only" });` }, { cwd, agentDir, projectTrusted: false, availableModels: new Set(["openai/gpt"]), rootTools: new Set(), knownModels: new Set(["openai/gpt"]), settingsPath: globalSettingsPath }), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_AGENT_TYPE");
-  assert.deepEqual(await listRunIds(cwd, "session", root), []);
-});
 
 void test("workflow JavaScript cannot cross filesystem, network, or process boundaries", async () => {
   const run = runWorkflow(`const escape = (() => { try { globalThis.constructor.constructor("return require('node:fs')")(); return "escaped"; } catch { return "blocked"; } })(); return { process: typeof process, require: typeof require, fetch: typeof fetch, websocket: typeof WebSocket, escape };`);
@@ -68,7 +32,7 @@ void test("forged worktree metadata cannot redirect cleanup", async () => {
   execFileSync("git", ["-C", repo, "branch", "keep-me"]);
 
   const store = new RunStore(repo, "session", "run", home);
-  await store.create({ id: "run", workflowName: "trust", cwd: repo, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trust" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "trust", cwd: repo, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trust" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
   const owned = await store.worktree("worker");
   writeFileSync(join(store.directory, "worktrees.json"), JSON.stringify([{ ...owned, path: repo, cwd: repo, branch: "keep-me" }]));
 
@@ -108,122 +72,6 @@ void test("accepted shell stays host-trusted while oversized RPC results are nev
   assert.ok(runId);
   const journal = JSON.parse(readFileSync(join(new RunStore(oversizedCwd, "session", runId, oversizedHome).directory, "journal.json"), "utf8")) as { completed: Record<string, unknown> };
   assert.deepEqual(journal.completed, {});
-});
-
-void test("retry attempts refresh global and role exclusions without reviving project policy", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-retry-"));
-  const cwd = join(root, "project");
-  const agentDir = join(root, "agent");
-  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify({ skills: ["global-first"], extensions: [] }));
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ skills: ["project-must-stay-ignored"], extensions: [] }));
-  const inputs: SessionInput[] = [];
-  let sessions = 0;
-  const executor = new WorkflowAgentExecutor({ cwd, model: { provider: "openai", model: "gpt" }, tools: new Set(), availableModels: new Set(["openai/gpt"]), agentDefinitions: { reviewer: { skills: ["role-only"], extensions: [] } }, agentResourcePolicy: () => resolveAgentResourcePolicy(cwd, false, settingsPath) }, testTransport(async (input): Promise<TestPiSession> => {
-    inputs.push(input);
-    const session = ++sessions;
-    return { sessionId: `retry-${String(session)}`, sessionFile: `/sessions/retry-${String(session)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (session === 1) { writeFileSync(settingsPath, JSON.stringify({ skills: ["global-second"], extensions: [] })); throw new Error("retry"); } }, dispose() {} };
-  }));
-
-  assert.equal((await executor.execute("inspect", { label: "reviewer", workflowName: "trust", role: "reviewer", retries: 1 })).value, "done");
-  assert.deepEqual(inputs.map(({ resourcePolicy }) => resourcePolicy?.effective.skills), [["global-first", "role-only"], ["global-second", "role-only"]]);
-  assert.ok(inputs.every(({ resourcePolicy }) => !resourcePolicy?.effective.skills.includes("project-must-stay-ignored")));
-});
-
-void test("cold resume rejects persisted project roles before launching them", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-resume-"));
-  const cwd = join(home, "project");
-  mkdirSync(cwd, { recursive: true });
-  const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "untrusted", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: `return agent("review", { role: "reviewer" });`, args: null, metadata: { name: "untrusted" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "project role" } }, projectRoles: ["reviewer"], schemas: [] }));
-
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
-  let launched = 0;
-  const createSession = async (): Promise<TestPiSession> => { launched += 1; throw new Error("must not launch"); };
-  const notices: string[] = [];
-  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, isProjectTrusted: () => false, ui: { notify(message: string) { notices.push(message); } } };
-  workflowExtension(testExtensionApi({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, registerTool() {}, registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession), home);
-  const startHandler = start;
-  const commandHandler = command;
-  assert.ok(startHandler && commandHandler);
-  await startHandler({}, context);
-  assert.equal((await store.load()).run.state, "interrupted");
-  await resumeFromDashboard(commandHandler, context, "run");
-  assert.ok(notices.some((message) => /untrusted project/.test(message)));
-  assert.equal(launched, 0);
-  assert.deepEqual((await store.load()).run.agents, []);
-  await shutdown?.();
-});
-
-void test("cold resume propagates persisted roles with current global selectors", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-cold-policy-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  mkdirSync(cwd, { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify({ skills: ["global-cold"], extensions: [] }));
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ skills: ["project-ignored"], extensions: [] }));
-  const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "cold-policy", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: `return agent("review", { role: "reviewer" });`, args: null, metadata: { name: "cold-policy" }, settings: { concurrency: 1, skills: ["stale-snapshot"], extensions: [] }, models: ["openai/gpt"], tools: [], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "Cold-resumed reviewer role", skills: ["role-cold"], extensions: [] } }, projectRoles: [], schemas: [] }));
-
-  const inputs: SessionInput[] = [];
-  const createSession = async (input: SessionInput): Promise<TestPiSession> => {
-    inputs.push(input);
-    return { transport: "local", session: { transport: "local", sessionId: "cold-session", locator: { sessionFile: "/sessions/cold-session.jsonl" } }, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
-  };
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
-  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, isProjectTrusted: () => false, ui: { notify() {} } };
-  workflowExtension(testExtensionApi({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, registerTool() {}, registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession), agentDir);
-  assert.ok(start && command);
-  await start({}, context);
-  await resumeFromDashboard(command, context, "run");
-  for (let attempt = 0; attempt < 1_000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal((await store.load()).run.state, "completed");
-  assert.equal(inputs.length, 1);
-  const policy = inputs[0]?.resourcePolicy;
-  assert.ok(policy);
-  assert.equal(inputs[0]?.systemPromptAppend, "Cold-resumed reviewer role");
-  assert.deepEqual(policy.effective.skills, ["global-cold", "role-cold"]);
-  assert.equal(policy.effective.skills.includes("project-ignored"), false);
-  await shutdown?.();
-});
-
-void test("cold resume preserves current tool selectors at the session boundary", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-cold-tools-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const settingsPath = join(agentDir, "pi-extensible-workflows", "settings.json");
-  mkdirSync(cwd, { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify({ tools: ["*", "!write"] }));
-  const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "cold-tools", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: `return agent("review", { role: "reviewer" });`, args: null, metadata: { name: "cold-tools" }, settings: { concurrency: 1, tools: ["read", "write"] }, models: ["openai/gpt"], tools: ["read", "write"], agentTypes: ["reviewer"], roles: { reviewer: { prompt: "Cold-resumed reviewer role" } }, projectRoles: [], schemas: [] }));
-  const inputs: SessionInput[] = [];
-  const createSession = async (input: SessionInput): Promise<TestPiSession> => {
-    inputs.push(input);
-    return { transport: "local", session: { transport: "local", sessionId: "cold-tools-session", locator: { sessionFile: "/sessions/cold-tools-session.jsonl" } }, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
-  };
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
-  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, isProjectTrusted: () => false, ui: { notify() {} } };
-  workflowExtension(testExtensionApi({ on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, registerTool() {}, registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow", "read", "write"] }), home, async () => {}, testTransport(createSession), agentDir);
-  assert.ok(start && command);
-  await start({}, context);
-  await resumeFromDashboard(command, context, "run");
-  for (let attempt = 0; attempt < 1_000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal((await store.load()).run.state, "completed");
-  assert.equal(inputs.length, 1);
-  assert.deepEqual(inputs[0]?.tools, ["read"]);
-  await shutdown?.();
 });
 void test("rejects oversized raw shell output and terminates its process group", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-raw-shell-limit-"));

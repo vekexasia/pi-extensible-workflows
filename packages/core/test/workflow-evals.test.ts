@@ -293,7 +293,7 @@ void test("skips the semantic judge when every captured call fails production va
 
 void test("static workflow inspection exposes roles, retries, schemas, and execution structure", () => {
   const calls = inspectWorkflowScript(`phase("review"); await parallel("batch", { one: () => agent("one", { role: "scout" }), two: () => agent("two", { retries: 0, outputSchema: ${JSON.stringify(schema)} }) }); await pipeline("pipe", { item: 1 }, { check: value => agent("check:" + value) }); await agent("after");`);
-  assert.deepEqual(calls.map(({ kind, name, role, retries, outputSchema, execution, structure }) => ({ kind, name, role, retries: retries ?? null, hasSchema: outputSchema !== undefined, execution, structure })), [
+  assert.deepEqual(calls.map(({ kind, name, options, retries, outputSchema, execution, structure }) => ({ kind, name, role: options?.role ?? null, retries: retries ?? null, hasSchema: outputSchema !== undefined, execution, structure })), [
     { kind: "phase", name: "review", role: null, retries: null, hasSchema: false, execution: "sequential", structure: [] },
     { kind: "parallel", name: "batch", role: null, retries: null, hasSchema: false, execution: "parallel", structure: [] },
     { kind: "agent", name: null, role: "scout", retries: null, hasSchema: false, execution: "parallel", structure: [{ kind: "parallel", name: "batch", key: "one" }] },

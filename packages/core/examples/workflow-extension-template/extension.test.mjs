@@ -1,7 +1,5 @@
-import { collectRoleContributions } from "@piewf/pi-ext-roles";
 import assert from "node:assert/strict";
 import { cp, mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
-import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -17,8 +15,6 @@ test("discovers the copied directory as a trusted Pi extension", async () => {
     const packageEntry = fileURLToPath(import.meta.resolve("pi-extensible-workflows"));
     const packageRoot = join(dirname(packageEntry), "..", "..");
     await symlink(packageRoot, join(root, "node_modules", "pi-extensible-workflows"), "dir");
-    await mkdir(join(root, "node_modules", "@piewf"), { recursive: true });
-    await symlink(join(dirname(fileURLToPath(import.meta.resolve("@piewf/pi-ext-roles"))), ".."), join(root, "node_modules", "@piewf", "pi-ext-roles"), "dir");
     await cp(dirname(fileURLToPath(import.meta.url)), destination, { recursive: true });
     const result = await discoverAndLoadExtensions([], root, join(root, ".pi", "agent"));
     assert.equal(result.errors.length, 0);
@@ -37,10 +33,6 @@ test("discovers the copied directory as a trusted Pi extension", async () => {
   assert.deepEqual(catalog.functions.map(({ name }) => name), ["greet"]);
   assert.deepEqual(catalog.modelAliasEntries?.filter(({ name }) => name === "template-model").map(({ name, kind }) => ({ name, kind })), [{ name: "template-model", kind: "dynamic" }]);
   assert.equal(await registeredWorkflowFunctions().greet.run({ name: "Ada" }, {}), "Hello, Ada!");
-
-  const registration = collectRoleContributions(bus, [fileURLToPath(new URL("./index.js", import.meta.url))])[0];
-  assert.ok(registration);
-  assert.match(readFileSync(join(registration.path, "reviewer.md"), "utf8"), /Packaged reviewer role/);
 
   for (const [name, availableModels, expected] of [["root-model", ["example/root"], "example/root"], ["available-fallback", ["example/available"], "example/available"], ["no-model-fallback", [], "example/root"]]) {
     const resolved = await loadingRegistry().resolveModelAliases({ cwd: process.cwd(), projectTrusted: true, rootModel: { provider: "example", model: "root" }, knownModels: new Set(["example/root", "example/available"]), availableModels: new Set(availableModels), signal: new AbortController().signal });

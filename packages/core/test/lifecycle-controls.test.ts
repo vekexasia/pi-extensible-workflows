@@ -12,24 +12,7 @@ import { listRunIds } from "../src/persistence.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { waitForIssue105 } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
-void test("advertises only described effective roles in the system prompt while workflow is active", () => {
-  type StartHandler = (event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined;
-  let handler: StartHandler | undefined;
-  const activeTools = ["workflow"];
-  const cwd = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-role-guidance-"));
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "project-reviewer.md"), "---\ndescription: Reviews correctness\nmodel: private/model:medium\ntools: [private-tool]\n---\nPRIVATE ROLE BODY");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "hidden.md"), "UNDESCRIBED ROLE BODY");
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => activeTools, on(name: string, candidate: unknown) { if (name === "before_agent_start") handler = candidate as StartHandler; } }));
-  assert.ok(handler);
-  const result = handler({ systemPrompt: "BASE SYSTEM" }, { cwd });
-  const guidance = result?.systemPrompt ?? "";
-  assert.match(guidance, /^BASE SYSTEM\n\nWorkflow role descriptions:/);
-  assert.match(guidance, /`project-reviewer`: Reviews correctness/);
-  assert.doesNotMatch(guidance, /PRIVATE ROLE BODY|UNDESCRIBED ROLE BODY|private\/model|private-tool|workflow_catalog/);
-  const untrustedGuidance = handler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => false })?.systemPrompt ?? "";
-  assert.doesNotMatch(untrustedGuidance, /project-reviewer|Reviews correctness/);
-});
+
 
 void test("foreground lifecycle events are redacted and throwing listeners cannot stop execution", async () => {
   const events: Array<{ channel: string; data: unknown }> = [];
@@ -320,7 +303,7 @@ void test("workflow_stop reports unknown and terminal runs and persists cancella
   const result = (await stop.execute("id", { runId: "missing" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(result.content[0].text), { runId: "missing", state: "unknown", stopped: false, reason: "unknown_run" });
   const foreignStore = new RunStore(home, "other-session", "foreign", home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "foreign" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "foreign" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await foreignStore.create({ id: "foreign", workflowName: "foreign", cwd: home, sessionId: "other-session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const foreignResult = (await stop.execute("id", { runId: "foreign" })) as { content: [{ text: string }] };
   assert.deepEqual(JSON.parse(foreignResult.content[0].text), { runId: "foreign", state: "unknown", stopped: false, reason: "unknown_run" });
@@ -405,7 +388,7 @@ void test("session recovery emits interruption as state change only", async () =
   const cwd = join(home, "project");
   const runId = "interrupted-run";
   const store = new RunStore(cwd, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "interrupted" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "interrupted" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: runId, workflowName: "interrupted", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const events: Array<{ channel: string; data: unknown }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -470,7 +453,7 @@ void test("resuming a launched trusted-project run keeps per-run concurrency and
   assert.equal(resumed.run.state, "completed");
   assert.equal(resumed.snapshot.settings.concurrency, 4);
   assert.equal(resumed.snapshot.settingsSources?.concurrency, "per-run options");
-  assert.deepEqual(resumed.snapshot.settings.skills, ["project-old"]);
+  assert.deepEqual(resumed.snapshot.settings.skills, []);
   await shutdown?.();
 });
 

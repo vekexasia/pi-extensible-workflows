@@ -6,7 +6,7 @@ import { StringDecoder } from "node:string_decoder";
 import { RunStore, structuralPath as operationPath } from "./persistence.js";
 import type { AgentAttempt } from "./agent-execution.js";
 import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution } from "./types.js";
-import { WorkflowError, roleNameOf, sumAccounting, zeroAccounting } from "./types.js";
+import { WorkflowError, sumAccounting, zeroAccounting } from "./types.js";
 import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonDigest, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
 import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
 
@@ -152,15 +152,12 @@ const internalAgent = (...values) => {
   void result.then(() => agentInflight.delete(occurrenceKey), () => agentInflight.delete(occurrenceKey));
   return guardedAgentResult(result);
 };
-const AGENT_HANDLE_KEYS = ["name", "role", "model", "tools", "skills", "extensions", "contextFiles", "label"];
 const agentHandleNames = new Set();
 const agentHandleInflight = new Set();
 const internalAgentCreate = (...values) => {
   if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("INVALID_METADATA", "agent.create requires one options object");
   const options = values[0];
   const name = named(options.name, "agent.create");
-  const unsupported = Object.keys(options).find(key => !AGENT_HANDLE_KEYS.includes(key));
-  if (unsupported) throw workError("INVALID_METADATA", "agent.create option is unsupported: " + unsupported);
   if (agentHandleNames.has(name)) throw workError("INVALID_METADATA", "Duplicate agent handle name: " + name);
   agentHandleNames.add(name);
   const config = Object.freeze(Object.fromEntries(Object.entries(options).filter(([key]) => key !== "name")));
@@ -584,7 +581,7 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         const opts = validateAgentOptions(values[1]);
         const identity = readAgentIdentity(values[2]);
         const path = agentIdentityPath(identity);
-        const label = typeof opts.label === "string" ? opts.label : roleNameOf(opts.role) ?? "agent";
+        const label = typeof opts.label === "string" ? opts.label : "agent";
         try {
           const result = await bridge.agent(values[0], opts, controller.signal, identity);
           value = branded({ name: label, ok: true, value: result ?? null });

@@ -1,5 +1,5 @@
 import { Value } from "typebox/value";
-import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext } from "./types.js";
+import type { AgentAttemptAction, JsonSchema, JsonValue, RegisteredAgentSetupHook, RegisteredAgentPreparationHook, WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogModelAlias, WorkflowExtension, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowFunction, WorkflowFunctionContext, WorkflowFunctionSource, WorkflowJournal, WorkflowModelAlias, WorkflowModelAliasResolverContext } from "./types.js";
 import type { SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, MODEL_ALIAS_NAME, object, validWorkflowExtensionNamespace } from "./utils.js";
 import { loadSettings, resolveWorkflowSettings } from "./settings.js";
@@ -19,6 +19,7 @@ export class WorkflowRegistry {
   readonly #extensions = new Set<Readonly<WorkflowExtension>>();
   readonly #functionSources = new Map<string, WorkflowFunctionSource>();
   readonly #globals = new Map<string, string>();
+  readonly #preparationHooks = new Map<string, RegisteredAgentPreparationHook>();
   readonly #hooks = new Map<string, RegisteredAgentSetupHook>();
   readonly #agentAttemptActions = new Map<string, AgentAttemptAction>();
   readonly #modelAliases = new Map<string, { name: string; version: string; headline: string; resolve: WorkflowModelAlias["resolve"] }>();
@@ -32,12 +33,12 @@ export class WorkflowRegistry {
   observeSubagentStatus(status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>): void { this.#subagentStatusObserver?.(status, request); }
 
   register(extension: WorkflowExtension): void {
-    if (object(extension) && "roleDirectories" in extension) fail("INVALID_METADATA", "Workflow extension roleDirectories was removed; use registerRoleContribution from @piewf/pi-ext-roles instead");
     if (this.#frozen) fail("REGISTRY_FROZEN", "Workflow extension registration is closed after session_start");
     if (object(extension) && Object.prototype.hasOwnProperty.call(extension, "workflows")) fail("INVALID_METADATA", "Separate registered workflow definitions were removed; register a function with input and output schemas instead");
-    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "source", "dependencies", "validateSettings", "functions", "modelAliases", "agentSetupHooks", "agentAttemptActions"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version and non-empty headline");
+    if (!object(extension) || Object.keys(extension).some((key) => !["version", "headline", "description", "source", "dependencies", "validateSettings", "functions", "modelAliases", "agentPreparationHooks", "agentSetupHooks", "agentAttemptActions"].includes(key)) || typeof extension.version !== "string" || !SEMVER.test(extension.version) || typeof extension.headline !== "string" || !extension.headline.trim()) fail("INVALID_METADATA", "Workflow extensions require a semantic version and non-empty headline");
     const functions = extension.functions ?? {};
     const modelAliases = extension.modelAliases ?? {};
+    const agentPreparationHooks = extension.agentPreparationHooks ?? {};
     const agentSetupHooks = extension.agentSetupHooks ?? {};
     const agentAttemptActions = extension.agentAttemptActions ?? {};
     const source = extension.source;
@@ -47,7 +48,7 @@ export class WorkflowRegistry {
     if (validateSettings !== undefined && typeof validateSettings !== "function") fail("INVALID_METADATA", "Workflow extension validateSettings must be a function");
     if (source !== undefined && (typeof source !== "string" || !source.trim())) fail("INVALID_METADATA", "Workflow extension source must be a non-empty module URL");
     if (dependencyValues !== undefined && (!Array.isArray(dependencyValues) || dependencyValues.some((dependency) => typeof dependency !== "string" || dependency.trim() !== dependency || !PACKAGE_NAME.test(dependency)) || new Set(dependencyValues).size !== dependencyValues.length)) fail("INVALID_METADATA", "Workflow extension dependencies must be unique, non-empty package names");
-    if (!object(functions) || !object(modelAliases) || !object(agentSetupHooks) || !object(agentAttemptActions) || (Object.keys(functions).length === 0 && Object.keys(modelAliases).length === 0 && Object.keys(agentSetupHooks).length === 0 && Object.keys(agentAttemptActions).length === 0 && validateSettings === undefined)) fail("INVALID_METADATA", "Workflow extensions require functions, model aliases, agent setup hooks, agent attempt actions, or a settings validator");
+    if (!object(functions) || !object(modelAliases) || !object(agentPreparationHooks) || !object(agentSetupHooks) || !object(agentAttemptActions) || (Object.keys(functions).length === 0 && Object.keys(modelAliases).length === 0 && Object.keys(agentPreparationHooks).length === 0 && Object.keys(agentSetupHooks).length === 0 && Object.keys(agentAttemptActions).length === 0 && validateSettings === undefined)) fail("INVALID_METADATA", "Workflow extensions require functions, model aliases, agent preparation hooks, agent setup hooks, agent attempt actions, or a settings validator");
     const names = Object.keys(functions);
     if (new Set(names).size !== names.length) fail("GLOBAL_COLLISION", "Global name collision inside extension");
     for (const name of names) {
@@ -66,6 +67,11 @@ export class WorkflowRegistry {
       if (!object(alias) || Object.keys(alias).some((key) => key !== "resolve") || typeof alias.resolve !== "function") fail("INVALID_METADATA", `Invalid model alias resolver: ${name}`);
       if (this.#modelAliases.has(name)) fail("DUPLICATE_NAME", `Model alias already registered: ${name}`);
     }
+    for (const [name, hook] of Object.entries(agentPreparationHooks)) {
+      if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "optionsSchema", "prepare"].includes(key)) || typeof hook.prepare !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent preparation hook: ${name}`);
+      if (this.#preparationHooks.has(name)) fail("DUPLICATE_NAME", `Agent preparation hook already registered: ${name}`);
+      if (hook.optionsSchema !== undefined) validateSchema(hook.optionsSchema, `${name} options schema`);
+    }
     for (const [name, hook] of Object.entries(agentSetupHooks)) {
       if (!IDENTIFIER.test(name) || !object(hook) || Object.keys(hook).some((key) => !["priority", "setup"].includes(key)) || typeof hook.setup !== "function" || hook.priority !== undefined && (typeof hook.priority !== "number" || !Number.isFinite(hook.priority))) fail("INVALID_METADATA", `Invalid agent setup hook: ${name}`);
       if (this.#hooks.has(name)) fail("DUPLICATE_NAME", `Agent setup hook already registered: ${name}`);
@@ -75,14 +81,20 @@ export class WorkflowRegistry {
       if ((action.visibleStandalone !== undefined) !== (action.runStandalone !== undefined)) fail("INVALID_METADATA", `Standalone agent attempt actions require visibleStandalone and runStandalone: ${name}`);
       if (this.#agentAttemptActions.has(name)) fail("DUPLICATE_NAME", `Agent attempt action already registered: ${name}`);
     }
-    const stored = deepFreeze({ ...extension, functions, modelAliases, agentSetupHooks, agentAttemptActions });
+    const stored = deepFreeze({ ...extension, functions, modelAliases, agentPreparationHooks, agentSetupHooks, agentAttemptActions });
     if (source !== undefined) for (const name of names) this.#functionSources.set(name, Object.freeze({ module: source, export: "default", dependencies: Object.freeze([...dependencies]) }));
     this.#extensions.add(stored);
     for (const name of names) this.#globals.set(name, name);
     for (const [name, alias] of Object.entries(modelAliases)) this.#modelAliases.set(name, { name, version: extension.version, headline: extension.headline, resolve: alias.resolve });
+    for (const [name, hook] of Object.entries(agentPreparationHooks)) this.#preparationHooks.set(name, { name, priority: hook.priority ?? 10, prepare: hook.prepare, ...(hook.optionsSchema === undefined ? {} : { optionsSchema: structuredClone(hook.optionsSchema) }), ...(source === undefined ? {} : { source }) });
     for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });
     for (const [name, action] of Object.entries(agentAttemptActions)) this.#agentAttemptActions.set(name, action);
     if (validateSettings !== undefined) this.#settingsValidators.add({ headline: extension.headline, validate: validateSettings });
+  }
+
+  /** Every registration's headline and declared module provenance, for hosts that must prove which extension made it. */
+  registrations(): ReadonlyArray<Readonly<{ headline: string; source?: string }>> {
+    return [...this.#extensions].map(({ headline, source }) => Object.freeze({ headline, ...(source === undefined ? {} : { source }) }));
   }
 
   function(name: string): WorkflowFunction {
@@ -161,7 +173,7 @@ export class WorkflowRegistry {
     for (const { headline, validate } of this.#settingsValidators) {
       try { validate(frozenSettings, Object.freeze({ ...context })); }
       catch (error) {
-        const location = context.source === "role" && context.role ? `role ${context.role}` : context.source;
+        const location = context.source;
         fail("INVALID_SETTINGS", `Invalid extension settings (${headline}; ${location}): ${errorText(error)}`);
       }
     }
@@ -181,6 +193,7 @@ export class WorkflowRegistry {
     return structuredClone(stored);
   }
 
+  agentPreparationHooks(): readonly RegisteredAgentPreparationHook[] { return [...this.#preparationHooks.values()].sort(byPriorityThenName); }
   agentSetupHooks(): readonly RegisteredAgentSetupHook[] {
     return [...this.#hooks.values()].sort(byPriorityThenName);
   }
@@ -205,7 +218,7 @@ export class WorkflowRegistry {
     return Object.freeze(resolved);
   }
 }
-export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "validateExtensionSettings" | "modelAliases" | "resolveModelAliases" | "agentSetupHooks" | "agentAttemptActions" | "setSubagentStatusObserver" | "observeSubagentStatus">;
+export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "validateExtensionSettings" | "modelAliases" | "resolveModelAliases" | "agentPreparationHooks" | "agentSetupHooks" | "agentAttemptActions" | "setSubagentStatusObserver" | "observeSubagentStatus" | "registrations">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi; activeHosts: number }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -227,8 +240,10 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     validateExtensionSettings: (...args) => { registry.validateExtensionSettings(...args); },
     modelAliases: () => registry.modelAliases(),
     resolveModelAliases: (...args) => registry.resolveModelAliases(...args),
+    agentPreparationHooks: () => registry.agentPreparationHooks(),
     agentSetupHooks: () => registry.agentSetupHooks(),
     agentAttemptActions: () => registry.agentAttemptActions(),
+    registrations: () => registry.registrations(),
   };
 }
 function workflowRegistryHost(): WorkflowRegistryHost {
@@ -268,4 +283,4 @@ export function registeredWorkflowFunctionSources(): Readonly<Record<string, Wor
   const sources = loadingRegistry().functionSources;
   return typeof sources === "function" ? sources() : {};
 }
-export type { WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogIndexFunction, WorkflowCatalogModelAlias, WorkflowCatalogSettings, WorkflowRoleDirectoryRegistration } from "./types.js";
+export type { WorkflowCatalog, WorkflowCatalogContext, WorkflowCatalogError, WorkflowCatalogFunction, WorkflowCatalogIndex, WorkflowCatalogIndexFunction, WorkflowCatalogModelAlias, WorkflowCatalogSettings } from "./types.js";

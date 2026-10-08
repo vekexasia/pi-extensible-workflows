@@ -1,18 +1,18 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
 import test from "node:test";
-import { collectRoleContributions, registerRoleContribution } from "@piewf/pi-ext-roles";
-import { createEventBus } from "@earendil-works/pi-coding-agent";
-import { testExtensionApi, waitForIssue105 } from "./support.js";
-import workflowExtension, { createLaunchSnapshot, loadAgentDefinitions, registerWorkflowExtension, RunStore, runWorkflow, structuralPath, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowFunctionContext } from "../src/index.js";
+
+
+import { testExtensionApi } from "./support.js";
+import workflowExtension, { createLaunchSnapshot, registerWorkflowExtension, RunStore, runWorkflow, structuralPath, WorkflowError, WorkflowRegistry, type JsonValue, type WorkflowFunctionContext } from "../src/index.js";
 import { loadingRegistry } from "../src/registry.js";
 import { withWorkflowFunctions, workflowRunContext } from "../src/host-runtime.js";
 import type { SessionInput } from "../src/agent-execution.js";
-import { listRunIds } from "../src/persistence.js";
+
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { reuseExtension } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
@@ -38,90 +38,6 @@ void test("registered function schemas remain enforced inside scripts", async ()
   assert.equal(named.content[0]?.text, '"ok"');
   assert.equal(named.details.run.workflowName, "needs-value");
   await assert.rejects(execute("id", { name: "bad-result", script: "return await badResult(args);", args: {}, foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
-});
-void test("registered globals preserve role definitions for agent calls across retries", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-registered-role-retry-"));
-  const agentDir = mkdtempSync(join(home, "agent-"));
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "developer.md"), "Developer role");
-  let sessions = 0;
-  const createSession = async (): Promise<TestPiSession> => {
-    const attempt = ++sessions;
-    return { sessionId: `registered-role-${String(attempt)}`, sessionFile: `/sessions/registered-role-${String(attempt)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => { if (attempt === 1) throw new Error("source failure"); }, steer: async () => {}, dispose() {} };
-  };
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession), agentDir);
-  registerWorkflowExtension({ version: "1.0.0", headline: "Registered role retry", functions: { registeredRoleRetry: { description: "Run a developer role", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: async (_input, context) => { await context.agent("work", { role: "developer", retries: 0 }); return "done"; } } } });
-  const workflow = tools.find(({ name }) => name === "workflow");
-  const retry = tools.find(({ name }) => name === "workflow_retry");
-  assert.ok(workflow && retry);
-  const context = { cwd: home, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
-  await assert.rejects(workflow.execute("source", { name: "registered-role-retry", script: "return await registeredRoleRetry(args);", args: {}, foreground: true }, new AbortController().signal, undefined, context), WorkflowError);
-  const sourceId = (await listRunIds(home, "session", home))[0];
-  assert.ok(sourceId);
-  const source = await new RunStore(home, "session", sourceId, home).load();
-  assert.deepEqual(source.snapshot.roles, { developer: { provenance: { path: join(agentDir, "pi-extensible-workflows", "roles", "developer.md"), scope: "global", priority: 0 }, prompt: "Developer role" } });
-  rmSync(join(agentDir, "pi-extensible-workflows", "roles", "developer.md"));
-  const started = await retry.execute("retry", { runId: sourceId, foreground: false }, undefined, undefined, context) as { content: Array<{ text: string }> };
-  const childId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const child = (await new RunStore(home, "session", childId, home).load()).run;
-    if (child.state === "completed") return;
-    if (child.state === "failed") throw new Error(JSON.stringify(child.error));
-    await new Promise<void>((resolve) => setTimeout(resolve, 10));
-  }
-  throw new Error(`Timed out waiting for ${childId} to complete`);
-});
-void test("cold resume launches a registered function's role that the snapshot never captured (#284)", async () => {
-  type Tool = { name: string; execute: (...args: unknown[]) => Promise<unknown> };
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-resume-function-role-"));
-  const agentDir = mkdtempSync(join(home, "agent-"));
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "developer.md"), "Developer role");
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Reviewer role");
-  const context = { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {} } };
-  const roles: string[] = [];
-  let release!: () => void;
-  const held = new Promise<void>((resolve) => { release = resolve; });
-  const session = (prompt: () => Promise<void>) => async (input: SessionInput): Promise<TestPiSession> => {
-    roles.push(input.systemPromptAppend ?? "");
-    return { sessionId: `resume-role-${String(roles.length)}`, sessionFile: `/sessions/resume-role-${String(roles.length)}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt, steer: async () => {}, abort: async () => { release(); }, dispose() {} };
-  };
-  const firstTools: Tool[] = [];
-  let firstShutdown: (() => Promise<void>) | undefined;
-  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { firstTools.push(tool); }, registerCommand() {}, on(name: string, handler: unknown) { if (name === "session_shutdown") firstShutdown = handler as typeof firstShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(session(async () => { await held; })), agentDir);
-  // A new Pi process loads extensions again; mirror that by registering the function for each host instance.
-  const registerFunction = () => { registerWorkflowExtension({ version: "1.0.0", headline: "Developer then reviewer", functions: { developThenReview: { description: "Two roles", input: { type: "object", additionalProperties: false }, output: { type: "string" }, run: async (_input, context) => { await context.agent("build", { role: "developer", retries: 0 }); await context.agent("review", { role: "reviewer", retries: 0 }); return "reviewed"; } } } }); };
-  registerFunction();
-  const firstWorkflow = firstTools.find(({ name }) => name === "workflow");
-  assert.ok(firstWorkflow);
-  const started = await firstWorkflow.execute("first", { name: "function-roles", script: "return await developThenReview({});" }, undefined, undefined, context) as { content: Array<{ text: string }> };
-  const runId = (JSON.parse(started.content[0]?.text ?? "null") as { runId: string }).runId;
-  const store = new RunStore(home, "session", runId, home);
-  await waitForIssue105(() => roles.length > 0);
-  assert.deepEqual(roles, ["Developer role"]);
-  await firstShutdown?.();
-  assert.equal((await store.load()).run.state, "interrupted");
-  assert.deepEqual(Object.keys((await store.load()).snapshot.roles ?? {}), ["developer"], "the snapshot captured only the role that launched before the interruption");
-  const secondTools: Tool[] = [];
-  let secondStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  let secondCommand: ((args: string, ctx: unknown) => Promise<void>) | undefined;
-  let secondShutdown: (() => Promise<void>) | undefined;
-  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { secondTools.push(tool); }, registerCommand(_name: string, value: { handler: NonNullable<typeof secondCommand> }) { secondCommand = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") secondStart = handler as typeof secondStart; if (name === "session_shutdown") secondShutdown = handler as typeof secondShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(session(async () => {})), agentDir);
-  registerFunction();
-  try {
-    assert.ok(secondStart && secondCommand);
-    await secondStart({}, context);
-    await contextualWorkflowAction(secondCommand, context, runId, "Resume");
-    await waitForIssue105(async () => ["completed", "failed"].includes((await store.load()).run.state));
-    const resumed = await store.load();
-    assert.equal(resumed.run.state, "completed", JSON.stringify(resumed.run.error));
-    assert.deepEqual(roles, ["Developer role", "Developer role", "Reviewer role"]);
-    assert.deepEqual(Object.keys(resumed.snapshot.roles ?? {}).sort(), ["developer", "reviewer"], "the resumed run captures the newly used role for later retries");
-  } finally {
-    release();
-    await secondShutdown?.();
-  }
 });
 void test("attributes dynamic alias availability failures to the exact extension", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-alias-provenance-"));
@@ -171,36 +87,7 @@ void test("attributes colliding dynamic alias availability failures to the valid
   await assert.rejects(execute("id", { name: "collision-provenance", script: "return true;", foreground: true }, new AbortController().signal, undefined, context), (error: unknown) => error instanceof WorkflowError && error.code === "UNKNOWN_MODEL" && error.message.includes("Missing target extension") && !error.message.includes("Target extension"));
   loadingRegistry().freeze();
 });
-void test("production launches dynamic aliases through role files with precedence and thinking overrides", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-dynamic-production-"));
-  const agentDir = join(home, "agent");
-  const cwd = join(home, "project");
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(cwd, { recursive: true });
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ modelAliases: { "policy-model": "openai/gpt:low" } }));
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "---\nmodel: policy-chain\n---\nReview the change.");
-  const inputs: SessionInput[] = [];
-  let shadowedCalls = 0;
-  let shutdown: (() => Promise<void>) | undefined;
-  try {
-    const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-    const createSession = async (input: SessionInput): Promise<TestPiSession> => {
-      inputs.push(input);
-      return { sessionId: `dynamic-${String(inputs.length)}`, sessionFile: `/sessions/dynamic-${String(inputs.length)}`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, steer: async () => {}, dispose() {} };
-    };
-    workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; } }), home, async () => {}, testTransport(createSession), agentDir);
-    registerWorkflowExtension({ version: "1.0.0", headline: "Production policy", modelAliases: { "policy-model": { resolve: () => { shadowedCalls += 1; return "anthropic/opus:high"; } }, "policy-chain": { resolve: () => "policy-model" }, "direct-model": { resolve: () => "anthropic/opus:high" } } });
-    const execute = tools.find(({ name }) => name === "workflow")?.execute;
-    assert.ok(execute);
-    const context = { cwd, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }], getAvailable: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" } };
-    await execute("id", { name: "dynamic-production", script: "return { role: await agent(\"role\", { role: \"reviewer\" }), direct: await agent(\"direct\", { model: \"direct-model:medium\" }) };", foreground: true }, new AbortController().signal, undefined, context);
-    assert.equal(shadowedCalls, 0);
-    assert.deepEqual(inputs.map(({ model }) => model), [{ provider: "openai", model: "gpt", thinking: "low" }, { provider: "anthropic", model: "opus", thinking: "medium" }]);
-    loadingRegistry().freeze();
-  } finally {
-    await shutdown?.();
-  }
-});
+
 void test("production resume reruns dynamic aliases, replays completed work, and records drift", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-dynamic-resume-"));
   const agentDir = join(home, "agent");
@@ -210,7 +97,7 @@ void test("production resume reruns dynamic aliases, replays completed work, and
   let replayPath = "";
   await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "historical"; } }).result;
   const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "dynamic-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "dynamic-resume" }, settings: { concurrency: 1, modelAliases: { "dynamic-model": "old/model" } }, modelAliases: { "dynamic-model": "old/model" }, models: ["root/model", "old/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "dynamic-resume", cwd, sessionId: "session", state: "interrupted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script, args: null, metadata: { name: "dynamic-resume" }, settings: { concurrency: 1, modelAliases: { "dynamic-model": "old/model" } }, modelAliases: { "dynamic-model": "old/model" }, models: ["root/model", "old/model"], tools: [], agentConfigurations: {}, schemas: [] }));
   await store.complete(replayPath, "historical");
   const inputs: SessionInput[] = [];
   let resolverCalls = 0;
@@ -243,7 +130,7 @@ void test("production budget resume cancellation aborts a dynamic alias resolver
   const cwd = join(home, "project");
   mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
   const store = new RunStore(cwd, "session", "run", home);
-  await store.create({ id: "run", workflowName: "cancel-resume", cwd, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "cancel-resume" }, settings: { concurrency: 1, modelAliases: { "cancel-model": "root/model" } }, modelAliases: { "cancel-model": "root/model" }, models: ["root/model"], tools: [], agentTypes: [], roles: {}, schemas: [] }));
+  await store.create({ id: "run", workflowName: "cancel-resume", cwd, sessionId: "session", state: "budget_exhausted", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "cancel-resume" }, settings: { concurrency: 1, modelAliases: { "cancel-model": "root/model" } }, modelAliases: { "cancel-model": "root/model" }, models: ["root/model"], tools: [], agentConfigurations: {}, schemas: [] }));
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -544,116 +431,6 @@ void test("freezes registries and produces a deterministic flat catalog", () => 
   assert.equal(registry.frozen, true);
   assert.throws(() => { registry.register({ version: "1.0.0", headline: "Late", functions: { x: { description: "x", input: { type: "object" }, output: { type: "string" }, run: () => "x" } } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "REGISTRY_FROZEN");
   assert.throws(() => registry.function("release.check"), (error: unknown) => error instanceof WorkflowError && error.code === "MISSING_WORKFLOW");
-});
-void test("loads extension role directories as defaults beneath standard roles", () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-roles-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const extensionDirectory = join(home, "extension-roles");
-  const secondExtensionDirectory = join(home, "second-extension-roles");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(extensionDirectory);
-  mkdirSync(secondExtensionDirectory);
-  writeFileSync(join(extensionDirectory, "packaged.md"), "---\ndescription: Packaged role\n---\nPackaged body");
-  writeFileSync(join(secondExtensionDirectory, "packaged.md"), "---\ndescription: Later packaged role\n---\nLater packaged body");
-  writeFileSync(join(secondExtensionDirectory, "extension-only.md"), "Extension-only body");
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "packaged.md"), "Global override body");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "packaged.md"), "Project override body");
-  for (const directories of [[extensionDirectory, secondExtensionDirectory], [secondExtensionDirectory, extensionDirectory]]) {
-    assert.throws(() => loadAgentDefinitions(cwd, agentDir, true, directories), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && error.message.includes(extensionDirectory) && error.message.includes(secondExtensionDirectory));
-  }
-  const roles = loadAgentDefinitions(cwd, agentDir, true, [secondExtensionDirectory]);
-  assert.equal(roles["extension-only"]?.prompt, "Extension-only body");
-  assert.equal(roles.packaged?.prompt, "Project override body");
-  const bus = createEventBus(), owner = join(home, "contributor.mjs");
-  const unsubscribe = registerRoleContribution({ events: bus }, { owner, roleDirectories: [extensionDirectory, pathToFileURL(extensionDirectory)] });
-  assert.equal(collectRoleContributions(bus, [owner]).length, 1);
-  unsubscribe();
-  for (const roleDirectories of [[""], [new URL("https://example.com/roles")], [{ path: extensionDirectory, priority: NaN }]]) {
-    assert.throws(() => registerRoleContribution({ events: bus }, { owner, roleDirectories }));
-  }
-
-});
-void test("independent starter roles are fallback defaults beneath extension, global, and project roles", () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-starter-role-precedence-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const extensionDirectory = join(home, "extension-roles");
-  mkdirSync(join(cwd, ".pi", "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(join(agentDir, "pi-extensible-workflows", "roles"), { recursive: true });
-  mkdirSync(extensionDirectory);
-  writeFileSync(join(extensionDirectory, "developer.md"), "Extension developer role");
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "roles", "reviewer.md"), "Global reviewer role");
-  writeFileSync(join(cwd, ".pi", "pi-extensible-workflows", "roles", "scout.md"), "Project scout role");
-  const registrations = [extensionDirectory];
-  const roles = loadAgentDefinitions(cwd, agentDir, true, registrations);
-  assert.equal(roles.developer?.prompt, "Extension developer role");
-  assert.equal(roles.reviewer?.prompt, "Global reviewer role");
-  assert.equal(roles.scout?.prompt, "Project scout role");
-});
-void test("extension roles flow through host guidance, preflight, launch snapshots, and agent setup", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-extension-role-host-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const roleDirectory = join(home, "roles");
-  const roleExtension = join(home, "role-extension.ts");
-  mkdirSync(roleDirectory, { recursive: true });
-  writeFileSync(join(roleDirectory, "extension-reviewer.md"), `---\ndescription: Packaged review role\nmodel: anthropic/opus:high\ntools: [read, grep]\nskills: [role-skill]\nextensions: ["${roleExtension}"]\n---\nExtension prompt`);
-  const inputs: SessionInput[] = [];
-  const prompts: string[] = [];
-  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details?: unknown }> }> = [];
-  let guidanceHandler: ((event: { systemPrompt: string }, ctx: { cwd: string; isProjectTrusted?: () => boolean }) => { systemPrompt?: string } | undefined) | undefined;
-  let shutdown: (() => Promise<void>) | undefined;
-  const createSession = async (input: SessionInput): Promise<TestPiSession> => {
-    inputs.push(input);
-    return { sessionId: input.sessionLabel, sessionFile: `/sessions/${input.sessionLabel}.jsonl`, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async (text) => { prompts.push(text); }, steer: async () => {}, dispose() {} };
-  };
-  const bus = createEventBus(), owner = join(home, "contributor.mjs");
-  const unsubscribe = registerRoleContribution({ events: bus }, { owner, roleDirectories: [roleDirectory] });
-  const inactiveDirectory = join(home, "inactive-roles");
-  mkdirSync(inactiveDirectory);
-  writeFileSync(join(inactiveDirectory, "inactive.md"), "Must not be captured");
-  const unsubscribeInactive = registerRoleContribution({ events: bus }, { owner: join(home, "inactive.mjs"), roleDirectories: [inactiveDirectory] });
-  const capturedSources = collectRoleContributions(bus, [owner]);
-  assert.deepEqual(collectRoleContributions(bus, { activeOnly: true }), []);
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["read", "grep", "workflow"], on(name: string, candidate: unknown) { if (name === "before_agent_start") guidanceHandler = candidate as typeof guidanceHandler; if (name === "session_shutdown") shutdown = candidate as typeof shutdown; } }), home, async () => {}, testTransport(createSession), agentDir, [], capturedSources);
-  unsubscribe();
-  unsubscribeInactive();
-  assert.ok(guidanceHandler);
-  const guidance = guidanceHandler({ systemPrompt: "BASE SYSTEM" }, { cwd, isProjectTrusted: () => true })?.systemPrompt ?? "";
-  assert.match(guidance, /`extension-reviewer`: Packaged review role/);
-  const workflow = tools.find(({ name }) => name === "workflow");
-  assert.ok(workflow);
-  const result = await workflow.execute("role-launch", { name: "extension-role-launch", script: `return await agent("delegate", { role: "extension-reviewer" });`, foreground: true }, new AbortController().signal, undefined, { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, modelRegistry: { getAll: () => [{ provider: "openai", id: "gpt" }, { provider: "anthropic", id: "opus" }] }, sessionManager: { getSessionId: () => "session" } });
-  const runId = (result.details as { runId?: string } | undefined)?.runId;
-  assert.ok(runId);
-  assert.equal(inputs.length, 1);
-  const input = inputs[0];
-  assert.ok(input);
-  assert.deepEqual(input.model, { provider: "anthropic", model: "opus", thinking: "high" });
-  assert.deepEqual(input.tools, ["read", "grep"]);
-  assert.equal(input.systemPromptAppend, "Extension prompt");
-  assert.deepEqual(input.resourcePolicy?.effective, { skills: ["role-skill"], extensions: [roleExtension], tools: ["read", "grep"] });
-  const prompt = prompts[0];
-  assert.ok(prompt);
-  assert.match(prompt, /Task:\ndelegate/);
-  const loaded = await new RunStore(cwd, "session", runId, home).load();
-  assert.deepEqual(loaded.snapshot.agentTypes, ["extension-reviewer"]);
-  assert.deepEqual(loaded.snapshot.models, ["openai/gpt", "anthropic/opus"]);
-  assert.deepEqual(loaded.snapshot.tools, ["read", "grep"]);
-  assert.deepEqual(loaded.snapshot.projectRoles, []);
-  assert.deepEqual(loaded.snapshot.roles, { "extension-reviewer": { provenance: { path: join(roleDirectory, "extension-reviewer.md"), scope: "extension", owner }, prompt: "Extension prompt", description: "Packaged review role", model: "anthropic/opus:high", tools: ["read", "grep"], skills: ["role-skill"], extensions: [roleExtension] } });
-  await shutdown?.();
-});
-void test("labels standard role directory scan failures as standard roles", () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-standard-role-scan-"));
-  const cwd = join(home, "project");
-  const agentDir = join(home, "agent");
-  const roleDirectory = join(agentDir, "pi-extensible-workflows", "roles");
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(roleDirectory, "not a directory");
-  assert.throws(() => loadAgentDefinitions(cwd, agentDir, true, []), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA" && error.message.includes("Standard workflow role directory") && !error.message.includes("extension"));
 });
 void test("registers setup hooks by priority and stable name", () => {
   const registry = new WorkflowRegistry();

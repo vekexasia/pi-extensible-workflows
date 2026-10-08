@@ -65,7 +65,6 @@ void test("recovery validates a resumable snapshot in one place", () => {
   const recovery = source("host-recovery.ts");
   assert.equal(count(recovery, /function assertResumableSnapshot\(/g), 1);
   assert.equal(count(recovery, /identity version is incompatible/g), 1);
-  assert.equal(count(recovery, /Role definition is missing from the launch snapshot/g), 1);
   assert.equal(count(recovery, /assertResumableSnapshot\(/g), 3, "declaration plus the cold-resume and retry call sites");
 });
 

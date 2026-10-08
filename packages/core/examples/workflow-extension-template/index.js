@@ -1,4 +1,3 @@
-import { registerRoleContribution } from "@piewf/pi-ext-roles";
 import { registerWorkflowExtension } from "pi-extensible-workflows";
 
 const templateExtension = {
@@ -44,11 +43,6 @@ const templateExtension = {
   },
 };
 
-export default function extension(pi) {
-  registerRoleContribution(pi, {
-    owner: import.meta.url,
-    roleDirectories: ["./roles"],
-    extension: { version: templateExtension.version, headline: templateExtension.headline },
-  });
+export default function extension() {
   registerWorkflowExtension(templateExtension);
 }

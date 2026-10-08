@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { TestHarness } from "./harness.js";
@@ -19,14 +19,6 @@ function installPackage(root: string, agentDir: string): void {
   execFileSync("npm", ["pack", "--workspace=packages/core", "--pack-destination", tarballs], { cwd: repositoryRoot, stdio: "pipe", timeout: 120_000 });
   const tarball = readdirSync(tarballs).find((name) => name.endsWith(".tgz"));
   assert.ok(tarball, "npm pack did not produce a package tarball");
-  const manifest = JSON.parse(readFileSync(join(coreRoot, "package.json"), "utf8")) as { dependencies: Record<string, string> };
-  const rolesDependency = manifest.dependencies["@piewf/pi-ext-roles"];
-  if (rolesDependency?.startsWith("file:")) {
-    const relative = rolesDependency.slice(5);
-    const destination = resolve(npmRoot, "node_modules", "pi-extensible-workflows", relative);
-    mkdirSync(dirname(destination), { recursive: true });
-    copyFileSync(resolve(coreRoot, relative), destination);
-  }
   execFileSync("npm", ["install", "--prefix", npmRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", join(tarballs, tarball)], { stdio: "pipe", timeout: 120_000 });
   const packagePath = join(npmRoot, "node_modules", "pi-extensible-workflows");
   assert.ok(existsSync(join(packagePath, "package.json")), "npm did not install pi-extensible-workflows");

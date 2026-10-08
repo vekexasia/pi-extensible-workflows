@@ -48,7 +48,7 @@ void test("selected workflow agent details use the shared formatter seam", () =>
   const agent = { id: "agent-1", name: "reviewer", path: "agent-1", state: "running" as const, model: { provider: "openai", model: "gpt" }, tools: ["read"], attempts: 2, startedAt: 0, durationMs: 2000, lastEventAt: 0, role: "critic", activity: { kind: "tool" as const, text: "read" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } };
   const shared = formatAgentDetail(agent, undefined, 600_000);
   const run = { id: "run-1", workflowName: "shared", cwd: "/tmp", sessionId: "session", state: "running" as const, agents: [agent], agentSessions: [] };
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'shared'}", args: null, metadata: { name: "shared" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'shared'}", args: null, metadata: { name: "shared" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
   const dashboard = formatNavigatorDashboard(run, [], [], 600_000);
   const phase = formatWorkflowPhaseDashboard(run, snapshot, 120, { agentId: agent.id }, undefined, 600_000).join("\n");
   for (const line of shared) assert.ok(phase.includes(line), `missing shared detail line: ${line}`);
@@ -66,9 +66,9 @@ void test("shared agent action labels gate standalone controls by state", () => 
 void test("session-scoped navigator shows metadata and confirms terminal deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'nav',description:'nav'}", args: null, metadata: { name: "nav", description: "nav" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
   const store = new RunStore(cwd, "session-a", "run-a", home);
-  await store.create({ id: "run-a", workflowName: "nav", cwd, sessionId: "session-a", state: "completed", phase: "review", agents: [{ id: "run-a:1", name: "reviewer", path: "run-a:1", state: "failed", role: "reviewer", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read"], attempts: 2, attemptDetails: [{ attempt: 2, transport: "local", session: { transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/native-a.jsonl" } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, error: { code: "AGENT_FAILED", message: "boom" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/native-a.jsonl" } }] }, snapshot);
+  await store.create({ id: "run-a", workflowName: "nav", cwd, sessionId: "session-a", state: "completed", phase: "review", agents: [{ id: "run-a:1", name: "reviewer", path: "run-a:1", state: "failed", model: { provider: "openai", model: "gpt", thinking: "medium" }, tools: ["read"], attempts: 2, attemptDetails: [{ attempt: 2, transport: "local", session: { transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/native-a.jsonl" } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, error: { code: "AGENT_FAILED", message: "boom" }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } }], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/native-a.jsonl" } }] }, snapshot);
   const same = new RunStore(cwd, "session-a", "run-c", home);
   await same.create({ id: "run-c", workflowName: "nav", cwd, sessionId: "session-a", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
   await same.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
@@ -76,7 +76,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   await other.create({ id: "run-b", workflowName: "other", cwd, sessionId: "session-b", state: "completed", agents: [], agentSessions: [] }, snapshot);
   const rendered = formatNavigatorRun(await store.load(), [], [{ owner: "worktree/named/reviewer", branch: "pi-extensible-workflows/run-a/tree", path: "/worktree", cwd: "/worktree/project", base: "abc" }]);
   assert.match(rendered, /Phase: review/);
-  assert.match(rendered, /reviewer state=failed model=openai\/gpt:medium role=reviewer tools=read attempts=2 retries=1/);
+  assert.match(rendered, /reviewer state=failed model=openai\/gpt:medium tools=read attempts=2 retries=1/);
   assert.match(rendered, /error=AGENT_FAILED: boom/);
   assert.match(rendered, /Worktrees: 1/);
   assert.match(rendered, /Agent sessions: 1/);
@@ -92,7 +92,7 @@ void test("session-scoped navigator shows metadata and confirms terminal deletio
   const workingMessages: Array<string | undefined> = [];
   registerWorkflowExtension({ version: "1.0.0", headline: "Navigator actions", agentAttemptActions: { inspectLatest: { label: "Inspect latest attempt", visible: (context) => context.attempt.attempt === 2, run: (context) => { actionRuns.push({ attempt: context.attempt.attempt, sessionId: context.session?.sessionId, live: context.liveSession !== undefined }); context.ui.setWorkingMessage?.("navigator working"); } } } });
   let selectCall = 0;
-  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, setWorkingMessage(message?: string) { workingMessages.push(message); }, select: async (prompt: string, options: string[]) => { prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options.find((option) => option.includes("completed")); if (selectCall === 2) return "Agents..."; if (selectCall === 3) return options.find((option) => option.includes("#1")); if (selectCall === 4) return "Inspect latest attempt"; if (selectCall === 5) return "Back"; return prompt === "Workflows\n" ? "Close" : "Back"; }, confirm: async () => false } };
+  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session-a" }, ui: { notify() {}, setWorkingMessage(message?: string) { workingMessages.push(message); }, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; prompts.push(prompt); selections.push(options); selectCall += 1; if (selectCall === 1) return options.find((option) => option.includes("completed")); if (selectCall === 2) return "Agents..."; if (selectCall === 3) return options.find((option) => option.includes("#1")); if (selectCall === 4) return "Inspect latest attempt"; if (selectCall === 5) return "Back"; return prompt === "Workflows\n" ? "Close" : "Back"; }, confirm: async () => false } };
   const command = commands[0]?.handler;
   assert.ok(command);
   await executeCommand(command, "", ctx);
@@ -253,7 +253,7 @@ void test("TUI navigator exposes agent-scoped worktree actions without transcrip
   const transcriptA = join(home, "transcript-a.jsonl");
   const transcriptB = join(home, "transcript-b.jsonl");
   const store = new RunStore(repo, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", worktreeOwner: "copy-owner", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native-a", locator: { sessionFile: transcriptA } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }, { attempt: 2, transport: "local", session: { transport: "local", sessionId: "native-b", locator: { sessionFile: transcriptB } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], agentSessions: [] }, snapshot);
   const worktree = await store.worktree("copy-owner");
   const copied: string[] = [];
@@ -269,7 +269,7 @@ void test("TUI navigator exposes agent-scoped worktree actions without transcrip
     ui: {
       notify(message: string, type?: string) { notifications.push({ message, type }); },
       confirm: async () => false,
-      select: async (prompt: string, options: string[]) => {
+      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip";
         if (prompt === "Workflows\n") { pickerCalls += 1; return pickerCalls === 1 ? options.find((option) => option.includes("copy")) ?? "Close" : "Close"; }
         if (prompt === "Agents") return options.find((option) => option.includes("#1")) ?? "Back";
         if (prompt.includes("issue-65")) { const action = ["Copy branch", "Copy worktree path", "Copy agent ID", "Back"][detailActions] ?? "Back"; detailActions += 1; return options.includes(action) ? action : "Back"; }
@@ -358,7 +358,7 @@ void test("navigator stop asks for confirmation inside the dashboard and keeps i
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-confirm-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -377,7 +377,7 @@ void test("navigator stop asks for confirmation inside the dashboard and keeps i
     ui: {
       // Pi's dialog would replace the dashboard and restore the editor, leaving the command pending.
       notify() {}, setStatus() {}, confirm: async () => { dialogCalls += 1; return false; },
-      select: async (prompt: string, options: string[]) => { if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
+      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
       custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean; overlayOptions?: { width?: string; maxHeight?: string } }) => {
         customCalls += 1;
         assert.equal(options?.overlay, undefined);
@@ -423,7 +423,7 @@ void test("navigator stop stays visible through cleanup, then closes", async () 
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-progress-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   let releaseCleanup = () => {};
@@ -446,7 +446,7 @@ void test("navigator stop stays visible through cleanup, then closes", async () 
     cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
     ui: {
       notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async () => { dialogCalls += 1; return true; },
-      select: async (prompt: string, options: string[]) => { if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
+      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
       custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
         assert.equal(options?.overlay, undefined);
         let result: string | undefined;
@@ -494,7 +494,7 @@ void test("non-TUI navigator Stop confirms before cancelling", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-select-confirm-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "select-stop" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "select-stop" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "select-stop", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -529,7 +529,7 @@ void test("navigator dashboard auto-refreshes the selected run", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-refresh-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", phase: "before", agents: [], agentSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
@@ -590,7 +590,7 @@ void test("navigator returns to the picker after cancelling a recovered run dash
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-actions-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "actions" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "actions" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "actions", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
@@ -634,7 +634,7 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-actions-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "checkpoints" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "checkpoints" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "checkpoints", cwd, sessionId: "session", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
   await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
   await store.awaitCheckpoint({ path: "checkpoint/deploy", name: "deploy", prompt: "Deploy?", context: null });
@@ -647,7 +647,7 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
   let customCalls = 0;
   let pickerCalls = 0;
   const ctx = { ...sessionContext, mode: "tui", ui: {
-    notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { if (prompt === "Workflow actions") return options.find((option) => option.startsWith("Review ")) ?? options[0]; pickerCalls += 1; return pickerCalls === 1 ? options[0] : "Close"; },
+    notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return options.find((option) => option.startsWith("Review ")) ?? options[0]; pickerCalls += 1; return pickerCalls === 1 ? options[0] : "Close"; },
     custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
       customCalls += 1;
       let result: string | undefined;
@@ -690,7 +690,7 @@ void test("navigator keeps consecutive checkpoint decisions in the same dashboar
 void test("navigator returns to the picker after deleting a run", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delete-actions-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "delete", }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "delete", }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const oldStore = new RunStore(cwd, "session", "old", home);
   const keepStore = new RunStore(cwd, "session", "keep", home);
   await oldStore.create({ id: "old", workflowName: "old", cwd, sessionId: "session", state: "completed", agents: [], agentSessions: [] }, snapshot);
@@ -700,7 +700,7 @@ void test("navigator returns to the picker after deleting a run", async () => {
   let pickerCalls = 0;
   let customCalls = 0;
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  const ctx = { cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => true, select: async (prompt: string, options: string[]) => { if (prompt === "Workflow actions") return "Delete"; pickerCalls += 1; pickerOptions.push(options); return pickerCalls === 1 ? options.find((option) => option.includes("old")) : "Close"; }, custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
+  const ctx = { cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => true, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Delete"; pickerCalls += 1; pickerOptions.push(options); return pickerCalls === 1 ? options.find((option) => option.includes("old")) : "Close"; }, custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
       customCalls += 1;
       let result: string | undefined;
       const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
@@ -724,7 +724,7 @@ void test("navigator opens the workflow script in the configured external editor
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
   const script = ["// SCRIPT_START", ...Array.from({ length: 20 }, (_, index) => `const line${String(index)} = ${String(index)};`), "// SCRIPT_END"].join("\n");
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "running", phase: "view", agents: [], agentSessions: [] }, snapshot);
   const editorPath = join(home, "fake-editor.sh");
   const editedPath = join(home, "edited-content");
@@ -796,7 +796,7 @@ void test("navigator opens a persisted top-level agent prompt and result in the 
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
   const resultPath = "agent/reviewer/callsite%3Areviewer/occurrence%3A1";
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agent-result" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agent-result" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "agent-result", cwd, sessionId: "session", state: "completed", phase: "review", agents: [{ id: "agent", name: "reviewer", path: "agent", state: "completed", prompt: "PROMPT_START\nInspect the target\nPROMPT_END", systemPrompt: "SYSTEM_PROMPT_START\nFollow the workflow\nSYSTEM_PROMPT_END", resultPath, structuralPath: ["reviewer"], model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], agentSessions: [] }, snapshot);
   await store.complete(resultPath, { answer: 42 });
   const editorPath = join(home, "fake-editor.sh");
@@ -899,7 +899,7 @@ void test("navigator omits transcript actions outside and inside Herdr", async (
       const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-transcript-actions-"));
       const cwd = join(home, "project");
       mkdirSync(cwd);
-      const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "navigator" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+      const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "navigator" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
       const noAgent = new RunStore(cwd, "session", "no-agent-run", home);
       await noAgent.create({ id: "no-agent-run", workflowName: "no-agent-run", cwd, sessionId: "session", state: "completed", agents: [], agentSessions: [{ transport: "local", sessionId: "native", locator: { sessionFile: join(home, "native.jsonl") } }] }, snapshot);
       const withAgent = new RunStore(cwd, "session", "agent-run", home);
@@ -916,7 +916,7 @@ void test("navigator omits transcript actions outside and inside Herdr", async (
         ui: {
           notify() {},
           confirm: async () => false,
-          select: async (prompt: string, options: string[]) => {
+          select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip";
             if (prompt === "Workflows\n") {
               workflowPickers.push(options);
               workflowSelection += 1;
@@ -959,11 +959,11 @@ void test("navigator omits transcript actions outside and inside Herdr", async (
 void test("navigator attention-orders runs, disambiguates names, shows breadcrumbs and bulk delete", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-v2-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'build',description:'b'}", args: null, metadata: { name: "build", description: "b" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'build',description:'b'}", args: null, metadata: { name: "build", description: "b" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["read"], agentConfigurations: {}, schemas: [] });
   const storeA = new RunStore(cwd, "s", "aaaa-1111-2222-3333", home);
   await storeA.create({ id: "aaaa-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "completed", agents: [{ id: "a:1", name: "scout", path: "a:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: ["read"], attempts: 1, accounting: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01 } }], agentSessions: [] }, snapshot);
   const storeB = new RunStore(cwd, "s", "bbbb-1111-2222-3333", home);
-  await storeB.create({ id: "bbbb-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "running", phase: "review", agents: [{ id: "b:1", name: "root", path: "b:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }, { id: "b:2", name: "child", path: "b:2", state: "running", parentId: "b:1", role: "reviewer", model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], attempts: 1, attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }], accounting: { input: 10, output: 5, cacheRead: 20, cacheWrite: 2, cost: 0.04 }, toolCalls: [{ id: "tc1", name: "read", state: "running" }], activity: { kind: "reasoning", text: "checking source" } }], agentSessions: [{ transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }] }, snapshot);
+  await storeB.create({ id: "bbbb-1111-2222-3333", workflowName: "build", cwd, sessionId: "s", state: "running", phase: "review", agents: [{ id: "b:1", name: "root", path: "b:1", state: "completed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }, { id: "b:2", name: "child", path: "b:2", state: "running", parentId: "b:1", model: { provider: "openai", model: "gpt", thinking: "high" }, tools: ["read"], attempts: 1, attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }], accounting: { input: 10, output: 5, cacheRead: 20, cacheWrite: 2, cost: 0.04 }, toolCalls: [{ id: "tc1", name: "read", state: "running" }], activity: { kind: "reasoning", text: "checking source" } }], agentSessions: [{ transport: "local", sessionId: "active", locator: { sessionFile: "/sessions/active.jsonl" } }] }, snapshot);
   const storeC = new RunStore(cwd, "s", "cccc-1111-2222-3333", home);
   await storeC.create({ id: "cccc-1111-2222-3333", workflowName: "deploy", cwd, sessionId: "s", state: "failed", agents: [{ id: "c:1", name: "deployer", path: "c:1", state: "failed", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 2, transport: "local", session: { transport: "local", sessionId: "n", locator: { sessionFile: "/n" } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, error: { code: "AGENT_FAILED", message: "timeout" }, accounting: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], agentSessions: [] }, snapshot);
 
@@ -1021,7 +1021,7 @@ void test("navigator attention-orders runs, disambiguates names, shows breadcrum
 void test("navigator refuses deletion of a run needed by a surviving retry", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-delete-dependency-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "dependency" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "dependency" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(cwd, "session", "source-run", home);
   await source.create({ id: source.runId, workflowName: "source", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   await source.complete("agent/replayable", "kept");
@@ -1033,7 +1033,7 @@ void test("navigator refuses deletion of a run needed by a surviving retry", asy
   workflowExtension(testExtensionApi(pi), home);
   let pickerCall = 0;
   let selectCall = 0;
-  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (prompt: string, options: string[]) => { if (prompt === "Workflows\n") { pickerCall += 1; return pickerCall === 1 ? options.find((option) => option.includes("source")) ?? "Close" : "Close"; } selectCall += 1; return selectCall === 1 ? "Delete" : "Back"; }, confirm: async () => true } };
+  const ctx = { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notifications.push(message); }, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflows\n") { pickerCall += 1; return pickerCall === 1 ? options.find((option) => option.includes("source")) ?? "Close" : "Close"; } selectCall += 1; return selectCall === 1 ? "Delete" : "Back"; }, confirm: async () => true } };
   const command = commands[0]?.handler;
   assert.ok(command);
   await executeCommand(command, "", ctx);
@@ -1045,7 +1045,7 @@ void test("navigator refuses deletion of a run needed by a surviving retry", asy
 void test("navigator bulk deletion protects dependencies of surviving runs", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-bulk-dependency-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "dependency-bulk" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "dependency-bulk" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(cwd, "session", "failed-source", home);
   await source.create({ id: source.runId, workflowName: "source", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   await source.complete("agent/replayable", "kept");
@@ -1069,7 +1069,7 @@ void test("navigator bulk deletion protects dependencies of surviving runs", asy
 void test("navigator bulk deletion reports invalid run dependencies without leaving the picker", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-bulk-corrupt-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "corrupt-bulk" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "corrupt-bulk" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const corrupt = new RunStore(cwd, "session", "corrupt-failed", home);
   await corrupt.create({ id: corrupt.runId, workflowName: "corrupt", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   writeFileSync(join(corrupt.directory, "borrowed-worktrees.json"), "{}");
@@ -1096,7 +1096,7 @@ void test("navigator bulk deletion protects borrowed worktrees of surviving retr
   writeFileSync(join(cwd, "tracked.txt"), "tracked\n");
   execFileSync("git", ["-C", cwd, "add", "."]);
   execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "borrowed" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "borrowed" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(cwd, "session", "failed-source", home);
   await source.create({ id: source.runId, workflowName: "source", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   await source.complete("agent/replayable", "kept");
@@ -1125,7 +1125,7 @@ void test("navigator bulk deletion protects borrowed worktrees of surviving retr
 void test("manual deletion orders retry children before their failed sources", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-manual-deletion-order-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "ordered" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentTypes: [], roles: {}, schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "ordered" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(cwd, "session", "source", home);
   await source.create({ id: source.runId, workflowName: "source", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);
   const child = new RunStore(cwd, "session", "child", home);
@@ -1137,7 +1137,7 @@ void test("manual deletion orders retry children before their failed sources", a
 void test("navigator bulk deletes only failed runs after confirmation", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-failed-bulk-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "bulk", description: "bulk" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "bulk", description: "bulk" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const states = ["failed", "failed", "completed", "stopped", "running", "interrupted", "budget_exhausted"] as const;
   const stores = await Promise.all(states.map(async (state, index) => {
     const store = new RunStore(cwd, "session", `bulk-${String(index)}`, home);
@@ -1170,13 +1170,13 @@ void test("navigator bulk deletes only failed runs after confirmation", async ()
 void test("navigator remains usable when retry provenance is unavailable", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-missing-retry-source-"));
   const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "broken-retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "broken-retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   const store = new RunStore(cwd, "session", "broken-retry", home);
   await store.create({ id: "broken-retry", workflowName: "broken-retry", cwd, sessionId: "session", state: "failed", retry: { sourceRunId: "deleted-source", lineageRootRunId: "broken-retry", completedPaths: [], incompletePaths: [], namedWorktrees: [] }, agents: [], agentSessions: [] }, snapshot);
   const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
   const selections: string[][] = [];
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { selections.push(options); if (prompt === "Workflows\n") return selections.length === 1 ? options[0] ?? "Close" : "Close"; return "Back"; } } };
+  const ctx = { cwd, mode: "rpc", hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; selections.push(options); if (prompt === "Workflows\n") return selections.length === 1 ? options[0] ?? "Close" : "Close"; return "Back"; } } };
   const command = commands[0]?.handler;
   assert.ok(command);
   await assert.doesNotReject(executeCommand(command, "", ctx));
@@ -1188,7 +1188,7 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-failure-"));
   const cwd = join(home, "project");
   const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'broken',description:'broken'}", args: null, metadata: { name: "broken", description: "broken" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentTypes: [], schemas: [] });
+  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'broken',description:'broken'}", args: null, metadata: { name: "broken", description: "broken" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
   await store.create({ id: "run", workflowName: "broken", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
   failedOwnership.add(store.directory);
@@ -1207,7 +1207,7 @@ void test("navigator stop reports cleanup failures without closing unexpectedly"
     cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
     ui: {
       notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async () => { throw new Error("the dashboard confirms in place"); },
-      select: async (prompt: string, options: string[]) => { if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
+      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
       custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
         customCalls += 1;
         assert.equal(options?.overlay, undefined);
