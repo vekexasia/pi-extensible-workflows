@@ -202,9 +202,16 @@ try {
   }
   console.log('paired: SDK/CLI contributors collected after real session_start in both load orders passed');
   for (const entry of ['sdk', 'cli']) {
-    const override = await run(await fixture({ reverse: true, roleBody: "ROLE_BASE", roleHeader: "overrideSystemPrompt: true\ncontextFiles: [global]" }), { role: "reviewer", model: "paired/call:off", contextFiles: [], systemPrompt: "CALL_BASE", systemPromptAppend: "CALL_APPEND" }, entry);
-    assert.equal(override.code, 0, override.stderr); assert.match(override.stdout, /paired-ok/); assert.equal(override.payloads[0].model, "call"); assert.match(system(override.payloads[0]), /CALL_BASE[\s\S]*CALL_APPEND/);
-    assert.doesNotMatch(system(override.payloads[0]), /ROLE_BASE|GLOBAL_AGENTS|CWD_AGENTS/);
+    for (const systemPrompt of ["CALL_BASE", ""]) {
+      const conflict = await run(await fixture({ reverse: true, roleBody: "ROLE_BASE", roleHeader: "overrideSystemPrompt: true\ncontextFiles: [global]" }), { role: "reviewer", systemPrompt }, entry);
+      assert.match(conflict.stdout + conflict.stderr, /reviewer.*overrideSystemPrompt.*systemPrompt.*systemPromptAppend/);
+      assert.equal(conflict.payloads.length, 0, "conflicting prompts must fail before any child provider request");
+    }
+    const override = await run(await fixture({ reverse: true, roleBody: "ROLE_BASE", roleHeader: "overrideSystemPrompt: true\ncontextFiles: [global]" }), { role: "reviewer", model: "paired/call:off", contextFiles: [], systemPromptAppend: "CALL_APPEND" }, entry);
+    assert.equal(override.code, 0, override.stderr); assert.match(override.stdout, /paired-ok/); assert.equal(override.payloads[0].model, "call"); assert.match(system(override.payloads[0]), /ROLE_BASE[\s\S]*CALL_APPEND/);
+    assert.doesNotMatch(system(override.payloads[0]), /GLOBAL_AGENTS|CWD_AGENTS/);
+    const nonoverride = await run(await fixture(), { role: "reviewer", systemPrompt: "CALL_BASE" }, entry);
+    assert.equal(nonoverride.code, 0, nonoverride.stderr); assert.match(system(nonoverride.payloads[0]), /CALL_BASE[\s\S]*ROLE_APPEND/);
   }
   const shared = await run(await fixture({ shared: { modelAliases: { chosen: "paired/call:off" }, tools: ["!*", "read"] } }), { model: "chosen" });
   assert.match(shared.stdout, /paired-ok/); assert.equal(shared.payloads[0].model, "call"); assert.deepEqual(names(shared.payloads[0]), ["read", "workflow_result"]);
