@@ -125,8 +125,12 @@ npm pack --dry-run --json --workspace=packages/extensions/herdr
 npm run test:packages
 # After packing core, CLI and roles locally into the same directory:
 PI_OFFLINE=1 node scripts/verify-local-roles-adapter.mjs <local-tarball-directory>
-PI_OFFLINE=1 node scripts/verify-pre6-parity.mjs <local-tarball-directory>
+PI_OFFLINE=1 node scripts/verify-pre6-parity.mjs <local-tarball-directory> --old <pre6-5.x-tarball-directory> --legacy <pre-freeze-6.x-tarball-directory>
 ```
+
+The full parity case set requires `--legacy` core/CLI tarballs from a 6.x build
+that predates frozen `excludeTools`; without them the legacy upgrade case fails
+closed. `--old` adds the optional pre6 controls.
 
 The obsolete compatibility upgrade script has been removed. The paired harness
 uses temporary HOME, agent and install directories, local product tarballs and a

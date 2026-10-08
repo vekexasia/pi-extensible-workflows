@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+## [6.1.0] - 2026-10-08
+
+**This minor version contains breaking changes.** Shipping them as 6.1.0 shortly after 6.0.0 is an explicit operator choice, not a SemVer-compliant version. Read the migration notes before upgrading.
+
 ### Breaking changes
 
 - Roles are now interpreted only by the explicitly enabled optional `@piewf/pi-ext-roles` extension. Core and CLI have no roles dependency, discovery, typed role fields, `/roles` export, `pi-role` bridge or legacy role paths. Without the plugin, unknown agent options are opaque JSON and ignored. The five fallback roles belong to the independent package.
@@ -8,6 +12,15 @@
 - New runs freeze generic prepared configurations before dispatch. Workflow identity version 6 and standalone configuration version 1 reject previous formats without migration. Retry/resume reuse configuration; new identities resolve current settings. Extension code and skill/AGENTS/SYSTEM/APPEND bytes are reread, not frozen.
 - Doctor uses `--agent-options <json>` and `agentInspection`, not role targets or `--role`. Bundles require explicit plugin resources/dependencies instead of role inference. Obsolete compatibility upgrade/warning checks are removed; generic and extension-owned regressions plus the local paired SDK/CLI harness replace their still-relevant coverage.
 - Role descriptions append to Pi's structured prompt channel, preserving existing append instructions and dynamic provider/tool prefixes (#311); they never force the entire system prompt.
+
+### Migration
+
+- To keep using `role` options, install `@piewf/pi-ext-roles` 0.2.0 or newer and enable it explicitly as a Pi extension next to workflows. Core and CLI no longer install or load it.
+- Roles and shared settings are read only from the roles package paths: `~/.pi/agent/pi-ext-roles/{settings.json,roles/}` and authorized project `.pi/pi-ext-roles/{settings.json,roles/}`. Legacy workflow role paths are ignored; move files manually, nothing is rewritten.
+- Runs persisted before 6.1.0 cannot be resumed or retried. Finish them before upgrading, then relaunch them as new runs.
+- Role text is appended through Pi's structured system-prompt append channel. Only roles with `overrideSystemPrompt: true` replace the base prompt.
+- `pi-role` is owned only by the independent `@piewf/pi-ext-roles` package, which works without workflows. Upgrade an old global `@piewf/cli` first; never overwrite the binary with `--force`.
+- Prepared options stay bounded by root and parent tool ceilings, project trust and `excludeTools`; setup hooks cannot change the agent cwd.
 
 ### Fixes
 
