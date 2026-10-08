@@ -86,7 +86,7 @@ export interface AgentOptions {
 }
 ```
 
-`role` is not a core field: it is an extra JSON key (`[key: string]: JsonValue`) read only by the optional roles extension. With that extension enabled, a `role` supplies model, tools, skills, extensions, and context files during preparation; without it, `role` is ignored. Pass `{ role }` alone unless an override is indispensable. Restrict selectors with `["!*", "read", "grep"]`; `["*"]` turns everything back on.
+Restrict resource selectors with `["!*", "read", "grep"]`; `["*"]` selects every resource allowed by the parent ceiling.
 
 Extensions may add JSON-compatible agent options such as `advisor: true`; core keys retain validation and parent ceilings. Extension options go to setup hooks/native setup and are not inherited by child agents.
 
@@ -97,7 +97,7 @@ Agent calls are unnamed. Direct calls receive hidden source call-site identity; 
 Use `agent.create(...)` when one agent must keep its transcript across several turns; use plain `agent(...)` calls for independent work.
 
 ```js
-const author = agent.create({ name: "author", role: "developer" });
+const author = agent.create({ name: "author" });
 const draft = await author.send("Create the first draft");
 const revised = await author.send(
   prompt("Apply these findings:\n\n{findings}", { findings }),
