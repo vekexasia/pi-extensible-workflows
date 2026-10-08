@@ -365,23 +365,19 @@ function bundledWorkflowModule(workflow: WorkflowCatalogFunction, source: Portab
   const aliases = Object.entries(aliasTargets);
   const modules = ["./extension.mjs", ...extensionModules.map((name) => `./extensions/${name}`)];
   return [
-    "import { fileURLToPath } from 'node:url';",
     "export async function register(registerWorkflowExtension) {",
     "  const captured = [];",
-    "  const listeners = new Map();",
-    "  const pi = { events: { on(name, listener) { const list = listeners.get(name) ?? []; list.push(listener); listeners.set(name, list); return () => { const index = list.indexOf(listener); if (index >= 0) list.splice(index, 1); }; }, emit(name, event) { for (const listener of listeners.get(name) ?? []) listener(event); } } };",
     "  const previousCapture = globalThis.__pi_bundle_capture;",
+    // Each registration records the bundled module it came from; factories still run without a Pi API.
     "  let moduleSource;",
-    "  globalThis.__pi_bundle_capture = (extension) => {",
-    "    captured.push({ ...extension, source: moduleSource });",
-    "  };",
+    "  globalThis.__pi_bundle_capture = (extension) => { captured.push({ ...extension, source: moduleSource }); };",
     "  try {",
     ...modules.map((name, index) => `    moduleSource = new URL(${JSON.stringify(name)}, import.meta.url).href; const extension${String(index)} = await import(${JSON.stringify(name)});`),
     `    const factory = extension0[${JSON.stringify(source.export)}];`,
     `    if (typeof factory !== "function") throw new Error(${JSON.stringify(`Workflow extension export ${source.export} is not a function`)});`,
     '    moduleSource = new URL("./extension.mjs", import.meta.url).href;',
-    "    await factory(pi);",
-    ...modules.slice(1).map((_name, index) => `    moduleSource = new URL(${JSON.stringify(modules[index + 1])}, import.meta.url).href; if (typeof extension${String(index + 1)}.default === "function") await extension${String(index + 1)}.default(pi);`),
+    "    await factory();",
+    ...modules.slice(1).map((_name, index) => `    moduleSource = new URL(${JSON.stringify(modules[index + 1])}, import.meta.url).href; if (typeof extension${String(index + 1)}.default === "function") await extension${String(index + 1)}.default();`),
     "  } finally {",
     "    if (previousCapture === undefined) delete globalThis.__pi_bundle_capture; else globalThis.__pi_bundle_capture = previousCapture;",
     "  }",

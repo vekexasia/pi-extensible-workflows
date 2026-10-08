@@ -96,6 +96,7 @@ const typeCheckAgentSetupHook: WorkflowExtension = {
         const model: string | undefined = agent.options.model;
         const tools: string[] | undefined = agent.options.tools;
         const extension: InlineExtension = () => {};
+        // @ts-expect-error Setup hooks cannot move an agent: Pi derives trust, settings and .pi resources from cwd.
         agent.sessionInput.cwd = "/tmp";
         agent.sessionInput.tools.push("read");
         agent.sessionInput.extensionFactories ??= [];

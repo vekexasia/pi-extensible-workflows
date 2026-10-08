@@ -46,6 +46,8 @@ export interface AgentOptions<Schema extends TSchema = never> {
   label?: string;
   model?: string;
   tools?: string[];
+  /** Exact tool names removed after preparation hooks; never widens the parent ceiling. */
+  excludeTools?: string[];
   skills?: string[];
   extensions?: string[];
   contextFiles?: ContextFileScope[];
@@ -119,6 +121,8 @@ export interface AgentResourcePolicy {
   unmatchedExtensions: readonly string[];
   unmatchedTools?: readonly string[];
   selectorSources: AgentResourceSelectorSources;
+  /** Skills loaded by the parent session; ceiling for skills that extensions contribute through resources_discover. Absent for top-level agents. */
+  parentSkills?: readonly string[];
 }
 export interface AgentResourceInspection { selectors: AgentResourceSelectorSet; skills: readonly string[]; extensions: readonly string[]; tools: readonly string[]; unmatchedSkills: readonly string[]; unmatchedExtensions: readonly string[]; unmatchedTools: readonly string[]; selectorSources?: AgentResourceSelectorSources }
 
@@ -273,7 +277,8 @@ export interface WorkflowAgentSession {
 type SessionTools = NonNullable<CreateAgentSessionOptions["tools"]>;
 type SessionCustomTools = NonNullable<CreateAgentSessionOptions["customTools"]>;
 export interface SessionInput {
-  cwd: string;
+  /** Read-only: setup hooks cannot move an agent, because Pi derives trust, settings and `.pi` resources from cwd. */
+  readonly cwd: string;
   model: ModelSpec;
   tools: SessionTools;
   sessionLabel: string;
@@ -337,9 +342,12 @@ export interface AgentPreparation {
 export interface AgentPreparationContext {
   readonly options: Readonly<AgentOptions>;
   readonly cwd: string;
+  /** Launch project root that owns project configuration; differs from `cwd` inside worktree scopes. Optional for older hosts. */
+  readonly projectCwd?: string;
   readonly agentDir: string;
   readonly projectTrusted: boolean;
-  readonly defaults: Readonly<{ model: ModelSpec; modelAliases: Readonly<Record<string, string>>; selectorSources: AgentResourceSelectorSources; settings: Readonly<WorkflowExtensionSettings> }>;
+  /** `dynamicModelAliasNames` lists the `modelAliases` entries resolved by extensions rather than read from static settings. */
+  readonly defaults: Readonly<{ model: ModelSpec; modelAliases: Readonly<Record<string, string>>; dynamicModelAliasNames?: readonly string[]; selectorSources: AgentResourceSelectorSources; settings: Readonly<WorkflowExtensionSettings> }>;
   readonly capabilities: Readonly<{ tools: readonly string[]; skills: readonly string[]; extensions: readonly string[] }>;
   readonly knownModels: ReadonlySet<string>;
   readonly availableModels: ReadonlySet<string>;
@@ -347,8 +355,13 @@ export interface AgentPreparationContext {
   readonly mode: AgentInspectionMode;
 }
 export interface AgentPreparationHook { priority?: number; optionsSchema?: JsonSchema; prepare: (configuration: AgentPreparation, context: Readonly<AgentPreparationContext>) => void | Promise<void> }
-export interface RegisteredAgentPreparationHook { name: string; priority: number; optionsSchema?: JsonSchema; prepare: AgentPreparationHook["prepare"] }
-export interface PreparedAgentConfiguration extends Omit<AgentPreparation, "model"> { model: ModelSpec; projectTrusted: boolean }
+/** `source` is the registering extension's module provenance, when it declared one. */
+export interface RegisteredAgentPreparationHook { name: string; priority: number; optionsSchema?: JsonSchema; source?: string; prepare: AgentPreparationHook["prepare"] }
+/**
+ * `excludeTools` holds the exact tool names the agent and its ancestors excluded, frozen with the configuration so setup and
+ * children apply them even when re-evaluated options change. It is absent only in configurations prepared before it existed, which cannot resume.
+ */
+export interface PreparedAgentConfiguration extends Omit<AgentPreparation, "model"> { model: ModelSpec; projectTrusted: boolean; excludeTools?: string[] }
 export interface AgentSetupHook { priority?: number; setup: (agent: AgentSetup, context: Readonly<AgentSetupContext>) => void | Promise<void> }
 export interface RegisteredAgentSetupHook { name: string; priority: number; setup: AgentSetupHook["setup"] }
 export interface WorkflowExtensionMetadata { version: string; headline: string }

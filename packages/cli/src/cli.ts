@@ -8,7 +8,7 @@ import { createEventBus, ProjectTrustStore, SessionManager, SettingsManager, cre
 import { Value } from "typebox/value";
 import { doctor, doctorExitCode, formatDoctorReport, type DoctorOptions } from "./doctor.js";
 import { doctorCleanup, doctorCleanupExitCode, formatDoctorCleanupReport, type DoctorCleanupOptions } from "./doctor-cleanup.js";
-import workflowExtension, { errorText, formatWorkflowProgress, isNodeError, jsonValue, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowProgressStyles } from "pi-extensible-workflows";
+import workflowExtension, { errorText, extensionIdentity, formatWorkflowProgress, isNodeError, jsonValue, loadingRegistry, object, registeredWorkflowFunctionSources, sameFilesystemPath, truncateWorkflowProgress, workflowCatalog, workflowSettingsPath, type JsonSchema, type JsonValue, type WorkflowProgressStyles } from "pi-extensible-workflows";
 import { portableEngineVersion, portablePiVersion, writePortableWorkflowBundle } from "./bundles.js";
 import { runSessionInspector, transcriptFileLines, type InspectMode } from "./session-inspector.js";
 import { isPersistedRun, listPersistedSessionIds, listRunIds, type PersistedRun } from "pi-extensible-workflows/persistence";
@@ -301,7 +301,7 @@ type HeadlessWorkflowTool = { name: "workflow"; execute: (toolCallId: string, pa
 function isHeadlessWorkflowResult(value: unknown): value is HeadlessWorkflowResult { return object(value) && Array.isArray(value.content) && value.content.every((entry) => object(entry) && typeof entry.type === "string" && typeof entry.text === "string"); }
 function isHeadlessWorkflowTool(value: unknown): value is HeadlessWorkflowTool { return object(value) && value.name === "workflow" && typeof value.execute === "function"; }
 type ShutdownHandler = (event: unknown, context: unknown) => Promise<void> | void;
-type WorkflowRuntime = { session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]; catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[] };
+type WorkflowRuntime = { session: Awaited<ReturnType<typeof createAgentSessionFromServices>>["session"]; catalog: ReturnType<typeof workflowCatalog>; services: Awaited<ReturnType<typeof createAgentSessionServices>>; workflowTool: HeadlessWorkflowTool; shutdownHandlers: ShutdownHandler[]; loadErrors: readonly string[]; loadedPaths: readonly string[] };
 
 async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: ShutdownHandler[] = []): Promise<WorkflowRuntime> {
   const cwd = options.cwd ?? process.cwd();
@@ -338,6 +338,9 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
   };
   const bus = createEventBus();
   shutdownHandlers.push(() => { bus.clear(); });
+  // Registrations that completed before Pi loads extensions (portable bundle payloads) are proven to have loaded.
+  const registrations = () => { const registry = loadingRegistry(); return typeof registry.registrations === "function" ? registry.registrations() : undefined; };
+  const preloaded = (registrations() ?? []).flatMap(({ source }) => source === undefined ? [] : [source]);
   const services = await createAgentSessionServices({
     cwd, agentDir, settingsManager,
     resourceLoaderOptions: {
@@ -350,14 +353,25 @@ async function createWorkflowRuntime(options: WorkflowIo, shutdownHandlers: Shut
     resourceLoaderReloadOptions: { resolveProjectTrust },
   });
   const extensions = services.resourceLoader.getExtensions();
-  if (extensions.errors.length) throw new Error(extensions.errors.map(({ path, error }) => `${path}: ${error}`).join("\n"));
+  const loadErrors = extensions.errors.map(({ path, error }) => `${path}: ${error}`);
   const candidates: unknown[] = extensions.extensions.flatMap((extension) => [...extension.tools.values()].map(({ definition }) => definition));
   const workflowTool = candidates.find(isHeadlessWorkflowTool);
-  if (!workflowTool) throw new Error("The workflow runtime could not be initialized");
+  if (!workflowTool) throw new Error(["The workflow runtime could not be initialized", ...loadErrors].join("\n"));
+  // Unrelated extension failures stay non-fatal, as before 6.0. The workflow host receives them with the proven loaded
+  // sources, so agent options that no proven preparation hook declares fail closed instead of being ignored.
+  for (const loadError of loadErrors) options.stderr(`Warning: ${loadError}\n`);
   const { session } = await createAgentSessionFromServices({ services, sessionManager: SessionManager.inMemory() });
   shutdownHandlers.unshift(async () => { try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); } finally { session.dispose(); } });
   await session.bindExtensions({ mode: "print" });
-  return { session, catalog: workflowCatalog({ cwd, projectTrusted: settingsManager.isProjectTrusted(), globalSettingsPath: workflowSettingsPath(agentDir) }), services, workflowTool, shutdownHandlers };
+  const loadedPaths = [...preloaded, ...extensions.extensions.map(({ resolvedPath }) => resolvedPath)];
+  if (loadErrors.length) {
+    // A factory can register functions, hooks or aliases and then fail; Pi discards its lifecycle but not those
+    // registrations. Beside a failure, every registration must name a loaded extension as its source, or nothing runs.
+    const proven = new Set(loadedPaths.map(extensionIdentity));
+    const unproven = (registrations() ?? [{ headline: "workflow registry without provenance" }]).filter(({ source }) => source === undefined || !proven.has(extensionIdentity(source)));
+    if (unproven.length) throw new Error([`Extensions failed to load, and these workflow registrations cannot be proven to come from a loaded extension: ${unproven.map(({ headline, source }) => `${headline} (${source ?? "no source"})`).join(", ")}`, ...loadErrors].join("\n"));
+  }
+  return { session, catalog: workflowCatalog({ cwd, projectTrusted: settingsManager.isProjectTrusted(), globalSettingsPath: workflowSettingsPath(agentDir) }), services, workflowTool, shutdownHandlers, loadErrors, loadedPaths };
 }
 
 function availableModelInfo(services: WorkflowRuntime["services"], available = false): { provider: string; id: string }[] {
@@ -489,7 +503,7 @@ async function createWorkflowContext(runtime: WorkflowRuntime, options: Workflow
   const model = runtime.session.model;
   const sessionManager = runtime.session.sessionManager;
   const modelRegistry = { getAll: () => availableModelInfo(runtime.services), getAvailable: () => availableModelInfo(runtime.services, true) };
-  return { ...native, cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true };
+  return { ...native, cwd: options.cwd ?? process.cwd(), mode: "print" as const, hasUI: false, ...(model ? { model } : {}), modelRegistry, sessionManager, isProjectTrusted: () => runtime.services.settingsManager.isProjectTrusted(), ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify: () => {}, onTerminalInput: () => () => {}, setStatus: () => {}, setWorkingMessage: () => {}, setWorkingVisible: () => {}, setWorkingIndicator: () => {}, setHiddenThinkingLabel: () => {}, setWidget: () => {}, setFooter: () => {}, setHeader: () => {}, setTitle: () => {}, custom: async () => undefined, pasteToEditor: () => {}, setEditorText: () => {}, getEditorText: () => "", editor: async () => undefined, addAutocompleteProvider: () => {} }, headless: true, extensionLoadErrors: [...runtime.loadErrors], loadedExtensionPaths: [...runtime.loadedPaths] };
 }
 
 async function shutdownWorkflowRuntime(handlers: readonly ShutdownHandler[], context: unknown): Promise<void> {

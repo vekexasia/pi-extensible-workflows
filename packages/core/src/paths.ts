@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WorkflowError } from "./types.js";
 import { isNodeError } from "./utils.js";
 
@@ -12,6 +12,22 @@ export function safePart(value: string): string { return value.replace(/[^a-zA-Z
 export function canonicalPath(path: string): string { const absolute = resolve(path); try { return realpathSync(absolute); } catch { return absolute; } }
 export function extensionIdentity(path: string): string { return path.startsWith("builtin:") ? path : canonicalPath(path.startsWith("file:") ? fileURLToPath(path) : path); }
 export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
+/**
+ * The path Pi's resource loader uses for a resource path an extension returns: trimmed, `~`, `~/` and `file://` expanded,
+ * relative to the loader cwd. Synthetic `<...>` and `builtin:` paths stay as they are.
+ */
+export function piResourcePath(path: string, cwd: string): string {
+  //NOTE: Pi also rewrites Windows shell paths and `~\` on win32; those forms are not mirrored here and fail closed.
+  if (path.startsWith("<") || path.startsWith("builtin:")) return path;
+  const trimmed = path.trim();
+  const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? join(homedir(), trimmed.slice(2)) : /^file:\/\//.test(trimmed) ? fileURLToPath(trimmed) : trimmed;
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
+}
+/** Pi attributes a loaded resource to a contributed path by lexical containment of resolved paths, without following symlinks. */
+export function piResourceContains(root: string, path: string): boolean {
+  const relativePath = relative(resolve(root), resolve(path));
+  return relativePath === "" || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+}
 
 export function projectStorageKey(cwd: string): string {
   const exact = resolve(cwd);

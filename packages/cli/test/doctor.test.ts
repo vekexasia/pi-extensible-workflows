@@ -123,6 +123,19 @@ void test("doctor keeps unknown JSON options out of internal execution controls"
   assert.equal(doctorExitCode(report), 0);
 });
 
+void test("doctor inspection separates dynamic alias names from static settings", async (t) => {
+  const paths = fixture();
+  t.after(() => { rmSync(paths.root, { recursive: true, force: true }); });
+  writeFileSync(paths.settingsPath, JSON.stringify({ modelAliases: { fixed: "openai-codex/gpt-5.6-sol", shared: "openai-codex/gpt-5.6-sol" } }));
+  const observed: unknown[] = [];
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Dynamic aliases", modelAliases: { dynamic: { resolve: () => "openai-codex/gpt-5.6-luna" }, shared: { resolve: () => "openai-codex/gpt-5.6-luna" } }, agentPreparationHooks: { observe: { prepare(_configuration, context) {
+    observed.push({ projectCwd: context.projectCwd, dynamicModelAliasNames: context.defaults.dynamicModelAliasNames, modelAliases: { ...context.defaults.modelAliases } });
+  } } } });
+  const report = await withHome(paths.root, () => doctor({ ...paths, registry, agentOptions: {}, discoverPi: async () => pi({ model: { provider: "openai-codex", model: "gpt-5.6-sol" }, knownModels: ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-luna"], availableModels: ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-luna"] }) }));
+  assert.deepEqual(report.diagnostics.filter(({ severity }) => severity === "error"), []);
+  assert.deepEqual(observed, [{ projectCwd: paths.cwd, dynamicModelAliasNames: ["dynamic"], modelAliases: { dynamic: "openai-codex/gpt-5.6-luna", fixed: "openai-codex/gpt-5.6-sol", shared: "openai-codex/gpt-5.6-sol" } }]);
+});
 void test("doctor reports malformed auth and trust discovery diagnostics", async () => {
   const cases = [
     ["auth.json", "{\n", /Expected property name/],

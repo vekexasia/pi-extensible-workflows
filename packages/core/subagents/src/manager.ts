@@ -151,6 +151,7 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
     availableModels,
     knownModels,
     ...(Object.keys(staticAliases).length ? { modelAliases: staticAliases } : {}),
+    dynamicModelAliasNames: [],
     settingsPath: settings.sources.modelAliases,
     extensionSettingsPath,
     agentPreparationHooks: registry.agentPreparationHooks(),
@@ -170,7 +171,7 @@ async function addDynamicAliases(context: Readonly<SubagentManagerContext>, sign
   const trustedProject = resourcePolicy?.projectTrusted ?? context.extensionContext.isProjectTrusted();
   const dynamicAliases = await registry.resolveModelAliases({ cwd: context.extensionContext.cwd, projectTrusted: trustedProject, rootModel: root.model, knownModels: root.knownModels ?? new Set(), availableModels: root.availableModels ?? new Set(), signal }, new Set(Object.keys(staticAliases)));
   validateModelAliasAvailability(dynamicAliases, Object.keys(dynamicAliases), root.availableModels ?? new Set(), root.knownModels ?? new Set(), root.settingsPath);
-  return { ...root, modelAliases: { ...dynamicAliases, ...staticAliases } };
+  return { ...root, modelAliases: { ...dynamicAliases, ...staticAliases }, dynamicModelAliasNames: Object.keys(dynamicAliases) };
 }
 
 function executionOptions(request: Readonly<SubagentRunRequest>, onAttempt: NonNullable<AgentExecutionOptions["onAttempt"]>, onProgress: NonNullable<AgentExecutionOptions["onProgress"]>): AgentExecutionOptions {

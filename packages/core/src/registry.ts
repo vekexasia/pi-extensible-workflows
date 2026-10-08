@@ -86,10 +86,15 @@ export class WorkflowRegistry {
     this.#extensions.add(stored);
     for (const name of names) this.#globals.set(name, name);
     for (const [name, alias] of Object.entries(modelAliases)) this.#modelAliases.set(name, { name, version: extension.version, headline: extension.headline, resolve: alias.resolve });
-    for (const [name, hook] of Object.entries(agentPreparationHooks)) this.#preparationHooks.set(name, { name, priority: hook.priority ?? 10, prepare: hook.prepare, ...(hook.optionsSchema === undefined ? {} : { optionsSchema: structuredClone(hook.optionsSchema) }) });
+    for (const [name, hook] of Object.entries(agentPreparationHooks)) this.#preparationHooks.set(name, { name, priority: hook.priority ?? 10, prepare: hook.prepare, ...(hook.optionsSchema === undefined ? {} : { optionsSchema: structuredClone(hook.optionsSchema) }), ...(source === undefined ? {} : { source }) });
     for (const [name, hook] of Object.entries(agentSetupHooks)) this.#hooks.set(name, { name, priority: hook.priority ?? 10, setup: hook.setup });
     for (const [name, action] of Object.entries(agentAttemptActions)) this.#agentAttemptActions.set(name, action);
     if (validateSettings !== undefined) this.#settingsValidators.add({ headline: extension.headline, validate: validateSettings });
+  }
+
+  /** Every registration's headline and declared module provenance, for hosts that must prove which extension made it. */
+  registrations(): ReadonlyArray<Readonly<{ headline: string; source?: string }>> {
+    return [...this.#extensions].map(({ headline, source }) => Object.freeze({ headline, ...(source === undefined ? {} : { source }) }));
   }
 
   function(name: string): WorkflowFunction {
@@ -213,7 +218,7 @@ export class WorkflowRegistry {
     return Object.freeze(resolved);
   }
 }
-export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "validateExtensionSettings" | "modelAliases" | "resolveModelAliases" | "agentPreparationHooks" | "agentSetupHooks" | "agentAttemptActions" | "setSubagentStatusObserver" | "observeSubagentStatus">;
+export type WorkflowRegistryApi = Pick<WorkflowRegistry, "frozen" | "freeze" | "register" | "function" | "functions" | "functionSources" | "catalog" | "catalogIndex" | "catalogDetail" | "globals" | "invokeFunction" | "validateExtensionSettings" | "modelAliases" | "resolveModelAliases" | "agentPreparationHooks" | "agentSetupHooks" | "agentAttemptActions" | "setSubagentStatusObserver" | "observeSubagentStatus" | "registrations">;
 interface WorkflowRegistryHost { api: WorkflowRegistryApi; activeHosts: number }
 const WORKFLOW_REGISTRY_KEY = Symbol.for("pi-extensible-workflows.workflow-registry");
 const globalRegistry = globalThis as typeof globalThis & Record<symbol, WorkflowRegistryHost | undefined>;
@@ -238,6 +243,7 @@ function createWorkflowRegistryApi(registry: WorkflowRegistry): WorkflowRegistry
     agentPreparationHooks: () => registry.agentPreparationHooks(),
     agentSetupHooks: () => registry.agentSetupHooks(),
     agentAttemptActions: () => registry.agentAttemptActions(),
+    registrations: () => registry.registrations(),
   };
 }
 function workflowRegistryHost(): WorkflowRegistryHost {

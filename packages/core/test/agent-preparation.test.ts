@@ -194,22 +194,6 @@ void test("preparation can remove nested orchestration tools before session crea
   await assert.rejects(executor.execute("task", options({}), undefined, customTools), /stopped after inspection/);
   assert.equal(inspected, true);
 });
-void test("nested nodes do not reuse their parent's logical configuration identity", async (t) => {
-  const root = fixture(t);
-  const scheduler = new FairAgentScheduler(async ({ signal }) => {
-    await new Promise<void>((resolve) => { signal.addEventListener("abort", () => { resolve(); }, { once: true }); });
-    throw new WorkflowError("CANCELLED", "cancelled");
-  });
-  scheduler.addRun("run", 1);
-  const parent = scheduler.spawn("run", "parent", { label: "parent", cwd: root.cwd, tools: ["agent", "read"], agentIdentity: { structuralPath: [], callSite: "parent-site", occurrence: 1 } });
-  scheduler.spawn("run", "child", { label: "child", cwd: root.cwd, tools: ["read"], agentOptions: { policy: "child" } }, parent.id);
-  const child = scheduler.snapshot().find(({ parentId }) => parentId === parent.id);
-  assert.ok(child);
-  assert.equal(child.options.agentIdentity, undefined);
-  assert.deepEqual(child.options.agentOptions, { policy: "child" });
-  scheduler.cancel(parent.id);
-  await parent.result;
-});
 void test("untrusted project factories are excluded before policy discovery", async (t) => {
   const root = fixture(t);
   const extensions = join(root.cwd, ".pi", "extensions");
@@ -414,4 +398,12 @@ void test("nested preparation and SDK factories inherit setup-narrowed project t
   await assert.rejects(executor.prepare({ ...options({}), configuration: configurations[0], projectTrusted: false }), /lost project trust/);
   assert.deepEqual(await executor.prepare({ ...options({}), configuration: configurations[1], projectTrusted: false }), configurations[1]);
   assert.equal(preparations.length, 3, "frozen child configuration must resume without rerunning preparation");
+});
+
+void test("a hook passing on an inherited virtual workflow root model prepares its physical alias target, like no hook", async (t) => {
+  const root: AgentExecutionRoot = { ...fixture(t), model: { provider: "workflow", model: "cheap", thinking: "high" }, modelAliases: { cheap: "test/model" }, knownModels: new Set(["test/model", "workflow/cheap"]), availableModels: new Set(["test/model", "workflow/cheap"]) };
+  const plain = await new WorkflowAgentExecutor(root).prepare(options({}));
+  const passing = await new WorkflowAgentExecutor({ ...root, agentPreparationHooks: [{ name: "inherit", priority: 0, prepare(configuration) { configuration.model = "workflow/cheap:high"; } }] }).prepare(options({}));
+  assert.deepEqual(plain.model, { provider: "test", model: "model", thinking: "high" });
+  assert.deepEqual(passing.model, plain.model);
 });

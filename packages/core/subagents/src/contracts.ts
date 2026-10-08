@@ -29,6 +29,7 @@ export const SUBAGENTS_RUN_PARAMETERS = Type.Object({
   label: Type.Optional(Type.String({ description: "Optional display label for the subagent" })),
   model: Type.Optional(Type.String({ description: "Optional model as provider/model:thinking or alias[:thinking]" })),
   tools: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered tool selectors; candidates start enabled and !* restricts the set" })),
+  excludeTools: Type.Optional(Type.Array(Type.String(), { description: "Optional exact tool names removed after preparation; no patterns, cannot remove workflow_result" })),
   skills: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered skill selectors; candidates start enabled and !* restricts the set" })),
   extensions: Type.Optional(Type.Array(Type.String(), { description: "Optional ordered extension selectors; candidates start enabled and !* restricts the set" })),
   contextFiles: Type.Optional(Type.Array(Type.String(), { description: "Optional context-file scopes: global, project, cwd" })),

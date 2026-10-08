@@ -85,8 +85,9 @@ export function decodePreparedAgentConfiguration(value: unknown): PreparedAgentC
   const contextFiles = value.contextFiles === undefined ? undefined : decodeContextFileScopes(value.contextFiles);
   const label = optionalString(value.label);
   const systemPrompt = optionalString(value.systemPrompt);
-  if (!model || !tools || !skills || !extensions || !settings || label === INVALID_PERSISTED_VALUE || systemPrompt === INVALID_PERSISTED_VALUE || value.contextFiles !== undefined && !contextFiles) return undefined;
-  return { model, tools, skills, extensions, settings, projectTrusted: value.projectTrusted, systemPromptAppend: value.systemPromptAppend, ...(contextFiles === undefined ? {} : { contextFiles }), ...(label === undefined ? {} : { label }), ...(systemPrompt === undefined ? {} : { systemPrompt }) };
+  const excludeTools = value.excludeTools === undefined ? undefined : decodeStringArray(value.excludeTools);
+  if (!model || !tools || !skills || !extensions || !settings || label === INVALID_PERSISTED_VALUE || systemPrompt === INVALID_PERSISTED_VALUE || value.contextFiles !== undefined && !contextFiles || value.excludeTools !== undefined && !excludeTools) return undefined;
+  return { model, tools, skills, extensions, settings, projectTrusted: value.projectTrusted, systemPromptAppend: value.systemPromptAppend, ...(contextFiles === undefined ? {} : { contextFiles }), ...(excludeTools === undefined ? {} : { excludeTools }), ...(label === undefined ? {} : { label }), ...(systemPrompt === undefined ? {} : { systemPrompt }) };
 }
 function decodeWorkflowMetadata(value: unknown): LaunchSnapshot["metadata"] | undefined {
   if (!object(value) || typeof value.name !== "string") return undefined;

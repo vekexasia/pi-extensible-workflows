@@ -9,6 +9,14 @@
 - Doctor uses `--agent-options <json>` and `agentInspection`, not role targets or `--role`. Bundles require explicit plugin resources/dependencies instead of role inference. Obsolete compatibility upgrade/warning checks are removed; generic and extension-owned regressions plus the local paired SDK/CLI harness replace their still-relevant coverage.
 - Role descriptions append to Pi's structured prompt channel, preserving existing append instructions and dynamic provider/tool prefixes (#311); they never force the entire system prompt.
 
+### Fixes
+
+- Restored pre-6 behavior: `excludeTools` for workflow, nested and standalone agents, also in the `agent` and `subagents_run` tool schemas (exact names as in Pi, applied after preparation, bounded by parent ceilings and frozen with each logical agent's configuration; patterns and `workflow_result` are rejected, unknown names warn); `resources_discover` skills for root, nested and standalone agents, attributed per resource generation with Pi's path normalization; static preparation failures, including unavailable models and unknown roles, fail before shell, tool or run effects; nested children keep core error codes and their parent's structural scope under their own identity; unrelated extension load failures are CLI warnings; bundled factories run without a Pi API again and keep their module source.
+- Launch inspection covers only completely static agent options (handles only when no send adds options) and stops on cancellation, also after the session lease. Nested children are new spawns of their parent's attempt, with identities per parent spawn: after retry or cold resume they prepare against current configuration.
+- After a CLI extension load failure, every workflow registration must declare a `source` that is a loaded extension entry or a portable bundle module, or the CLI stops before running anything (a factory may register and then fail). Agent options that no such preparation hook declares in its `optionsSchema` fail with `INVALID_METADATA` instead of being ignored, also after paused resume, cold resume or retry. Setup hooks cannot reintroduce an excluded or outside-ceiling root tool as a same-named custom tool, and `excludeTools` names, own or inherited, also remove custom tools of those names.
+- Preparation context adds `projectCwd` and `defaults.dynamicModelAliasNames`, so plugins can read launch-project configuration inside worktrees and order dynamic aliases below their own static aliases. A paused run resumed after an alias change prepares new agents with the refreshed aliases. A hook passing on a virtual `workflow/<alias>` root model gets its physical target.
+- Setup hooks still cannot change the agent cwd, including to a project subdirectory; `SessionInput.cwd` is now read-only. This deliberate deviation from pre-6 prevents loading another directory's trust, settings and `.pi` resources.
+
 ## [6.0.0] - 2026-10-07
 
 ### Breaking changes

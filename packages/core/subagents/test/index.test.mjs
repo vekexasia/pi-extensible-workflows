@@ -1422,7 +1422,7 @@ test("opens bounded prompt and result artifacts while terminal runs hide system 
   }
 });
 test("exposes extensible run options and closed control schemas and minimal prompt guidance", () => {
-  assert.deepEqual(Object.keys(SUBAGENTS_RUN_PARAMETERS.properties), ["prompt", "mode", "label", "model", "tools", "skills", "extensions", "contextFiles", "worktree", "outputSchema", "retries", "timeoutMs"]);
+  assert.deepEqual(Object.keys(SUBAGENTS_RUN_PARAMETERS.properties), ["prompt", "mode", "label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "worktree", "outputSchema", "retries", "timeoutMs"]);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.required, ["prompt"]);
   assert.equal(SUBAGENTS_RUN_PARAMETERS.additionalProperties, true);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.properties.mode.anyOf.map(({ const: value }) => value), ["background", "foreground"]);
@@ -2516,6 +2516,42 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
     await waitFor(() => typeof branch === "string" && execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
   } finally {
     await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("standalone worktree preparation sees the launch project root and dynamic alias names", async () => {
+  resetWorkflowRegistry();
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-preparation-context-"));
+  const agentDir = join(cwd, "agent");
+  await mkdir(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ modelAliases: { fixed: "fixture/model", shared: "fixture/model" } }));
+  await writeFile(join(cwd, "README.md"), "base\n");
+  await writeFile(join(cwd, ".gitignore"), "subagents-storage/\nagent/\n");
+  execFileSync("git", ["init", "-q"], { cwd });
+  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
+  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+  const observed = [];
+  registerWorkflowExtension({ version: "1.0.0", headline: "Standalone context observer", modelAliases: { dynamic: { resolve: () => "fixture/cheap" }, shared: { resolve: () => "fixture/cheap" } }, agentPreparationHooks: { observe: { prepare(_configuration, context) {
+    observed.push({ cwd: context.cwd, projectCwd: context.projectCwd, dynamicModelAliasNames: context.defaults.dynamicModelAliasNames, modelAliases: { ...context.defaults.modelAliases } });
+  } } } });
+  let worktreePath;
+  const manager = createSubagentManager({
+    agentDir,
+    storageDir: join(cwd, "subagents-storage"),
+    createExecutor(root) {
+      return { async execute(_task, options) { worktreePath = (await root.runStore.validateWorktree(options.worktreeOwner)).cwd; return { value: "done", attempts: [], cwd: worktreePath }; } };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const launched = await manager.run({ prompt: "work", worktree: "context" }, context);
+    await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
+    assert.equal(typeof worktreePath, "string");
+    assert.notEqual(worktreePath, cwd);
+    assert.deepEqual(observed, [{ cwd: worktreePath, projectCwd: cwd, dynamicModelAliasNames: ["dynamic"], modelAliases: { dynamic: "fixture/cheap", fixed: "fixture/model", shared: "fixture/model" } }]);
+  } finally {
+    await manager.dispose();
+    resetWorkflowRegistry();
     await rm(cwd, { recursive: true, force: true });
   }
 });

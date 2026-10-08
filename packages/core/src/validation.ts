@@ -290,7 +290,8 @@ export function workflowPrompt(template: string, values: Readonly<Record<string,
   });
 }
 
-const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "skills", "extensions", "contextFiles", "outputSchema", "retries", "timeoutMs"]);
+const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "outputSchema", "retries", "timeoutMs"]);
+export function isCoreAgentOption(key: string): boolean { return AGENT_OPTION_KEYS.has(key); }
 function validateAgentOption(key: string, value: unknown): void {
   switch (key) {
     case "label":
@@ -304,6 +305,10 @@ function validateAgentOption(key: string, value: unknown): void {
     case "skills":
     case "extensions":
       validateSelectorList(value, "agent options", key, "INVALID_METADATA", key !== "extensions");
+      break;
+    case "excludeTools":
+      if (!Array.isArray(value) || value.some((tool) => typeof tool !== "string" || !tool.trim() || tool !== tool.trim() || tool.startsWith("!") || resourcePatternHasMagic(tool))) fail("INVALID_METADATA", "agent excludeTools must be an array of exact tool names");
+      if (value.includes("workflow_result")) fail("INVALID_METADATA", "agent excludeTools cannot remove workflow_result");
       break;
     case "contextFiles":
       validateContextFileScopes(value, "agent options");
@@ -413,6 +418,62 @@ export function inspectWorkflowScript(script: string): StaticWorkflowCall[] {
     if (kind === "shell") return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null };
     return { ...placement, kind, start: call.start, end: call.end, name: staticString(first), prompt: null, model: null };
   });
+}
+
+/** Every option is a preparation input, because any hook may read it; one dynamic value leaves the whole call to runtime. */
+function staticPreparationOptions(node: acorn.AnyNode | undefined, omitted?: string): Record<string, JsonValue> | undefined {
+  if (node?.type !== "ObjectExpression") return undefined;
+  const options = new Map<string, JsonValue>();
+  for (const property of node.properties) {
+    if (property.type === "SpreadElement" || property.computed) return undefined;
+    const key = propertyKeyName(property);
+    if (key === undefined) return undefined;
+    if (key === omitted) continue;
+    const value = staticValue(property.value);
+    if (!value.known || !jsonValue(value.value)) return undefined;
+    options.set(key, value.value);
+  }
+  return Object.fromEntries(options);
+}
+/**
+ * A handle prepares its first turn with the create options merged with that send's options, so create options are complete
+ * only when every use of the handle provably passes no send options: `agent.create(...).send(prompt)` directly, or a
+ * `const` handle whose every reference is `handle.send(prompt)`. Computed access, destructuring, aliases or any other
+ * use leave the handle to runtime.
+ */
+function handlesWithCompleteOptions(program: acorn.Program): acorn.CallExpression[] {
+  const parents = new Map<acorn.AnyNode, acorn.AnyNode>();
+  const references = new Map<string, acorn.AnyNode[]>();
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "Identifier") references.set(node.name, [...(references.get(node.name) ?? []), node]);
+    for (const child of astChildren(node)) { parents.set(child, node); visit(child); }
+  };
+  visit(program);
+  const plainSend = (member: acorn.AnyNode | undefined): boolean => {
+    const call = member ? parents.get(member) : undefined;
+    return member?.type === "MemberExpression" && !member.computed && member.property.type === "Identifier" && member.property.name === "send"
+      && call?.type === "CallExpression" && call.callee === member && call.arguments.length <= 1 && call.arguments.every((argument) => argument.type !== "SpreadElement");
+  };
+  return agentCreateCalls(program).filter((create) => {
+    const parent = parents.get(create);
+    if (parent?.type === "MemberExpression" && parent.object === create) return plainSend(parent);
+    const declaration = parent ? parents.get(parent) : undefined;
+    if (parent?.type !== "VariableDeclarator" || parent.init !== create || parent.id.type !== "Identifier" || declaration?.type !== "VariableDeclaration" || declaration.kind !== "const") return false;
+    const name = parent.id.name;
+    return (references.get(name) ?? []).every((reference) => reference === parent.id || (parents.get(reference)?.type === "MemberExpression" && (parents.get(reference) as acorn.MemberExpression).object === reference && plainSend(parents.get(reference))));
+  });
+}
+/**
+ * Distinct, completely static option objects of agent(...) and agent.create(...) calls, so launch can inspect them
+ * before any effect. Calls with any dynamic option stay runtime-checked, and so do handles whose sends may add options.
+ */
+export function staticAgentPreparationOptions(script: string): Array<Readonly<Record<string, JsonValue>>> {
+  const program = parseWorkflow(script);
+  const calls = workflowCalls(program).filter((call) => call.callee.name === "agent").map((call) => call.arguments.some((argument) => argument.type === "SpreadElement") ? undefined : call.arguments.length < 2 ? {} : staticPreparationOptions(callArgument(call, 1)));
+  const handles = handlesWithCompleteOptions(program).map((call) => staticPreparationOptions(callArgument(call, 0), "name"));
+  const distinct = new Map<string, Readonly<Record<string, JsonValue>>>();
+  for (const options of [...calls, ...handles]) if (options) distinct.set(JSON.stringify(options), deepFreeze(options));
+  return [...distinct.values()];
 }
 
 function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {
