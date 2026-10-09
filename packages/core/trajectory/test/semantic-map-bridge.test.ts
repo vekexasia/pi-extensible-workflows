@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isSemanticMapNodeId, isValidSemanticMapBridgeEnvelope } from "../src/semantic-map/bridge.js";
+import { SemanticMapBridge, isSemanticMapNodeId, isValidSemanticMapBridgeEnvelope } from "../src/semantic-map/bridge.js";
 import { projectCurrentSemanticSnapshot } from "../src/semantic-map/index.js";
 import { adaptSemanticSnapshot } from "../src/semantic-map/adapter.js";
 
@@ -155,4 +155,37 @@ void test("more than 16 agents are paged; totals cover every agent on every page
   assert.deepEqual([summary.agents, summary.failed, summary.completed, summary.toolCalls, summary.retries, summary.usage?.input], [40, 4, 36, 40, 2, 400]);
   for (const item of pages) { assert.ok(item); assert.ok(item.nodes.size <= 500); const graph = adaptSemanticSnapshot(item.snapshot); assert.equal(graph.nodes.length, item.nodeCount); assert.equal(graph.summary?.agents, 40); }
   assert.ok(pages[1]?.snapshot.partial?.reasons?.includes("Agents 17–32 of 40 (page 2 of 3)"));
+});
+
+void test("Semantic Map rate limit uses monotonic time after posting, not rounded wall time", (context) => {
+  let monotonicMs = 1000;
+  let wallMs = 1000;
+  const sent: number[] = [];
+  context.mock.method(performance, "now", () => monotonicMs);
+  context.mock.method(Date, "now", () => wallMs);
+  context.mock.timers.enable({ apis: ["setTimeout"] });
+  const bridge = new SemanticMapBridge({
+    host: { replaceChildren() {} } as unknown as HTMLElement,
+    url: "http://127.0.0.1/semantic-map.html?v=0123456789abcdef",
+    build: "0123456789abcdef", theme: () => "dark", onStatus() {}, onRequest() {},
+  });
+  const nonce = "a".repeat(64);
+  const instance = "b".repeat(64);
+  const port = { postMessage() { sent.push(monotonicMs); monotonicMs += 0.2; }, close() {} };
+  // Only bootstrap is replaced: public updates and production ACK/rate handling are exercised.
+  Object.assign(bridge, { active: true, phase: "ready", port, nonce, instance });
+  const receiving = bridge as unknown as { receive(value: unknown): void };
+  const snapshot = (name: string) => ({ scope: { publisherId: "pub", targetKind: "run" as const, targetId: "run" }, run: { id: "run", workflowName: name, state: "running", agents: [] } });
+  bridge.update(snapshot("first"), "run", new Map(), 0);
+  receiving.receive({ type: "ack", version: 1, nonce, instance, sequence: 1, epoch: 1, nodeIds: [] });
+  monotonicMs = 1249.6;
+  wallMs = 1250; // The wall clock rounded up before 250 real milliseconds elapsed.
+  bridge.update(snapshot("second"), "run", new Map(), 0);
+  assert.equal(sent.length, 1, "a rounded wall-clock boundary must not send early");
+  wallMs = 999_999; // A clock correction must not defeat the same pending timer.
+  monotonicMs = 1250.3;
+  context.mock.timers.tick(1);
+  assert.equal(sent.length, 2);
+  assert.ok((sent[1] ?? 0) - (sent[0] ?? 0) >= 250);
+  bridge.close();
 });

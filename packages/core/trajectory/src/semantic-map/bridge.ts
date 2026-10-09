@@ -75,7 +75,7 @@ export class SemanticMapBridge {
   private loadTimer: ReturnType<typeof setTimeout> | undefined;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
   private sendTimer: ReturnType<typeof setTimeout> | undefined;
-  private lastSendAt = 0;
+  private lastSendAt = Number.NEGATIVE_INFINITY;
   private sequence = 0;
   private epoch = 0;
   private inFlight: { sequence: number; epoch: number; text: string; nodes: ReadonlyMap<string, ParentSemanticNode> } | undefined;
@@ -363,7 +363,7 @@ export class SemanticMapBridge {
 
   private flush(): void {
     if (!this.active || this.phase !== "ready" || !this.visible || this.inFlight || !this.pending || !this.port) return;
-    const delay = Math.max(0, 250 - (Date.now() - this.lastSendAt));
+    const delay = Math.max(0, 250 - (performance.now() - this.lastSendAt));
     if (delay) {
       if (!this.sendTimer) this.sendTimer = setTimeout(() => { this.sendTimer = undefined; this.flush(); }, delay);
       return;
@@ -372,10 +372,11 @@ export class SemanticMapBridge {
     this.pending = undefined;
     const sequence = ++this.sequence;
     this.inFlight = { sequence, epoch: next.epoch, text: next.text, nodes: next.nodes };
-    this.lastSendAt = Date.now();
     try {
       this.port.postMessage({ type: "snapshot", version: SEMANTIC_MAP_VERSION, nonce: this.nonce, instance: this.instance, sequence, epoch: next.epoch, snapshot: next.snapshot });
     } catch { this.fail("Semantic Map update could not be sent"); return; }
+    // Measure after posting so serialization and clock rounding cannot shorten the send interval.
+    this.lastSendAt = performance.now();
     this.options.onStatus("Rendering Semantic Map…");
     this.ackTimer = setTimeout(() => { this.fail("Semantic Map stopped responding"); }, 10_000);
   }
