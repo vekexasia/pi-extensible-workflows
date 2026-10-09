@@ -1,6 +1,8 @@
 # Changelog
 ## Unreleased
 
+- Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach.
+
 ## [6.1.0] - 2026-10-08
 
 **This minor version contains breaking changes.** Shipping them as 6.1.0 shortly after 6.0.0 is an explicit operator choice, not a SemVer-compliant version. Read the migration notes before upgrading.
