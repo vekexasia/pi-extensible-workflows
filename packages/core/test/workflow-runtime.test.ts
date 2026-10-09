@@ -23,7 +23,10 @@ void test("preflight rejects every static boundary before run creation", () => {
   const createRun = (script: string) => { preflight(script, capabilities, [], { name: "test" }); created += 1; };
   const cases: Array<[string, string]> = [
     ["const x = ;", "INVALID_SYNTAX"],
-    [`agent('a',{model:'openai/gpt:turbo'})`, "UNKNOWN_MODEL"],
+    [`agent('a',{model:'openai/:high'})`, "UNKNOWN_MODEL"],
+    // A trailing segment that names no thinking level reads as part of the model id, so a
+    // mistyped level is now rejected as missing metadata rather than as an unknown model.
+    [`agent('a',{model:'openai/gpt:turbo'})`, "INVALID_METADATA"],
     [`agent('a',{outputSchema:[]})`, "INVALID_SCHEMA"],
     [`agent('a',{label:' '})`, "INVALID_METADATA"],
     [`agent('a',{timeoutMs:0})`, "INVALID_METADATA"],
