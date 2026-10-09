@@ -318,10 +318,14 @@ function limitsRun() {
 const XSS_NAME = `<img src=x onerror="window.__xss=1;parent.__xss=1"></script><script>window.__xss=2</script>`;
 function xssRun() { return run("xss-run", `<svg onload="window.__xss=3">`, [agent("xss-agent", XSS_NAME), agent("plain-agent", "Plain agent")]); }
 
-class Publisher {
+export class Publisher {
   constructor(port, id) { this.port = port; this.id = id; this.runs = new Map(); this.sent = 0; }
   async connect() {
     this.socket = new globalThis.WebSocket(`ws://127.0.0.1:${String(this.port)}/ws`);
+    this.socket.addEventListener("message", (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type === "publisher:transcript") this.socket.send(JSON.stringify({ ...message, type: "publisher:transcript-result", ok: true, status: "empty", revision: message.revision ?? 1, entries: [] }));
+    });
     await new Promise((resolveOpen, reject) => { this.socket.addEventListener("open", () => { resolveOpen(); }, { once: true }); this.socket.addEventListener("error", () => { reject(new Error("publisher connect failed")); }, { once: true }); });
     this.socket.send(JSON.stringify({ type: "publisher:attach", publisherId: this.id }));
   }
@@ -332,6 +336,18 @@ class Publisher {
       runs: [...this.runs.values()].map((item) => ({ run: item, snapshot: { script: "ACC-PRIVATE-SCRIPT", args: { secret: "ACC-PRIVATE-ARGS" } }, transcripts: {} })), subagents: [] }));
   }
   close() { try { this.socket?.close(); } catch { /* Closed. */ } }
+}
+
+export async function waitForHeapTranscripts(target, timeoutMs = 5_000) {
+  return waitUntil(() => target.eval(`(() => {
+    const { state, selected } = window.__PIEWF_SEMANTIC_MAP_CONTEXT__;
+    const found = selected();
+    if (!found?.record.run) return false;
+    const keys = found.record.run.agents.slice(0, 16).filter(agent => agent.state !== 'queued').map(agent => found.publisher.id + '\\t' + found.record.run.id + '\\t' + agent.id);
+    const pending = Object.keys(state.transcriptPending).length;
+    const cached = keys.filter(key => Array.isArray(state.transcripts[key]) && state.transcriptStatus[key] === 'empty').length;
+    return keys.length > 0 && pending === 0 && cached === keys.length ? { expected: keys.length, cached, pending } : false;
+  })()`), timeoutMs, "heap baseline transcripts");
 }
 
 async function freePort() {
@@ -699,6 +715,7 @@ async function main() {
           await cdp.send("Memory.getDOMCounters", {}, target.sessionId).catch(() => undefined);
           const samples = [];
           const iframe = [];
+          let baselineTranscripts;
           const sample = async (cycle) => {
             await gc(target.sessionId);
             const heap = await cdp.send("Runtime.getHeapUsage", {}, target.sessionId);
@@ -714,6 +731,7 @@ async function main() {
             publishTick(tick + 1);
             if (withMap) {
               await openMap(target);
+              if (index === warm) baselineTranscripts = await waitForHeapTranscripts(target);
               if (index > warm && (index - warm) % 10 === 0) {
                 const frameSession = target.frameSession();
                 if (frameSession) { await gc(frameSession); const heap = await cdp.send("Runtime.getHeapUsage", {}, frameSession); iframe.push({ cycle: index - warm, usedSize: heap.usedSize, totalSize: heap.totalSize }); }
@@ -734,7 +752,7 @@ async function main() {
           await target.close();
           const used = samples.map((item) => item.usedSize);
           const deltas = used.slice(1).map((value, index) => value - used[index]);
-          return { label, withMap, samples, iframe, resourceEntries, growth: used.at(-1) - used[0], spread: Math.max(...used) - Math.min(...used), deltas, snapshot };
+          return { label, withMap, samples, iframe, baselineTranscripts, resourceEntries, growth: used.at(-1) - used[0], spread: Math.max(...used) - Math.min(...used), deltas, snapshot };
         };
         const controls = [await heapRun("control-1", false), await heapRun("control-2", false)];
         const noise = Math.max(...controls.map((control) => control.spread), ...controls.map((control) => Math.abs(control.growth)));
