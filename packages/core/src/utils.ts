@@ -93,11 +93,19 @@ export const WORKFLOW_EXTENSION_NAMESPACE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 export function validWorkflowExtensionNamespace(value: string): boolean { return WORKFLOW_EXTENSION_NAMESPACE.test(value) && value !== "__proto__" && value !== "constructor" && value !== "prototype"; }
 export function parseThinking(value: unknown): ModelSpec["thinking"] | undefined { return isThinkingLevel(value) ? value : undefined; }
 export function parseModelReference(value: string): ModelSpec {
-  const match = /^([^/:\s]+)\/([^:\s]+)(?::([^:\s]+))?$/.exec(value);
+  const match = /^([^/:\s]+)\/([^\s]+)$/.exec(value);
   if (!match?.[1] || !match[2]) fail("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
-  const thinking = match[3];
-  if (thinking !== undefined && !isThinkingLevel(thinking)) fail("UNKNOWN_MODEL", `Invalid thinking level: ${thinking}`);
-  return { provider: match[1], model: match[2], ...(thinking !== undefined ? { thinking } : {}) };
+  // The model id is everything after the first slash, so namespaced ids such as
+  // `deepseek/deepseek-v4.1-flash:nitro` survive intact. Only a trailing segment
+  // that names a thinking level is one.
+  const reference = match[2];
+  const separator = reference.lastIndexOf(":");
+  const suffix = separator === -1 ? undefined : reference.slice(separator + 1);
+  if (suffix === "") fail("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
+  const thinking = suffix !== undefined && isThinkingLevel(suffix) ? suffix : undefined;
+  const model = thinking === undefined ? reference : reference.slice(0, separator);
+  if (model === "") fail("UNKNOWN_MODEL", `Invalid model spec: ${value}`);
+  return { provider: match[1], model, ...(thinking === undefined ? {} : { thinking }) };
 }
 export function assertModelThinking(value: string, path = "model"): void {
   if (value.includes("/") && parseModelReference(value).thinking === undefined) fail("INVALID_METADATA", `${path} must be provider/model:thinking`);
