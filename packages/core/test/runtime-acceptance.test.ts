@@ -1071,7 +1071,7 @@ void test("session_start foreground recovery returns before completion and deliv
   await shutdown();
 });
 
-void test("interactive interrupted recovery stays detached from foreground completion", { timeout: 10000 }, async () => {
+void test("interactive background interrupted recovery returns before the run completes", { timeout: 10000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-interrupted-recovery-"));
   const cwd = join(home, "project");
   const sessionId = "session";
@@ -1085,16 +1085,17 @@ void test("interactive interrupted recovery stays detached from foreground compl
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) { command = options.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
   assert.ok(start && command && shutdown);
   await start({}, context);
-  const resumedAt = Date.now();
-  await contextualWorkflowAction(command, context, runId, "Resume");
-  assert.ok(Date.now() - resumedAt < 500);
-  for (let attempt = 0; attempt < 2000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  // The resumed run stops at its checkpoint, which is answered only after the command returns: a command awaiting completion never returns.
+  await contextualWorkflowAction(command, context, runId, "Resume", "Background");
+  await waitForRunState(store, "awaiting_input");
+  await contextualWorkflowAction(command, context, runId, "Approve approval");
+  await waitForRunState(store, "completed");
   const loaded = await store.load();
   assert.equal(loaded.run.state, "completed", JSON.stringify(loaded.run.error));
   await shutdown();
 });
 
-void test("interactive budget recovery stays detached from foreground completion", { timeout: 10000 }, async () => {
+void test("interactive background budget recovery returns before the run completes", { timeout: 10000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-budget-recovery-"));
   const cwd = join(home, "project");
   const sessionId = "session";
@@ -1116,11 +1117,11 @@ void test("interactive budget recovery stays detached from foreground completion
   const assertDetached = async (action: string, store: RunStore) => {
     const handler = command;
     assert.ok(handler);
-    const resumedAt = Date.now();
-    await contextualWorkflowAction(handler, context, store.runId, action.startsWith("adjust") ? "Adjust budget" : "Resume unchanged");
-    assert.ok(Date.now() - resumedAt < 500);
-    for (let attempt = 0; attempt < 2000 && (await store.load()).run.state !== "completed"; attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 2));
-    assert.equal((await store.load()).run.state, "completed");
+    // The resumed run stops at its checkpoint, which is answered only after the command returns: a command awaiting completion never returns.
+    await contextualWorkflowAction(handler, context, store.runId, action.startsWith("adjust") ? "Adjust budget" : "Resume unchanged", "Background");
+    await waitForRunState(store, "awaiting_input");
+    await contextualWorkflowAction(handler, context, store.runId, "Approve approval");
+    await waitForRunState(store, "completed");
   };
   await assertDetached("resume budget-resume", resumeStore);
   await assertDetached("adjust budget-adjust", adjustStore);

@@ -424,8 +424,8 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
     const progress: string[] = [];
     const result = await runWorkflowEvals({
       cases: [
-        { id: "first", prompt: "ignored", timeoutMs: 2_000, maxCost: 0.1, expectations: {} },
-        { id: "second", prompt: "ignored", timeoutMs: 2_000, maxCost: 0.1, expectations: {} },
+        { id: "first", prompt: "ignored", maxCost: 0.1, expectations: {} },
+        { id: "second", prompt: "ignored", maxCost: 0.1, expectations: {} },
       ],
       model: "fake/model",
       piCommand: fakePi,
@@ -438,6 +438,21 @@ void test("uses the effective remaining spend ceiling for untrusted case fallbac
     assert.equal(existsSync(seededRole), true);
     assert.match(progress.join("\n"), /first: starting[\s\S]*first: failed/);
     assert.match(formatEvalSummary(result), /first: failed[\s\S]*error:[\s\S]*Artifacts:/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+void test("reports a case that outlives its timeout as timed out and charges its whole budget", async () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-workflow-eval-timeout-"));
+  const fakePi = join(root, "fake-pi.mjs");
+  // Outlives the case timeout, but a fake pi orphaned by a killed case process still exits on its own.
+  writeFileSync(fakePi, "#!/usr/bin/env node\nsetTimeout(() => {}, 60_000);\n");
+  chmodSync(fakePi, 0o755);
+  try {
+    const result = await runWorkflowEvals({ cases: [{ id: "slow", prompt: "ignored", timeoutMs: 50, maxCost: 0.1, expectations: {} }], model: "fake/model", piCommand: fakePi, artifactsDir: join(root, "artifacts"), spendCeiling: 1 });
+    assert.deepEqual(result.cases.map(({ id, status, limits }) => [id, status, limits.timeoutMs]), [["slow", "timed_out", 50]]);
+    assert.equal(result.cases[0]?.accountingTrustworthy, false);
+    assert.equal(result.spent.toFixed(2), "0.10");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

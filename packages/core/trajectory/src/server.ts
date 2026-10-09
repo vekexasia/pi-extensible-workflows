@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { URL } from "node:url";
 import { isTrajectoryAction, isTrajectoryTarget, trajectoryActionError } from "../../src/trajectory-contracts.js";
+import { atomicWriteFile } from "../../src/io.js";
 import { sameFilesystemPath } from "../../src/paths.js";
+import { isNodeError, object } from "../../src/utils.js";
+import { processStart, readStartupHolder, releaseStartupMutex, tryAcquireStartupMutex } from "./startup-mutex.js";
 import { TOOL_TIMING_ENTRY_TYPE } from "../../src/tool-timing.js";
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
 
@@ -270,16 +273,30 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     if (!requests.size) pending.delete(browser);
     emit(browser, errorResponse(requestId, request, "failed", error));
   };
+  const busy = () => closed || [...publishers.values()].some(({ value }) => value.connected === true);
   const scheduleIdleExit = () => {
-    if (closed || [...publishers.values()].some(({ value }) => value.connected === true) || idleTimer !== undefined) return;
+    if (busy() || idleTimer !== undefined) return;
     idleTimer = setTimeout(() => {
-      server.closeAllConnections();
-      for (const client of clients) client.socket.destroy();
-      server.close(() => {
-        void rm(lockPath, { force: true }).then(() => { process.exit(0); }).catch(() => { process.exit(1); });
-      });
+      idleTimer = undefined;
+      void tryAcquireStartupMutex(lockPath).then(async (token) => {
+        // A Pi holding the startup mutex may be about to reuse this server, so the exit waits for another idle period.
+        if (token === undefined) { scheduleIdleExit(); return; }
+        if (busy() || idleTimer !== undefined) { await releaseStartupMutex(lockPath, token); return; }
+        server.closeAllConnections();
+        for (const client of clients) client.socket.destroy();
+        server.close(() => {
+          void removeOwnLock().then(() => releaseStartupMutex(lockPath, token)).then(() => { process.exit(0); }).catch(() => { process.exit(1); });
+        });
+      }).catch(() => { process.exit(1); });
     }, TRAJECTORY_IDLE_EXIT_MS);
     idleTimer.unref();
+  };
+  // Runs under the startup mutex; a Pi may have replaced the lock while this server was idle.
+  const removeOwnLock = async (): Promise<void> => {
+    let current: unknown;
+    try { current = JSON.parse(await readFile(lockPath, "utf8")); }
+    catch (error) { if (isNodeError(error, "ENOENT")) return; throw error; }
+    if (object(current) && current.pid === process.pid && current.startedAt === startedAt) await rm(lockPath, { force: true });
   };
   const cancelIdleExit = () => {
     if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; }
@@ -528,9 +545,26 @@ export function createTrajectoryServer(port: number, lockPath: string, options: 
     // A dropped tab only sends FIN, and an upgraded socket stays half-open until this side closes it.
     socket.on("end", () => { socket.destroy(); });
   });
-  server.once("listening", () => { startedAt = Date.now(); void writeFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt })}\n`, { mode: 0o600 }).catch(() => { process.exitCode = 1; }); scheduleIdleExit(); });
+  // Listening is emitted before the event loop accepts a connection, so the synchronous atomic write publishes the lock before /health can answer.
+  server.once("listening", () => {
+    startedAt = Date.now();
+    try { atomicWriteFile(lockPath, `${JSON.stringify({ pid: process.pid, port, fingerprint: serverFingerprint, startedAt, start: processStart(process.pid) })}\n`, true); }
+    catch (error) { server.close(); server.emit("error", error); return; }
+    scheduleIdleExit();
+  });
   server.on("close", () => { closed = true; if (idleTimer !== undefined) { clearTimeout(idleTimer); idleTimer = undefined; } });
   return server;
+}
+
+// The spawning Pi records this server in its startup holder, which then stays held until this server publishes or exits; without that record the startup was abandoned.
+async function awaitStartupRecord(lockPath: string, token: string): Promise<void> {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const holder = readStartupHolder(lockPath, token);
+    if (holder === undefined) break;
+    if (holder.server?.pid === process.pid) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("Trajectory startup was abandoned before the server listened");
 }
 
 async function main(): Promise<void> {
@@ -539,7 +573,9 @@ async function main(): Promise<void> {
   const port = Number(args.get("--port"));
   const lockPath = args.get("--lock");
   const fingerprint = args.get("--fingerprint");
+  const startupToken = args.get("--startup");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535 || !lockPath || !fingerprint) throw new Error("Invalid Trajectory server arguments");
+  if (startupToken !== undefined) await awaitStartupRecord(lockPath, startupToken);
   const server = createTrajectoryServer(port, lockPath, { fingerprint });
   await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", () => { resolve(); }); });
 }
