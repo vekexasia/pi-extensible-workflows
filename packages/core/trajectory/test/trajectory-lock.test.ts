@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { createTrajectoryController, trajectoryServerPath, type TrajectoryController } from "../src/index.js";
+import { SEMANTIC_MAP_BUILD_STAMP } from "../src/semantic-map-assets.js";
 import { isNodeError } from "../../src/utils.js";
 
 type TrajectoryLock = { pid: number; port: number; fingerprint?: string };
@@ -32,8 +33,8 @@ function input(home: string, port: number) {
 }
 async function currentFingerprint(): Promise<string> {
   const serverPath = fileURLToPath(new URL("../src/server.js", import.meta.url));
-  const [serverBytes, htmlBytes] = await Promise.all([readFile(serverPath), readFile(join(dirname(serverPath), "assets/index.html"))]);
-  return `${createHash("sha256").update(serverBytes).digest("hex")}:${createHash("sha256").update(htmlBytes).digest("hex")}`;
+  const serverBytes = await readFile(serverPath);
+  return `${createHash("sha256").update(serverBytes).digest("hex")}:${SEMANTIC_MAP_BUILD_STAMP}`;
 }
 function kill(pid: number): void {
   try { process.kill(pid, "SIGKILL"); }
