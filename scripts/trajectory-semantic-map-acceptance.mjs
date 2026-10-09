@@ -444,7 +444,7 @@ async function main() {
         const opened = await openMap(page);
         const xss = await page.childEval(`(()=>{const node=[...document.querySelectorAll('.semantic-map-node')].find(n=>n.getAttribute('data-node-label')===${JSON.stringify(XSS_NAME)});return {found:Boolean(node),text:node?node.querySelector('text').textContent:null,markup:document.querySelectorAll('.diagram-container svg img,.diagram-container svg script,.diagram-container svg foreignObject').length,childXss:window.__xss??null,origin:self.origin}})()`);
         const parentXss = await page.eval("({xss:window.__xss??null,injected:document.querySelectorAll('img[src=\"x\"],svg[onload]').length})");
-        criterion("security", "live-path XSS label renders as inert text in parent and opaque viewer", xss.found && xss.text === XSS_NAME && xss.markup === 0 && xss.childXss === null && parentXss.xss === null && parentXss.injected === 0 && xss.origin === "null", { ...xss, parent: parentXss, firstVisibleMs: round(opened.latency.value) });
+        criterion("security", "live-path XSS label renders as inert text in parent and opaque viewer", xss.found && xss.text === `${XSS_NAME.slice(0, 20)}…` && xss.markup === 0 && xss.childXss === null && parentXss.xss === null && parentXss.injected === 0 && xss.origin === "null", { ...xss, parent: parentXss, firstVisibleMs: round(opened.latency.value) });
         await delay(300);
         const sends = await slice(page, "sends", 0);
         criterion("security", "no private prompt/script/args/cwd/result string in any snapshot posted to the viewer", sends.length > 0 && sends.every((send) => !send.leak), { snapshots: sends.length, leaks: sends.filter((send) => send.leak).length });
@@ -643,29 +643,39 @@ async function main() {
         const graph = await page.childEval("(()=>{const nodes=[...document.querySelectorAll('.semantic-map-node')];const labels=new Set(nodes.filter(n=>/^Agent \\d\\d$/.test(n.getAttribute('data-node-label'))).map(n=>n.getAttribute('data-node-label')));return {nodes:nodes.length,agents:labels.size,relations:[...document.querySelectorAll('.semantic-map-edge')].filter(e=>['dependency','fork','merge'].includes(e.getAttribute('data-edge-type'))).length,notice:document.getElementById('semantic-map-completeness')?.textContent||''}})()");
         results.limits = { source: { agents: 18, relations: 9 }, parentLimits: { agents: 16, relations: 8, toolCalls: 16 }, drawn: graph };
         write("limits.json", results.limits);
-        criterion("limits", "parent projection honours 16 agents / 8 recorded relations and says so (source 18/9)", graph.agents === 16 && graph.relations <= 8 && graph.notice.includes("Source agent list bounded") && graph.notice.includes("Recorded relation list bounded"), graph);
+        criterion("limits", "parent projection honours 16 agents / 8 recorded relations and says so (source 18/9)", graph.agents === 16 && graph.relations <= 8 && graph.notice.includes("Agents 1–16 of 18 (page 1 of 2)") && graph.notice.includes("Recorded relation list bounded"), graph);
         await closeMap(page);
         await page.eval(`[...document.querySelectorAll('#sidebar [data-run]')].find(b=>b.dataset.run==='accpublisher:acc-run').click()`);
         await waitUntil(async () => (await page.eval("document.body.dataset.view")) === "run", 5_000, "acc run view");
       }
       if (phase === "renderer") {
         // Adapter/renderer limit, separately from the parent: the real served viewer rendering 600 agents / 1797 relations.
-        const viewer = await openPage(cdp, `${base}/semantic-map.html?v=${SEMANTIC_MAP_BUILD_STAMP}&embed=1`);
-        await waitUntil(() => viewer.eval("Boolean(window.SemanticMap && window.__accProbe)"), 10_000, "standalone viewer");
+        // The opaque viewer intentionally has no direct JS/CSS includes. Exercise the trusted parent bootstrap,
+        // then inject large snapshots into its initialized renderer without the smaller parent projection cap.
+        const viewer = await newPage(false);
+        await openMap(viewer);
+        await waitUntil(() => viewer.childEval("Boolean(window.SemanticMap && window.__accProbe)"), 10_000, "bootstrapped viewer");
+        const rendererSession = viewer.frameSession() ?? viewer.sessionId;
         // Size sweep: each size renders once fresh (new scope) and then three in-place updates. The largest input is CPU-profiled.
-        const sweep = async (agentsCount, relationsPerAgent) => viewer.eval(String.raw`(async()=>{
+        const sweep = async (agentsCount, relationsPerAgent) => viewer.childEval(String.raw`(async()=>{
           const frame=()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
           const n=${String(agentsCount)},per=${String(relationsPerAgent)};
           const make=(offset)=>{const agents=Array.from({length:n},(_,i)=>({id:'a'+i,name:'Agent '+i,state:(i+offset)%7===0?'completed':'running',attempts:1,output:{status:'pending'}}));const relations=[];for(let i=0;i<n;i++)for(let d=1;d<=per;d++)if(i+d<n)relations.push({kind:d===2?'fork':'dependency',fromAgentId:agents[i].id,toAgentId:agents[i+d].id,evidence:'recorded'});return {scope:{publisherId:'p',targetKind:'run',targetId:'t'+n},run:{id:'t'+n,workflowName:'Renderer limit',state:'running',agents},relations};};
           const out=[];
-          for(let k=0;k<4;k++){const s=make(k);const t=performance.now();const g=window.SemanticMap.render(s);const r=performance.now();await frame();out.push({agents:n,relationsIn:s.relations.length,kind:k===0?'initial':'update',renderMs:r-t,visibleMs:performance.now()-t,nodes:g.nodes.length,edges:g.edges.length,domNodes:document.querySelectorAll('.semantic-map-node').length,domEdges:document.querySelectorAll('.semantic-map-edge').length,partial:g.completeness.partial,reasons:g.completeness.reasons,payloadBytes:new TextEncoder().encode(JSON.stringify(g)).byteLength});}
+          for(let k=0;k<4;k++){const s=make(k);const t=performance.now();const g=window.SemanticMap.render(s);const r=performance.now();await frame();
+            // Scope/workflow nodes are represented by headings, not cards. These sweep agents have no folded events.
+            const expectedNodes=g.nodes.filter(node=>node.agentId!==undefined).map(node=>node.id).sort();
+            const drawn=new Set(expectedNodes);const expectedEdges=g.edges.filter(edge=>drawn.has(edge.from)&&drawn.has(edge.to)).map(edge=>edge.id).sort();
+            const domNodes=[...document.querySelectorAll('.semantic-map-node')].map(node=>node.getAttribute('data-node-id')).sort();
+            const domEdges=[...document.querySelectorAll('.semantic-map-edge')].map(edge=>edge.getAttribute('data-edge-id')).sort();
+            out.push({agents:n,relationsIn:s.relations.length,kind:k===0?'initial':'update',renderMs:r-t,visibleMs:performance.now()-t,nodes:g.nodes.length,edges:g.edges.length,domNodes:domNodes.length,domEdges:domEdges.length,expectedDrawnNodes:expectedNodes.length,expectedDrawnEdges:expectedEdges.length,domMatches:JSON.stringify(domNodes)===JSON.stringify(expectedNodes)&&JSON.stringify(domEdges)===JSON.stringify(expectedEdges),partial:g.completeness.partial,reasons:g.completeness.reasons,payloadBytes:new TextEncoder().encode(JSON.stringify(g)).byteLength});}
           return out;})()`);
         const samples = [];
         for (const [count, per] of [[20, 3], [60, 3], [120, 3], [200, 3], [240, 6], [300, 3]]) samples.push(...await sweep(count, per));
-        await cdp.send("Profiler.enable", {}, viewer.sessionId);
-        await cdp.send("Profiler.start", {}, viewer.sessionId);
+        await cdp.send("Profiler.enable", {}, rendererSession);
+        await cdp.send("Profiler.start", {}, rendererSession);
         samples.push(...await sweep(600, 3));
-        const { profile } = await cdp.send("Profiler.stop", {}, viewer.sessionId);
+        const { profile } = await cdp.send("Profiler.stop", {}, rendererSession);
         const selfTime = {};
         const byId = new Map(profile.nodes.map((node) => [node.id, node]));
         const intervals = profile.timeDeltas ?? [];
@@ -677,7 +687,7 @@ async function main() {
         const largest = samples.filter((item) => item.agents === 600);
         const reachedNodes = Math.max(...samples.map((item) => item.nodes));
         const reachedEdges = Math.max(...samples.map((item) => item.edges));
-        criterion("renderer", "adapter/renderer never exceed 500 nodes / 1500 edges / 512 KiB, DOM equals the graph, and truncation is explicit", samples.every((item) => item.nodes <= 500 && item.edges <= 1500 && item.payloadBytes <= 512 * 1024 && item.domNodes === item.nodes && item.domEdges === item.edges && (item.agents * 2 + 1 <= 500 || item.partial)), { reachedNodes, reachedEdges, largest: largest.map(({ nodes, edges, payloadBytes, reasons }) => ({ nodes, edges, payloadBytes, reasons })).at(0) });
+        criterion("renderer", "adapter/renderer never exceed 500 nodes / 1500 edges / 512 KiB, DOM exactly matches drawable graph IDs, and truncation is explicit", samples.every((item) => item.nodes <= 500 && item.edges <= 1500 && item.payloadBytes <= 512 * 1024 && item.domMatches && (item.agents * 2 + 1 <= 500 || item.partial)), { reachedNodes, reachedEdges, largest: largest.map(({ nodes, edges, payloadBytes, reasons }) => ({ nodes, edges, payloadBytes, reasons })).at(0) });
         criterion("renderer", "largest-input render (600 agents / 1797 relations, truncated) stays within 1000 ms per render", largest.every((item) => item.visibleMs <= 1000), { visibleMs: largest.map((item) => round(item.visibleMs)), hot: hot.slice(0, 5) });
       }
       if (phase === "heap") {
