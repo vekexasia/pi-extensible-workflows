@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -246,17 +246,21 @@ void test("mounts once and only animates while a run spins", async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-void test("refreshes elapsed clocks without spinner animation", async () => {
+void test("refreshes elapsed clocks without spinner animation", (t) => {
   const root = mkdtempSync(join(tmpdir(), "widget-elapsed-"));
   const directory = writeRun(join(root, "run-1"), runState({ state: "paused" }));
+  // The clock starts half a second after the run directory's birth time, so one rescan interval crosses exactly one second.
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Math.ceil(statSync(directory).birthtimeMs) + 500 });
   const host = harness();
   host.start();
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
 
   const header = () => host.frames.at(-1).map(plain).find((line) => line.includes(" smoke "));
-  const initial = header();
-  await new Promise((resolve) => globalThis.setTimeout(resolve, 1250));
-  assert.notEqual(header(), initial, "a paused run's elapsed time keeps moving");
+  assert.match(header(), / 00:00 │$/);
+  const renders = host.renderRequests;
+  t.mock.timers.tick(1000);
+  assert.equal(host.renderRequests, renders + 1, "only the rescan renders a paused run");
+  assert.match(header(), / 00:01 │$/, "a paused run's elapsed time keeps moving");
 
   host.shutdown();
   rmSync(root, { recursive: true, force: true });

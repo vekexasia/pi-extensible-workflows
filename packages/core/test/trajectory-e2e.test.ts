@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -59,6 +59,10 @@ void test("an npm-installed package opens Trajectory from the real Pi TUI", { sk
   const h = TestHarness.create({ prefix: "trajectory-e2e", agentDir, homeDir: root, environment: { PI_WORKFLOW_TRAJECTORY_PORT: trajectoryPort } });
   try {
     installPackage(root, agentDir);
+    // The fixture agent has already seen this release's notes: the long changelog notice would push the startup header out of the harness readiness window.
+    const { version } = JSON.parse(readFileSync(join(coreRoot, "package.json"), "utf8")) as { version: string };
+    mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(agentDir, "pi-extensible-workflows", "changelog-state.json"), `${JSON.stringify({ lastNotifiedVersion: version })}\n`);
     await h.addRun({ workflowName: "trajectory-fixture", state: "completed" });
     await h.launch({ installedExtensions: true });
 

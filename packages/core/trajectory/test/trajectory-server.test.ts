@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createConnection, createServer as createNetServer, type Socket } from "node:net";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { watch } from "node:fs";
+import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createTrajectoryServer } from "../src/server.js";
+import { identityOf, releaseStartupMutex, tryAcquireStartupMutex } from "../src/startup-mutex.js";
 
 async function availablePort(): Promise<number> {
   const probe = createNetServer();
@@ -149,7 +152,7 @@ void test("Trajectory persists the server fingerprint in its listening lock", as
   try {
     const lock: unknown = JSON.parse(await readFile(join(root, "trajectory.lock"), "utf8"));
     assert.ok(typeof lock === "object" && lock !== null && "startedAt" in lock && typeof lock.startedAt === "number" && lock.startedAt <= Date.now());
-    assert.deepEqual({ ...lock, startedAt: undefined }, { pid: process.pid, port, fingerprint, startedAt: undefined });
+    assert.deepEqual({ ...lock, startedAt: undefined }, { ...identityOf(process.pid), port, fingerprint, startedAt: undefined });
   } finally {
     server.closeAllConnections();
     server.closeIdleConnections();
@@ -632,6 +635,159 @@ void test("Trajectory idle exit closes open clients and removes its lock", async
     socket?.destroy();
     pending?.destroy();
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+type Health = { pid?: unknown; fingerprint?: unknown; startedAt?: unknown };
+async function health(port: number): Promise<Health | undefined> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${String(port)}/health`, { signal: AbortSignal.timeout(300) });
+    return response.ok ? await response.json() as Health : undefined;
+  } catch { return undefined; }
+}
+function spawnServer(port: number, lockPath: string): ReturnType<typeof spawn> {
+  return spawn(process.execPath, [fileURLToPath(new URL("../src/server.js", import.meta.url)), "--port", String(port), "--lock", lockPath, "--fingerprint", "test-fingerprint"], { stdio: "ignore" });
+}
+
+void test("Trajectory answers /health only after its lock names it", { skip: process.platform === "win32" ? "needs a POSIX FIFO" : false }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-publish-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  // A FIFO with no reader holds back any write into the existing lock file indefinitely.
+  execFileSync("mkfifo", [lockPath]);
+  const child = spawnServer(port, lockPath);
+  try {
+    let served: Health | undefined;
+    for (let attempt = 0; attempt < 500 && served === undefined && child.exitCode === null; attempt += 1) {
+      served = await health(port);
+      if (served === undefined) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(served, "Trajectory server never became healthy");
+    assert.ok((await lstat(lockPath)).isFile(), "/health answered before the lock was published");
+    const lock: unknown = JSON.parse(await readFile(lockPath, "utf8"));
+    assert.ok(child.pid);
+    assert.deepEqual(lock, { ...identityOf(child.pid), port, fingerprint: "test-fingerprint", startedAt: served.startedAt });
+    assert.equal(served.pid, child.pid);
+  } finally {
+    child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory server that cannot publish its lock exits without answering /health", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-publish-failure-"));
+  const port = await availablePort();
+  const child = spawnServer(port, join(root, "missing", "trajectory.lock"));
+  const exited = waitForExit(child, 15000);
+  try {
+    let answered = false;
+    while (child.exitCode === null && !answered) {
+      answered = await health(port) !== undefined;
+      if (!answered) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(answered, false, "Trajectory reported ready without a lock");
+    assert.equal(await exited, 1);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await exited.catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory server that cannot listen exits and leaves the current lock alone", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-port-taken-"));
+  const occupant = createNetServer();
+  await new Promise<void>((resolve, reject) => { occupant.once("error", reject); occupant.listen(0, "127.0.0.1", resolve); });
+  const address = occupant.address();
+  assert.ok(address && typeof address === "object");
+  const lockPath = join(root, "trajectory.lock");
+  const current = `${JSON.stringify({ pid: process.pid, port: address.port, fingerprint: "current", startedAt: Date.now() })}\n`;
+  await writeFile(lockPath, current, "utf8");
+  try {
+    assert.equal(await waitForExit(spawnServer(address.port, lockPath), 15000), 1);
+    assert.equal(await readFile(lockPath, "utf8"), current);
+  } finally {
+    await new Promise<void>((resolve) => { occupant.close(() => { resolve(); }); });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory server whose startup was revoked exits without publishing its lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-revoked-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  // The Pi that launched it gave up and released the startup, so a later owner's lock must not be replaced.
+  const current = `${JSON.stringify({ pid: process.pid, port, fingerprint: "current", startedAt: Date.now() })}\n`;
+  await writeFile(lockPath, current, "utf8");
+  const child = spawn(process.execPath, [fileURLToPath(new URL("../src/server.js", import.meta.url)), "--port", String(port), "--lock", lockPath, "--fingerprint", "test-fingerprint", "--startup", "revoked-token"], { stdio: "ignore" });
+  try {
+    assert.equal(await waitForExit(child, 15000), 1);
+    assert.equal(await readFile(lockPath, "utf8"), current);
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory idle exit keeps a lock another process published", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-idle-foreign-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  const moduleUrl = new URL("../src/server.js", import.meta.url).href;
+  // Only the idle exit scheduled after the publisher detaches is shortened, so the lock is replaced before it can fire.
+  const childScript = `const realSetTimeout = globalThis.setTimeout; let idleTimers = 0; globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(callback, delay === 300000 && idleTimers++ > 0 ? 50 : delay, ...args); const { createTrajectoryServer } = await import(${JSON.stringify(moduleUrl)}); createTrajectoryServer(${String(port)}, ${JSON.stringify(lockPath)}, { fingerprint: "test-fingerprint" }).listen(${String(port)}, "127.0.0.1");`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", childScript], { stdio: "ignore" });
+  const exited = waitForExit(child, 15000);
+  let socket: Socket | undefined;
+  try {
+    socket = (await handshakeWhenReady(port, `http://127.0.0.1:${String(port)}`)).socket;
+    const foreign = `${JSON.stringify({ pid: process.pid, port, fingerprint: "other", startedAt: Date.now() })}\n`;
+    await writeFile(lockPath, foreign, "utf8");
+    socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "idle" })));
+    socket.write(maskedFrame(JSON.stringify({ type: "publisher:detach" })));
+    assert.equal(await exited, 0);
+    assert.equal(await readFile(lockPath, "utf8"), foreign);
+  } finally {
+    socket?.destroy();
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await exited.catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+void test("Trajectory idle exit waits while a Pi holds the startup mutex", async () => {
+  const root = await mkdtemp(join(tmpdir(), "trajectory-server-idle-startup-"));
+  const port = await availablePort();
+  const lockPath = join(root, "trajectory.lock");
+  const moduleUrl = new URL("../src/server.js", import.meta.url).href;
+  const childScript = `const realSetTimeout = globalThis.setTimeout; let idleTimers = 0; globalThis.setTimeout = (callback, delay, ...args) => realSetTimeout(callback, delay === 300000 && idleTimers++ > 0 ? 50 : delay, ...args); const { createTrajectoryServer } = await import(${JSON.stringify(moduleUrl)}); createTrajectoryServer(${String(port)}, ${JSON.stringify(lockPath)}, { fingerprint: "test-fingerprint" }).listen(${String(port)}, "127.0.0.1");`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", childScript], { stdio: "ignore" });
+  const exited = waitForExit(child, 15000);
+  let socket: Socket | undefined;
+  let watcher: ReturnType<typeof watch> | undefined;
+  try {
+    socket = (await handshakeWhenReady(port, `http://127.0.0.1:${String(port)}`)).socket;
+    const token = await tryAcquireStartupMutex(lockPath);
+    assert.ok(token);
+    // The server's own acquisition attempt shows up as its temporary holder file in the mutex directory.
+    const holders = watch(`${lockPath}.startup`);
+    watcher = holders;
+    const attempted = new Promise<void>((resolve) => { holders.on("change", (_event, name) => { if (String(name).includes(`.${String(child.pid)}.`)) resolve(); }); });
+    socket.write(maskedFrame(JSON.stringify({ type: "publisher:attach", publisherId: "idle" })));
+    socket.write(maskedFrame(JSON.stringify({ type: "publisher:detach" })));
+    assert.equal(await Promise.race([attempted.then(() => "attempted"), exited.then(() => "exited")]), "attempted");
+    assert.equal(child.exitCode, null);
+    assert.equal((await health(port))?.pid, child.pid);
+
+    await releaseStartupMutex(lockPath, token);
+    assert.equal(await exited, 0);
+    await assert.rejects(readFile(lockPath), { code: "ENOENT" });
+  } finally {
+    watcher?.close();
+    socket?.destroy();
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await exited.catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

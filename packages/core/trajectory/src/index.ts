@@ -1,15 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { clearTrajectoryHost, setTrajectoryHost, type TrajectoryHost, type TrajectoryPublisherProvider } from "../../src/trajectory-host-handle.js";
-import { processAlive } from "../../src/session-lease.js";
+import { atomicJson } from "../../src/io.js";
 import { errorText, isNodeError, object, positiveInteger } from "../../src/utils.js";
 import { isTimingTranscriptEntry, isTrajectoryAction, isTrajectoryTarget, trajectoryActionError, TRAJECTORY_MAX_TRANSCRIPT_BYTES, type TrajectoryPublisherInput, type TrajectoryPublisherMetadata, type TrajectoryTranscriptRequest, type TrajectoryTranscriptResult } from "../../src/trajectory.js";
 import { shareTrajectoryRun } from "./export.js";
+import { identityOf, processConfirmed, processLive, processStart, recordStartupServer, releaseStartupMutex, tryAcquireStartupMutex } from "./startup-mutex.js";
 
 const DEFAULT_TRAJECTORY_PORT = 7432;
 const TRAJECTORY_IDLE_EXIT_MS = 5 * 60 * 1000;
@@ -24,7 +25,7 @@ type TrajectoryPublisherClient = {
 
 type TrajectoryPublisherConstructor = new (url: string) => TrajectoryPublisherClient;
 
-type TrajectoryLock = { pid: number; port: number; fingerprint?: string; startedAt?: number };
+type TrajectoryLock = { pid: number; port: number; fingerprint?: string; startedAt?: number; start?: string };
 export type TrajectoryController = {
   open(input: TrajectoryPublisherInput): Promise<{ port: number }>;
   close(): Promise<void>;
@@ -65,111 +66,134 @@ function signalProcess(pid: number, signal: NodeJS.Signals): void {
     if (!isNodeError(error, "ESRCH")) throw error;
   }
 }
-async function stopStaleServer(lock: TrajectoryLock): Promise<void> {
-  // During startup, the lock can name the current Pi process rather than the detached server.
-  if (lock.pid === process.pid) return;
-  // NOTE: after a reboot the pid can belong to an unrelated process; startedAt (checked against /proc ctime) is the only proof it is still ours.
-  if (!await processAlive(lock.pid, lock.startedAt)) return;
-  signalProcess(lock.pid, "SIGTERM");
+// Called right after /health named this pid; its start, read now, tells a later reuse of the pid apart before SIGKILL.
+// Returns only once the server is gone: a server that may still serve keeps its lock and port, so nothing replaces it.
+async function stopStaleServer(pid: number, port: number): Promise<void> {
+  const server = identityOf(pid);
+  if (!processLive(server)) return;
+  signalProcess(pid, "SIGTERM");
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {
-    if (!await serverHealthy(lock.port)) break;
+    if (!await serverHealthy(port)) break;
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     await delay(Math.min(50, remaining));
   }
-  if (await processAlive(lock.pid, lock.startedAt)) signalProcess(lock.pid, "SIGKILL");
+  // Without a confirmed identity the pid may now be an unrelated process, so SIGTERM is never escalated.
+  if (processConfirmed(server)) signalProcess(pid, "SIGKILL");
+  for (let attempt = 0; attempt < 50 && processLive(server); attempt += 1) await delay(20);
+  if (processLive(server)) throw new Error(`Stale Trajectory server ${String(pid)} on port ${String(port)} did not stop; stop it and retry`);
 }
 
+// Only a missing or malformed lock reads as absent; any other read error leaves its owner unknown, so it is thrown.
 async function readLock(path: string): Promise<TrajectoryLock | undefined> {
-  try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (!object(parsed) || !positiveInteger(parsed.pid) || !positiveInteger(parsed.port) || parsed.port > 65535) return undefined;
-    const fingerprint = typeof parsed.fingerprint === "string" ? parsed.fingerprint : undefined;
-    const startedAt = positiveInteger(parsed.startedAt) ? parsed.startedAt : undefined;
-    return { pid: parsed.pid, port: parsed.port, ...(fingerprint === undefined ? {} : { fingerprint }), ...(startedAt === undefined ? {} : { startedAt }) };
-  } catch (error) {
-    if (isNodeError(error, "ENOENT")) return undefined;
-    return undefined;
+  let text: string;
+  try { text = await readFile(path, "utf8"); }
+  catch (error) { if (isNodeError(error, "ENOENT")) return undefined; throw error; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(text); } catch { return undefined; }
+  if (!object(parsed) || !positiveInteger(parsed.pid) || !positiveInteger(parsed.port) || parsed.port > 65535) return undefined;
+  const fingerprint = typeof parsed.fingerprint === "string" ? parsed.fingerprint : undefined;
+  const startedAt = positiveInteger(parsed.startedAt) ? parsed.startedAt : undefined;
+  const start = typeof parsed.start === "string" ? parsed.start : undefined;
+  return { pid: parsed.pid, port: parsed.port, ...(fingerprint === undefined ? {} : { fingerprint }), ...(startedAt === undefined ? {} : { startedAt }), ...(start === undefined ? {} : { start }) };
+}
+
+// One holder runs at most two bounded health waits (60 × (300 + 50) ms each) and one stop (3 s, its final health check, and 1 s for its exit).
+const STARTUP_MUTEX_WAIT_MS = 2 * 60 * (300 + 50) + 3_000 + 1_000 + 1_000;
+async function acquireStartupMutex(lockPath: string): Promise<string> {
+  const deadline = Date.now() + STARTUP_MUTEX_WAIT_MS;
+  for (;;) {
+    const token = await tryAcquireStartupMutex(lockPath);
+    if (token !== undefined) return token;
+    if (Date.now() >= deadline) throw new Error("Another Pi is still starting Trajectory; retry");
+    // Contenders that saw each other both back off; a random delay keeps them from retrying in step.
+    await delay(25 + Math.floor(Math.random() * 50));
   }
 }
-
-// Only a server reporting this fingerprint counts: an older one still bound to the port would otherwise be adopted forever.
-async function waitForServer(port: number, fingerprint: string): Promise<void> {
-  let foreign = false;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+type IdentifiedHealth = ServerHealth & { pid: number; fingerprint: string };
+// Only a Trajectory server reports a fingerprint; any other service answering /health is never signalled.
+function isTrajectoryServer(health: ServerHealth | undefined): health is IdentifiedHealth { return health?.pid !== undefined && health.fingerprint !== undefined; }
+// A lock proves which process serves its port only when that process reports the same identity.
+function ownsLock(health: ServerHealth | undefined, lock: TrajectoryLock): health is IdentifiedHealth {
+  return isTrajectoryServer(health) && health.pid === lock.pid && (lock.startedAt === undefined || lock.startedAt === health.startedAt);
+}
+async function awaitHealth(port: number, accept: (health: ServerHealth) => boolean, stopped: () => boolean = () => false): Promise<ServerHealth | undefined> {
+  for (let attempt = 0; attempt < 60 && !stopped(); attempt += 1) {
     const health = await serverHealth(port);
-    if (health?.fingerprint === fingerprint) return;
-    foreign = health !== undefined;
+    if (health !== undefined && accept(health)) return health;
     await delay(50);
   }
-  throw new Error(foreign ? `Trajectory port ${String(port)} is held by another Trajectory server; stop it and retry` : `Trajectory server did not start on port ${String(port)}`);
-}
-async function resolveExistingServer(lockPath: string, existing: TrajectoryLock, fingerprint: string): Promise<TrajectoryLock | undefined> {
-  const health = await serverHealth(existing.port);
-  if (health) {
-    if (existing.fingerprint === fingerprint && health.fingerprint === fingerprint) return existing;
-    await stopStaleServer(existing);
-    await rm(lockPath, { force: true });
-    return undefined;
-  }
-  if (await processAlive(existing.pid, existing.startedAt)) {
-    try {
-      await waitForServer(existing.port, fingerprint);
-      return existing;
-    } catch {
-      // A live lock can still name the attaching process during startup; after the bounded wait, replace the unrecoverable startup owner and retry normally.
-      await stopStaleServer(existing);
-      await rm(lockPath, { force: true });
-      return undefined;
-    }
-  }
-  await rm(lockPath, { force: true });
   return undefined;
 }
 
+async function startServer(lockPath: string, serverPath: string, fingerprint: string, port: number, startupToken: string): Promise<{ port: number }> {
+  // NOTE: under a Bun-compiled pi binary process.execPath is the pi CLI, and Bun's node:http never writes the WebSocket 101 upgrade (oven-sh/bun#28157), so the server must run on a real node from PATH.
+  const child = spawn(process.versions.bun ? "node" : process.execPath, [serverPath, "--port", String(port), "--lock", lockPath, "--fingerprint", fingerprint, "--startup", startupToken], { detached: true, stdio: "ignore" });
+  const startup: { ended: boolean; error?: Error } = { ended: false };
+  const exited = new Promise<void>((resolve) => {
+    child.once("error", (error) => { startup.error = error; startup.ended = true; resolve(); });
+    child.once("exit", () => { startup.ended = true; resolve(); });
+  });
+  try {
+    if (child.pid !== undefined) recordStartupServer(lockPath, startupToken, child.pid);
+    const health = await awaitHealth(port, (candidate) => candidate.pid === child.pid && candidate.fingerprint === fingerprint, () => startup.ended);
+    if (startup.error !== undefined) throw startup.error;
+    // The server publishes its lock before it answers, so readiness is reported only once both agree.
+    const lock = health === undefined ? undefined : await readLock(lockPath);
+    // The detached server outlives this Pi only once it is ready; until then this Pi keeps waiting for its exit.
+    if (lock !== undefined && ownsLock(health, lock) && lock.port === port && lock.fingerprint === fingerprint) { child.unref(); return { port }; }
+    throw new Error(`Trajectory server did not start on port ${String(port)}`);
+  } catch (error) {
+    // A server outliving its startup could later publish over another owner's lock, so it is stopped before the mutex is released.
+    if (!startup.ended) { child.kill("SIGKILL"); await exited; }
+    if ((await readLock(lockPath))?.pid === child.pid) await rm(lockPath, { force: true });
+    throw error;
+  }
+}
+
+// Runs under the startup mutex, so no other Pi or idle server changes the lock meanwhile.
+async function startOrReuseServer(lockPath: string, serverPath: string, fingerprint: string, configuredPort: number, startupToken: string): Promise<{ port: number }> {
+  const existing = await readLock(lockPath);
+  if (existing) {
+    let health = await serverHealth(existing.port);
+    // A live lock owner can be a server still starting or one too loaded to answer in time.
+    if (health === undefined && processLive(existing)) health = await awaitHealth(existing.port, (candidate) => candidate.pid === existing.pid);
+    const lock = health === undefined ? existing : await readLock(lockPath) ?? existing;
+    if (ownsLock(health, lock)) {
+      if (lock.fingerprint === fingerprint && health.fingerprint === fingerprint) return { port: lock.port };
+      await stopStaleServer(health.pid, lock.port);
+    } else if (!isTrajectoryServer(health) && lock.pid !== process.pid && processLive(lock)) {
+      // Unidentified is not dead: a suspended or overloaded owner can resume serving, so its lock stays and no second server is started beside it.
+      // Only a lock naming this Pi, left by an older release's startup reservation, is known not to name a server.
+      throw new Error(health === undefined ? `Trajectory server ${String(lock.pid)} named by ${lockPath} is alive but not answering on port ${String(lock.port)}; retry once it answers, or remove the lock if that process is not a Trajectory server` : `Trajectory port ${String(lock.port)} is held by another Trajectory server; stop it and retry`);
+    }
+    // Any other owner is dead, or another Trajectory server holds its port, so it is never signalled.
+    await rm(lockPath, { force: true });
+  }
+  const occupant = await serverHealth(configuredPort);
+  if (occupant !== undefined) {
+    if (!isTrajectoryServer(occupant)) throw new Error(`Trajectory port ${String(configuredPort)} is held by another Trajectory server; stop it and retry`);
+    if (occupant.fingerprint === fingerprint && occupant.startedAt !== undefined) {
+      // This server lost its lock; restoring it keeps every healthy server named by the lock.
+      //NOTE: its start is read just after /health named the pid; a reuse of that pid in between is not excluded.
+      await atomicJson(lockPath, { pid: occupant.pid, port: configuredPort, fingerprint, startedAt: occupant.startedAt, start: processStart(occupant.pid) });
+      return { port: configuredPort };
+    }
+    await stopStaleServer(occupant.pid, configuredPort);
+  }
+  return startServer(lockPath, serverPath, fingerprint, configuredPort, startupToken);
+}
+
+//NOTE: Pi releases without the startup mutex do not take it, so a concurrent start by one of them is not excluded.
 async function ensureTrajectoryServer(agentDir: string, configuredPort: number): Promise<{ port: number }> {
   const lockPath = trajectoryLockPath(agentDir);
   const serverPath = trajectoryServerPath();
   const fingerprint = await trajectoryFingerprint(serverPath);
   await mkdir(dirname(lockPath), { recursive: true, mode: 0o700 });
-  const existing = await readLock(lockPath);
-  if (existing) {
-    const reused = await resolveExistingServer(lockPath, existing, fingerprint);
-    if (reused) return reused;
-  }
-  let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    lockHandle = await open(lockPath, "wx", 0o600);
-    await lockHandle.writeFile(`${JSON.stringify({ pid: process.pid, port: configuredPort, fingerprint, startedAt: Date.now() })}\n`, "utf8");
-  } catch (error) {
-    if (isNodeError(error, "EEXIST")) {
-      const raced = await readLock(lockPath);
-      if (raced) {
-        const reused = await resolveExistingServer(lockPath, raced, fingerprint);
-        if (reused) return reused;
-      }
-      await rm(lockPath, { force: true });
-      lockHandle = await open(lockPath, "wx", 0o600);
-      await lockHandle.writeFile(`${JSON.stringify({ pid: process.pid, port: configuredPort, fingerprint, startedAt: Date.now() })}\n`, "utf8");
-    } else {
-      throw error;
-    }
-  } finally { await lockHandle?.close(); }
-  // A server can answer on the port without owning the lock, e.g. one whose lock was lost; it reports its pid, so replace it before spawning.
-  const occupant = await serverHealth(configuredPort);
-  if (occupant?.pid !== undefined && occupant.fingerprint !== fingerprint) await stopStaleServer({ pid: occupant.pid, port: configuredPort, ...(occupant.startedAt === undefined ? {} : { startedAt: occupant.startedAt }) });
-  try {
-    // NOTE: under a Bun-compiled pi binary process.execPath is the pi CLI, and Bun's node:http never writes the WebSocket 101 upgrade (oven-sh/bun#28157), so the server must run on a real node from PATH.
-    const child = spawn(process.versions.bun ? "node" : process.execPath, [serverPath, "--port", String(configuredPort), "--lock", lockPath, "--fingerprint", fingerprint], { detached: true, stdio: "ignore" });
-    const startupError = new Promise<never>((_resolve, reject) => { child.once("error", reject); });
-    child.unref();
-    await Promise.race([waitForServer(configuredPort, fingerprint), startupError]);
-    return { port: configuredPort };
-  } catch (error) {
-    await rm(lockPath, { force: true });
-    throw error;
-  }
+  const startupToken = await acquireStartupMutex(lockPath);
+  try { return await startOrReuseServer(lockPath, serverPath, fingerprint, configuredPort, startupToken); }
+  finally { await releaseStartupMutex(lockPath, startupToken); }
 }
 
 function trajectoryWebSocket(): TrajectoryPublisherConstructor | undefined {

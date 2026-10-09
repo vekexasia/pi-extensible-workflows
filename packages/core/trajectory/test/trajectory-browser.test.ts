@@ -36,6 +36,8 @@ function findBrowser(): string | undefined {
   return typeof found === "string" ? found : undefined;
 }
 
+// Bounds Chrome startup and every DevTools round trip, so a stalled browser fails with its state instead of hanging until the test timeout.
+const DEVTOOLS_WAIT_MS = 30_000;
 class Devtools {
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (message: CdpMessage) => void; reject: (error: Error) => void }>();
@@ -53,7 +55,10 @@ class Devtools {
   command(method: string, params: CdpRecord = {}): Promise<CdpMessage> {
     const id = this.nextId++;
     this.socket.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => { this.pending.set(id, { resolve, reject }); });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Chrome DevTools ${method} did not answer within ${String(DEVTOOLS_WAIT_MS)} ms`)); }, DEVTOOLS_WAIT_MS);
+      this.pending.set(id, { resolve: (message) => { clearTimeout(timer); resolve(message); }, reject: (error) => { clearTimeout(timer); reject(error); } });
+    });
   }
   async evaluate(expression: string): Promise<unknown> {
     const message = await this.command("Runtime.evaluate", { expression, returnByValue: true });
@@ -73,25 +78,33 @@ class Devtools {
 async function connectDevtools(url: string): Promise<Devtools> {
   const socket = new WebSocket(url);
   await new Promise<void>((resolve, reject) => {
-    socket.addEventListener("open", () => { resolve(); });
-    socket.addEventListener("error", () => { reject(new Error("Chrome DevTools connection failed")); });
+    const timer = setTimeout(() => { socket.close(); reject(new Error(`Chrome DevTools connection did not open within ${String(DEVTOOLS_WAIT_MS)} ms`)); }, DEVTOOLS_WAIT_MS);
+    socket.addEventListener("open", () => { clearTimeout(timer); resolve(); });
+    socket.addEventListener("error", () => { clearTimeout(timer); reject(new Error("Chrome DevTools connection failed")); });
   });
   return new Devtools(socket);
 }
 
-async function waitForDevtools(port: number, child: ReturnType<typeof spawn>, stderr: () => string): Promise<string> {
-  for (let attempt = 0; attempt < 600; attempt += 1) {
-    if (child.exitCode !== null) throw new Error(`Chrome exited before DevTools started (code ${String(child.exitCode)}, signal ${String(child.signalCode)}${stderr() ? `): ${stderr().trim()}` : ")"}`);
-    try {
-      const response = await fetch(`http://127.0.0.1:${String(port)}/json`);
-      const pages = await response.json() as Array<{ type?: unknown; webSocketDebuggerUrl?: unknown }>;
-      const page = pages.find((candidate) => candidate.type === "page" && typeof candidate.webSocketDebuggerUrl === "string");
-      const websocketUrl = page?.webSocketDebuggerUrl;
-      if (typeof websocketUrl === "string") return websocketUrl;
-    } catch { /* Chrome is still starting. */ }
+// Chrome picks its own DevTools port and announces it on stderr, so no port is reserved and released before Chrome binds it.
+async function waitForDevtools(child: ReturnType<typeof spawn>, stderr: () => string): Promise<string> {
+  const startedAt = Date.now();
+  let endpoint: string | undefined;
+  const failure = (reason: string): Error => new Error(`Chrome ${reason} after ${String(Date.now() - startedAt)} ms (pid ${String(child.pid)}, exit code ${String(child.exitCode)}, signal ${String(child.signalCode)}, DevTools endpoint ${endpoint ?? "not announced"})${stderr() ? `: ${stderr().trim()}` : ""}`);
+  for (;;) {
+    if (child.exitCode !== null || child.signalCode !== null) throw failure("exited before DevTools started");
+    endpoint ??= /DevTools listening on (ws:\/\/\S+)/.exec(stderr())?.[1];
+    if (endpoint !== undefined) {
+      try {
+        const response = await fetch(`http://${new URL(endpoint).host}/json`, { signal: AbortSignal.timeout(Math.max(1, DEVTOOLS_WAIT_MS - (Date.now() - startedAt))) });
+        const pages = await response.json() as Array<{ type?: unknown; webSocketDebuggerUrl?: unknown }>;
+        const page = pages.find((candidate) => candidate.type === "page" && typeof candidate.webSocketDebuggerUrl === "string");
+        const websocketUrl = page?.webSocketDebuggerUrl;
+        if (typeof websocketUrl === "string") return websocketUrl;
+      } catch { /* The page target is not listed yet. */ }
+    }
+    if (Date.now() - startedAt >= DEVTOOLS_WAIT_MS) throw failure("DevTools did not start");
     await delay(50);
   }
-  throw new Error(`Chrome DevTools did not start${stderr() ? `: ${stderr().trim()}` : ""}`);
 }
 
 async function serve(routes: ReadonlyMap<string, RouteBody>): Promise<{ url: string; close: () => Promise<void> }> {
@@ -108,33 +121,33 @@ async function serve(routes: ReadonlyMap<string, RouteBody>): Promise<{ url: str
   return { url: `http://127.0.0.1:${String(address.port)}`, close: () => new Promise<void>((resolve, reject) => { server.close((error) => { if (error) reject(error); else resolve(); }); }) };
 }
 
-async function withChrome(url: string, callback: (page: Devtools) => Promise<void>): Promise<void> {
+async function withChrome(url: string, signal: AbortSignal, callback: (page: Devtools) => Promise<void>): Promise<void> {
   const browser = findBrowser();
   assert.ok(browser, "Chromium is required for Trajectory browser verification");
-  const portServer = createServer();
-  await new Promise<void>((resolve, reject) => { portServer.once("error", reject); portServer.listen(0, "127.0.0.1", resolve); });
-  const address = portServer.address();
-  assert.ok(address && typeof address !== "string");
-  const port = address.port;
-  await new Promise<void>((resolve, reject) => { portServer.close((error) => { if (error) reject(error); else resolve(); }); });
   const profile = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-chrome-"));
-  const child = spawn(browser, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", `--remote-debugging-port=${String(port)}`, `--user-data-dir=${profile}`, url], { stdio: ["ignore", "ignore", "pipe"] });
+  const child = spawn(browser, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage", "--no-first-run", "--no-default-browser-check", "--remote-debugging-port=0", `--user-data-dir=${profile}`, url], { stdio: ["ignore", "ignore", "pipe"] });
   const stderr: string[] = [];
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => { stderr.push(chunk); });
   const childExited = new Promise<void>((resolve) => { child.once("close", () => { resolve(); }); });
+  // A test timeout abandons this function without running its cleanup, so the browser is killed from the test's signal.
+  const killOnAbort = (): void => { child.kill("SIGKILL"); };
+  signal.addEventListener("abort", killOnAbort, { once: true });
   let page: Devtools | undefined;
   try {
-    page = await connectDevtools(await waitForDevtools(port, child, () => stderr.join("")));
+    page = await connectDevtools(await waitForDevtools(child, () => stderr.join("")));
     for (let attempt = 0; attempt < 100; attempt += 1) {
       if (await page.evaluate("document.readyState === 'complete'")) break;
       await delay(25);
     }
     await callback(page);
   } finally {
+    signal.removeEventListener("abort", killOnAbort);
     page?.close();
     child.kill("SIGTERM");
     await Promise.race([childExited, delay(2000)]);
+    // A browser stuck in startup can ignore SIGTERM; it must not outlive the test.
+    if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await Promise.race([childExited, delay(2000)]); }
     for (let attempt = 0; attempt < 10; attempt += 1) {
       try { rmSync(profile, { recursive: true, force: true }); break; } catch { await delay(50); }
     }
@@ -151,7 +164,7 @@ function clickExpression(selector: string): string { return `document.querySelec
 function outputTabClickExpression(): string { return "Array.from(document.querySelectorAll('#sys-tabs span')).find((tab) => tab.dataset.pane === 'output').click()"; }
 
 const browserPath = findBrowser();
-void test("Trajectory static export opens Agent details and its Output tab in Chromium", { skip: !browserPath, timeout: 120_000 }, async () => {
+void test("Trajectory static export opens Agent details and its Output tab in Chromium", { skip: !browserPath, timeout: 120_000 }, async (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-browser-"));
   const cwd = join(root, "project");
   const home = join(root, "home");
@@ -167,7 +180,7 @@ void test("Trajectory static export opens Agent details and its Output tab in Ch
     const html = await exportTrajectoryRunHtml({ cwd, sessionId: "session", runId: "run", home });
     const server = await serve(new Map([["/report.html", html]]));
     try {
-      await withChrome(`${server.url}/report.html`, async (page) => {
+      await withChrome(`${server.url}/report.html`, t.signal, async (page) => {
         await waitFor(page, "Boolean(document.querySelector('.agent-grid-row'))");
         assert.doesNotMatch(String(await page.evaluate("document.querySelector('.agent-grid-head').textContent")), /ROLE/);
         assert.equal(await page.evaluate("document.querySelector('.agent-grid-row').children.length"), 6);
@@ -182,7 +195,7 @@ void test("Trajectory static export opens Agent details and its Output tab in Ch
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-void test("Trajectory Chromium view preserves the selected Output tab across live publisher updates", { skip: !browserPath, timeout: 120_000 }, async () => {
+void test("Trajectory Chromium view preserves the selected Output tab across live publisher updates", { skip: !browserPath, timeout: 120_000 }, async (t) => {
   const source = readFileSync(new URL("../src/assets/index.html", import.meta.url), "utf8");
   const marked = readFileSync(new URL("../src/assets/marked.min.js", import.meta.url));
   const morphdom = readFileSync(new URL("../src/assets/morphdom.min.js", import.meta.url));
@@ -191,7 +204,7 @@ void test("Trajectory Chromium view preserves the selected Output tab across liv
   assert.notEqual(html, source);
   const server = await serve(new Map<string, RouteBody>([["/index.html", html], ["/marked.min.js", marked], ["/morphdom.min.js", morphdom]]));
   try {
-    await withChrome(`${server.url}/index.html`, async (page) => {
+    await withChrome(`${server.url}/index.html`, t.signal, async (page) => {
       await waitFor(page, "Boolean(window.__trajectorySocket)");
       const pending = JSON.stringify(makeState({ status: "pending" }, "running"));
       await page.evaluate(`window.__trajectorySocket.emit('message', ${JSON.stringify(pending)})`);
@@ -213,7 +226,7 @@ function toolTiming(id: string, startedAt: number, durationMs: number, isError =
   return { type: "custom", customType: "pi-workflows:tool-timing", data: { toolCallId: id, toolName: "read", startedAt, completedAt: startedAt + durationMs, durationMs, isError } };
 }
 
-void test("Trajectory live gantt keeps cached timing, merges dense calls, and pauses while hidden", { skip: !browserPath, timeout: 120_000 }, async () => {
+void test("Trajectory live gantt keeps cached timing, merges dense calls, and pauses while hidden", { skip: !browserPath, timeout: 120_000 }, async (t) => {
   const probe = createServer();
   await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
   const address = probe.address();
@@ -243,7 +256,7 @@ void test("Trajectory live gantt keeps cached timing, merges dense calls, and pa
   const timer = setInterval(publish, 250);
   const bars = (lane: string, selector = ".bar.tool") => `document.querySelectorAll('#swim-content .lane[data-agent="${lane}"] ${selector}').length`;
   try {
-    await withChrome(`http://127.0.0.1:${String(port)}/?view=run&run=${publisherId}:live`, async (page) => {
+    await withChrome(`http://127.0.0.1:${String(port)}/?view=run&run=${publisherId}:live`, t.signal, async (page) => {
       await waitFor(page, `${bars("done")} > 0 && ${bars("busy")} > 0`);
       const done = Number(await page.evaluate(bars("done")));
       assert.ok(done > 1 && done < baseline.length, `dense calls merge into fewer bars, got ${String(done)}`);
@@ -269,7 +282,7 @@ void test("Trajectory live gantt keeps cached timing, merges dense calls, and pa
   }
 });
 
-void test("Trajectory keeps a subagent transcript when a refresh races a newer revision", { skip: !browserPath, timeout: 120_000 }, async () => {
+void test("Trajectory keeps a subagent transcript when a refresh races a newer revision", { skip: !browserPath, timeout: 120_000 }, async (t) => {
   const probe = createServer();
   await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
   const address = probe.address();
@@ -302,7 +315,7 @@ void test("Trajectory keeps a subagent transcript when a refresh races a newer r
   publish();
   const toolRows = "[...document.querySelectorAll('#events .evt .pill')].filter((pill) => pill.textContent === 'TOOL').length";
   try {
-    await withChrome(`http://127.0.0.1:${String(port)}/?view=subagent&subagent=${publisherId}:${subagentId}`, async (page) => {
+    await withChrome(`http://127.0.0.1:${String(port)}/?view=subagent&subagent=${publisherId}:${subagentId}`, t.signal, async (page) => {
       await waitFor(page, `${toolRows} === 2`);
       revision = 2; publish();
       await delay(500);
