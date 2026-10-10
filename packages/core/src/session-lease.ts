@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -12,12 +13,39 @@ const SESSION_OWNER_FILE = "owner.json";
 const SESSION_OWNER_WRITE_GRACE_MS = 30_000;
 const RUN_CREATE_TEMP = /^\.([a-zA-Z0-9._-]+)\.(\d+)\.[0-9a-f-]+\.tmp$/;
 
-export async function processAlive(pid: number, startedAt?: number): Promise<boolean> {
+const START_MARGIN_MS = 60_000;
+let clockTicks: number | undefined;
+
+function clockTickRate(): number {
+  if (clockTicks !== undefined) return clockTicks;
+  try {
+    const rate = Number(execFileSync("getconf", ["CLK_TCK"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+    clockTicks = Number.isInteger(rate) && rate > 0 ? rate : 100;
+  } catch { clockTicks = 100; }
+  return clockTicks;
+}
+
+// Process start in epoch ms from /proc/<pid>/stat field 22; undefined when unreadable or unparsable.
+async function linuxProcessStart(pid: number, procRoot: string): Promise<number | undefined> {
+  try {
+    const text = await readFile(join(procRoot, String(pid), "stat"), "utf8");
+    // Field 2 (command name) may contain spaces and parentheses, so count fields after the last ")".
+    const close = text.lastIndexOf(")");
+    const ticks = close < 0 ? Number.NaN : Number(text.slice(close + 2).split(" ")[19]);
+    const btime = /^btime (\d+)$/m.exec(await readFile(join(procRoot, "stat"), "utf8"))?.[1];
+    if (btime === undefined || !Number.isInteger(ticks) || ticks < 0) return undefined;
+    return Number(btime) * 1000 + (ticks / clockTickRate()) * 1000;
+  } catch { return undefined; }
+}
+
+// The /proc/<pid> ctime is not a start time: procfs rebuilds the inode after cache reclaim.
+// A live owner never starts after its stamp; a reused pid starts later.
+export async function processAlive(pid: number, startedAt?: number, procRoot = "/proc"): Promise<boolean> {
   try { process.kill(pid, 0); } catch (error) { return !isNodeError(error, "ESRCH"); }
-  if (startedAt !== undefined && process.platform === "linux") {
-    try { if ((await stat(`/proc/${String(pid)}`)).ctimeMs > startedAt) return false; }
-    catch (error) { if (isNodeError(error, "ENOENT")) return false; }
-  }
+  if (startedAt === undefined || process.platform !== "linux") return true;
+  const start = await linuxProcessStart(pid, procRoot);
+  if (start !== undefined) return start <= startedAt + START_MARGIN_MS;
+  try { process.kill(pid, 0); } catch (error) { return !isNodeError(error, "ESRCH"); }
   return true;
 }
 export async function hasLiveSessionLease(cwd: string, sessionId: string, home = homedir()): Promise<boolean> {
@@ -73,7 +101,7 @@ export async function acquireSessionLease(cwd: string, sessionId: string, home =
   const path = join(directory, SESSION_OWNER_FILE);
   for (;;) {
     const token = randomUUID();
-    const owner: SessionOwner = { pid: process.pid, token, startedAt: process.platform === "linux" ? (await stat(`/proc/${String(process.pid)}`)).ctimeMs : Date.now() };
+    const owner: SessionOwner = { pid: process.pid, token, startedAt: Date.now() };
     try {
       const handle = await open(path, "wx", 0o600);
       try { await handle.writeFile(`${JSON.stringify(owner)}\n`, "utf8"); } finally { await handle.close(); }
