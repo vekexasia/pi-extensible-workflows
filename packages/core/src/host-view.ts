@@ -870,7 +870,8 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
     return ["", styles.bold(actions.title), ...actions.options.map((option, index) => `${index === actions.index ? "→ " : "  "}${index === actions.index ? styles.accent(option) : option}`)];
   };
   const treeRows = [styles.bold("Tree"), ...(visibleNodes.length ? visibleNodes.map(treeLine) : [styles.muted("(empty)")])];
-  lines.push(...formatNavigatorColumns(treeRows, [...details(selectedNode), ...actionRows()], safeWidth, selection));
+  const detailOffset = Math.max(0, (selection.scrollTop ?? 0) - lines.flatMap(wrap).length);
+  lines.push(...formatNavigatorColumns(treeRows, [...details(selectedNode), ...actionRows()], safeWidth, { ...selection, detailOffset }));
   if (model.unassignedAgents?.length && !tree.nodes.some((node) => node.phaseId === "unassigned")) lines.push(...wrap(styles.muted(`Unassigned agents: ${String(model.unassignedAgents.length)}`)));
   return lines.flatMap((line) => wrap(line));
 }
@@ -878,12 +879,15 @@ function wrapNavigatorLine(text: string, width: number): string[] {
   return truncateToVisualLines(text, Number.MAX_SAFE_INTEGER, Math.max(1, width), 0).visualLines.map((line) => line.trimEnd());
 }
 /** The navigator layout: a sidebar beside details at 80 columns or wider, otherwise one of them (or both stacked). */
-export function formatNavigatorColumns(sidebar: readonly string[], detail: readonly string[], width: number, layout: Readonly<{ treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined }> = {}): string[] {
+export function formatNavigatorColumns(sidebar: readonly string[], detail: readonly string[], width: number, layout: Readonly<{ treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined; detailOffset?: number | undefined }> = {}): string[] {
   const safeWidth = Math.max(1, width);
   if (safeWidth >= 80) {
     const sidebarWidth = Math.min(42, Math.max(24, Math.floor((safeWidth - 3) * 0.38)));
     const left = sidebar.flatMap((line) => wrapNavigatorLine(line, sidebarWidth));
-    const right = detail.flatMap((line) => wrapNavigatorLine(line, safeWidth - sidebarWidth - 3));
+    const wrapped = detail.flatMap((line) => wrapNavigatorLine(line, safeWidth - sidebarWidth - 3));
+    // Keep the details in view when the tree is scrolled, without making the block taller than the tree.
+    const shift = Math.min(Math.max(0, layout.detailOffset ?? 0), Math.max(0, left.length - wrapped.length));
+    const right = [...Array<string>(shift).fill(""), ...wrapped];
     return Array.from({ length: Math.max(left.length, right.length) }, (_, index) => {
       const cell = left[index] ?? "";
       return `${cell}${" ".repeat(Math.max(0, sidebarWidth - visibleWidth(cell)))} | ${right[index] ?? ""}`;

@@ -700,9 +700,10 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       const styles = themeWorkflowProgressStyles(theme);
                       const agent = selectedAgentRecord();
                       const actions = actionMode ? { title: agent ? "Agent actions" : "Run actions", options: actionOptions(), index: actionIndex } : undefined;
-                      const phaseLines = formatWorkflowPhaseDashboard(view.run, view.snapshot, width, { nodeId: selectedNodeId, expandedNodeIds: [...expandedNodeIds], ...(narrow && !detailsMode && !actionMode ? { treeOnly: true } : {}), ...(narrow && (detailsMode || actionMode) ? { detailsOnly: true } : {}), ...(actions ? { actions } : {}) }, styles, progressNow());
+                      const formatPhaseLines = (scrollTop: number): string[] => formatWorkflowPhaseDashboard(view.run, view.snapshot, width, { scrollTop, nodeId: selectedNodeId, expandedNodeIds: [...expandedNodeIds], ...(narrow && !detailsMode && !actionMode ? { treeOnly: true } : {}), ...(narrow && (detailsMode || actionMode) ? { detailsOnly: true } : {}), ...(actions ? { actions } : {}) }, styles, progressNow());
+                      const phaseLines = formatPhaseLines(0);
                       const statusLines = stopStatus ? truncateToVisualLines(styles.error(stopStatus), Number.MAX_SAFE_INTEGER, width, 0).visualLines.map((line) => line.trimEnd()) : [];
-                      const content = [...statusLines, ...phaseLines];
+                      let content = [...statusLines, ...phaseLines];
                       const rows = terminalRows();
                       const hintRows = rows >= 3 ? 1 : 0;
                       const confirmRows = inlineConfirm.rows(width, styles);
@@ -725,6 +726,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                         selectionNeedsScroll = false;
                       }
                       dashboardOffset = Math.max(0, Math.min(maxOffset, dashboardOffset));
+                      if (!narrow && !actionMode) content = [...statusLines, ...formatPhaseLines(Math.max(0, dashboardOffset - statusLines.length))];
                       const selectedNode = selectedNodeId ? tree.byId.get(selectedNodeId) : undefined;
                       const enterAction = selectedNode?.kind === "workflow" ? "run actions" : selectedNode?.kind === "agent" ? "agent actions" : selectedNode?.children.length ? "expand/collapse" : narrow ? "inspect" : "focus details";
                       const hint = truncateToVisualLines(theme.fg("dim", inlineConfirm.active() ? inlineConfirm.hint(keybindings) : actionMode ? `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} actions · ${keyLabel("tui.select.confirm", "enter")} run · ${keyLabel("tui.editor.cursorLeft", "←")} tree · ${keyLabel("tui.select.cancel", "esc")} tree` : `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} tree · ${keyLabel("tui.editor.cursorLeft", "←")}/${keyLabel("tui.editor.cursorRight", "→")} collapse/expand · ${keyLabel("tui.select.confirm", "enter")} ${enterAction} · a actions · ${keyLabel("tui.select.cancel", "esc")} ${narrow && detailsMode ? "tree" : "back"}${content.length > viewport ? ` · ${keyLabel("tui.select.pageUp", "pgup")}/${keyLabel("tui.select.pageDown", "pgdn")} scroll` : ""} · auto-refresh 1s`), Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "";

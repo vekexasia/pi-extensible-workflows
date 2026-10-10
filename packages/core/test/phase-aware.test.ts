@@ -351,3 +351,19 @@ void test("workflow artifact views use type-appropriate temporary file content",
   assert.deepEqual(workflowResultArtifact({ answer: 42 }), { extension: ".json", content: "{\n  \"answer\": 42\n}\n" });
   for (const value of [null, false, ["a", 1]]) assert.deepEqual(workflowResultArtifact(value), { extension: ".json", content: `${JSON.stringify(value, null, 2)}\n` });
 });
+void test("details column follows the scrolled viewport beside a long tree", () => {
+  const agents = Array.from({ length: 60 }, (_, index) => agent(`agent-${String(index)}`));
+  const current = run("running", agents, [{ phase: "review", afterAgent: 0 }]);
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(current, ["review"]));
+  const expandedNodeIds = tree.nodes.filter((node) => node.kind !== "agent").map((node) => node.id);
+  const selected = tree.nodes.find((node) => node.kind === "agent" && node.agentId === "agent-50");
+  assert.ok(selected);
+  const detailRow = (lines: readonly string[]): number => lines.findIndex((line) => (line.split(" | ")[1] ?? "").trim() !== "");
+  const base = { nodeId: selected.id, expandedNodeIds };
+  const top = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, base);
+  const scrolled = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, { ...base, scrollTop: 40 });
+  assert.ok(detailRow(top) < 40, "details start at the top when the viewport is at the top");
+  assert.ok(detailRow(scrolled) >= 40, `details must start inside the scrolled viewport, got row ${String(detailRow(scrolled))}`);
+  assert.equal(scrolled.length, top.length);
+  assert.ok(scrolled.some((line) => line.startsWith("→")), "the selected tree row is unchanged");
+});

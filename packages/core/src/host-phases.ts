@@ -90,7 +90,7 @@ export function buildWorkflowPhaseModel(run: WorkflowPhaseRun, source?: Workflow
   if (unassignedAgents.length) result.unassignedAgents = unassignedAgents;
   return result;
 }
-export interface WorkflowPhaseSelection { phaseId?: string | undefined; agentId?: string | undefined; nodeId?: string | undefined; expandedNodeIds?: readonly string[] | undefined; treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined; actions?: { title: string; options: readonly string[]; index: number } | undefined }
+export interface WorkflowPhaseSelection { phaseId?: string | undefined; agentId?: string | undefined; nodeId?: string | undefined; expandedNodeIds?: readonly string[] | undefined; treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined; scrollTop?: number | undefined; actions?: { title: string; options: readonly string[]; index: number } | undefined }
 export type WorkflowPhaseTreeNodeKind = "workflow" | "phase" | "operation" | "agent" | "shell";
 export interface WorkflowPhaseTreeNode { id: string; kind: WorkflowPhaseTreeNodeKind; label: string; depth: number; phaseId: string; operationPath: readonly string[]; parentId?: string; children: readonly string[]; state: WorkflowPhaseState | RunState | AgentRecord["state"]; agentId?: string; agent?: AgentRecord; phase?: WorkflowPhaseView; shellActivity?: WorkflowPhaseShellActivity }
 export interface WorkflowPhaseTree { roots: readonly string[]; nodes: readonly WorkflowPhaseTreeNode[]; byId: ReadonlyMap<string, WorkflowPhaseTreeNode> }
