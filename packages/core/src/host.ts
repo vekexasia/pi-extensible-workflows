@@ -23,7 +23,7 @@ import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
 import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
@@ -289,9 +289,9 @@ async function resolveLaunchAliases(registry: WorkflowRegistryApi, staticAliases
  * and options without persisting a configuration. Any preparation failure rejects launch before effects; cancellation stops
  * the remaining inspections.
  */
-async function inspectStaticAgentConfigurations(executor: WorkflowAgentExecutor, script: string, workflowName: string, signal: AbortSignal): Promise<void> {
+async function inspectStaticAgentConfigurations(executor: WorkflowAgentExecutor, script: string, workflowName: string, signal: AbortSignal, functions: Readonly<Record<string, WorkflowFunction>>): Promise<void> {
   // NOTE: inspection uses the launch cwd; agents inside withWorktree(...) prepare against their checkout at runtime.
-  for (const agentOptions of staticAgentPreparationOptions(script)) {
+  for (const agentOptions of staticAgentPreparationOptions(script, functions)) {
     if (signal.aborted) throw new WorkflowError("CANCELLED", "Workflow launch cancelled");
     await executor.prepare({ label: "agent", workflowName, agentOptions }, undefined, signal, "inspection");
   }
@@ -1286,7 +1286,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       if (loadErrors.length) extensionLoad = Object.freeze({ errors: loadErrors, loaded: object(ctx) ? strings(ctx.loadedExtensionPaths) : [] });
       const executorRoot = { cwd: ctx.cwd, projectTrusted: launch.resourcePolicy.projectTrusted, model: rootModel, tools: new Set(rootTools), resourceSelectors: launch.resourcePolicy.effective, extensionSettings: settings.extensionSettings, availableModels, knownModels, modelAliases, dynamicModelAliasNames: resolvedAliases.dynamicNames, settingsPath, agentResourcePolicy: frozenResourcePolicy(launch.resourcePolicy) };
       // Runtime emits the same resource warnings, so inspection stays silent.
-      await inspectStaticAgentConfigurations(createAgentExecutor({ ...executorRoot, onResourceWarning: () => undefined }), script, checked.metadata.name, runController.signal);
+      await inspectStaticAgentConfigurations(createAgentExecutor({ ...executorRoot, onResourceWarning: () => undefined }), script, checked.metadata.name, runController.signal, registry.functions());
       await ensureSessionLease(ctx.cwd, ctx.sessionManager.getSessionId());
       // Cancellation can arrive while the lease or a queued parent validation is pending; no run may be created after it.
       const assertLaunchActive = () => { if (runController.signal.aborted) throw new WorkflowError("CANCELLED", "Workflow launch cancelled"); };

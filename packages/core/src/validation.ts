@@ -430,6 +430,8 @@ function staticPreparationOptions(node: acorn.AnyNode | undefined, omitted?: str
     if (key === undefined) return undefined;
     if (key === omitted) continue;
     const value = staticValue(property.value);
+    // NOTE: an output schema only shapes the result, so a computed one (a const declared elsewhere) does not hide the call.
+    if (key === "outputSchema" && !value.known) continue;
     if (!value.known || !jsonValue(value.value)) return undefined;
     options.set(key, value.value);
   }
@@ -467,13 +469,35 @@ function handlesWithCompleteOptions(program: acorn.Program): acorn.CallExpressio
  * Distinct, completely static option objects of agent(...) and agent.create(...) calls, so launch can inspect them
  * before any effect. Calls with any dynamic option stay runtime-checked, and so do handles whose sends may add options.
  */
-export function staticAgentPreparationOptions(script: string): Array<Readonly<Record<string, JsonValue>>> {
+export function staticAgentPreparationOptions(script: string, registered: Readonly<Record<string, { run: (...args: never[]) => unknown }>> = {}): Array<Readonly<Record<string, JsonValue>>> {
   const program = parseWorkflow(script);
+  const sources = [program, ...registeredFunctionPrograms(program, registered)];
+  const distinct = new Map<string, Readonly<Record<string, JsonValue>>>();
+  for (const source of sources) for (const options of programAgentOptions(source)) distinct.set(JSON.stringify(options), deepFreeze(options));
+  return [...distinct.values()];
+}
+/** Programs of the registered functions the script calls by name, so their agents are inspected before launch like inline ones. */
+function registeredFunctionPrograms(program: acorn.Program, registered: Readonly<Record<string, { run: (...args: never[]) => unknown }>>): acorn.Program[] {
+  const called = new Set<string>();
+  const visit = (node: acorn.AnyNode): void => {
+    if (node.type === "CallExpression" && node.callee.type === "Identifier" && Object.prototype.hasOwnProperty.call(registered, node.callee.name)) called.add(node.callee.name);
+    for (const child of astChildren(node)) visit(child);
+  };
+  visit(program);
+  const programs: acorn.Program[] = [];
+  for (const name of called) {
+    const source = registered[name]?.run.toString() ?? "";
+    // A method prints as `async run(...) {}`, which only parses inside an object literal.
+    for (const wrapped of [`(${source})`, `({${source}})`]) {
+      try { programs.push(acorn.parse(wrapped, { ecmaVersion: "latest", sourceType: "module" })); break; } catch { /* try the next form; an unparsable function stays runtime-checked */ }
+    }
+  }
+  return programs;
+}
+function programAgentOptions(program: acorn.Program): Array<Readonly<Record<string, JsonValue>>> {
   const calls = workflowCalls(program).filter((call) => call.callee.name === "agent").map((call) => call.arguments.some((argument) => argument.type === "SpreadElement") ? undefined : call.arguments.length < 2 ? {} : staticPreparationOptions(callArgument(call, 1)));
   const handles = handlesWithCompleteOptions(program).map((call) => staticPreparationOptions(callArgument(call, 0), "name"));
-  const distinct = new Map<string, Readonly<Record<string, JsonValue>>>();
-  for (const options of [...calls, ...handles]) if (options) distinct.set(JSON.stringify(options), deepFreeze(options));
-  return [...distinct.values()];
+  return [...calls, ...handles].filter((options): options is Record<string, JsonValue> => options !== undefined);
 }
 
 function validateStaticAgentOptions(node: acorn.AnyNode | undefined): void {

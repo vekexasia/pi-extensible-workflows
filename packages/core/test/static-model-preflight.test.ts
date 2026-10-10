@@ -21,7 +21,7 @@ class ForeignPluginError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = "ForeignPluginError"; }
 }
 
-async function launch(t: TestContext, script: string, setup: { hooks?: Record<string, AgentPreparationHook>; schemaHooks?: Record<string, AgentPreparationHook>; schemaSource?: string; aliases?: Record<string, string>; parentNested?: Record<string, JsonValue>; controller?: AbortController; context?: Record<string, unknown> } = {}) {
+async function launch(t: TestContext, script: string, setup: { hooks?: Record<string, AgentPreparationHook>; schemaHooks?: Record<string, AgentPreparationHook>; schemaSource?: string; functions?: Record<string, { description: string; input: JsonValue; output: JsonValue; run: (...args: never[]) => unknown }>; aliases?: Record<string, string>; parentNested?: Record<string, JsonValue>; controller?: AbortController; context?: Record<string, unknown> } = {}) {
   const home = mkdtempSync(join(tmpdir(), "workflow-static-model-preflight-"));
   const cwd = join(home, "project");
   const agentDir = join(home, "agent");
@@ -55,6 +55,7 @@ async function launch(t: TestContext, script: string, setup: { hooks?: Record<st
   workflowExtension(testExtensionApi({ registerTool(tool: Tool) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "off", getActiveTools: () => ["agent", "read"] }), home, async () => {}, testTransport(createSession), agentDir);
   if (setup.hooks) registerWorkflowExtension({ version: "1.0.0", headline: "Generic preparation plugin", agentPreparationHooks: setup.hooks });
   if (setup.schemaHooks) registerWorkflowExtension({ version: "1.0.0", headline: "Schema-declaring preparation plugin", ...(setup.schemaSource ? { source: setup.schemaSource } : {}), agentPreparationHooks: setup.schemaHooks });
+  if (setup.functions) registerWorkflowExtension({ version: "1.0.0", headline: "Function plugin", functions: setup.functions as never });
   const workflow = tools.find(({ name }) => name === "workflow");
   assert.ok(workflow);
   const context = { cwd, hasUI: false, model: { provider: "test", id: "model" }, modelRegistry: { getAll: () => [{ provider: "test", id: "model" }, { provider: "test", id: "other" }], getAvailable: () => [{ provider: "test", id: "model" }] }, isProjectTrusted: () => false, sessionManager: { getSessionId: () => "session" }, ...setup.context };
@@ -238,4 +239,15 @@ void test("handle inspection uses the create options only when no send can add p
   }
   assertFailedBeforeEffects(await launch(t, `${MARKER} const h = agent.create({ name: "h" }); return await h.send("task");`, { hooks: { byTimeout } }), "UNKNOWN_MODEL", /test\/other/);
   assertFailedBeforeEffects(await launch(t, `${MARKER} return await agent.create({ name: "h" }).send("task");`, { hooks: { byTimeout } }), "UNKNOWN_MODEL", /test\/other/);
+});
+
+void test("agents inside called registered functions are inspected before launch, even with a computed outputSchema", async (t) => {
+  const byRole: AgentPreparationHook = { prepare(configuration, context) { if (context.options.role === "reviewer") configuration.model = "test/other:off"; } };
+  const reviewLoop = { description: "loop", input: { type: "object", additionalProperties: false }, output: { type: "null" }, async run(_input: unknown, { agent }: { agent: (prompt: string, options: Record<string, unknown>) => Promise<unknown> }) {
+    const schema = { type: "object" };
+    await agent("dev", { role: "developer" });
+    await agent("review", { role: "reviewer", outputSchema: schema });
+    return null;
+  } };
+  assertFailedBeforeEffects(await launch(t, `${MARKER} return await reviewLoop({});`, { hooks: { byRole }, functions: { reviewLoop } }), "UNKNOWN_MODEL", /test\/other/);
 });
