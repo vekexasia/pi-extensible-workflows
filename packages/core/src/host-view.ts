@@ -816,6 +816,11 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
     if (node.agent) agents.push(node.agent); else for (const childId of node.children) visit(childId);
     return agents;
   };
+  const usageLines = (agents: readonly AgentRecord[]): string[] => {
+    const spans = agents.flatMap((agent) => agent.startedAt === undefined ? [] : [[agent.startedAt, agent.startedAt + (elapsedDurationMs(agent, now) ?? 0)] as const]);
+    const elapsed = spans.length ? formatWorkflowRuntime(Math.max(...spans.map(([, end]) => end)) - Math.min(...spans.map(([start]) => start))) : "";
+    return [...formatAgentAccounting(sumAccounting(agents.map((agent) => agent.accounting ?? zeroAccounting()))), ...(elapsed ? [`Elapsed: ${elapsed}`] : [])];
+  };
   const nodeStatus = (node: WorkflowPhaseTreeNode): string => phaseStyle(node.state)(node.state);
   const nodeIcon = (node: WorkflowPhaseTreeNode): string => node.children.length ? expanded.has(node.id) ? "▾" : "▸" : node.kind === "agent" ? "•" : node.kind === "shell" ? "◇" : " ";
   const treeLine = (node: WorkflowPhaseTreeNode): string => {
@@ -835,12 +840,12 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
       const selected = node.phase;
       const counts = selected?.counts ?? phaseAgentCounts(agents);
       const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
-      return [styles.bold(`Selected phase: ${node.label}`), `Status: ${nodeStatus(node)}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...(selection.actions ? [] : [styles.muted(hint)])];
+      return [styles.bold(`Selected phase: ${node.label}`), `Status: ${nodeStatus(node)}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(selection.actions ? [] : [styles.muted(hint)])];
     }
     if (node.kind === "operation") {
       const states = phaseAgentCounts(agents);
       const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
-      return [styles.bold(`Selected operation: ${node.operationPath.join(" > ")}`), `Phase: ${node.phase?.name ?? node.phaseId}`, `Status: ${nodeStatus(node)}`, `agents completed=${String(states.completed)} running=${String(states.running)} failed=${String(states.failed)} cancelled=${String(states.cancelled)} pending=${String(states.pending)}`, `Agents: ${String(agents.length)}`, ...(selection.actions ? [] : [styles.muted(hint)])];
+      return [styles.bold(`Selected operation: ${node.operationPath.join(" > ")}`), `Phase: ${node.phase?.name ?? node.phaseId}`, `Status: ${nodeStatus(node)}`, `agents completed=${String(states.completed)} running=${String(states.running)} failed=${String(states.failed)} cancelled=${String(states.cancelled)} pending=${String(states.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(selection.actions ? [] : [styles.muted(hint)])];
     }
     if (node.kind === "shell") {
       return [styles.bold("Selected shell"), formatShellActivity(node.shellActivity?.active, node.shellActivity?.startedAt, "⠦", styles, now) ?? "shell [running]"];

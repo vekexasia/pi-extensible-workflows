@@ -152,6 +152,23 @@ void test("phase dashboard shows agent accounting breakdown only when measured",
   assert.match(free, /Tokens: ∑3 ↑1 ↓2 ⇢0 ⇠0/);
   assert.match(free, /Cost: \$0\.00/);
 });
+void test("phase and operation details total usage across their agents", () => {
+  const usage = (input: number, output: number, cost: number, startedAt: number, durationMs: number): Partial<AgentRecord> => ({ accounting: { input, output, cacheRead: 0, cacheWrite: 0, cost }, startedAt, durationMs });
+  const agents = [
+    { ...agent("a"), structuralPath: ["fn", "a"], ...usage(100, 10, 0.5, 1000, 2000) },
+    { ...agent("b"), structuralPath: ["fn", "b"], ...usage(200, 20, 0.25, 2000, 4000) },
+  ];
+  const current = run("completed", agents, [{ phase: "review", afterAgent: 0 }]);
+  const tree = buildWorkflowPhaseTree(buildWorkflowPhaseModel(current, snapshot(["review"])));
+  for (const kind of ["phase", "operation"]) {
+    const node = tree.nodes.find((candidate) => candidate.kind === kind);
+    assert.ok(node, kind);
+    const text = formatWorkflowPhaseDashboard(current, snapshot(["review"]), 120, { detailsOnly: true, nodeId: node.id }).join("\n");
+    assert.match(text, /Tokens: ∑330 ↑300 ↓30/, kind);
+    assert.match(text, /Cost: \$0\.75/, kind);
+    assert.match(text, /Elapsed: 5s/, kind);
+  }
+});
 void test("phase dashboard puts activity first and only shows repeated attempts", () => {
   const selected = { ...agent("worker", "running"), structuralPath: ["work", "worker"], activity: { kind: "text" as const, text: "responding" } };
   const render = (value: AgentRecord): string => formatWorkflowPhaseDashboard(run("running", [value], [{ phase: "review", afterAgent: 0 }]), snapshot(["review"]), 120, { detailsOnly: true, agentId: value.id }).join("\n");

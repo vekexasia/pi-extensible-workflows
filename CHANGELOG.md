@@ -1,6 +1,7 @@
 # Changelog
 ## Unreleased
 
+- Selecting a phase or registered function in the workflow tree now shows total tokens, cost, and elapsed time across all its agents (#318).
 - Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach.
 
 ## [6.1.0] - 2026-10-08
