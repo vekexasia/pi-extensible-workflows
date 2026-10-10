@@ -811,9 +811,10 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
     const visit = (id: string): void => {
       const child = tree.byId.get(id);
       if (!child) return;
-      if (child.agent) agents.push(child.agent); else for (const childId of child.children) visit(childId);
+      if (child.agent) agents.push(child.agent);
+      for (const childId of child.children) visit(childId);
     };
-    if (node.agent) agents.push(node.agent); else for (const childId of node.children) visit(childId);
+    visit(node.id);
     return agents;
   };
   const usageLines = (agents: readonly AgentRecord[]): string[] => {
