@@ -1,8 +1,19 @@
 # Changelog
 ## Unreleased
 
-- Selecting a phase or registered function in the workflow tree now shows total tokens, cost, and elapsed time across all its agents (#318).
-- Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach.
+## [6.2.0] - 2026-10-10
+
+### New capabilities
+
+- Selecting a phase or registered function in the workflow navigator now shows total tokens, cost, and elapsed time across all its agents, including nested agents (#318).
+
+### Fixes
+
+- Launch now checks static agent calls inside registered functions that the script calls by name, so an unknown model for a later agent fails before the workflow starts. A computed `outputSchema` no longer makes a call dynamic (#309).
+- On Linux, session lease liveness uses the process start time from `/proc/<pid>/stat` instead of the `/proc/<pid>` entry time, so a live session owner is no longer reported dead (#307).
+- In the wide workflow navigator, the details column follows the scrolled tree, so details for a selected node further down a long workflow stay visible (#317).
+- Model references keep colon-bearing and namespaced model IDs, such as `openrouter/deepseek/deepseek-v4.1-flash:nitro:high`. The final `:` segment is read as a thinking level only when it names one, so `provider/model:turbo` now fails as `INVALID_METADATA` instead of `UNKNOWN_MODEL` (#314).
+- Concurrent Trajectory starts in one agent directory now share one server whose lock always names the process answering `/health`. A lock whose owner is alive but does not answer within the startup budget, or a lock that cannot be read, is kept and the attach fails with a clear error, instead of a second server being started beside it. Process liveness is checked against the kernel start time, not the `/proc` entry time, and Trajectory sends SIGKILL only to a process whose recorded start time still matches; a stale server that cannot be confirmed stopped keeps its lock and fails the attach (#315).
 
 ## [6.1.0] - 2026-10-08
 

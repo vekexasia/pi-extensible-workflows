@@ -1,6 +1,6 @@
 {
   "name": "@piewf/cli",
-  "version": "6.1.0",
+  "version": "6.2.0",
   "description": "CLI for pi-extensible-workflows",
   "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
   "repository": {
@@ -43,7 +43,7 @@
     "@earendil-works/pi-coding-agent": "1.0.0",
     "@earendil-works/pi-server": "1.0.0",
     "@earendil-works/pi-tui": "1.0.0",
-    "pi-extensible-workflows": "6.1.0",
+    "pi-extensible-workflows": "6.2.0",
     "typebox": "1.3.7"
   },
   "publishConfig": {
