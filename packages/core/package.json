@@ -1,7 +1,7 @@
 {
   "name": "pi-extensible-workflows",
   "version": "6.2.0",
-  "description": "Deterministic multi-agent workflow orchestration for Pi",
+  "description": "Deterministic multi-agent workflow orchestration and codemode scripts for Pi",
   "homepage": "https://vekexasia.github.io/pi-extensible-workflows/",
   "repository": {
     "type": "git",
@@ -15,7 +15,8 @@
     "workflow",
     "multi-agent",
     "orchestration",
-    "automation"
+    "automation",
+    "codemode"
   ],
   "exports": {
     ".": "./dist/src/index.js",
