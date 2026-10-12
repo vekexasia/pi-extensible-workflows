@@ -1,0 +1,7 @@
+.semantic-map-profile-node rect { fill: #172b42; stroke: #82b5df; stroke-width: 2; }
+.semantic-map-profile-node[data-node-status="completed"] rect { stroke: #83d19a; }
+.semantic-map-profile-node[data-node-status="failed"] rect { stroke: #f28b82; }
+.semantic-map-profile-node text { fill: #f3f6fa; font: 16px sans-serif; pointer-events: none; }
+.semantic-map-profile-node .semantic-map-profile-status { fill: #bdc8d6; font-size: 12px; }
+.semantic-map-profile-edge path { fill: none; stroke: #8395aa; stroke-width: 3; }
+.semantic-map-profile-edge[data-focus-match] path { stroke: #ffd166; stroke-width: 5; }

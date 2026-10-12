@@ -1,0 +1,8 @@
+{
+  "project": "tt-a1i/archify",
+  "revision": "9e35d2b0b39b155553ba9fcfe0b4f2a5198dd993",
+  "versionLabel": "2.17.0-dev.1",
+  "path": "archify/assets/template.html",
+  "sha256": "505f1c6baa9c2454475c048aa75df8abd867e680e7b3b794b9218a95a56fc370",
+  "license": "MIT; embedded JetBrains Mono font subsets are SIL OFL 1.1"
+}

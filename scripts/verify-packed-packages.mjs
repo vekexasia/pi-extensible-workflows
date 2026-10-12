@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,17 +58,117 @@ try {
     const packed = json(resolve(extracted, "package.json"));
     if (packed.dependencies?.["@piewf/pi-ext-roles"]) errors.push(`${manifest.name}: roles must remain optional`);
     const packedFiles = files(extracted);
+    const relativeFiles = packedFiles.map((path) => path.slice(extracted.length + 1));
     const entrypoints = [packed.main, ...strings(packed.bin), ...strings(packed.exports), ...strings(packed.pi?.extensions)].filter((path) => typeof path === "string" && path.startsWith("./"));
     for (const entrypoint of entrypoints) if (!existsSync(resolve(extracted, entrypoint))) errors.push(`${manifest.name}: missing entrypoint ${entrypoint}`);
     for (const file of packedFiles.filter((path) => path.startsWith(resolve(extracted, "dist")) && (filePathHasTestDirectory(path.slice(extracted.length + 1)) || path.includes(".test.")))) errors.push(`${manifest.name}: published test artifact ${file.slice(extracted.length + 1)}`);
     for (const file of packedFiles.filter((path) => path.endsWith(".js"))) {
       for (const specifier of relativeImports(readFileSync(file, "utf8"))) if (!existsSync(resolve(dirname(file), specifier))) errors.push(`${manifest.name}: ${file.slice(extracted.length + 1)} imports missing ${specifier}`);
     }
+    if (manifest.name === "pi-extensible-workflows") {
+      const semanticAssets = relativeFiles.filter((path) => /^.*\/semantic-map\.(html|js|css)$/.test(path)).sort();
+      const expectedAssets = ["dist/trajectory/assets/semantic-map.css", "dist/trajectory/assets/semantic-map.html", "dist/trajectory/assets/semantic-map.js"];
+      if (JSON.stringify(semanticAssets) !== JSON.stringify(expectedAssets)) errors.push(`${manifest.name}: expected one canonical copy of each Semantic Map browser asset, found ${JSON.stringify(semanticAssets)}`);
+      if (!relativeFiles.includes("trajectory/vendor/archify/LICENSE")) errors.push(`${manifest.name}: missing Archify and embedded-font license notices`);
+      for (const forbidden of ["trajectory/vendor/archify/template.html", "trajectory/test/fixtures/semantic-map-feasibility/archify-template.html"]) if (relativeFiles.includes(forbidden)) errors.push(`${manifest.name}: packaged pinned vendor input ${forbidden}`);
+      if (relativeFiles.some((path) => path.includes("semantic-map-feasibility"))) errors.push(`${manifest.name}: packaged Semantic Map test fixture`);
+    }
   }
   if (errors.length) throw new Error(errors.join("\n"));
 
   const tarballs = packages.map(({ manifest }) => resolve(output, tarballName(manifest)));
   execFileSync("npm", ["install", "--prefix", installRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", ...tarballs], { stdio: "pipe", timeout: 120_000 });
+  const semanticConsumer = resolve(work, "semantic-map-installed-consumer.mjs");
+  writeFileSync(semanticConsumer, [
+    'import assert from "node:assert/strict";',
+    'import { createHash } from "node:crypto";',
+    'import { createServer } from "node:http";',
+    'import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";',
+    'import { tmpdir } from "node:os";',
+    'import { join, resolve } from "node:path";',
+    'import { pathToFileURL } from "node:url";',
+    'const packageRoot = resolve(process.argv[2]);',
+    'const assetsRoot = resolve(packageRoot, "dist/trajectory/assets");',
+    'const parentShell = resolve(packageRoot, "dist/trajectory/src/assets/index.html");',
+    'const { createTrajectoryServer } = await import(pathToFileURL(resolve(packageRoot, "dist/trajectory/src/server.js")).href);',
+    'const { SEMANTIC_MAP_ASSET_MANIFEST: manifest } = await import(pathToFileURL(resolve(packageRoot, "dist/trajectory/src/semantic-map-assets.js")).href);',
+    'const stamp = manifest.stamp;',
+    'assert.match(stamp, /^[0-9a-f]{16}$/);',
+    'const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");',
+    'const expected = new Map([["/semantic-map.html", ["text/html; charset=utf-8", "semantic-map.html"]], ["/semantic-map.js", ["application/javascript; charset=utf-8", "semantic-map.js"]], ["/semantic-map.css", ["text/css; charset=utf-8", "semantic-map.css"]]]);',
+    'for (const [, [, filename]] of expected) { const bytes = readFileSync(resolve(assetsRoot, filename)); assert.equal(bytes.byteLength, manifest.assets[filename].bytes, filename); assert.equal(digest(bytes), manifest.assets[filename].sha256, filename); }',
+    'assert.equal(digest(readFileSync(parentShell)), manifest.assets["index.html"].sha256, "installed parent shell matches the manifest");',
+    'const root = mkdtempSync(join(tmpdir(), "piewf-installed-semantic-map-"));',
+    'const probe = createServer();',
+    'await new Promise((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });',
+    'const address = probe.address(); assert.ok(address && typeof address !== "string");',
+    'await new Promise((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));',
+    'const port = address.port;',
+    'const server = createTrajectoryServer(port, join(root, "trajectory.lock"), { fingerprint: "installed-semantic-map-consumer" });',
+    'await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, "127.0.0.1", resolve); });',
+    'const base = "http://127.0.0.1:" + String(port);',
+    'const noStore = (response, label) => { assert.equal(response.headers.get("cache-control"), "no-store", label); assert.equal(response.headers.get("x-content-type-options"), "nosniff", label); };',
+    'const restores = [];',
+    'let rawBytes = 0; let rejected = 0; let incoherent = 0;',
+    'try {',
+    '  const parent = await fetch(base + "/");',
+    '  assert.equal(parent.status, 200);',
+    '  noStore(parent, "/");',
+    '  assert.match(parent.headers.get("content-security-policy") || "", /frame-src \'self\'/);',
+    '  assert.ok((await parent.text()).includes(stamp), "parent shell requests the viewer build it was built with");',
+    '  for (const [route, [mime, filename]] of expected) {',
+    '    const response = await fetch(base + route + "?v=" + stamp + (route.endsWith(".html") ? "&embed=1" : ""));',
+    '    assert.equal(response.status, 200, route);',
+    '    assert.equal(response.headers.get("content-type"), mime, route);',
+    '    noStore(response, route);',
+    '    assert.equal(response.headers.get("referrer-policy"), "no-referrer", route);',
+    '    const actual = Buffer.from(await response.arrayBuffer());',
+    '    const packaged = readFileSync(resolve(assetsRoot, filename));',
+    '    assert.deepEqual(actual, packaged, route + " is served from the installed canonical package asset");',
+    '    assert.equal(Number(response.headers.get("content-length")), packaged.byteLength, route);',
+    '    rawBytes += actual.byteLength;',
+    '    if (route.endsWith(".html")) {',
+    '      const html = actual.toString("utf8");',
+    '      assert.ok(html.includes("semantic-map.js?v=" + stamp) && html.includes("semantic-map.css?v=" + stamp), "viewer requests its own build");',
+    '      assert.match(response.headers.get("content-security-policy") || "", /connect-src \'none\'/);',
+    '    }',
+    '    for (const query of ["", "?v=", "?v=0000000000000000", "?v=" + stamp + "&v=" + stamp, "?v=" + stamp.toUpperCase(), "?build=ignored"].filter((query) => query !== "?v=" + stamp)) {',
+    '      const stale = await fetch(base + route + query);',
+    '      assert.equal(stale.status, 404, route + query);',
+    '      noStore(stale, route + query);',
+    '      rejected += 1;',
+    '    }',
+    '  }',
+    '  // In-place replacement of the installed files beside the running server fails closed, then recovers when restored.',
+    '  const replace = (path, bytes) => { const original = readFileSync(path); restores.push(() => writeFileSync(path, original)); writeFileSync(path, bytes); return original; };',
+    '  const css = resolve(assetsRoot, "semantic-map.css");',
+    '  const cssBytes = replace(css, readFileSync(css).subarray(0, 64));',
+    '  for (const route of expected.keys()) { const response = await fetch(base + route + "?v=" + stamp); assert.equal(response.status, 503, "truncated css: " + route); noStore(response, route); incoherent += 1; }',
+    '  writeFileSync(css, Buffer.from(cssBytes.toString("utf8").replace(/[a-z]/, "Z")));',
+    '  assert.equal((await fetch(base + "/semantic-map.css?v=" + stamp)).status, 503, "same-size replacement"); incoherent += 1;',
+    '  restores.pop()();',
+    '  assert.equal((await fetch(base + "/semantic-map.css?v=" + stamp)).status, 200, "restored css");',
+    '  replace(parentShell, Buffer.concat([readFileSync(parentShell), Buffer.from("<!-- B -->")]));',
+    '  const parentB = await fetch(base + "/"); assert.equal(parentB.status, 503, "parent B"); noStore(parentB, "parent B"); incoherent += 1;',
+    '  restores.pop()();',
+    '  assert.equal((await fetch(base + "/")).status, 200, "restored parent");',
+    '  assert.equal((await fetch(base + "/semantic-map.json")).status, 404);',
+    '  assert.equal((await fetch(base + "/semantic-map.js?v=" + stamp, { method: "POST" })).status, 404);',
+    '  assert.equal((await fetch(base + "/semantic-map.js?v=" + stamp, { headers: { origin: "http://evil.test" } })).status, 403);',
+    '  process.stdout.write("Installed Semantic Map consumer passed: stamp=" + stamp + ", routes=3, rawBytes=" + String(rawBytes) + ", rejectedVersions=" + String(rejected) + ", incoherent503=" + String(incoherent) + ".\\n");',
+    '} finally {',
+    '  for (const restore of restores.reverse()) restore();',
+    '  server.closeAllConnections(); server.closeIdleConnections();',
+    '  await new Promise((resolve) => server.close(() => resolve()));',
+    '  rmSync(root, { recursive: true, force: true });',
+    '}'
+  ].join("\n"));
+  const corePackage = packagePath(installRoot, "pi-extensible-workflows");
+  const semanticResult = spawnSync(process.execPath, [semanticConsumer, corePackage], { cwd: work, encoding: "utf8", env: { ...process.env, PI_OFFLINE: "1" }, timeout: 30_000 });
+  if (semanticResult.error) throw semanticResult.error;
+  if (semanticResult.status !== 0) throw new Error(`Installed Semantic Map consumer failed:\n${semanticResult.stderr}`);
+  process.stdout.write(semanticResult.stdout);
+
   const cli = spawnSync(resolve(installRoot, "node_modules", ".bin", "piewf"), ["run", "--help"], { cwd: work, encoding: "utf8" });
   const cliOutput = `${cli.stdout ?? ""}${cli.stderr ?? ""}`;
   if (cli.error) throw cli.error;

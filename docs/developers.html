@@ -326,6 +326,17 @@
 <span class="tok-command">npm</span> run check
 <span class="tok-command">npm</span> run test:packages</code></pre>
         <p>Pull requests and main-branch pushes run these same commands on Node.js 24. <code>check</code> builds and type-checks all packages, lints, runs the workspace and template tests, and validates documentation links. <code>test:packages</code> additionally packs and installs all three artifacts in temporary directories, checks imports and entrypoints, exercises the installed CLI and Pi package discovery, and runs npm audit. It requires npm registry access but does not publish anything. Release checks remain in <a href="https://github.com/vekexasia/pi-extensible-workflows/blob/main/RELEASING.md">RELEASING.md</a>.</p>
+        <h3 id="browser-checks">Semantic Map browser checks</h3>
+        <p>The optional live Semantic Map uses a bounded, opaque sandbox projection. See the Trajectory section of the <a href="llm.md">LLM reference</a> for asset versioning, privacy and limits. The offline core build generates its pinned assets; <code>test:layout</code> also verifies deterministic generation.</p>
+        <p>After a build, run browser tests serially with an isolated headless Chrome executable and temporary agent directory. Do not overlap builds or prepack with tests:</p>
+        <pre><code class="language-shell"><span class="tok-command">export</span> PI_TRAJECTORY_CHROME=/path/to/chrome
+<span class="tok-command">npm</span> run build --workspace=packages/core
+<span class="tok-command">cd</span> packages/core
+agent=$(mktemp -d); PI_CODING_AGENT_DIR="$agent" <span class="tok-command">node</span> --expose-gc --test --test-concurrency=1 --test-timeout=300000 --test-force-exit dist/trajectory/test/*.test.js; <span class="tok-command">rm</span> -rf "$agent"
+<span class="tok-command">cd</span> ../..
+<span class="tok-command">node</span> scripts/trajectory-semantic-map-acceptance.mjs --out .tmp/semantic-map-acceptance</code></pre>
+        <p>The acceptance harness uses a temporary browser profile and owned loopback server, records raw samples and criteria, and fails on unmet security, rate, projection, latency or heap criteria. Its default ordinary-update phase runs for 10 real minutes. Other <code>--phases</code> selections are focused diagnostics, not full acceptance. The original heap protocol requires 10 warm-up cycles; changing <code>--heap-warmups</code> cannot close that criterion.</p>
+        <p>Run <code>node scripts/demo-trajectory-semantic-map.mjs</code> after building for a local live demo. It exercises the real workflow runtime, tools, persistence, publisher and UI with only the model replaced by a deterministic loopback endpoint. It never uses personal port 7432. Stop with Ctrl+C or a <code>stop</code> line. <code>--auto --evidence .tmp/semantic-map-demo</code> drives isolated headless Chrome, captures screenshots and a walkthrough, then cleans up owned resources. No provider is contacted or personal browser attached.</p>
         <h3>Focused iteration</h3>
         <p>Build before running compiled tests; otherwise <code>test:run</code> can exercise stale output. <code>TEST_FILES</code> paths are relative to the selected workspace. For example:</p>
         <pre><code class="language-shell"><span class="tok-command">npm</span> run build --workspace=packages/core

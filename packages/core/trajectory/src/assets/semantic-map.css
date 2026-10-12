@@ -1,0 +1,146 @@
+/* Semantic Map d48e5e3be431480f */
+/*
+ * Semantic Map, paper style: same palette and type as the Trajectory UI (paper #fbf8f1, rules #e4dbc9, ink #2b2723,
+ * serif headings, monospace metrics). Light paper is the default; html[data-theme="dark"] is the warm dark variant.
+ */
+html[data-embed="true"] body { overflow: auto !important; background: #fbf8f1; }
+html[data-embed="true"] .diagram-container { overflow: auto; background: #fbf8f1; }
+html[data-theme="dark"][data-embed="true"] body, html[data-theme="dark"][data-embed="true"] .diagram-container { background: #1c1a17; }
+.c-grid { stroke: #ece4d3; }
+html[data-theme="dark"] .c-grid { stroke: #2a2621; }
+
+/* Agent boxes */
+.semantic-map-group-background { pointer-events: none; }
+.semantic-map-group-shape { fill: #f6f1e7; stroke: #d9cfbb; stroke-width: 1; }
+.semantic-map-group-label { fill: #2b2723; font: 600 14px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; }
+.semantic-map-group-status { fill: #6f665a; font: 10px ui-monospace, Menlo, Consolas, monospace; }
+.semantic-map-group-scope { fill: #6f665a; font: italic 10px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; pointer-events: none; }
+.semantic-map-group-stats { fill: #4a443c; font: 9.5px ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+.semantic-map-group-toggle { fill: #2f5d8a; font: 600 10px ui-monospace, Menlo, Consolas, monospace; cursor: pointer; }
+.semantic-map-group-toggle:hover, .semantic-map-group-toggle:focus-visible { text-decoration: underline; outline: none; }
+.semantic-map-group-toggle.is-hidden, .semantic-map-summary.is-hidden { display: none; }
+.agent-color-0 .semantic-map-group-shape { fill: #eaf0f7; stroke: #9fb6d1; }
+.agent-color-1 .semantic-map-group-shape { fill: #e9f1e6; stroke: #a9c2a0; }
+.agent-color-2 .semantic-map-group-shape { fill: #f6eedc; stroke: #d2b98a; }
+.agent-color-3 .semantic-map-group-shape { fill: #efe9f4; stroke: #bba9cc; }
+.agent-color-4 .semantic-map-group-shape { fill: #f6e7e5; stroke: #d3a6a0; }
+.agent-color-5 .semantic-map-group-shape { fill: #e4f0ee; stroke: #95bdb6; }
+.agent-color-6 .semantic-map-group-shape { fill: #eff0dc; stroke: #bdbf8c; }
+.agent-color-7 .semantic-map-group-shape { fill: #f8eadf; stroke: #d9ad8d; }
+.group-running .semantic-map-group-shape { stroke: #2f80c9; stroke-width: 2; stroke-dasharray: 8 4; }
+.group-running .semantic-map-group-status { fill: #2f80c9; font-weight: 700; }
+.semantic-map-stage-label { fill: #6f665a; font: 600 12px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; letter-spacing: .16em; pointer-events: none; }
+html[data-theme="dark"] .semantic-map-group-shape { fill: #23201c; stroke: #3a352e; }
+html[data-theme="dark"] .agent-color-0 .semantic-map-group-shape { fill: #1f2630; stroke: #4b6383; }
+html[data-theme="dark"] .agent-color-1 .semantic-map-group-shape { fill: #1f2a20; stroke: #4f6e4b; }
+html[data-theme="dark"] .agent-color-2 .semantic-map-group-shape { fill: #2c261a; stroke: #7a6542; }
+html[data-theme="dark"] .agent-color-3 .semantic-map-group-shape { fill: #29222e; stroke: #66557a; }
+html[data-theme="dark"] .agent-color-4 .semantic-map-group-shape { fill: #2e2120; stroke: #7d5450; }
+html[data-theme="dark"] .agent-color-5 .semantic-map-group-shape { fill: #1c2a28; stroke: #4a7069; }
+html[data-theme="dark"] .agent-color-6 .semantic-map-group-shape { fill: #2a2b1c; stroke: #6e6f45; }
+html[data-theme="dark"] .agent-color-7 .semantic-map-group-shape { fill: #2e241c; stroke: #80604a; }
+html[data-theme="dark"] .semantic-map-group-label { fill: #ebe4d6; }
+html[data-theme="dark"] .semantic-map-group-status, html[data-theme="dark"] .semantic-map-group-scope, html[data-theme="dark"] .semantic-map-stage-label { fill: #a89e8e; }
+html[data-theme="dark"] .semantic-map-group-stats { fill: #c9bfae; }
+html[data-theme="dark"] .semantic-map-group-toggle { fill: #8db4de; }
+html[data-theme="dark"] .group-running .semantic-map-group-shape { stroke: #5aa9f0; }
+html[data-theme="dark"] .group-running .semantic-map-group-status { fill: #5aa9f0; }
+
+/* Summary card for the folded middle of a collapsed box */
+.semantic-map-summary { cursor: pointer; }
+.semantic-map-summary-shape { fill: #f3eee3; stroke: #a99d89; stroke-width: 1.25; stroke-dasharray: 5 3; }
+.semantic-map-summary:hover .semantic-map-summary-shape, .semantic-map-summary:focus-visible .semantic-map-summary-shape { stroke: #2f5d8a; stroke-width: 1.75; }
+.semantic-map-summary:focus-visible { outline: none; }
+.semantic-map-summary-label { fill: #2f5d8a; font: italic 600 10.5px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; pointer-events: none; }
+.semantic-map-summary-detail { fill: #4a443c; font: 8.5px ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+.semantic-map-summary-issues { fill: #6f665a; font: 8.5px ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+.semantic-map-summary-issues.has-failure { fill: #b4232f; font-weight: 700; }
+.semantic-map-summary-link { stroke-dasharray: 2 3; }
+html[data-theme="dark"] .semantic-map-summary-shape { fill: #26231f; stroke: #6f665a; }
+html[data-theme="dark"] .semantic-map-summary-label { fill: #8db4de; }
+html[data-theme="dark"] .semantic-map-summary-detail { fill: #c9bfae; }
+html[data-theme="dark"] .semantic-map-summary-issues { fill: #a89e8e; }
+html[data-theme="dark"] .semantic-map-summary-issues.has-failure { fill: #ff8a95; }
+#semantic-map-target { inset: .4rem auto auto .4rem; max-width: 75%; }
+
+/* Nodes: the outline shape tells the kind, the neon outline tells the state. */
+.semantic-map-node { cursor: pointer; }
+.semantic-map-node-shape { fill: #fffdf8; stroke: #a99d89; stroke-width: 1.5; }
+.kind-system .semantic-map-node-shape { fill: #f2edf7; }
+.kind-user .semantic-map-node-shape { fill: #eaf3f1; }
+.kind-assistant .semantic-map-node-shape { fill: #eef1f7; }
+.kind-tool .semantic-map-node-shape { fill: #faf1dc; }
+.kind-result .semantic-map-node-shape { fill: #eef5e8; }
+html[data-theme="dark"] .semantic-map-node-shape { fill: #24211d; stroke: #6f665a; }
+html[data-theme="dark"] .kind-system .semantic-map-node-shape { fill: #2a2433; }
+html[data-theme="dark"] .kind-user .semantic-map-node-shape { fill: #1d2b29; }
+html[data-theme="dark"] .kind-assistant .semantic-map-node-shape { fill: #22262f; }
+html[data-theme="dark"] .kind-tool .semantic-map-node-shape { fill: #2f281b; }
+html[data-theme="dark"] .kind-result .semantic-map-node-shape { fill: #1f2a1e; }
+.semantic-map-node-shape.state-success { stroke: #1f9d63; stroke-width: 2; filter: drop-shadow(0 0 3px rgba(31, 157, 99, .55)); }
+.semantic-map-node-shape.state-running { stroke: #2f80c9; stroke-width: 2.5; filter: drop-shadow(0 0 5px rgba(47, 128, 201, .7)); }
+.semantic-map-node-shape.state-failure { stroke: #d2394b; stroke-width: 2.25; filter: drop-shadow(0 0 4px rgba(210, 57, 75, .6)); }
+.semantic-map-node-shape.state-retrying { stroke: #c98a12; stroke-width: 2; filter: drop-shadow(0 0 3px rgba(201, 138, 18, .55)); }
+.semantic-map-node-shape.state-cancelled, .semantic-map-node-shape.state-interrupted { stroke: #c98a12; stroke-dasharray: 4 2; }
+html[data-theme="dark"] .semantic-map-node-shape.state-success { stroke: #22f59a; filter: drop-shadow(0 0 4px rgba(34, 245, 154, .8)); }
+html[data-theme="dark"] .semantic-map-node-shape.state-running { stroke: #38bdf8; filter: drop-shadow(0 0 6px rgba(56, 189, 248, .9)); }
+html[data-theme="dark"] .semantic-map-node-shape.state-failure { stroke: #ff3b5c; filter: drop-shadow(0 0 5px rgba(255, 59, 92, .9)); }
+html[data-theme="dark"] .semantic-map-node-shape.state-retrying { stroke: #fbbf24; }
+.node-running .semantic-map-node-shape { stroke-width: 3.25; animation: semantic-map-running 1.4s ease-in-out infinite; }
+.node-running .semantic-map-node-label { font-weight: 700; }
+@keyframes semantic-map-running { 50% { stroke-opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .node-running .semantic-map-node-shape { animation: none; } }
+/* Retries: inner red frame = at least one failed attempt; outer frame keeps the final state colour. */
+.semantic-map-node-inner { display: none; fill: none; pointer-events: none; }
+.node-had-failure.kind-agent .semantic-map-node-inner { display: inline; stroke: #d2394b; stroke-width: 2; filter: drop-shadow(0 0 3px rgba(210, 57, 75, .6)); }
+html[data-theme="dark"] .node-had-failure.kind-agent .semantic-map-node-inner { stroke: #ff3b5c; filter: drop-shadow(0 0 4px rgba(255, 59, 92, .95)); }
+.semantic-map-retry-loop { display: none; fill: none; pointer-events: none; }
+.node-retried .semantic-map-retry-loop { display: inline; stroke: #b7791f; stroke-width: 1.75; }
+.semantic-map-retry-count { fill: #b7791f; font: 700 11px ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+html[data-theme="dark"] .node-retried .semantic-map-retry-loop { stroke: #fbbf24; }
+html[data-theme="dark"] .semantic-map-retry-count { fill: #fbbf24; }
+/* Grouped tool calls: a stack of paper cards behind the front card and a ×N count; red count when a call failed. */
+.semantic-map-node-stack { display: none; pointer-events: none; fill: #f3e7c8; stroke: #a99d89; stroke-width: 1; }
+.node-stacked .semantic-map-node-stack { display: inline; }
+.node-stack-failure .semantic-map-node-stack { stroke: #d2394b; }
+.node-stack-failure .semantic-map-retry-count { fill: #b4232f; }
+html[data-theme="dark"] .semantic-map-node-stack { fill: #3a3121; stroke: #6f665a; }
+html[data-theme="dark"] .node-stack-failure .semantic-map-node-stack { stroke: #ff3b5c; }
+html[data-theme="dark"] .node-stack-failure .semantic-map-retry-count { fill: #ff8a95; }
+/* Dense graphs keep state colours but drop glow filters so large updates stay inside the performance budget. */
+.semantic-map-nodes.semantic-map-dense .semantic-map-node-shape.state-success, .semantic-map-nodes.semantic-map-dense .semantic-map-node-shape.state-failure, .semantic-map-nodes.semantic-map-dense .semantic-map-node-shape.state-retrying { filter: none; }
+.semantic-map-node[aria-pressed="true"] .semantic-map-node-shape { stroke: #c98a12; stroke-width: 3; }
+.semantic-map-node:focus-visible .semantic-map-node-shape { stroke: #2f5d8a; stroke-width: 3; }
+.semantic-map-node-label { fill: #2b2723; font: 11px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; pointer-events: none; }
+.semantic-map-node-status { fill: #6f665a; font: 8px ui-monospace, Menlo, Consolas, monospace; pointer-events: none; }
+.semantic-map-node-status.status-running { fill: #2f80c9; font-weight: 700; }
+.semantic-map-node-status.status-success { fill: #1f7a4f; }
+.semantic-map-node-status.status-failure { fill: #b4232f; }
+html[data-theme="dark"] .semantic-map-node-label { fill: #ebe4d6; }
+html[data-theme="dark"] .semantic-map-node-status { fill: #a89e8e; }
+html[data-theme="dark"] .semantic-map-node-status.status-running { fill: #7dd3fc; }
+html[data-theme="dark"] .semantic-map-node-status.status-success { fill: #4ade80; }
+html[data-theme="dark"] .semantic-map-node-status.status-failure { fill: #fb7185; }
+
+/* Edges: one ink per meaning. */
+.semantic-map-edge-path { fill: none; stroke: #8a7f70; stroke-width: 1.35; opacity: .95; }
+.semantic-map-edge-path.relation-invokes { stroke: #b7791f; }
+.semantic-map-edge-path.relation-produces { stroke: #3f8f4f; }
+.semantic-map-edge-path.relation-phase { stroke: #2f5d8a; stroke-width: 1.75; stroke-dasharray: 7 4; }
+.semantic-map-edge-path.relation-contains { stroke: #8b5fb0; stroke-dasharray: 3 3; }
+.semantic-map-edge-path.relation-dependency, .semantic-map-edge-path.relation-fork, .semantic-map-edge-path.relation-merge { stroke: #7c5cbf; stroke-width: 1.6; stroke-dasharray: 4 3; }
+.semantic-map-edge-path.relation-retry { stroke: #c98a12; stroke-dasharray: 2 3; }
+html[data-theme="dark"] .semantic-map-edge-path { stroke: #a89e8e; }
+html[data-theme="dark"] .semantic-map-edge-path.relation-invokes { stroke: #fbbf24; }
+html[data-theme="dark"] .semantic-map-edge-path.relation-produces { stroke: #4ade80; }
+html[data-theme="dark"] .semantic-map-edge-path.relation-phase { stroke: #8db4de; }
+html[data-theme="dark"] .semantic-map-edge-path.relation-contains { stroke: #c084fc; }
+
+/* Workflow totals on the canvas background */
+.semantic-map-canvas-stats { pointer-events: none; }
+.semantic-map-canvas-stats-title { fill: #6f665a; font: 600 11px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; letter-spacing: .16em; }
+.semantic-map-canvas-stats-line { fill: #2b2723; font: 12px ui-monospace, Menlo, Consolas, monospace; }
+html[data-theme="dark"] .semantic-map-canvas-stats-title { fill: #a89e8e; }
+html[data-theme="dark"] .semantic-map-canvas-stats-line { fill: #ebe4d6; }
+.semantic-map-completeness { position: absolute; inset: auto auto 1rem 1rem; z-index: 5; max-width: min(30rem, 50%); margin: 0; padding: .4rem .65rem; border: 1px solid #e4dbc9; border-radius: 8px; background: #fbf8f1f0; color: #2b2723; font: 12px "Iowan Old Style", Charter, "Palatino Linotype", Georgia, serif; box-shadow: 0 1px 2px rgba(43, 39, 35, .08); pointer-events: none; }
+html[data-theme="dark"] .semantic-map-completeness { border-color: #312d27; background: #1c1a17f0; color: #ebe4d6; }
