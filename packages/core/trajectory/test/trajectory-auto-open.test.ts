@@ -15,10 +15,11 @@ type WorkflowHandler = (args: string, context: unknown) => Promise<void>;
 type SessionStartHandler = (event: unknown, context: unknown) => Promise<void>;
 type TrajectoryProbe = {
   inputs: TrajectoryPublisherInput[];
+  reports: ((message: string) => void)[];
   urls: string[];
   waiters: Array<() => void>;
   controller: {
-    open(input: TrajectoryPublisherInput): Promise<{ port: number }>;
+    open(input: TrajectoryPublisherInput, report?: (message: string) => void): Promise<{ port: number }>;
     close(): Promise<void>;
   };
 };
@@ -27,15 +28,18 @@ const SESSION_ID = "session";
 
 function trajectoryProbe(): TrajectoryProbe {
   const inputs: TrajectoryPublisherInput[] = [];
+  const reports: ((message: string) => void)[] = [];
   const urls: string[] = [];
   const waiters: Array<() => void> = [];
   return {
     inputs,
+    reports,
     urls,
     waiters,
     controller: {
-      async open(input) {
+      async open(input, report) {
         inputs.push(input);
+        if (report) reports.push(report);
         for (const resolve of waiters.splice(0)) resolve();
         return { port: 9876 };
       },
@@ -187,6 +191,23 @@ void test("manual Trajectory re-open uses the same path after auto-attach", asyn
   assert.deepEqual(probe.urls, ["http://127.0.0.1:9876/"]);
   await host.shutdown();
 });
+
+void test("a lost Trajectory connection is reported as a warning through the session that attached it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-report-"));
+  const cwd = join(home, "project");
+  const probe = trajectoryProbe();
+  const host = install(home, probe);
+  const notices: string[] = [];
+  const ctx = { ...context(cwd, true), ui: { notify(message: string, level?: string) { notices.push(`${level ?? "info"}: ${message}`); }, select: async () => undefined } };
+  await host.start({}, ctx);
+  await host.command("trajectory", ctx);
+  assert.equal(probe.reports.length, 1, "the controller gets a reporter for this session");
+  notices.length = 0;
+  probe.reports[0]?.("Trajectory disconnected, retrying in the background: boom");
+  assert.deepEqual(notices, ["warning: Trajectory disconnected, retrying in the background: boom"]);
+  await host.shutdown();
+});
+
 void test("Trajectory overlays live subagent status observed by the workflow registry", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trajectory-subagent-overlay-"));
   const cwd = join(home, "project");
