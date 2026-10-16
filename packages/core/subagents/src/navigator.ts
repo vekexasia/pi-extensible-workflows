@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { copyToClipboard, getAgentDir, SettingsManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Editor, truncateToWidth, type EditorTheme } from "@earendil-works/pi-tui";
 import { agentActionLabels, createInlineConfirm, deepFreeze, errorText, formatAgentDetail, formatAgentError, formatCost, formatNavigatorColumns, formatWorkflowRuntime, jsonValue, loadingRegistry, navigatorAttentionSortByState, openWorkflowArtifact, PLAIN_WORKFLOW_PROGRESS_STYLES, progressStyleForState, runStateGlyph, themeWorkflowProgressStyles, visibleStandaloneAgentAttemptActions, workflowKeyLabel, workflowKeyMatches, workflowPromptArtifact, workflowResultArtifact, type AgentAttemptSummary, type AgentDetailPresentation, type StandaloneAgentAttemptActionContext, type WorkflowArtifact, type WorkflowProgressStyles } from "../../src/index.js";
+import { getAgentsWorkspaceOpener, type OpenAgentsAt } from "../../src/host-navigator.js";
 import { normalizeSubagentRunRequest, type SubagentManager, type SubagentManagerContext, type SubagentProgress, type SubagentRunRequest, type SubagentStatus } from "./contracts.js";
 import { attemptValue, statusValue } from "./decode.js";
 const MAX_DETAIL_TEXT = 4000;
@@ -219,6 +220,7 @@ function actionOptions(manager: SubagentManager, inspection: Inspection, context
     openSystemPrompt: context.mode === "tui" && liveSystemPrompt(manager, inspection.entry.status) !== undefined,
     openResult: context.mode === "tui" && Object.prototype.hasOwnProperty.call(inspection.record, "value") && jsonValue(value),
     standaloneState: inspection.entry.status.state,
+    viewTranscript: context.mode === "tui",
   });
   const runActions = [...(manager.delete !== undefined && inspection.entry.status.state !== "running" ? ["Delete"] : []), ...bulk, ...(context.mode === "tui" ? ["Copy run path"] : [])];
   labels.splice(labels.indexOf("Copy agent ID"), 0, ...runActions);
@@ -324,7 +326,7 @@ async function showDetail(manager: SubagentManager, storageDirectory: string, en
 }
 
 /** The `/workflow` dashboard layout for standalone runs: the run list beside the selected run's details. */
-async function showDashboard(manager: SubagentManager, storageDirectory: string, initial: readonly NavigatorEntry[], context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>): Promise<void> {
+async function showDashboard(manager: SubagentManager, storageDirectory: string, initial: readonly NavigatorEntry[], context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>, openAgents: OpenAgentsAt): Promise<void> {
   const first = initial[0];
   if (first === undefined) return;
   let initialInspection: Inspection;
@@ -459,6 +461,13 @@ async function showDashboard(manager: SubagentManager, storageDirectory: string,
       shutDown();
       done(value);
     };
+    // t and "View transcript": the /agents workspace opens over Pi on the selected run; this dashboard is back when it closes.
+    const viewTranscript = (): void => {
+      actionMode = false;
+      offset = 0;
+      selectionNeedsScroll = true;
+      void openAgents(context, `subagent:${inspection.entry.status.id}`).catch((error: unknown) => { warn(`Cannot open the agents workspace: ${errorText(error)}`); });
+    };
     steerEditor.onSubmit = (value) => {
       const message = value.trim();
       if (message) close({ entry: inspection.entry, message });
@@ -525,8 +534,8 @@ async function showDashboard(manager: SubagentManager, storageDirectory: string,
         const hint = steerMode ? "enter submit · esc back"
           : inlineConfirm.active() ? inlineConfirm.hint(keybindings)
           : actionMode ? `${up}/${down} actions · ${enter} run · ${keyLabel("tui.editor.cursorLeft", "←")} ${back} · ${esc} ${back}`
-            : narrow && detailsMode ? `${up}/${down} scroll · ${enter} actions · a actions · ${esc} list${scroll}${refreshHint}`
-              : `${up}/${down} select · ${enter} ${narrow ? "details" : "actions"} · a actions · ${esc} close${scroll}${refreshHint}`;
+            : narrow && detailsMode ? `${up}/${down} scroll · ${enter} actions · a actions · t transcript · ${esc} list${scroll}${refreshHint}`
+              : `${up}/${down} select · ${enter} ${narrow ? "details" : "actions"} · a actions · t transcript · ${esc} close${scroll}${refreshHint}`;
         return [...content.slice(offset, offset + viewport), ...footer, ...(hintRows ? [styles.dim(hint)] : [])].map((line) => truncateToWidth(line, Math.max(1, width), "…"));
       },
       invalidate() {},
@@ -552,10 +561,12 @@ async function showDashboard(manager: SubagentManager, storageDirectory: string,
           else if (matches(data, "tui.select.confirm")) {
             const action = actions[actionIndex];
             if (action === "Steer") { steerMode = true; actionMode = false; steerEditor.setText(""); }
+            else if (action === "View transcript") viewTranscript();
             else if (action && action !== "Back") runAction(action);
             else { actionMode = false; offset = 0; selectionNeedsScroll = true; }
           }
         } else if (data === "a" || data === "A") { actionMode = true; actionIndex = 0; offset = 0; }
+        else if (data === "t") viewTranscript();
         else if (matches(data, "tui.select.cancel")) {
           if (!narrow || !detailsMode) { close(undefined); return; }
           detailsMode = false;
@@ -583,7 +594,7 @@ async function showDashboard(manager: SubagentManager, storageDirectory: string,
   catch (error) { context.ui.notify(`Cannot steer: ${errorText(error)}`, "warning"); }
 }
 
-async function runNavigator(manager: SubagentManager, storageDirectory: string, args: string, context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>): Promise<void> {
+async function runNavigator(manager: SubagentManager, storageDirectory: string, args: string, context: ExtensionCommandContext, clipboard: (value: string) => Promise<void>, openAgents: OpenAgentsAt): Promise<void> {
   if (args.trim()) {
     context.ui.notify("Subagent slash commands do not accept arguments. Open the picker with /subagents to inspect and control current-session runs.", "warning");
     return;
@@ -600,7 +611,7 @@ async function runNavigator(manager: SubagentManager, storageDirectory: string, 
       return;
     }
     if (context.mode === "tui") {
-      await showDashboard(manager, storageDirectory, entries, context, clipboard);
+      await showDashboard(manager, storageDirectory, entries, context, clipboard, openAgents);
       return;
     }
     const choice = await context.ui.select("Subagents\n", [...labels, "Close", ...bulkDeleteLabels(manager, entries)]);
@@ -621,12 +632,19 @@ async function runNavigator(manager: SubagentManager, storageDirectory: string, 
   }
 }
 
-export function registerSubagentNavigator(registerCommand: RegisterCommand, manager: SubagentManager, storageDirectory: string, clipboard: (value: string) => Promise<void> = copyToClipboard): void {
+/** The workspace the core workflow extension publishes (src/host.ts); this extension may run without it. */
+const openPublishedAgentsWorkspace: OpenAgentsAt = async (context, initialKey) => {
+  const open = getAgentsWorkspaceOpener();
+  if (open === undefined) { context.ui.notify("The agents workspace needs the pi-extensible-workflows workflow extension.", "warning"); return; }
+  await open(context, initialKey);
+};
+
+export function registerSubagentNavigator(registerCommand: RegisterCommand, manager: SubagentManager, storageDirectory: string, clipboard: (value: string) => Promise<void> = copyToClipboard, openAgents: OpenAgentsAt = openPublishedAgentsWorkspace): void {
   registerCommand("subagents", {
     description: "Open the durable subagent picker and inspect run status",
     handler: async (args, context) => {
       try {
-        await runNavigator(manager, storageDirectory, args, context, clipboard);
+        await runNavigator(manager, storageDirectory, args, context, clipboard, openAgents);
       } catch (error) {
         context.ui.notify(`Cannot inspect subagents: ${errorText(error)}`, "warning");
       }

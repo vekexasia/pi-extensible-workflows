@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { type ExtensionUIContext, SettingsManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionCommandContext, type ExtensionUIContext, SettingsManager, truncateToVisualLines, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { listRunIds, RunStore, type AwaitingCheckpoint, type PersistedRun, type WorktreeReference } from "./persistence.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { deepFreeze, errorText, object, resolveModelReference, validateModelAliases } from "./utils.js";
@@ -161,6 +161,13 @@ export function createInlineConfirm(requestRender: () => void) {
   };
 }
 
+/** Opens the /agents workspace (agents-workspace.ts) with one agent selected: `run:<runId>:<agentId>` or `subagent:<id>`. */
+export type OpenAgentsAt = (ctx: ExtensionCommandContext, initialKey: string) => Promise<void>;
+const AGENTS_WORKSPACE_KEY = Symbol.for("pi-extensible-workflows.agents-workspace");
+const globalAgentsWorkspaces = globalThis as typeof globalThis & Record<symbol, OpenAgentsAt | undefined>;
+/** The core host publishes its opener for the /subagents dashboard, which another extension bundle loads with its own copy of this module. */
+export function setAgentsWorkspaceOpener(open: OpenAgentsAt | undefined): void { globalAgentsWorkspaces[AGENTS_WORKSPACE_KEY] = open; }
+export function getAgentsWorkspaceOpener(): OpenAgentsAt | undefined { return globalAgentsWorkspaces[AGENTS_WORKSPACE_KEY]; }
 export type WorkflowNavigatorDependencies = {
   pi: Pick<ExtensionAPI, "registerCommand">;
   home: string | undefined;
@@ -187,9 +194,11 @@ export type WorkflowNavigatorDependencies = {
   setNavigatorOpen?: (open: boolean) => void;
   trajectoryProvider: TrajectoryPublisherProvider;
   coordinateRunMutation?: <T>(task: () => Promise<T>) => Promise<T>;
+  /** t and "View transcript" in the dashboard. */
+  openAgents: OpenAgentsAt;
 };
 export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): void {
-  const { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates, ensureSessionLease, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground, isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked, setNavigatorOpen, trajectoryProvider, coordinateRunMutation: coordinateRunMutationDependency } = deps;
+  const { pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates, ensureSessionLease, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground, isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked, setNavigatorOpen, trajectoryProvider, coordinateRunMutation: coordinateRunMutationDependency, openAgents } = deps;
   const coordinateRunMutation = coordinateRunMutationDependency ?? (<T>(task: () => Promise<T>): Promise<T> => task());
   const command = {
     description: "Open the workflow picker; workflow actions are available contextually",
@@ -516,6 +525,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
               openPrompt: ctx.mode === "tui" && agent.prompt !== undefined,
               openSystemPrompt: ctx.mode === "tui" && agent.systemPrompt !== undefined,
               openResult: ctx.mode === "tui" && dashboard.agentResults.has(agent.id),
+              viewTranscript: ctx.mode === "tui",
             });
           };
           const selectAgent = async (dashboard: Awaited<ReturnType<typeof loadDashboard>>, requestedAgentId?: string): Promise<void> => {
@@ -618,6 +628,15 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                     const agent = selectedAgentRecord();
                     return agent ? agentActionOptions(view, agent) : [...view.actions.keys(), "Back"];
                   };
+                  /** t and "View transcript": the /agents workspace opens over Pi on the selected agent; this dashboard is back when it closes. */
+                  const viewTranscript = (): void => {
+                    const agent = selectedAgentRecord();
+                    if (!agent) return;
+                    actionMode = false;
+                    dashboardOffset = 0;
+                    selectionNeedsScroll = true;
+                    void openAgents(ctx, `run:${view.run.id}:${agent.id}`).catch((error: unknown) => { ctx.ui.notify(`Cannot open the agents workspace: ${errorText(error)}`, "error"); });
+                  };
                   let editorRunning = false;
                   let timer: ReturnType<typeof setInterval> | undefined;
                   const stopTimer = () => {
@@ -711,11 +730,16 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       const maxOffset = Math.max(0, content.length - viewport);
                       dashboardOffset = Math.max(0, Math.min(maxOffset, dashboardOffset));
                       if (actionMode) {
-                        const label = actions?.options[actionIndex];
-                        const actionRow = label ? content.findIndex((line) => line.includes(label)) : -1;
-                        if (actionRow >= 0) {
-                          if (actionRow < dashboardOffset) dashboardOffset = actionRow;
-                          else if (actionRow >= dashboardOffset + viewport) dashboardOffset = actionRow - viewport + 1;
+                        // Options are looked up below the menu title, so a tree or detail line with the same text does not count.
+                        const titleRow = actions ? content.findIndex((line) => line.includes(actions.title)) : -1;
+                        const rowBelow = (text: string | undefined, above: number): number => text === undefined ? -1 : content.findIndex((line, index) => index > above && line.includes(text));
+                        const actionRow = rowBelow(actions?.options[actionIndex], titleRow);
+                        const lastRow = titleRow >= 0 && actionRow >= 0 ? rowBelow(actions?.options.at(-1), actionRow - 1) : -1;
+                        // A menu that fits stays whole in view, so the actions below the selected one remain visible; a longer one follows the selection.
+                        const [top, bottom] = lastRow >= 0 && lastRow - titleRow < viewport ? [titleRow, lastRow] : [actionRow, actionRow];
+                        if (top >= 0) {
+                          if (top < dashboardOffset) dashboardOffset = top;
+                          else if (bottom >= dashboardOffset + viewport) dashboardOffset = bottom - viewport + 1;
                         }
                       } else if (!detailsMode && selectionNeedsScroll) {
                         const selectedRow = content.findIndex((line) => line.startsWith("→"));
@@ -729,7 +753,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       if (!narrow && !actionMode) content = [...statusLines, ...formatPhaseLines(Math.max(0, dashboardOffset - statusLines.length))];
                       const selectedNode = selectedNodeId ? tree.byId.get(selectedNodeId) : undefined;
                       const enterAction = selectedNode?.kind === "workflow" ? "run actions" : selectedNode?.kind === "agent" ? "agent actions" : selectedNode?.children.length ? "expand/collapse" : narrow ? "inspect" : "focus details";
-                      const hint = truncateToVisualLines(theme.fg("dim", inlineConfirm.active() ? inlineConfirm.hint(keybindings) : actionMode ? `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} actions · ${keyLabel("tui.select.confirm", "enter")} run · ${keyLabel("tui.editor.cursorLeft", "←")} tree · ${keyLabel("tui.select.cancel", "esc")} tree` : `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} tree · ${keyLabel("tui.editor.cursorLeft", "←")}/${keyLabel("tui.editor.cursorRight", "→")} collapse/expand · ${keyLabel("tui.select.confirm", "enter")} ${enterAction} · a actions · ${keyLabel("tui.select.cancel", "esc")} ${narrow && detailsMode ? "tree" : "back"}${content.length > viewport ? ` · ${keyLabel("tui.select.pageUp", "pgup")}/${keyLabel("tui.select.pageDown", "pgdn")} scroll` : ""} · auto-refresh 1s`), Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "";
+                      const hint = truncateToVisualLines(theme.fg("dim", inlineConfirm.active() ? inlineConfirm.hint(keybindings) : actionMode ? `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} actions · ${keyLabel("tui.select.confirm", "enter")} run · ${keyLabel("tui.editor.cursorLeft", "←")} tree · ${keyLabel("tui.select.cancel", "esc")} tree` : `${keyLabel("tui.select.up", "↑")}/${keyLabel("tui.select.down", "↓")} tree · ${keyLabel("tui.editor.cursorLeft", "←")}/${keyLabel("tui.editor.cursorRight", "→")} collapse/expand · ${keyLabel("tui.select.confirm", "enter")} ${enterAction} · a actions${selectedNode?.kind === "agent" ? " · t transcript" : ""} · ${keyLabel("tui.select.cancel", "esc")} ${narrow && detailsMode ? "tree" : "back"}${content.length > viewport ? ` · ${keyLabel("tui.select.pageUp", "pgup")}/${keyLabel("tui.select.pageDown", "pgdn")} scroll` : ""} · auto-refresh 1s`), Number.MAX_SAFE_INTEGER, width, 1).visualLines[0] ?? "";
                       return [...content.slice(dashboardOffset, dashboardOffset + viewport), ...confirmRows, ...(hintRows ? [hint] : [])];
                     },
                     invalidate() {},
@@ -737,6 +761,7 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       if (inlineConfirm.active()) { inlineConfirm.handleInput(keybindings, data); return; }
                       if (stopRequested || editorRunning) return;
                       const narrow = renderedWidth < 80;
+                      if (!actionMode && data === "t") { viewTranscript(); tui.requestRender(); return; }
                       if (!actionMode && (data === "a" || data === "A")) { actionMode = true; actionIndex = 0; dashboardOffset = 0; tui.requestRender(); return; }
                       if (actionMode) {
                         const options = actionOptions();
@@ -751,7 +776,8 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                           if (!action || action === "Back") { actionMode = false; dashboardOffset = 0; }
                           else if (agent) {
                             const worktree = agentWorktreeFor(view, agent);
-                            if (action === "Open prompt in editor") {
+                            if (action === "View transcript") viewTranscript();
+                            else if (action === "Open prompt in editor") {
                               if (agent.prompt !== undefined) void openArtifact(Promise.resolve(workflowPromptArtifact(agent.prompt)), "agent prompt");
                             }
                             else if (action === "Open system prompt in editor") {

@@ -22,6 +22,8 @@ import extension, {
   SUBAGENTS_STOP_PARAMETERS,
 } from "../../dist/subagents/index.js";
 import { getSubagentManager } from "../../dist/src/subagent-manager-handle.js";
+import { getAgentsWorkspaceOpener, setAgentsWorkspaceOpener } from "../../dist/src/host-navigator.js";
+import { registerSubagentNavigator } from "../../dist/subagents/src/navigator.js";
 
 const toolNames = [
   "subagents_run",
@@ -733,6 +735,8 @@ test("matches workflow agent detail fields and runs standalone registered and co
         assert.match(actionScreen, /Stop/);
         assert.match(actionScreen, /Copy run path\n.*Copy agent ID/, "Copy run path sits before Copy agent ID, as in /workflow");
         assert.doesNotMatch(actionScreen, /Delete/, "a running run cannot be deleted");
+        assert.match(actionScreen, /Agent actions\n.*→ View transcript\n.*Standalone fixture action/, "View transcript comes first, as in /workflow");
+        await selectAction(component, "Standalone fixture action");
         component.handleInput("tui.select.confirm");
         await waitFor(() => actionContext !== undefined);
         assert.equal(actionContext.liveSession, liveSession);
@@ -1225,11 +1229,11 @@ test("bounds every narrow dashboard row while drilling from the list to details,
         component.handleInput("a");
         const actionScreen = component.render(width);
         assertNarrowRows(actionScreen);
-        assert.equal(actionScreen.some((row) => row.startsWith("→ Open")), true);
+        assert.equal(actionScreen.some((row) => row.startsWith("→ View")), true);
         await refreshWithToolCalls(6);
         const refreshed = component.render(width);
         assertNarrowRows(refreshed);
-        assert.equal(refreshed.some((row) => row.startsWith("→ Open")), true);
+        assert.equal(refreshed.some((row) => row.startsWith("→ View")), true);
         for (let index = 0; index < 10 && !component.render(width).join("\n").includes("→ Steer"); index += 1) component.handleInput("tui.select.down");
         assert.match(component.render(width).join("\n"), /→ Steer/);
         component.handleInput("tui.select.confirm");
@@ -1254,6 +1258,131 @@ test("bounds every narrow dashboard row while drilling from the list to details,
     globalThis.clearInterval = originalClearInterval;
     await rm(cwd, { recursive: true, force: true });
   }
+});
+
+/** Two settled runs of this session, alpha first, and a manager that inspects them. */
+async function workspaceRuns(cwd) {
+  const storageDir = join(cwd, "subagents-storage");
+  const statuses = [];
+  for (const [id, label, finishedAt] of [["run-alpha", "alpha", 2], ["run-beta", "beta", 1]]) {
+    await mkdir(join(storageDir, id), { recursive: true });
+    await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `${label} prompt`, label, mode: "background" }));
+    statuses.push({ id, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt });
+  }
+  const manager = {
+    async run() { throw new Error("unexpected run"); },
+    async inspect(params) { return params.id ? statuses.find(({ id }) => id === params.id) : statuses; },
+    async steer() {},
+    async stop() {},
+    async retry() {},
+  };
+  return { storageDir, manager };
+}
+
+test("t and View transcript open the agents workspace on the selected run", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-agents-workspace-"));
+  const { storageDir, manager } = await workspaceRuns(cwd);
+  const opened = [];
+  let command;
+  registerSubagentNavigator((name, options) => { if (name === "subagents") command = options; }, manager, storageDir, async () => {}, async (context, key) => { opened.push({ cwd: context.cwd, key }); });
+  assert.ok(command);
+  const context = {
+    ...(await executionContext(cwd)),
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      async custom(factory) {
+        const { component, completed, text } = openDashboard(factory);
+        assert.match(text(), /→ • alpha/);
+        assert.match(text(), /t transcript/);
+        component.handleInput("t");
+        assert.deepEqual(opened, [{ cwd, key: "subagent:run-alpha" }]);
+        component.handleInput("tui.select.down");
+        chooseAction(component, "View transcript");
+        assert.deepEqual(opened.at(-1), { cwd, key: "subagent:run-beta" });
+        assert.doesNotMatch(text(), /Agent actions/, "the menu closes behind the workspace");
+        component.handleInput("escape");
+        return completed;
+      },
+      notify: strictNotify(),
+    },
+  };
+  try {
+    await command.handler("", context);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+  assert.equal(opened.length, 2);
+});
+
+test("an opener that rejects warns once and leaves the dashboard open", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-agents-reject-"));
+  const { storageDir, manager } = await workspaceRuns(cwd);
+  const notices = [];
+  let command;
+  registerSubagentNavigator((name, options) => { if (name === "subagents") command = options; }, manager, storageDir, async () => {}, async () => { throw new Error("boom"); });
+  assert.ok(command);
+  const context = {
+    ...(await executionContext(cwd)),
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      async custom(factory) {
+        const { component, completed, text } = openDashboard(factory);
+        component.handleInput("t");
+        await waitFor(() => notices.length > 0);
+        assert.deepEqual(notices, ["warning: Cannot open the agents workspace: boom"]);
+        assert.match(text(), /→ • alpha/, "the dashboard stays open");
+        component.handleInput("escape");
+        return completed;
+      },
+      notify: (message, level) => { notices.push(`${level ?? "info"}: ${message}`); },
+    },
+  };
+  try {
+    await command.handler("", context);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+  // Checked here too: the command's own catch turns a failed assertion inside custom() into a "Cannot inspect" warning.
+  assert.deepEqual(notices, ["warning: Cannot open the agents workspace: boom"]);
+});
+
+test("t opens the workspace the workflow extension publishes, and warns while none is published", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-agents-published-"));
+  const { storageDir, manager } = await workspaceRuns(cwd);
+  const command = dashboardFixture(storageDir, manager);
+  const previous = getAgentsWorkspaceOpener();
+  const opened = [];
+  const notices = [];
+  const context = {
+    ...(await executionContext(cwd)),
+    mode: "tui",
+    hasUI: true,
+    ui: {
+      async custom(factory) {
+        const { component, completed } = openDashboard(factory);
+        setAgentsWorkspaceOpener(undefined);
+        component.handleInput("t");
+        await waitFor(() => notices.length > 0);
+        assert.match(notices[0], /^warning: .*agents workspace/);
+        setAgentsWorkspaceOpener(async (_context, key) => { opened.push(key); });
+        component.handleInput("t");
+        await waitFor(() => opened.length > 0);
+        assert.deepEqual(opened, ["subagent:run-alpha"]);
+        component.handleInput("escape");
+        return completed;
+      },
+      notify(message, level) { notices.push(`${level}: ${message}`); },
+    },
+  };
+  try {
+    await command.options.handler("", context);
+  } finally {
+    setAgentsWorkspaceOpener(previous);
+    await rm(cwd, { recursive: true, force: true });
+  }
+  assert.equal(notices.length, 1);
 });
 
 test("runs navigator steer, stop, and non-blocking retry actions with state revalidation", async () => {
@@ -1374,7 +1503,8 @@ test("opens bounded prompt and result artifacts while terminal runs hide system 
   const editorPath = join(cwd, "fake-editor.sh");
   const editedPath = join(cwd, "edited-content");
   const openedPath = join(cwd, "opened-path");
-  await writeFile(editorPath, "#!/bin/sh\ncat \"$3\" > \"$1\"\nprintf '%s' \"$3\" > \"$2\"\n", { mode: 0o755 });
+  // opened-path first: the test waits for the edited content and then reads opened-path at once.
+  await writeFile(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { mode: 0o755 });
   const previous = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
   process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
   process.env.EDITOR = process.env.VISUAL;

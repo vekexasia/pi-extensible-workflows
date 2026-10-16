@@ -4,11 +4,11 @@ import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
-import { copyToClipboard, getAgentDir, ModelSelectorComponent, type ExtensionAPI, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, ModelSelectorComponent, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
 import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
-import { registerWorkflowNavigator, uiHostCapabilities } from "./host-navigator.js";
+import { getAgentsWorkspaceOpener, registerWorkflowNavigator, setAgentsWorkspaceOpener, uiHostCapabilities } from "./host-navigator.js";
 import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
 import { retainTerminalRuns } from "./retention.js";
 import type { PersistedRun, WorktreeReference } from "./persistence.js";
@@ -23,6 +23,11 @@ import { showChangelogNotice } from "./changelog.js";
 import { createTrajectoryRunLoader, createTrajectoryRunMetadataLoader, createTrajectorySubagentLoader, createTrajectorySubagentMetadataLoader, createTrajectoryTranscriptLoader, trajectoryRunUsage, type TrajectoryActionRequest, type TrajectoryActionResult, type TrajectorySubagent } from "./trajectory.js";
 import { getTrajectoryHost, type TrajectoryPublisherProvider } from "./trajectory-host-handle.js";
 import { getSubagentManager } from "./subagent-manager-handle.js";
+import type { OpenAgentsWorkspace } from "./agents-workspace-contract.js";
+import { openAgentsWorkspace } from "./agents-workspace.js";
+import { createSessionAgentsSource } from "./session-agents.js";
+import { openSessionTranscript } from "./session-transcript.js";
+import { createTranscriptView } from "./transcript-components.js";
 import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_BLOCKED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext, SubagentRunRequest, SubagentStatus } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
@@ -298,7 +303,7 @@ async function inspectStaticAgentConfigurations(executor: WorkflowAgentExecutor,
   if (signal.aborted) throw new WorkflowError("CANCELLED", "Workflow launch cancelled");
 }
 
-export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = []) {
+export default function workflowExtension(pi: WorkflowExtensionAPI, home?: string, clipboard = copyToClipboard, transport: AgentTransport = localAgentTransport, agentDir?: string, additionalSkillPaths: readonly string[] = [], openWorkspace: OpenAgentsWorkspace = openAgentsWorkspace) {
   beginWorkflowExtensionLoading();
   const registry = loadingRegistry();
   const extensionAgentDir = agentDir ?? getAgentDir();
@@ -1486,8 +1491,31 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     },
   };
   pi.registerTool({ ...workflowTool, ...workflowToolExposure(workflowTool.name, codemodeTools) });
-  registerWorkflowNavigator({ pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, coordinateRunMutation, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); } });
+  /** True from a call of openAgents until its workspace closes: one workspace at a time (a second alternate screen would stay over Pi). */
+  let agentsOpening = false;
+  /** The /agents workspace over this Pi session's agents, `initialKey` selected; t in the /workflow and /subagents dashboards opens it too. */
+  const openAgents = async (ctx: ExtensionCommandContext, initialKey?: string): Promise<void> => {
+    if (agentsOpening) return;
+    agentsOpening = true;
+    try {
+      const agents = createSessionAgentsSource(ctx, { home, overlayRun: withLiveActivities, liveAgent: (runId, agentId) => liveAgents.get(runId, agentId)?.session, subagents: getSubagentManager });
+      // A list that fails still opens the workspace: its title says why the agents are unavailable.
+      const listed = await agents.list().catch(() => undefined);
+      if (listed !== undefined && !listed.some((node) => node.kind === "agent")) { ctx.ui.notify("No agents in this session.", "info"); return; }
+      await openWorkspace(ctx, { agents, openSource: (agent) => openSessionTranscript(agent.session), createView: createTranscriptView, ...(initialKey === undefined ? {} : { initialKey }) });
+    } finally { agentsOpening = false; }
+  };
+  registerWorkflowNavigator({ pi, home, clipboard, extensionAgentDir, runs, terminalRunStates, hardTerminalRunStates: HARD_TERMINAL_RUN_STATES, ensureSessionLease, coordinateRunMutation, answerCheckpoint, recovery, stopWorkflowRun, moveForegroundToBackground: deliveryController.moveForegroundToBackground, isForegroundAttached: deliveryController.isForegroundAttached, liveAgents, registry, projectTrusted, resumeHostContext, resumeSelectedWorkflow, reportBlocked: reportWorkflowBlocked, trajectoryProvider, setNavigatorOpen: (open) => { if (open) backgroundWidgetController.suspend(); else backgroundWidgetController.resume(); }, openAgents });
+  pi.registerCommand("agents", {
+    description: "Open the agents of this Pi session with their transcripts",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") { ctx.ui.notify("/agents needs the TUI.", "warning"); return; }
+      await openAgents(ctx);
+    },
+  });
+  setAgentsWorkspaceOpener(openAgents);
   pi.on("session_shutdown", async () => {
+    if (getAgentsWorkspaceOpener() === openAgents) setAgentsWorkspaceOpener(undefined);
     try {
       await Promise.all([...runs.entries()].map(async ([runId, run]) => {
         const isTerminal = SHUTDOWN_TERMINAL_RUN_STATES.has(run.lifecycle.state);

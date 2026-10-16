@@ -369,7 +369,7 @@ void test("cold resume does not duplicate the phase recorded before interruption
     getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
     prompt: async () => {}, steer: async () => {}, dispose() {},
   });
-  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { secondTools.push(tool); }, registerCommand(_name: string, value: { handler: NonNullable<typeof secondCommand> }) { secondCommand = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") secondStart = handler as typeof secondStart; if (name === "session_shutdown") secondShutdown = handler as typeof secondShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createImmediateSession));
+  workflowExtension(testExtensionApi({ registerTool(tool: Tool) { secondTools.push(tool); }, registerCommand(name: string, value: { handler: NonNullable<typeof secondCommand> }) { if (name === "workflow") secondCommand = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") secondStart = handler as typeof secondStart; if (name === "session_shutdown") secondShutdown = handler as typeof secondShutdown; }, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createImmediateSession));
   try {
     assert.ok(secondStart && secondCommand);
     await secondStart({}, context);
