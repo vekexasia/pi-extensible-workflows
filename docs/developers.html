@@ -298,7 +298,9 @@
       <section id="operations">
         <h2>Operations and debugging</h2>
         <h3>Doctor and inspector</h3>
-        <pre><code class="language-shell"><span class="tok-command">npx</span> -p @piewf/cli piewf doctor [--agent-options &lt;json&gt;] [--prompt &lt;text&gt;] [--json]
+        <pre><code class="language-shell"><span class="tok-command">npx</span> -p @piewf/cli piewf --version
+<span class="tok-command">npx</span> -p @piewf/cli piewf --help
+<span class="tok-command">npx</span> -p @piewf/cli piewf doctor [--agent-options &lt;json&gt;] [--prompt &lt;text&gt;] [--json]
 <span class="tok-command">npx</span> -p @piewf/cli piewf doctor cleanup [--older-than-days &lt;days&gt;] [--yes]
 <span class="tok-command">npx</span> -p @piewf/cli piewf inspect [session-id] [--json|--summary] [--failed]
 <span class="tok-command">npx</span> -p @piewf/cli piewf transcript &lt;session-file&gt;
@@ -306,8 +308,9 @@
 <span class="tok-command">npx</span> -p @piewf/cli piewf run --script &lt;workflow.js&gt; [--name &lt;workflow-name&gt;] [--input &lt;json&gt;]
 <span class="tok-command">npx</span> -p @piewf/cli piewf export &lt;workflow-name&gt; [--name &lt;command&gt;] [--output &lt;path&gt;] [--force]
 <span class="tok-command">npx</span> -p @piewf/cli piewf bundle &lt;workflow-name&gt; [--name &lt;command&gt;] [--output &lt;directory&gt;] [--force]
+<span class="tok-command">npx</span> -p @piewf/cli piewf share &lt;run-id&gt;
 <span class="tok-command">npm</span> run inspect -- [session-id] [--json|--summary] [--failed]</code></pre>
-        <p><code>piewf doctor</code> reports native resources, settings, model aliases, and registered functions. Use <code>--agent-options</code> with a JSON object and optional <code>--prompt</code> to inspect a generically prepared agent without a provider call. <code>--json</code> returns the report; warnings do not fail the command. Role-specific flags and positional role/file targets are removed. <code>piewf doctor cleanup</code> remains explicit and dry-run-first. <code>piewf inspect</code> and <code>transcript</code> inspect persisted artifacts.</p>
+        <p><code>piewf --help</code> prints structured command help, and every command accepts <code>--help</code> or <code>-h</code>. <code>piewf doctor</code> reports native resources, settings, model aliases, and registered functions. Use <code>--agent-options</code> with a JSON object and optional <code>--prompt</code> to inspect a generically prepared agent without a provider call. <code>--json</code> returns the report; warnings do not fail the command. Role-specific flags and positional role/file targets are removed. <code>piewf doctor cleanup</code> remains explicit and dry-run-first. <code>piewf inspect</code> and <code>transcript</code> inspect persisted artifacts.</p>
         <p>Doctor JSON includes cwd, agentDir, settingsPath, settings, settingsSources, trust, activeTools, piExtensions, piSkills, functions, modelAliases, resourcePolicy, optional agentInspection, and diagnostics. Inspection includes the resolved model, tools, native resources and prompt, and setup diagnostics. Registered extension validators check settings produced by preparation, just as during execution. There is no roles catalog or roleInspection field.</p>
         <p>Consumers should use diagnostic <code>code</code> and the named fields, treat optional fields as absent, and ignore unknown fields so additions remain compatible. There is no schema-version field. <code>settingsSources</code> identifies the source path for represented effective settings. <code>resourcePolicy.globalSettingsPath</code> and <code>projectSettingsPath</code> identify selector files, and top-level <code>resourcePolicy.selectorSources</code> carries only the global and project layers; prepared agent selectors appear under <code>agentInspection.resources.selectorSources</code>.</p>
 

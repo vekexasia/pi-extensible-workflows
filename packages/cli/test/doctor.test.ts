@@ -268,8 +268,11 @@ void test("package bin and CLI expose doctor and inspector commands", async () =
   assert.equal(await runCli(["inspect", "session-a"], { inspect: async (sessionId) => { inspected = sessionId; } }), 0);
   assert.equal(inspected, "session-a");
   output = "";
-  assert.equal(await runCli([], {}, (text) => { output += text; }), 1);
-  assert.equal(output, "Usage: piewf doctor [--agent-options <json>] [--prompt <text>] [--json] | inspect [session-id] [--json|--summary] [--failed] | transcript <session-file> | share <run-id> | bundle <workflow-name> [--name <command>] [--output <path>] [--force] | run <workflow-name> [workflow arguments] | run --script <path> [--name <workflow-name>] [--input <json>] | export <workflow-name> [--name <command>] [--output <path>] [--force] [--bundle]\n");
+  let errorOutput = "";
+  assert.equal(await runCli([], { stderr: (text) => { errorOutput += text; } }, (text) => { output += text; }), 1);
+  assert.equal(output, "");
+  assert.match(errorOutput, /^piewf - run, inspect and share Pi extensible workflows from the terminal\n\nUsage:/);
+  assert.match(errorOutput, /Global options:[\s\S]*--version/);
   const bin = join(paths.root, "bin", "piewf");
   mkdirSync(join(paths.root, "bin"), { recursive: true });
   symlinkSync(join(process.cwd(), "dist", "src", "cli.js"), bin);

@@ -15,6 +15,8 @@ npm install -g @piewf/cli
 ## piewf
 
 ```sh
+piewf --version
+piewf --help
 piewf doctor [--agent-options <json>] [--prompt <text>] [--json]
 piewf doctor cleanup [--older-than-days <days>] [--yes]
 piewf inspect [session-id] [--json|--summary] [--failed]
@@ -23,7 +25,10 @@ piewf run <workflow-name> [workflow arguments]
 piewf run --script <workflow.js> [--name <workflow-name>] [--input <json>]
 piewf export <workflow-name> [--name <command>] [--output <path>] [--force]
 piewf bundle <workflow-name> [--name <command>] [--output <directory>] [--force]
+piewf share <run-id>
 ```
+
+Use `piewf --help` for structured command help. Every command also supports `--help` and `-h`.
 
 See [CLI operations](https://vekexasia.github.io/pi-extensible-workflows/developers.html#operations).
 

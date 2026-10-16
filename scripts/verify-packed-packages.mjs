@@ -69,10 +69,15 @@ try {
 
   const tarballs = packages.map(({ manifest }) => resolve(output, tarballName(manifest)));
   execFileSync("npm", ["install", "--prefix", installRoot, "--ignore-scripts", "--omit=dev", "--legacy-peer-deps", ...tarballs], { stdio: "pipe", timeout: 120_000 });
-  const cli = spawnSync(resolve(installRoot, "node_modules", ".bin", "piewf"), ["run", "--help"], { cwd: work, encoding: "utf8" });
+  const cliPath = resolve(installRoot, "node_modules", ".bin", "piewf");
+  const cli = spawnSync(cliPath, ["run", "--help"], { cwd: work, encoding: "utf8" });
   const cliOutput = `${cli.stdout ?? ""}${cli.stderr ?? ""}`;
   if (cli.error) throw cli.error;
   if (cli.status !== 0 || !cliOutput.includes("Usage: piewf run")) throw new Error(`Standalone CLI smoke test failed (${String(cli.status)}):\n${cliOutput}`);
+  const cliVersion = spawnSync(cliPath, ["--version"], { cwd: work, encoding: "utf8" });
+  if (cliVersion.error) throw cliVersion.error;
+  const expectedCliVersion = packages.find(({ manifest }) => manifest.name === "@piewf/cli")?.manifest.version;
+  if (cliVersion.status !== 0 || cliVersion.stdout !== `${expectedCliVersion}\n` || cliVersion.stderr !== "") throw new Error(`Standalone CLI version smoke test failed (${String(cliVersion.status)}):\n${cliVersion.stdout ?? ""}${cliVersion.stderr ?? ""}`);
   if (existsSync(packagePath(installRoot, "@piewf/pi-ext-roles"))) throw new Error("Workflows installed the optional roles package");
   const smokeEnv = { ...process.env, HOME: work, PI_CODING_AGENT_DIR: resolve(work, "isolated-agent"), PI_OFFLINE: "1" };
   const importSmoke = spawnSync(process.execPath, ["--input-type=module", "-e", `
