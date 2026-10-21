@@ -480,7 +480,13 @@ void test("failed retry diagnostics preserve retry provenance", async () => {
   const childId = decodeTestRunStart(started.content[0]?.text ?? "null").runId;
   for (let attempt = 0; attempt < 100 && !diagnostics.some((diagnostic) => diagnostic.runId === childId); attempt += 1) await new Promise<void>((resolve) => setTimeout(resolve, 10));
   const childDiagnostic = diagnostics.find((diagnostic) => diagnostic.runId === childId);
-  if (!childDiagnostic) throw new Error("Child failure was not delivered");
+  if (!childDiagnostic) {
+    const read = async () => { try { const value = (await new RunStore(cwd, "session", childId, home).load()).run; return { state: value.state, delivery: value.delivery, agents: value.agents.map((agent) => [agent.label ?? agent.name, agent.state]) }; } catch (error) { return { error: String(error) }; } };
+    const atTimeout = await read();
+    let more = 0;
+    for (; more < 150 && !diagnostics.some((diagnostic) => diagnostic.runId === childId); more += 1) await new Promise<void>((resolve) => setTimeout(resolve, 200));
+    throw new Error(`DEBUG child failure not delivered in 1 s; ${more < 150 ? `delivered after ${String(more + 1)} more 200 ms polls` : "not delivered in 30 more s"}; at timeout ${JSON.stringify(atTimeout)}; now ${JSON.stringify(await read())}; delivered ${JSON.stringify(delivered.map((message) => message.slice(0, 160)))}`);
+  }
   const childRun = (await new RunStore(cwd, "session", childId, home).load()).run;
   assert.equal(childRun.state, "failed");
   if (!childRun.retry) throw new Error("Child retry provenance was not persisted");
