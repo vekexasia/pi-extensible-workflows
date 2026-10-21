@@ -95,7 +95,12 @@ void test("Trajectory publishes a running run unchanged when only the clock adva
   let finished: TrajectoryPublisherMetadata | undefined;
   const started = performance.now(); let checks = 0;
   try { await waitForIssue105(async () => { checks += 1; finished = await input.loadMetadata(); return finished.runs[0]?.run.state === "completed"; }); }
-  catch { assert.fail(`DEBUG not completed after ${String(checks)} checks, ${String(Math.round(performance.now() - started))} ms: ${JSON.stringify({ run: finished?.runs[0]?.run, agents: finished?.runs[0]?.run.agents }).slice(0, 6000)}`); }
+  catch {
+    const failedAt = Math.round(performance.now() - started);
+    let slow = 0;
+    for (; slow < 150; slow += 1) { await new Promise((resolve) => setTimeout(resolve, 200)); finished = await input.loadMetadata(); if (finished.runs[0]?.run.state === "completed") break; }
+    assert.fail(`DEBUG not completed after ${String(checks)} checks, ${String(failedAt)} ms; slow polling (200 ms) ${slow < 150 ? `completed after ${String(slow + 1)} more polls` : "never completed in 30 s"}, total ${String(Math.round(performance.now() - started))} ms, state ${String(finished?.runs[0]?.run.state)}`);
+  }
   assert.equal(finished?.runs[0]?.run.usage?.durationMs, 1_000);
 });
 
