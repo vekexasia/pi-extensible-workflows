@@ -93,7 +93,9 @@ void test("Trajectory publishes a running run unchanged when only the clock adva
 
   gate.release?.();
   let finished: TrajectoryPublisherMetadata | undefined;
-  await waitForIssue105(async () => { finished = await input.loadMetadata(); return finished.runs[0]?.run.state === "completed"; });
+  const started = performance.now(); let checks = 0;
+  try { await waitForIssue105(async () => { checks += 1; finished = await input.loadMetadata(); return finished.runs[0]?.run.state === "completed"; }); }
+  catch { assert.fail(`DEBUG not completed after ${String(checks)} checks, ${String(Math.round(performance.now() - started))} ms: ${JSON.stringify({ run: finished?.runs[0]?.run, agents: finished?.runs[0]?.run.agents }).slice(0, 6000)}`); }
   assert.equal(finished?.runs[0]?.run.usage?.durationMs, 1_000);
 });
 
