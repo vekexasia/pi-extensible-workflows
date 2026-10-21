@@ -388,13 +388,15 @@ export async function loadTrajectoryRuns(cwd: string, sessionId: string, home = 
 }
 
 async function fileMtime(path: string): Promise<number | undefined> { return stat(path).then((value) => value.mtimeMs).catch(() => undefined); }
-type CachedRunEntry<Value extends { run: PersistedRun }, Signature> = { value: Value; stateMtimeMs: number; journalMtimeMs: number; transcripts: ReadonlyMap<string, Signature> };
+/** Atomic writes replace the file, so its inode changes even when a write lands in the same timestamp tick as the one before it. */
+async function fileStamp(path: string): Promise<string | undefined> { return stat(path, { bigint: true }).then((info) => `${String(info.ino)}:${String(info.mtimeNs)}:${String(info.size)}`).catch(() => undefined); }
+type CachedRunEntry<Value extends { run: PersistedRun }, Signature> = { value: Value; state: string | undefined; journal: string | undefined; transcripts: ReadonlyMap<string, Signature> };
 /** Lists the session's runs, reloading one only when its state, journal, or a transcript (per `transcriptSignature`) changed. */
 function createCachedRunLoader<Value extends { run: PersistedRun }, Signature>(cwd: string, sessionId: string, home: string, load: (store: RunStore) => Promise<Value>, transcriptSignature: (path: string) => Promise<Signature>, overlay: ((run: PersistedRun) => PersistedRun) | undefined): () => Promise<readonly Value[]> {
   const cache = new Map<string, CachedRunEntry<Value, Signature>>();
   const changed = async (store: RunStore, entry: CachedRunEntry<Value, Signature>): Promise<boolean> => {
-    if (await fileMtime(join(store.directory, "state.json")) !== entry.stateMtimeMs) return true;
-    if (await fileMtime(join(store.directory, "journal.json")) !== entry.journalMtimeMs) return true;
+    if (await fileStamp(join(store.directory, "state.json")) !== entry.state) return true;
+    if (await fileStamp(join(store.directory, "journal.json")) !== entry.journal) return true;
     for (const [agentId, path] of transcriptPaths(entry.value.run)) if (await transcriptSignature(path) !== entry.transcripts.get(agentId)) return true;
     return false;
   };
@@ -408,10 +410,13 @@ function createCachedRunLoader<Value extends { run: PersistedRun }, Signature>(c
       try {
         let entry = cache.get(runId);
         if (!entry || await changed(store, entry)) {
+          // Stamped before the load: a write during the load leaves a newer stamp, so the next call reloads.
+          const state = await fileStamp(join(store.directory, "state.json"));
+          const journal = await fileStamp(join(store.directory, "journal.json"));
           const value = await load(store);
           const transcripts = new Map<string, Signature>();
           for (const [agentId, path] of transcriptPaths(value.run)) transcripts.set(agentId, await transcriptSignature(path));
-          entry = { value, stateMtimeMs: (await fileMtime(join(store.directory, "state.json"))) ?? 0, journalMtimeMs: (await fileMtime(join(store.directory, "journal.json"))) ?? 0, transcripts };
+          entry = { value, state, journal, transcripts };
           cache.set(runId, entry);
         }
         loaded.push(overlay ? { ...entry.value, run: overlayTrajectoryRun(entry.value.run as TrajectoryRunRecord, overlay) } : entry.value);
