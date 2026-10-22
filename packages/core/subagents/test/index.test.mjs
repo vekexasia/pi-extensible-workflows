@@ -2801,6 +2801,54 @@ test("retries an interrupted persisted subagent as a new run", async () => {
     await rm(cwd, { recursive: true, force: true });
   }
 });
+test("a listing reads a settled subagent's status from disk once, whatever its session", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-settled-listing-"));
+  const storageDir = join(cwd, "storage");
+  const startedAt = Date.now() - 1000;
+  const otherPi = { pid: 999999, processStart: 1, sessionId: "other-pi", token: "other-pi", acquiredAt: 1 };
+  const records = {
+    "11111111-1111-4111-8111-111111111111": { sessionId: "session-1", state: "completed", finishedAt: startedAt + 10 },
+    "22222222-2222-4222-8222-222222222222": { sessionId: "session-2", state: "completed", finishedAt: startedAt + 20 },
+    "33333333-3333-4333-8333-333333333333": { sessionId: "session-2", state: "failed", finishedAt: startedAt + 30, error: { code: "AGENT_FAILED", message: "failed" } },
+    "44444444-4444-4444-8444-444444444444": { sessionId: "session-3", state: "stopped", finishedAt: startedAt + 40 },
+    // Another live Pi runs this one: its status is read on every listing.
+    "55555555-5555-4555-8555-555555555555": { sessionId: "session-1", state: "running", owner: otherPi },
+  };
+  for (const [id, record] of Object.entries(records)) {
+    await mkdir(join(storageDir, id), { recursive: true });
+    await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: id }));
+    await writeFile(join(storageDir, id, "status.json"), JSON.stringify({ id, startedAt, ...record }));
+  }
+  const manager = createSubagentManager({ storageDir, liveness: { isLive: (owner) => owner.token === otherPi.token } });
+  const context = await managerContext(cwd);
+  const originalReadFile = fsPromises.readFile;
+  const reads = [];
+  try {
+    // Initialization reconciles storage before any listing; count only what the listings read.
+    assert.equal((await manager.inspect({ id: "55555555-5555-4555-8555-555555555555" }, context)).state, "running");
+    t.mock.method(fsPromises, "readFile", async (path, options) => {
+      if (String(path).endsWith("status.json")) reads.push(String(path));
+      return originalReadFile(path, options);
+    });
+    syncBuiltinESMExports();
+    const listed = async (request = {}) => (await manager.inspect(request, context)).map(({ id, state }) => `${id.slice(0, 1)}:${state}`);
+    assert.deepEqual(await listed(), ["1:completed", "5:running"]);
+    assert.equal(reads.length, 5, "the first listing reads every status");
+    reads.length = 0;
+    assert.deepEqual(await listed(), ["1:completed", "5:running"]);
+    assert.deepEqual(reads, [join(storageDir, "55555555-5555-4555-8555-555555555555", "status.json")], "the second listing reads only the running status");
+    reads.length = 0;
+    await rm(join(storageDir, "22222222-2222-4222-8222-222222222222"), { recursive: true, force: true });
+    assert.deepEqual(await listed({ scope: "all" }), ["1:completed", "3:failed", "4:stopped", "5:running"]);
+    assert.equal(reads.length, 1);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("removes legacy persisted worktree metadata without cleanup context", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-legacy-worktree-metadata-"));
   const storageDir = join(cwd, "storage");

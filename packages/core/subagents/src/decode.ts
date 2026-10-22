@@ -20,6 +20,8 @@ function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["
 }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function stringArrayValue(value: unknown): readonly string[] | undefined { return Array.isArray(value) && value.length <= 256 && value.every((item) => typeof item === "string") ? value : undefined; }
+/** A subagent id that is safe as one path segment under the storage directory: not "." or "..", only letters, digits, ".", "_" and "-". */
+export function safeSubagentId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
 export function accountingValue(value: unknown): SubagentProgress["accounting"] | undefined {
   const record = objectValue(value);
   if (!record) return undefined;

@@ -73,6 +73,7 @@ Supported settings shape:
 {
   "concurrency": 8,
   "backgroundWidget": true,
+  "codemodeTools": "all",
   "modelAliases": {
     "reviewer-model": "anthropic/claude-fable-5:high"
   },
@@ -84,7 +85,7 @@ Supported settings shape:
 }
 ```
 The supported resource fields are direct `skills`, `extensions`, and `tools` arrays. `skills` matches discovered skill names, `extensions` matches discovered normalized extension paths, and `tools` matches only the current root or parent tool boundary. Selectors never create unavailable resources. The legacy `disabledAgentResources` field is rejected; it is not an alias for these fields. `extensionSettings` is an arbitrary map of safe extension-owned JSON values; the core validates only its structure and built-in settings. A trusted project `extensionSettings` field replaces the complete global map, including `{}`. Registered extension validators receive the complete effective map plus source context. The obsolete `extensions.herdr` object is rejected.
-The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` is accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
+The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `codemodeTools` (`"all"` default, `"read-only"`, or `"none"`; global only), `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` and `codemodeTools` are accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
 
 ### Trajectory
 

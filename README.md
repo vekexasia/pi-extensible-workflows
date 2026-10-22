@@ -80,7 +80,7 @@ See the [optional roles integration](https://vekexasia.github.io/pi-extensible-w
 
 ## Included capabilities
 
-The single core installation provides workflows, the `reviewLoop` starter for developer-and-reviewer implementation cycles, durable standalone subagent tools (`subagents_run`, `subagents_inspect`, `subagents_steer`, `subagents_stop`, and `subagents_retry`). Ready-made slash commands launch them: `/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, and `/deep-research`. With the optional roles extension enabled, roles and aliases are overridable; `reviewLoop` is not. The starter, Subagents, and Trajectory can each be disabled with [Pi package filters](https://vekexasia.github.io/pi-extensible-workflows/extensions.html#bundled-filters).
+The single core installation provides workflows, the `reviewLoop` starter for developer-and-reviewer implementation cycles, durable standalone subagent tools (`subagents_run`, `subagents_inspect`, `subagents_steer`, `subagents_stop`, and `subagents_retry`). Ready-made slash commands launch them: `/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, and `/deep-research`. With the optional roles extension enabled, roles and aliases are overridable; `reviewLoop` is not. In Pi's TUI, `/workflow` opens the run dashboard and `/agents` a full-screen view of every agent of the session with its full transcript. The starter, Subagents, and Trajectory can each be disabled with [Pi package filters](https://vekexasia.github.io/pi-extensible-workflows/extensions.html#bundled-filters).
 
 ### Companion packages
 

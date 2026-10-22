@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- `/agents` opens a full-screen workspace over Pi's TUI: a sidebar with this session's workflow runs (phases, operation scopes, shells, and agents) and its subagents, and beside it the selected agent's full transcript, drawn as Pi's chat draws it and updated live while the agent runs. Other nodes show their details. The hint row lists the keys; `esc` gives Pi its screen back (#332).
+
 ### CLI
 
 - `piewf --version` (`-v`) prints the CLI version, and `piewf --help` (`-h`, `help`) prints structured help with the commands and global options. Every command, including `inspect` and `transcript`, answers `--help`. With no arguments `piewf` prints the help on stderr, and with an unknown command `Unknown command: <name>` followed by the help, instead of the one-line usage on stdout; the exit code stays 1.
@@ -19,6 +23,14 @@
 
 - Trajectory no longer keeps showing a stale run, for example a finished run as still running, when a run's `state.json` or `journal.json` was written while it was being read or twice within one filesystem timestamp tick. The run cache now stamps those files by inode, modification time and size before it reads them.
 - The Trajectory server no longer drops a publisher whose TCP chunk carries several complete WebSocket frames that together exceed the frame limit. Only the unfinished frame left after parsing is bounded, and an oversized receive buffer is trimmed after each chunk.
+
+### Documentation
+
+- The settings reference lists `codemodeTools` (global settings only) and `retention`, and says that `workflow.js` and the other files opened in the external editor are temporary copies whose edits are not kept (#331).
+
+### Internal
+
+- Core reads a Pi session file whole, as Pi does, and the complete lines its agent appends to it, and draws its records with Pi's own chat components, for the `/agents` transcript pane (#331).
 
 ## [6.2.2] - 2026-10-18
 

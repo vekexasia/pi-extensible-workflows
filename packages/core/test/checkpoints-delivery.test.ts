@@ -25,7 +25,7 @@ void test("navigator reviews each pending checkpoint before answering", async ()
   const notices: string[] = [];
   const pi = {
     registerTool() {},
-    registerCommand(_name: string, options: { handler: NonNullable<typeof command> }) { command = options.handler; },
+    registerCommand(name: string, options: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = options.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; },
     getThinkingLevel: () => "medium" as const,
     getActiveTools: () => ["workflow"],

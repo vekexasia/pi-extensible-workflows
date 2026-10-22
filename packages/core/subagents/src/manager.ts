@@ -829,6 +829,12 @@ class PersistentSubagentManager implements SubagentManager {
   private readonly pendingStarts = new Set<Promise<void>>();
   private activeRunCount = 0;
   private readonly terminalSummaries = new Map<string, TerminalSummary>();
+  /**
+   * Settled statuses a listing read from disk, by run directory, so each tick of /agents does not read every subagent ever run.
+   * Not bounded by MAX_TERMINAL_SUMMARIES, which would bring the reads back past that count: a listing drops the directories it no
+   * longer finds, so it holds at most one status per directory in storage.
+   */
+  private readonly listedSettled = new Map<string, PersistedSubagentStatus>();
   private readonly reconciliationErrors = new Map<string, WorkflowError>();
   private readonly notificationPromises = new Set<Promise<void>>();
   private readonly initialization: Promise<void>;
@@ -1039,6 +1045,9 @@ class PersistentSubagentManager implements SubagentManager {
     const root = storageDirectory(this.dependencies);
     await secureDirectory(root);
     const entries = await readdir(root, { withFileTypes: true });
+    // A directory deleted here or by another Pi is no longer listed.
+    const names = new Set(entries.map(({ name }) => name));
+    for (const id of this.listedSettled.keys()) if (!names.has(id)) this.listedSettled.delete(id);
     const statuses: Array<{ readonly status: SubagentStatus; readonly startedAt: number }> = [];
     for (const entry of entries) {
       if (!entry.isDirectory() || !validSubagentId(entry.name)) continue;
@@ -1046,7 +1055,14 @@ class PersistentSubagentManager implements SubagentManager {
       if (this.reconciliationErrors.has(entry.name)) continue;
       try {
         const active = this.activeRuns.get(entry.name);
-        const status = publicStatus(active ? persistedStatus(active) : this.terminalSummaries.get(entry.name) ?? await loadPersistedStatus(root, entry.name, false));
+        const known = active ? persistedStatus(active) : this.terminalSummaries.get(entry.name) ?? this.listedSettled.get(entry.name);
+        const persisted = known ?? await loadPersistedStatus(root, entry.name, false);
+        // A settled status is not written again unless it still records a worktree, which a later cleanup or reconciliation
+        // removes; a retry is a new run.
+        //NOTE: a run another Pi stopped records its last attempt once its execution settles; a listing in between keeps the
+        // earlier accounting, as the /agents source keeps the inspection it made then.
+        if (known === undefined && persisted.state !== "running" && persisted.worktree === undefined && persisted.worktreeContext === undefined) this.listedSettled.set(entry.name, persisted);
+        const status = publicStatus(persisted);
         if (status.startedAt === undefined || (sessionId !== undefined && status.sessionId !== sessionId)) continue;
         statuses.push({ status, startedAt: status.startedAt });
       } catch (error) {
@@ -1091,6 +1107,7 @@ class PersistentSubagentManager implements SubagentManager {
     if (status.worktree !== undefined) throw new WorkflowError("WORKTREE_FAILED", `Subagent ${id} still has a worktree to clean up`);
     await rm(runDirectory(root, id), { recursive: true, force: true });
     this.terminalSummaries.delete(id);
+    this.listedSettled.delete(id);
     return { id, deleted: true };
   }
 

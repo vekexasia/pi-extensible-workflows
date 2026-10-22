@@ -15,6 +15,7 @@ import {
   workflowPhaseTreePath,
   workflowPhaseTreeVisibleNodes,
   type WorkflowPhaseSelection,
+  type WorkflowPhaseTree,
   type WorkflowPhaseTreeNode,
 } from "./host-phases.js";
 
@@ -793,70 +794,77 @@ export function formatNavigatorRun(loaded: { run: PersistedRun; snapshot: Readon
   lines.push(`Agent sessions: ${String(run.agentSessions.length)}`);
   return lines.join("\n");
 }
+/** What a /workflow tree row shows of a node; `kind` is open so that /agents draws its Subagents group and their rows the same way. */
+export type WorkflowTreeLineNode = Pick<WorkflowPhaseTreeNode, "label" | "depth" | "state" | "agent" | "children"> & { readonly kind: string };
+/** A /workflow tree row: selection arrow, depth indent, ▾/▸ for an expanded/collapsed node with children, • for an agent, ◇ for a shell, the label, " · " and the state glyph. */
+export function formatWorkflowTreeLine(node: WorkflowTreeLineNode, selected: boolean, expanded: boolean, styles: WorkflowProgressStyles): string {
+  const state = progressStyleForState(node.state, styles);
+  const glyph = node.kind === "agent" && node.agent ? agentStateGlyph(node.agent.state, "⠦") : runStateGlyph(node.state, "⠦");
+  const icon = node.children.length ? expanded ? "▾" : "▸" : node.kind === "agent" ? "•" : node.kind === "shell" ? "◇" : " ";
+  return `${selected ? "→" : " "} ${"  ".repeat(node.depth)}${icon} ${node.label} · ${state(glyph)}`;
+}
+/** The agents of `node` and of every node below it. */
+function workflowTreeNodeAgents(tree: WorkflowPhaseTree, node: WorkflowPhaseTreeNode): AgentRecord[] {
+  const agents: AgentRecord[] = [];
+  const visit = (id: string): void => {
+    const child = tree.byId.get(id);
+    if (!child) return;
+    if (child.agent) agents.push(child.agent);
+    for (const childId of child.children) visit(childId);
+  };
+  visit(node.id);
+  return agents;
+}
+/** The details /workflow shows for a tree node; `hints` adds its enter hint (the dashboard leaves it out while its action menu is open). */
+export function formatWorkflowNodeDetails(run: Pick<PersistedRun, "workflowName" | "id">, tree: WorkflowPhaseTree, node: WorkflowPhaseTreeNode, styles: WorkflowProgressStyles, now: number, hints: boolean): string[] {
+  const usageLines = (agents: readonly AgentRecord[]): string[] => {
+    const spans = agents.flatMap((agent) => agent.startedAt === undefined ? [] : [[agent.startedAt, agent.startedAt + (elapsedDurationMs(agent, now) ?? 0)] as const]);
+    const elapsed = spans.length ? formatWorkflowRuntime(Math.max(...spans.map(([, end]) => end)) - Math.min(...spans.map(([start]) => start))) : "";
+    return [...formatAgentAccounting(sumAccounting(agents.map((agent) => agent.accounting ?? zeroAccounting()))), ...(elapsed ? [`Elapsed: ${elapsed}`] : [])];
+  };
+  const nodeStatus = phaseStyleForState(node.state, styles)(node.state);
+  const agents = workflowTreeNodeAgents(tree, node);
+  if (node.kind === "workflow") {
+    const counts = phaseAgentCounts(agents);
+    return [styles.bold(`Selected workflow: ${run.workflowName}`), `Run ID: ${run.id}`, `Status: ${nodeStatus}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...(hints ? [styles.muted("enter run actions")] : [])];
+  }
+  if (node.kind === "phase") {
+    const selected = node.phase;
+    const counts = selected?.counts ?? phaseAgentCounts(agents);
+    const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
+    return [styles.bold(`Selected phase: ${node.label}`), `Status: ${nodeStatus}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(hints ? [styles.muted(hint)] : [])];
+  }
+  if (node.kind === "operation") {
+    const states = phaseAgentCounts(agents);
+    const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
+    return [styles.bold(`Selected operation: ${node.operationPath.join(" > ")}`), `Phase: ${node.phase?.name ?? node.phaseId}`, `Status: ${nodeStatus}`, `agents completed=${String(states.completed)} running=${String(states.running)} failed=${String(states.failed)} cancelled=${String(states.cancelled)} pending=${String(states.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(hints ? [styles.muted(hint)] : [])];
+  }
+  if (node.kind === "shell") {
+    return [styles.bold("Selected shell"), formatShellActivity(node.shellActivity?.active, node.shellActivity?.startedAt, "⠦", styles, now) ?? "shell [running]"];
+  }
+  const agent = node.agent;
+  if (!agent) return [styles.muted("Agent details are unavailable")];
+  const attemptError = agent.attemptDetails?.at(-1)?.error;
+  const detail = formatAgentDetail(attemptError === undefined ? agent : { ...agent, error: attemptError }, styles, now, { includeError: false });
+  const errorLine = attemptError === undefined ? undefined : formatAgentError(attemptError, styles);
+  return [...detail, ...(hints ? [styles.muted("enter agent actions")] : []), ...(errorLine === undefined ? [] : [errorLine])];
+}
 export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, width: number, selection: WorkflowPhaseSelection = {}, styles: WorkflowProgressStyles = PLAIN_WORKFLOW_PROGRESS_STYLES, now = Date.now()): string[] {
   const safeWidth = Math.max(1, width);
   const model = buildWorkflowPhaseModel(run, snapshot);
   const tree = buildWorkflowPhaseTree(model);
   const expanded = selection.expandedNodeIds === undefined ? workflowPhaseTreeInitialExpanded(tree) : new Set(selection.expandedNodeIds);
   const wrap = (text: string): string[] => wrapNavigatorLine(text, safeWidth);
-  const phaseStyle = (state: string): ((text: string) => string) => phaseStyleForState(state, styles);
   const phase = selection.phaseId ? model.phases.find((candidate) => candidate.id === selection.phaseId) : undefined;
   const selectedByAgent = selection.agentId ? tree.nodes.find((node) => node.kind === "agent" && node.agentId === selection.agentId && (!selection.phaseId || node.phaseId === selection.phaseId)) : undefined;
   const selectedNode = (selection.nodeId ? tree.byId.get(selection.nodeId) : undefined) ?? selectedByAgent ?? (phase ? tree.byId.get(workflowPhaseTreePath("phase", phase.id, [])) : undefined) ?? tree.byId.get("workflow") ?? (model.currentPhaseId ? tree.byId.get(workflowPhaseTreePath("phase", model.currentPhaseId, [])) : undefined) ?? tree.nodes[0];
   const selectedPhase = selectedNode?.phase ?? (selectedNode ? model.phases.find((candidate) => candidate.id === selectedNode.phaseId) : undefined);
   const currentPhase = model.currentPhaseIndex === undefined ? undefined : model.phases[model.currentPhaseIndex];
   const visibleNodes = workflowPhaseTreeVisibleNodes(tree, expanded);
-  const nodeAgents = (node: WorkflowPhaseTreeNode): AgentRecord[] => {
-    const agents: AgentRecord[] = [];
-    const visit = (id: string): void => {
-      const child = tree.byId.get(id);
-      if (!child) return;
-      if (child.agent) agents.push(child.agent);
-      for (const childId of child.children) visit(childId);
-    };
-    visit(node.id);
-    return agents;
-  };
-  const usageLines = (agents: readonly AgentRecord[]): string[] => {
-    const spans = agents.flatMap((agent) => agent.startedAt === undefined ? [] : [[agent.startedAt, agent.startedAt + (elapsedDurationMs(agent, now) ?? 0)] as const]);
-    const elapsed = spans.length ? formatWorkflowRuntime(Math.max(...spans.map(([, end]) => end)) - Math.min(...spans.map(([start]) => start))) : "";
-    return [...formatAgentAccounting(sumAccounting(agents.map((agent) => agent.accounting ?? zeroAccounting()))), ...(elapsed ? [`Elapsed: ${elapsed}`] : [])];
-  };
-  const nodeStatus = (node: WorkflowPhaseTreeNode): string => phaseStyle(node.state)(node.state);
-  const nodeIcon = (node: WorkflowPhaseTreeNode): string => node.children.length ? expanded.has(node.id) ? "▾" : "▸" : node.kind === "agent" ? "•" : node.kind === "shell" ? "◇" : " ";
-  const treeLine = (node: WorkflowPhaseTreeNode): string => {
-    const selected = node.id === selectedNode?.id;
-    const state = progressStyleForState(node.state, styles);
-    const glyph = node.kind === "agent" && node.agent ? agentStateGlyph(node.agent.state, "⠦") : runStateGlyph(node.state, "⠦");
-    return `${selected ? "→" : " "} ${"  ".repeat(node.depth)}${nodeIcon(node)} ${node.label} · ${state(glyph)}`;
-  };
+  const treeLine = (node: WorkflowPhaseTreeNode): string => formatWorkflowTreeLine(node, node.id === selectedNode?.id, expanded.has(node.id), styles);
   const details = (node: WorkflowPhaseTreeNode | undefined): string[] => {
     if (!node) return [styles.muted("No workflow node is selected"), ...(selection.actions ? [] : [styles.muted("enter run actions")])];
-    const agents = nodeAgents(node);
-    if (node.kind === "workflow") {
-      const counts = phaseAgentCounts(agents);
-      return [styles.bold(`Selected workflow: ${run.workflowName}`), `Run ID: ${run.id}`, `Status: ${nodeStatus(node)}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...(selection.actions ? [] : [styles.muted("enter run actions")])];
-    }
-    if (node.kind === "phase") {
-      const selected = node.phase;
-      const counts = selected?.counts ?? phaseAgentCounts(agents);
-      const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
-      return [styles.bold(`Selected phase: ${node.label}`), `Status: ${nodeStatus(node)}`, `agents completed=${String(counts.completed)} running=${String(counts.running)} failed=${String(counts.failed)} cancelled=${String(counts.cancelled)} pending=${String(counts.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(selection.actions ? [] : [styles.muted(hint)])];
-    }
-    if (node.kind === "operation") {
-      const states = phaseAgentCounts(agents);
-      const hint = node.children.length ? "enter expand/collapse" : "enter phase details";
-      return [styles.bold(`Selected operation: ${node.operationPath.join(" > ")}`), `Phase: ${node.phase?.name ?? node.phaseId}`, `Status: ${nodeStatus(node)}`, `agents completed=${String(states.completed)} running=${String(states.running)} failed=${String(states.failed)} cancelled=${String(states.cancelled)} pending=${String(states.pending)}`, `Agents: ${String(agents.length)}`, ...usageLines(agents), ...(selection.actions ? [] : [styles.muted(hint)])];
-    }
-    if (node.kind === "shell") {
-      return [styles.bold("Selected shell"), formatShellActivity(node.shellActivity?.active, node.shellActivity?.startedAt, "⠦", styles, now) ?? "shell [running]"];
-    }
-    const agent = node.agent;
-    if (!agent) return [styles.muted("Agent details are unavailable")];
-    const attemptError = agent.attemptDetails?.at(-1)?.error;
-    const detail = formatAgentDetail(attemptError === undefined ? agent : { ...agent, error: attemptError }, styles, now, { includeError: false });
-    const errorLine = attemptError === undefined ? undefined : formatAgentError(attemptError, styles);
-    return [...detail, ...(selection.actions ? [] : [styles.muted("enter agent actions")]), ...(errorLine === undefined ? [] : [errorLine])];
+    return formatWorkflowNodeDetails(run, tree, node, styles, now, !selection.actions);
   };
   const statusSummary = WORKFLOW_PHASE_STATES.filter((state) => (model.counts[state] ?? 0) > 0).map((state) => `${String(model.counts[state])} ${state}`).join(" · ") || "0 phases";
   const lines: string[] = [styles.bold(styles.accent(`Workflow: ${run.workflowName}`))];
@@ -884,11 +892,13 @@ export function formatWorkflowPhaseDashboard(run: PersistedRun, snapshot: Readon
 function wrapNavigatorLine(text: string, width: number): string[] {
   return truncateToVisualLines(text, Number.MAX_SAFE_INTEGER, Math.max(1, width), 0).visualLines.map((line) => line.trimEnd());
 }
+/** The sidebar's columns beside details: 38% of the width less the 3-column separator, 24 to 42. */
+export function navigatorSidebarWidth(width: number): number { return Math.min(42, Math.max(24, Math.floor((width - 3) * 0.38))); }
 /** The navigator layout: a sidebar beside details at 80 columns or wider, otherwise one of them (or both stacked). */
 export function formatNavigatorColumns(sidebar: readonly string[], detail: readonly string[], width: number, layout: Readonly<{ treeOnly?: boolean | undefined; detailsOnly?: boolean | undefined; detailOffset?: number | undefined }> = {}): string[] {
   const safeWidth = Math.max(1, width);
   if (safeWidth >= 80) {
-    const sidebarWidth = Math.min(42, Math.max(24, Math.floor((safeWidth - 3) * 0.38)));
+    const sidebarWidth = navigatorSidebarWidth(safeWidth);
     const left = sidebar.flatMap((line) => wrapNavigatorLine(line, sidebarWidth));
     const wrapped = detail.flatMap((line) => wrapNavigatorLine(line, safeWidth - sidebarWidth - 3));
     // Keep the details in view when the tree is scrolled, without making the block taller than the tree.

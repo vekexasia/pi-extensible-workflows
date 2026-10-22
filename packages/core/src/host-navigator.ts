@@ -711,11 +711,16 @@ export function registerWorkflowNavigator(deps: WorkflowNavigatorDependencies): 
                       const maxOffset = Math.max(0, content.length - viewport);
                       dashboardOffset = Math.max(0, Math.min(maxOffset, dashboardOffset));
                       if (actionMode) {
-                        const label = actions?.options[actionIndex];
-                        const actionRow = label ? content.findIndex((line) => line.includes(label)) : -1;
-                        if (actionRow >= 0) {
-                          if (actionRow < dashboardOffset) dashboardOffset = actionRow;
-                          else if (actionRow >= dashboardOffset + viewport) dashboardOffset = actionRow - viewport + 1;
+                        // Options are looked up below the menu title, so a tree or detail line with the same text does not count.
+                        const titleRow = actions ? content.findIndex((line) => line.includes(actions.title)) : -1;
+                        const rowBelow = (text: string | undefined, above: number): number => text === undefined ? -1 : content.findIndex((line, index) => index > above && line.includes(text));
+                        const actionRow = rowBelow(actions?.options[actionIndex], titleRow);
+                        const lastRow = titleRow >= 0 && actionRow >= 0 ? rowBelow(actions?.options.at(-1), actionRow - 1) : -1;
+                        // A menu that fits stays whole in view, so the actions below the selected one remain visible; a longer one follows the selection.
+                        const [top, bottom] = lastRow >= 0 && lastRow - titleRow < viewport ? [titleRow, lastRow] : [actionRow, actionRow];
+                        if (top >= 0) {
+                          if (top < dashboardOffset) dashboardOffset = top;
+                          else if (bottom >= dashboardOffset + viewport) dashboardOffset = bottom - viewport + 1;
                         }
                       } else if (!detailsMode && selectionNeedsScroll) {
                         const selectedRow = content.findIndex((line) => line.startsWith("→"));
