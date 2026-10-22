@@ -116,7 +116,7 @@ export function trajectoryRunUsage(state: RunState, live: WorkflowBudgetUsage, p
   return state === "running" && persisted !== undefined ? { ...live, durationMs: persisted.durationMs } : live;
 }
 
-function sessionFile(reference: WorkflowAgentSessionReference | undefined): string | undefined {
+export function sessionFile(reference: WorkflowAgentSessionReference | undefined): string | undefined {
   const locator = reference?.locator;
   if (!object(locator) || typeof locator.sessionFile !== "string" || !locator.sessionFile) return undefined;
   return locator.sessionFile;
