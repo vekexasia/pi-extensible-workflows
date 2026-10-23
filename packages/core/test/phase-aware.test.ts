@@ -24,6 +24,7 @@ import {
   type PersistedRun,
 } from "../src/index.js";
 import { RunStore } from "../src/persistence.js";
+import { decodePersistedRun } from "../src/decoders.js";
 
 function agent(id: string, state: AgentRecord["state"] = "completed", parentId?: string): AgentRecord {
   return { id, name: id, path: id, state, ...(parentId ? { parentId } : {}), model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 };
@@ -234,6 +235,13 @@ void test("phase shell activity follows repeated phase occurrences", () => {
   const model = buildWorkflowPhaseModel(current, ["build", "build"]);
   assert.equal(model.phases[0]?.shellActivity, undefined);
   assert.equal(model.phases[1]?.shellActivity?.active, 1);
+});
+void test("a stored run with leftover activeShellsByScope loads without it", () => {
+  const stored = { ...run("running"), activeShellsByPhase: [{ phaseIndex: 0, active: 1, startedAt: 0 }], activeShellsByScope: [{ scope: "build", active: 1, startedAt: 0 }] };
+  const decoded = decodePersistedRun(JSON.parse(JSON.stringify(stored)));
+  assert.ok(decoded);
+  assert.equal(decoded.activeShellsByPhase?.[0]?.active, 1);
+  assert.equal(Object.hasOwn(decoded, "activeShellsByScope"), false);
 });
 void test("phase and agent selections survive read-model polling", () => {
   const before = buildWorkflowPhaseModel(run("running", [agent("one")], [{ phase: "build", afterAgent: 0 }]), ["build", "review"]);

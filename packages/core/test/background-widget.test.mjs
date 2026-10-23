@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import widget, { formatCost, renderReceipt, __navigationForTests } from "../dist/src/background-widget.js";
+import widget, { formatCost, mark, renderReceipt, __navigationForTests } from "../dist/src/background-widget.js";
 import { RunStore } from "../dist/src/persistence.js";
 import {
   WORKFLOW_AGENT_STATE_CHANGED_EVENT,
@@ -141,7 +142,7 @@ function harness(sessionId = "session-1", options = {}) {
     },
   };
 
-  const controller = widget(pi, options.backgroundWidget ?? true);
+  const controller = widget(pi, options.backgroundWidget ?? true, options.opener, options.subagents);
   return {
     context,
     controller,
@@ -221,72 +222,390 @@ void test("draws a tree for a live run and clears it once the run is over", () =
   host.shutdown();
 });
 
-void test("mounts once and only animates while a run spins", async () => {
+void test("mounts once, repaints once a second while a run spins and not at all while it is paused", (t) => {
   const root = mkdtempSync(join(tmpdir(), "widget-lifecycle-"));
   const directory = writeRun(join(root, "run-1"), runState());
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
   const host = harness();
   host.start();
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
 
   const mountedCalls = host.widgets.length;
-  await new Promise((resolve) => globalThis.setTimeout(resolve, 350));
-  assert.equal(host.widgets.length, mountedCalls, "animation does not remount the widget");
-  assert.ok(host.renderRequests > 0, "an active spinner requests animation renders");
+  const running = host.renderRequests;
+  for (let step = 0; step < 24; step += 1) t.mock.timers.tick(125);
+  assert.equal(host.widgets.length, mountedCalls, "the spinner does not remount the widget");
+  assert.equal(host.renderRequests, running + 3, "the spinner turns once a second");
 
   const beforePause = host.renderRequests;
   writeRun(directory, runState({ state: "paused" }));
   host.emit(WORKFLOW_RUN_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1", state: "paused" });
   assert.equal(host.renderRequests, beforePause + 1, "a state change requests one render");
   const pausedRenders = host.renderRequests;
-  await new Promise((resolve) => globalThis.setTimeout(resolve, 350));
+  t.mock.timers.tick(3000);
   assert.equal(host.widgets.length, mountedCalls, "a paused run stays mounted");
-  assert.equal(host.renderRequests, pausedRenders, "a paused run stops animation renders");
+  assert.equal(host.renderRequests, pausedRenders, "a paused run is not repainted");
 
   host.shutdown();
   rmSync(root, { recursive: true, force: true });
 });
 
-void test("refreshes elapsed clocks without spinner animation", (t) => {
-  const root = mkdtempSync(join(tmpdir(), "widget-elapsed-"));
-  const directory = writeRun(join(root, "run-1"), runState({ state: "paused" }));
-  // The clock starts half a second after the run directory's birth time, so one rescan interval crosses exactly one second.
-  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Math.ceil(statSync(directory).birthtimeMs) + 500 });
+for (const state of ["awaiting_input", "pausing", "queued"]) {
+  void test(`a run ${state} keeps its clock moving`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-elapsed-"));
+    const directory = writeRun(join(root, "run-1"), runState({ state }));
+    // The clock starts half a second after the run directory's birth time, so one tick crosses exactly one second.
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Math.ceil(statSync(directory).birthtimeMs) + 500 });
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const header = () => host.frames.at(-1).map(plain).find((line) => line.includes(" smoke "));
+    assert.match(header(), / 00:00 │$/);
+    const renders = host.renderRequests;
+    t.mock.timers.tick(1000);
+    assert.equal(host.renderRequests, renders + 1, "one repaint for the second that passed");
+    assert.match(header(), / 00:01 │$/, "the run's elapsed time keeps moving");
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const state of ["interrupted", "paused", "budget_exhausted"]) {
+  void test(`a run ${state}, which nothing ticks, shows the runtime it recorded, as /agents does`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-recorded-"));
+    const directory = writeRun(join(root, "run-1"), runState({ state, usage: { tokens: 44_700, costUsd: 0.056, durationMs: 82_529 } }));
+    // Ten minutes after the run directory's birth: the time since it started is not what the run recorded.
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Math.ceil(statSync(directory).birthtimeMs) + 600_000 });
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const header = () => drawAt(host, WIDTH).find((line) => line.includes(" smoke "));
+    assert.match(header(), / 01:22 │$/);
+    const renders = host.renderRequests;
+    t.mock.timers.tick(5000);
+    assert.equal(host.renderRequests, renders, "nothing ticks");
+    assert.match(header(), / 01:22 │$/, "a frame drawn later shows the same time");
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const [state, live] of [["running", true], ["pausing", true], ["awaiting_input", true], ["paused", false], ["budget_exhausted", false], ["interrupted", false]]) {
+  void test(`an agent recorded running in a ${state} run ${live ? "keeps its silence mark" : "shows no silence mark"}`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-silence-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      agents: [{ ...baseAgent, state: "running", startedAt: now - 600_000, lastEventAt: now - 4 * 60_000, attemptDetails: [] }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain).join("\n");
+    assert.equal(/quiet 04:00/.test(frame), live);
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+// The widget lists only runs that are not hard terminal, so no agent of these runs is drawn, with a mark or a clock.
+for (const state of ["completed", "failed", "stopped"]) {
+  void test(`a ${state} run draws no widget, so none of its agents shows a mark or a clock`, () => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-terminal-"));
+    const directory = writeRun(join(root, "run-1"), runState({ state }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+    assert.equal(host.widgets.at(-1), undefined);
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const [state, live] of [["running", true], ["pausing", true], ["awaiting_input", true], ["paused", false], ["budget_exhausted", false], ["interrupted", false]]) {
+  void test(`an agent recorded running in a ${state} run ${live ? "keeps its own clock" : "shows no clock, not the run's total"}`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-clock-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      usage: { tokens: 44_700, costUsd: 0.056, durationMs: 82_529 },
+      agents: [{ ...baseAgent, state: "running", startedAt: now - 600_000, lastEventAt: now, attemptDetails: [] }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const row = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain).find((line) => line.includes("fixture-model"));
+    assert.equal(/ 10:00/.test(row), live);
+    assert.doesNotMatch(row, /01:22|00:00/);
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const [state, live] of [["running", true], ["pausing", true], ["awaiting_input", true], ["paused", false], ["budget_exhausted", false], ["interrupted", false]]) {
+  void test(`the marks of an agent recorded running in a ${state} run ${live ? "spin" : "are the muted dot"}`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-mark-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      agents: [{ ...baseAgent, state: "running", startedAt: now - 600_000, lastEventAt: now, attemptDetails: [] }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const lines = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+    const markOf = (row) => lines.find((line) => row.test(line))?.match(/[├╰]─ (\S) /)?.[1];
+    assert.equal(markOf(/scout/) === "·", !live);
+    if (live) assert.notEqual(markOf(/[├╰]─ \S llm\b/), "·");
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const [agentState, shown] of [["completed", "00:05"], ["failed", "00:05"]]) {
+  void test(`a ${agentState} agent in a paused run shows its own durationMs, not the run's total`, () => {
+    const root = mkdtempSync(join(tmpdir(), "widget-agent-duration-"));
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state: "paused",
+      usage: { tokens: 44_700, costUsd: 0.056, durationMs: 82_529 },
+      agents: [{ ...baseAgent, state: agentState, durationMs: 5000 }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+    const row = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain).find((line) => line.includes("fixture-model"));
+    assert.match(row, new RegExp(` ${shown}`));
+    assert.doesNotMatch(row, /01:22/);
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+/** Three runs of three phases, each with twelve running agents writing their own transcripts. */
+function largeRuns(root) {
+  return [0, 1, 2].map((runIndex) => {
+    const id = `big-${String(runIndex)}`;
+    const agents = Array.from({ length: 12 }, (_, agentIndex) => {
+      const sessionFile = join(root, `${id}-${String(agentIndex)}.jsonl`);
+      writeFileSync(sessionFile, "{}\n");
+      return { ...runState().agents[0], id: `${id}-${String(agentIndex)}`, name: `worker-${String(runIndex * 12 + agentIndex).padStart(2, "0")}`, attemptDetails: [{ session: { locator: { sessionFile } } }] };
+    });
+    const phaseHistory = [{ phase: "p0", afterAgent: 0 }, { phase: "p1", afterAgent: 4 }, { phase: "p2", afterAgent: 8 }];
+    return { id, directory: writeRun(join(root, id), runState({ id, workflowName: id, phase: "p2", phaseHistory, agents })) };
+  });
+}
+
+void test("a large run repaints at most once a second, and a render with nothing new reads no file", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "widget-large-"));
+  const runs = largeRuns(root);
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
   const host = harness();
   host.start();
-  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  for (const { id, directory } of runs) host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
 
-  const header = () => host.frames.at(-1).map(plain).find((line) => line.includes(" smoke "));
-  assert.match(header(), / 00:00 │$/);
   const renders = host.renderRequests;
-  t.mock.timers.tick(1000);
-  assert.equal(host.renderRequests, renders + 1, "only the rescan renders a paused run");
-  assert.match(header(), / 00:01 │$/, "a paused run's elapsed time keeps moving");
+  for (let step = 0; step < 80; step += 1) t.mock.timers.tick(125);
+  assert.ok(host.renderRequests - renders <= 10, `ten seconds ask for ten repaints at most, not ${String(host.renderRequests - renders)}`);
+  assert.ok(host.renderRequests > renders, "the spinner still turns");
+
+  const component = host.widgets.at(-1)(host.tui, theme);
+  const stat = t.mock.method(fs, "statSync");
+  syncBuiltinESMExports();
+  try {
+    const first = component.render(WIDTH);
+    assert.ok(stat.mock.callCount() > 0, "a new frame looks at the transcripts");
+    const calls = stat.mock.callCount();
+    assert.deepEqual(component.render(WIDTH), first, "the kept frame is returned");
+    assert.equal(stat.mock.callCount(), calls, "a render with nothing changed reads no file");
+    assert.notDeepEqual(component.render(50), first, "a new width draws a new frame");
+    // Only the clock moves: the tick does not fire, so nothing else changed.
+    const requested = host.renderRequests;
+    t.mock.timers.setTime(Date.now() + 1000);
+    assert.equal(host.renderRequests, requested, "no tick fired");
+    const next = stat.mock.callCount();
+    component.render(50);
+    assert.ok(stat.mock.callCount() > next, "a new second draws a new frame");
+  } finally {
+    stat.mock.restore();
+    syncBuiltinESMExports();
+  }
 
   host.shutdown();
   rmSync(root, { recursive: true, force: true });
 });
 
+void test("on a narrow terminal every row keeps its name and fits", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-narrow-"));
+  // One run, so its agents are not folded into a count.
+  const runs = largeRuns(root).slice(0, 1);
+  const host = harness();
+  host.start();
+  for (const { id, directory } of runs) host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
 
-void test("suspending hides the widget and stops repainting until resumed", async () => {
-  const root = mkdtempSync(join(tmpdir(), "widget-suspended-"));
+  for (const width of [50, 40]) {
+    const lines = host.widgets.at(-1)(host.tui, theme).render(width);
+    for (const line of lines) assert.ok(visibleWidth(line) <= width, `${plain(line)} fits ${String(width)} columns`);
+    const body = lines.slice(1, -1).map(plain);
+    for (const line of body) assert.match(line, /│$/, `${line} keeps its right rule at ${String(width)} columns`);
+    // Every line is clamped on the way out; the closing corners say the title row and the floor were drawn within the width, not cut.
+    assert.match(plain(lines[0]), /^╭ Workflow ─+ Alt\+O to scroll ╮$/, `the title and its hint fit whole at ${String(width)} columns`);
+    assert.match(plain(lines.at(-1)), /^╰─+╯$/, `the floor fits at ${String(width)} columns`);
+    const agents = body.filter((line) => /[├╰]─ [⣷⣯⣟⡿⢿⣽⣻] w/.test(line));
+    assert.ok(agents.length > 0, `agent rows are drawn at ${String(width)} columns`);
+    for (const line of agents) assert.match(line, /worker-\d\d /, `${line} keeps the agent's whole name`);
+    for (const line of body.filter((row) => /big-\d/.test(row))) assert.match(line, /big-\d /, `${line} keeps the run's whole name`);
+  }
+
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
+
+void test("below 60 columns the title gives way to the hint: the counts are cut, the hint stays, and Alt+O is taken", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-narrow-hint-"));
+  const host = harness();
+  host.start();
+  for (const id of ["run-1", "run-2"]) {
+    const directory = writeRun(join(root, id), { ...tallRun(id), workflowName: `flow-${id}`, agents: [silentAgent(`${id}-q`, "asker")] });
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  }
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: join(root, "run-1"), sessionId: "session-1", name: "ok?", state: "awaiting" });
+  for (const width of [50, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    assert.match(frame[0], /^╭ Workflows[^─]* ─+ Alt\+O to scroll ╮$/, `the hint stays whole at ${String(width)} columns`);
+    host.key("\u001bo");
+    assert.match(plain(drawAt(host, width)[0]), /esc exit/, `Alt+O is taken at ${String(width)} columns`);
+    host.key("\u001b");
+  }
+  assert.match(drawAt(host, WIDTH)[0], /Alt\+O to scroll ╮$/);
+  assert.equal(host.key("\u001bo"), true, "where the hint shows, Alt+O is taken");
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
+
+void test("in scroll mode at 40 columns and below the title row keeps the frame name and a way out", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-narrow-scroll-"));
+  const host = harness("session-1", { opener: { available: () => true, open: () => {} } });
+  host.start();
+  const directory = writeRun(join(root, "run-1"), tallRun());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  for (const width of [40, 39, 35, 30]) {
+    host.key("\u001bo");
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    assert.match(plain(frame[0]), /^╭ Workflow[^─]* ─+ .*esc exit ╮$/, `${plain(frame[0])} keeps the name and the way out at ${String(width)} columns`);
+    host.key("\u001b");
+  }
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
+
+void test("on a narrow terminal a subagent whose one figure is a long model keeps its whole label", () => {
+  const model = { provider: "p", model: "a-very-long-model-name-for-the-row" };
+  const { host } = subagentHost([], [backgroundSubagent("s1", "reviewer-of-the-diff", { status: { startedAt: undefined, progress: { lastEventAt: Date.now(), toolCalls: [], state: { model } } } })]);
+  for (const width of [50, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const line = frame.map(plain).find((item) => item.includes("reviewer"));
+    assert.match(line ?? "", /reviewer-of-the-diff /, `${frame.map(plain).join("\n")}\nkeeps the label at ${String(width)} columns`);
+  }
+  host.shutdown();
+});
+
+void test("on a narrow terminal long names with several figures beside them stay whole", () => {
+  const figures = { model: { model: "fixture-model", thinking: "medium" }, accounting: { input: 44_000, output: 700, cacheRead: 0, cost: 0.056 } };
+  const { host } = subagentHost(
+    [{ id: "run-1", workflowName: "a-long-workflow-name", usage: { tokens: 44_700, costUsd: 0.056 }, agents: [agent("a1", "implementer-of-it", "running", figures)] }],
+    [backgroundSubagent("s1", "reviewer-of-the-diff")],
+  );
+  for (const width of [50, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const text = frame.map(plain).join("\n");
+    for (const name of ["a-long-workflow-name", "implementer-of-it", "reviewer-of-the-diff"]) {
+      assert.match(text, new RegExp(`${name}( |$)`, "m"), `${text}\nkeeps ${name} whole at ${String(width)} columns`);
+    }
+  }
+  host.shutdown();
+});
+
+void test("while an agents workspace is open (/agents, /workflow or /subagents) the widget paints nothing, its tick rescans nothing, and it is back on the tick after it closes", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "widget-workspace-"));
   const directory = writeRun(join(root, "run-1"), runState());
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+  const live = new Map([["s1", backgroundSubagent("s1", "alpha")]]);
+  const host = harness("session-1", { subagents: () => live.values() });
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  assert.equal(typeof host.widgets.at(-1), "function");
+
+  // The flag the workspace loop sets in every bundle while a workspace or its actions' dialogs are up.
+  Reflect.set(globalThis, Symbol.for("pi-extensible-workflows.agents-workspace-loop"), true);
+  const stat = t.mock.method(fs, "statSync");
+  syncBuiltinESMExports();
+  try {
+    t.mock.timers.tick(1000);
+    assert.equal(host.widgets.at(-1), undefined, "the tick under the workspace takes the frame away");
+    const calls = host.widgets.length;
+    const renders = host.renderRequests;
+    t.mock.timers.tick(3000);
+    stat.mock.resetCalls();
+    host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+    assert.ok(stat.mock.calls.length > 0 && stat.mock.calls.every(({ arguments: [path] }) => String(path).startsWith(directory)), "a run event reads only its own run, which a receipt needs");
+    live.set("s2", backgroundSubagent("s2", "beta"));
+    host.controller.subagentsChanged();
+    assert.equal(host.widgets.length, calls, "ticks, run events and subagent events draw nothing");
+    assert.equal(host.renderRequests, renders, "nothing repaints");
+    stat.mock.resetCalls();
+    t.mock.timers.tick(3000);
+    assert.equal(stat.mock.callCount(), 0, "the tick rescans no state file");
+  } finally {
+    stat.mock.restore();
+    syncBuiltinESMExports();
+    Reflect.deleteProperty(globalThis, Symbol.for("pi-extensible-workflows.agents-workspace-loop"));
+  }
+
+  t.mock.timers.tick(1000);
+  assert.equal(typeof host.widgets.at(-1), "function", "the tick after the workspace closed draws the widget again");
+  assert.ok(drawAt(host, WIDTH).some((line) => line.includes("beta")), "with what changed while it was open");
+
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
+
+void test("a frame mounted for a paused run, which nothing ticks, draws empty while an agents workspace is open", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "widget-workspace-paused-"));
+  const directory = writeRun(join(root, "run-1"), runState({ state: "paused" }));
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
   const host = harness();
   host.start();
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-
-  host.controller.suspend();
-  assert.equal(host.widgets.at(-1), undefined);
-  const suspendedCalls = host.widgets.length;
-  await new Promise((resolve) => globalThis.setTimeout(resolve, 300));
-  host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-  assert.equal(host.widgets.length, suspendedCalls, "ticks and events stay hidden while suspended");
-
-  host.controller.resume();
-  assert.equal(typeof host.widgets.at(-1), "function");
-  const resumedRenders = host.renderRequests;
-  await new Promise((resolve) => globalThis.setTimeout(resolve, 300));
-  assert.ok(host.renderRequests > resumedRenders, "the repaint timer restarts after the navigator closes");
-
+  assert.ok(drawAt(host, WIDTH).length > 0, "the paused run is drawn");
+  Reflect.set(globalThis, Symbol.for("pi-extensible-workflows.agents-workspace-loop"), true);
+  try {
+    assert.deepEqual(drawAt(host, WIDTH), [], "the mounted frame draws nothing under the workspace");
+  } finally {
+    Reflect.deleteProperty(globalThis, Symbol.for("pi-extensible-workflows.agents-workspace-loop"));
+  }
+  assert.ok(drawAt(host, WIDTH).length > 0, "the frame is back once the workspace closed");
   host.shutdown();
   rmSync(root, { recursive: true, force: true });
 });
@@ -740,6 +1059,76 @@ void test("a phase of shell work shows its commands once they have run a while",
   host.shutdown();
 });
 
+void test("a phase whose only live work is a running shell is drawn running, not done", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-shell-phase-"));
+  const host = harness();
+  host.start();
+  const directory = writeRun(join(root, "run-1"), {
+    ...runState(),
+    agents: [],
+    activeShellsByPhase: [{ phaseIndex: 0, active: 1, startedAt: Date.now() - 20_000 }],
+  });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const text = host.frames.at(-1).map(plain).join("\n");
+  assert.match(text, /1 command/, text);
+  assert.match(text, /[├╰]─ [⣷⣯⣟⡿⢿⣽⣻] shell/, text);
+  assert.doesNotMatch(text, /✓ shell/, text);
+  host.shutdown();
+});
+
+for (const [state, live] of [["running", true], ["pausing", true], ["awaiting_input", true], ["paused", false], ["budget_exhausted", false], ["interrupted", false]]) {
+  void test(`a running shell in a ${state} run ${live ? "spins and keeps its phase running" : "draws the quiet dot and its phase shows the run state"}`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-shell-mark-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      agents: [],
+      activeShellsByPhase: [{ phaseIndex: 0, active: 1, startedAt: now - 20_000 }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const lines = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+    const markOf = (row) => lines.find((line) => row.test(line))?.match(/[├╰]─ (\S) /)?.[1];
+    const spins = (glyph) => "⣷⣯⣟⡿⢿⣽⣻".includes(glyph);
+    assert.equal(spins(markOf(/1 command/)), live, lines.join("\n"));
+    assert.equal(spins(markOf(/[├╰]─ \S shell/)), live, lines.join("\n"));
+    if (!live) {
+      assert.equal(markOf(/1 command/), "·");
+      assert.equal(markOf(/[├╰]─ \S shell/), state === "budget_exhausted" ? "✗" : "·");
+    }
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
+for (const [state, glyph] of [["running", "✓"], ["pausing", "✓"], ["awaiting_input", "✓"], ["paused", "·"], ["interrupted", "·"], ["budget_exhausted", "✗"]]) {
+  void test(`a phase whose agents are all settled draws ${glyph} in a ${state} run: the check where agents count as running, else the run's own state mark`, (t) => {
+    const root = mkdtempSync(join(tmpdir(), "widget-phase-mark-"));
+    const now = 10_000_000;
+    t.mock.timers.enable({ apis: ["Date", "setInterval"], now });
+    const baseAgent = runState().agents[0];
+    const directory = writeRun(join(root, "run-1"), runState({
+      state,
+      phase: "work",
+      phaseHistory: [{ phase: "work", afterAgent: 0 }],
+      agents: [{ ...baseAgent, state: "completed", startedAt: now - 600_000, durationMs: 60_000, attemptDetails: [] }],
+    }));
+    const host = harness();
+    host.start();
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+
+    const lines = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+    assert.equal(lines.find((line) => /[├╰]─ \S work/.test(line))?.match(/[├╰]─ (\S) work/)?.[1], glyph, lines.join("\n"));
+
+    host.shutdown();
+    rmSync(root, { recursive: true, force: true });
+  });
+}
+
 void test("crossing a budget threshold shows on the run line", () => {
   const root = mkdtempSync(join(tmpdir(), "widget-budget-"));
   const directory = writeRun(join(root, "run-1"), {
@@ -1130,10 +1519,10 @@ void test("with scrolling off the widget claims no keys at all", () => {
   host.shutdown();
 });
 
-void test("the shortcut scrolls the widget through a tree too tall to show", () => {
+void test("Alt+O scrolls the widget through a tree too tall to show", () => {
   // Ten rows do not stretch to five runs three phases deep, and what is folded
   // away at rest is chosen by the widget, not the reader. Scrolling is how the
-  // rest is reached — entered by shortcut alone, since `↓` on an empty editor
+  // rest is reached — entered by Alt+O alone, since `↓` on an empty editor
   // belongs to whichever picker opens next.
   __navigationForTests.enabled = true;
   const root = mkdtempSync(join(tmpdir(), "widget-scroll-"));
@@ -1156,26 +1545,25 @@ void test("the shortcut scrolls the widget through a tree too tall to show", () 
   }
 
   const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
-  const shortcut = [...host.shortcuts.values()][0];
-  assert.ok(shortcut, "the shortcut is registered");
+  assert.equal(host.shortcuts.size, 0, "Alt+O is no Pi shortcut: Pi's editor would take it with or without the hint");
 
   const resting = draw();
   assert.ok(resting.length <= 10, `the frame keeps its budget, got ${resting.length}`);
-  assert.ok(resting.some((line) => line.includes("more")), "and says how much is hidden");
+  assert.ok(resting.some((line) => /more|… \d+ phases?/.test(line)), "and says how much is hidden");
 
-  // `↓` is left alone until the shortcut says otherwise.
+  // `↓` is left alone until Alt+O says otherwise.
   host.setEditorText("");
   assert.equal(host.key("\u001b[1;1:1B"), false, "↓ is not claimed at rest");
 
   const beforeFocus = host.renderRequests;
-  shortcut.handler();
+  assert.equal(host.key("\u001bo"), true, "Alt+O is taken while its hint shows");
   assert.equal(host.renderRequests, beforeFocus + 1, "entering scroll mode repaints immediately");
   assert.equal(host.key("\u001b[1;1:1B"), true, "and is claimed while scrolling");
   assert.equal(host.renderRequests, beforeFocus + 2, "scrolling repaints immediately");
   const scrolled = draw();
   assert.notDeepEqual(scrolled, resting, "the window moved");
   assert.ok(scrolled.length <= 10, "still within budget");
-  assert.match(scrolled[0], /↑\/↓ to scroll · Esc to exit/, "the keys are named while scrolling");
+  assert.match(scrolled[0], /↑↓ move · esc exit/, "the keys are named while scrolling");
 
   // Escape gives the keyboard back, and the arrow with it.
   assert.equal(host.key("\u001b"), true, "escape is taken");
@@ -1194,10 +1582,9 @@ void test("Alt+O is hidden and does not enter scrolling when the tree fits", () 
     phaseHistory: Array.from({ length: 7 }, (_, index) => ({ phase: `phase-${String(index)}`, afterAgent: 0 })),
   }));
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-  const shortcut = [...host.shortcuts.values()][0];
   const before = host.widgets.at(-1)(host.tui, theme).render(WIDTH);
   assert.doesNotMatch(plain(before[0]), /alt\+o to scroll/i);
-  shortcut.handler();
+  assert.equal(host.key("\u001bo"), false, "Alt+O passes through");
   assert.equal(host.key("\u001b[1;1:1B"), false);
   assert.deepEqual(host.widgets.at(-1)(host.tui, theme).render(WIDTH), before);
   host.shutdown();
@@ -1213,7 +1600,7 @@ void test("scroll mode yields arrows when a repaint leaves a fitting tree", () =
     agents: [],
   }));
   host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
-  [...host.shortcuts.values()][0].handler();
+  host.key("\u001bo");
   assert.equal(host.key("\u001b[1;1:1B"), true);
 
   writeRun(directory, runState({ agents: [], phaseHistory: [{ phase: "phase-0", afterAgent: 0 }] }));
@@ -1266,10 +1653,10 @@ void test("scrolling is visibly a mode: coloured rules, a scrollbar and a way ou
   assert.match(plain(resting[0]), /Alt\+O to scroll/, "and the way in is named");
   assert.ok(!resting.some((line) => line.includes("█")), "no scrollbar until it means something");
 
-  [...host.shortcuts.values()][0].handler();
+  host.key("\u001bo");
   const scrolling = draw();
   assert.ok(scrolling[0].startsWith("\u001b[33m╭"), "scrolling recolours the rules");
-  assert.match(plain(scrolling[0]), /↑\/↓ to scroll · Esc to exit/, "and names the way out");
+  assert.match(plain(scrolling[0]), /↑↓ move · esc exit/, "and names the way out");
   assert.ok(scrolling.some((line) => line.includes("█")), "the thumb shows where the window sits");
   assert.ok(scrolling.some((line) => line.includes("░")), "against the track it moves along");
 
@@ -1306,7 +1693,7 @@ void test("scrolling reaches the last row and stops there, with nothing banked p
   __navigationForTests.enabled = true;
   const host = tallTree();
   const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(stableLine);
-  [...host.shortcuts.values()][0].handler();
+  host.key("\u001bo");
 
   for (let press = 0; press < 40; press += 1) host.key("\u001b[1;1:1B");
   const bottom = draw();
@@ -1331,7 +1718,7 @@ void test("entering scroll mode shows the top of the tree, not the resting selec
   // that merely starts at the top is not enough — the rows after it must be
   // the ones that really follow. Scrolling to the end collects every row of
   // the tree in order; entering must show that sequence's first rows exactly.
-  [...host.shortcuts.values()][0].handler();
+  host.key("\u001bo");
   const entered = draw().slice(1, -1);
 
   const walked = [];
@@ -1361,7 +1748,7 @@ void test("the scrollbar thumb tracks the window it describes", () => {
     const last = rows.map((line) => line.endsWith("█")).lastIndexOf(true);
     return { first, last, rows: rows.length };
   };
-  [...host.shortcuts.values()][0].handler();
+  host.key("\u001bo");
 
   const top = thumb();
   assert.equal(top.first, 0, "at the top of the tree the thumb starts at the top");
@@ -1432,51 +1819,698 @@ void test("lines are measured in terminal cells, not JavaScript characters", () 
   host.shutdown();
 });
 
-void test("a run header survives however many checkpoints are waiting", () => {
-  // Checkpoints share the top rank because they need an answer, so ranking
-  // alone lets a few early ones spend the budget before a later run's header
-  // is reached. A run missing its detail is terse; a run missing its header is
-  // invisible, and the widget exists to say what is running.
-  const root = mkdtempSync(join(tmpdir(), "widget-headers-"));
-  const host = harness();
+/** Draws the current widget at a given width, colours stripped. */
+const drawAt = (host, width) => host.widgets.at(-1)(host.tui, theme).render(width).map(plain);
+
+function agent(id, name, state, extra = {}) {
+  return {
+    id,
+    name,
+    state,
+    attempts: 1,
+    startedAt: Date.now() - 5_000,
+    durationMs: 1_000,
+    tools: [],
+    model: { model: "m" },
+    accounting: { input: 1, output: 1, cacheRead: 0, cost: 0.001 },
+    ...extra,
+  };
+}
+
+function startRuns(runs, options = {}) {
+  const root = mkdtempSync(join(tmpdir(), "widget-attention-"));
+  const host = harness("session-1", options);
   host.start();
-
-  for (let index = 0; index < 8; index += 1) {
-    const id = `run-${String(index)}`;
-    const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
-    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
+  for (const run of runs) {
+    const directory = writeRun(join(root, run.id), runState(run));
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: run.id, runDirectory: directory, sessionId: "session-1" });
   }
-  for (let index = 0; index < 7; index += 1) {
-    host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
-      runId: `run-${String(index)}`,
-      runDirectory: join(root, `run-${String(index)}`),
-      sessionId: "session-1",
-      state: "awaiting",
-      name: `approve-${String(index)}`,
-    });
-  }
+  return host;
+}
 
-  const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
-  for (let index = 0; index < 8; index += 1) {
-    assert.ok(frame.some((line) => line.includes(`flow-${String(index)}`)), `flow-${String(index)} is still on screen`);
-  }
+function silentAgent(id, name) {
+  return agent(id, name, "running", { lastEventAt: Date.now() - 4 * 60_000, attemptDetails: [] });
+}
 
+void test("the title names runs, checkpoints waiting and quiet agents, only the non-zero parts", () => {
+  const host = startRuns([
+    { id: "run-1", workflowName: "one", agents: [silentAgent("q1", "asker")] },
+    { id: "run-2", workflowName: "two", agents: [] },
+  ]);
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+    runId: "run-2", runDirectory: undefined, sessionId: "session-1", name: "ok?", state: "awaiting",
+  });
+  assert.match(drawAt(host, 120)[0], /^╭ Workflows · 2 runs · ⚠ 1 quiet /, "invalid event leaves waiting out");
   host.shutdown();
 });
 
-void test("marks hidden rows when run headers exceed the body budget", () => {
-  const root = mkdtempSync(join(tmpdir(), "widget-header-budget-"));
+void test("waiting checkpoints are counted in the title", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-"));
   const host = harness();
   host.start();
-  for (let index = 0; index < 9; index += 1) {
+  const directory = writeRun(join(root, "run-1"), runState({ agents: [silentAgent("q1", "asker")] }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, {
+    runId: "run-1", runDirectory: directory, sessionId: "session-1", name: "ok?", state: "awaiting",
+  });
+  assert.match(drawAt(host, 120)[0], /^╭ Workflow · ◆ 1 waiting · ⚠ 1 quiet /);
+  host.shutdown();
+});
+
+void test("the run row drops the running tag, keeps other tags, and shows phase and progress", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "build",
+    phase: "review",
+    agents: [agent("a", "x", "completed"), agent("b", "y", "completed"), agent("c", "z", "completed"), agent("d", "w", "running"), agent("e", "v", "queued")],
+  }]);
+  const header = drawAt(host, 120).find((line) => line.includes("build"));
+  assert.ok(header);
+  assert.doesNotMatch(header, /\[running\]/);
+  assert.match(header, /build · review · 3\/5/);
+  host.shutdown();
+
+  const paused = startRuns([{ id: "run-1", workflowName: "build", state: "paused", agents: [] }]);
+  assert.match(drawAt(paused, 120).find((line) => line.includes("build")), /\[paused\] build/);
+  paused.shutdown();
+});
+
+void test("the short run id shows only when two shown runs share a name", () => {
+  const same = startRuns([
+    { id: "aaaaaaaa-1111", workflowName: "twin", agents: [] },
+    { id: "bbbbbbbb-2222", workflowName: "twin", agents: [] },
+  ]);
+  const frame = drawAt(same, 120).join("\n");
+  assert.match(frame, /twin aaaaaaaa/);
+  assert.match(frame, /twin bbbbbbbb/);
+  assert.doesNotMatch(frame, /aaaaaaaa-/);
+  same.shutdown();
+
+  const distinct = startRuns([
+    { id: "aaaaaaaa-1111", workflowName: "one", agents: [] },
+    { id: "bbbbbbbb-2222", workflowName: "two", agents: [] },
+  ]);
+  assert.doesNotMatch(drawAt(distinct, 120).join("\n"), /aaaaaaaa|bbbbbbbb/);
+  distinct.shutdown();
+});
+
+void test("nested agents draw their prefix with aligned stems at every depth", () => {
+  const host = startRuns([{
+    id: "run-1",
+    phaseHistory: [{ phase: "p", afterAgent: 0 }, { phase: "q", afterAgent: 5 }],
+    agents: [
+      agent("a", "root", "running"),
+      agent("b", "child", "running", { parentId: "a" }),
+      agent("c", "grand", "running", { parentId: "b" }),
+      agent("d", "sibling", "running", { parentId: "a" }),
+      agent("e", "other", "running"),
+    ],
+  }]);
+  const lines = drawAt(host, 120).map((line) => line.slice(2));
+  const at = (name) => lines.find((line) => line.includes(name));
+  assert.match(at("root"), /^ {2}│ ├─ /);
+  assert.match(at("child"), /^ {2}│ │ ├─ /);
+  assert.match(at("grand"), /^ {2}│ │ │ ╰─ /);
+  assert.match(at("sibling"), /^ {2}│ │ ╰─ /);
+  host.shutdown();
+});
+
+const many2 = (prefix, count, state) => Array.from({ length: count }, (_, i) => agent(`${prefix}${String(i)}`, `${prefix}-${String(i)}`, state));
+
+void test("children and grandchildren of a last root draw blank stems", () => {
+  const host = startRuns([{
+    id: "run-1",
+    agents: [
+      agent("a", "first", "running"),
+      agent("b", "root", "running"),
+      agent("c", "kid", "running", { parentId: "b" }),
+      agent("d", "grand", "running", { parentId: "c" }),
+      agent("e", "grand2", "running", { parentId: "c" }),
+    ],
+  }]);
+  const lines = drawAt(host, 120).map((line) => line.slice(2));
+  const at = (name) => lines.find((line) => line.includes(name));
+  assert.match(at("root"), /^ {4}╰─ .*root/);
+  assert.match(at("kid"), /^ {6}╰─ .*kid/);
+  assert.match(at("grand "), /^ {8}├─ .*grand/);
+  assert.match(at("grand2"), /^ {8}╰─ .*grand2/);
+  host.shutdown();
+});
+
+void test("a quiet grandchild keeps the agents that spawned it", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "flow",
+    agents: [
+      agent("r", "root", "running"),
+      ...Array.from({ length: 8 }, (_, i) => agent(`k${String(i)}`, `kid${String(i)}`, "completed", { parentId: "r" })),
+      agent("p", "parentx", "completed", { parentId: "r" }),
+      { ...silentAgent("q", "quietkid"), parentId: "p" },
+      ...Array.from({ length: 6 }, (_, i) => agent(`s${String(i)}`, `after${String(i)}`, "completed", { parentId: "r" })),
+    ],
+  }]);
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  const p = frame.findIndex((line) => line.includes("parentx"));
+  const q = frame.findIndex((line) => line.includes("quietkid"));
+  assert.ok(p >= 0 && q > p, text);
+  assert.ok(frame.some((line) => line.includes("root")), text);
+  host.shutdown();
+});
+
+void test("the run row counts every settled agent, and an empty run shows 0/0", () => {
+  const host = startRuns([{
+    id: "run-1",
+    workflowName: "mix",
+    agents: [agent("a", "x", "completed"), agent("b", "y", "failed"), agent("c", "z", "cancelled"), agent("d", "w", "running")],
+  }]);
+  assert.match(drawAt(host, 120).find((line) => line.includes("mix")), /mix · (.* · )?3\/4/);
+  host.shutdown();
+  const empty = startRuns([{ id: "run-1", workflowName: "none", agents: [] }]);
+  assert.match(drawAt(empty, 120).find((line) => line.includes("none")), /none · (.* · )?0\/0/);
+  empty.shutdown();
+});
+
+void test("four runs keep every header within the rows and count the detail that does not fit", () => {
+  const runs = Array.from({ length: 4 }, (_, r) => ({
+    id: `run-${String(r)}`,
+    workflowName: `flow${String(r)}`,
+    agents: [
+      agent(`a${String(r)}`, "first", "completed"),
+      agent(`b${String(r)}`, "second", "running"),
+      agent(`c${String(r)}`, "third", "completed"),
+      agent(`d${String(r)}`, "fourth", "completed"),
+    ],
+  }));
+  const host = startRuns(runs);
+  const frame = drawAt(host, 120);
+  const text = frame.join("\n");
+  assertFits(frame, 120);
+  for (let r = 0; r < 4; r += 1) assert.match(text, new RegExp(`flow${String(r)}`), text);
+  assert.match(frame.at(-2), /│ … \d+ more +│$/, text);
+  host.shutdown();
+});
+
+function assertFits(frame, width, label = "") {
+  const text = frame.join("\n");
+  assert.ok(frame.length <= 10, `${label}${String(width)}: ${String(frame.length)} lines\n${text}`);
+  assert.ok(frame.every((line) => visibleWidth(line) <= width), `${label}fits ${String(width)}`);
+}
+
+void test("rows collapse in one ordered pass: headers, then what needs a person, then live and failed work, then the rest, and one row counts the others", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-one-pass-"));
+  const host = harness();
+  host.start();
+  const work = [{ phase: "work", afterAgent: 0 }];
+  const alpha = writeRun(join(root, "run-1"), runState({
+    workflowName: "alpha",
+    phaseHistory: work,
+    agents: [...many2("done-a", 3, "completed"), agent("l", "live-a", "running"), agent("f", "broke", "failed"), silentAgent("q", "asker")],
+  }));
+  const beta = writeRun(join(root, "run-2"), runState({ id: "run-2", workflowName: "beta", phaseHistory: work, agents: many2("done-b", 3, "completed") }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: alpha, sessionId: "session-1" });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: beta, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: alpha, sessionId: "session-1", name: "ok?", state: "awaiting" });
+  const frame = drawAt(host, 120);
+  assert.equal(frame.length, 10, frame.join("\n"));
+  const body = frame.slice(1, -1);
+  // Fourteen rows: the seven kept are drawn in tree order, the other seven are counted.
+  const expected = [/ alpha · /, /waiting: ok\?/, /╰─ \S work/, /live-a/, /broke/, /⚠ asker/, / beta · /, /^│ … 7 more +│$/];
+  assert.equal(body.length, expected.length, frame.join("\n"));
+  expected.forEach((pattern, index) => assert.match(body[index], pattern, frame.join("\n")));
+  host.shutdown();
+});
+
+void test("quiet agents among completed ones take the rows, and no completed agent shows while one is hidden", () => {
+  for (const phaseHistory of [undefined, [{ phase: "work", afterAgent: 0 }]]) {
+    const agents = Array.from({ length: 11 }, (_, i) => i % 2 === 0 ? silentAgent(`q${String(i)}`, `q${String(i)}`) : agent(`x${String(i)}`, `x${String(i)}`, "completed"));
+    const host = startRuns([{ id: "run-1", workflowName: "mix", ...(phaseHistory ? { phaseHistory } : {}), agents }]);
+    const frame = drawAt(host, 120);
+    assertFits(frame, 120);
+    const text = frame.map(plain).join("\n");
+    // The header and the phase leave five rows to quiet agents, above the count of the rest.
+    for (let i = 0; i < 10; i += 2) assert.match(text, new RegExp(`q${String(i)}\\b`), text);
+    assert.match(frame.at(-2), /… \d+ more/, text);
+    assert.doesNotMatch(text, /✓ x\d/, text);
+    host.shutdown();
+  }
+});
+
+void test("eight run headers and a waiting checkpoint: the waiting row or its mark stays with the header", () => {
+  const root = mkdtempSync(join(tmpdir(), "widget-waiting-eight-"));
+  const host = harness();
+  host.start();
+  for (let index = 0; index < 8; index += 1) {
     const id = `run-${String(index)}`;
     const directory = writeRun(join(root, id), { ...runState(), id, workflowName: `flow-${String(index)}` });
     host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: id, runDirectory: directory, sessionId: "session-1" });
   }
-
-  const frame = host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
-  assert.ok(frame.length <= 10, "the strict frame budget still wins");
-  assert.ok(frame.some((line) => line.includes("more")), "hidden headers are accounted for");
-  assert.ok(!frame.some((line) => line.includes("flow-8")), "not every header is claimed to fit");
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-3", runDirectory: join(root, "run-3"), sessionId: "session-1", state: "awaiting", name: "ok?" });
+  const frame = drawAt(host, 120);
+  assertFits(frame, 120);
+  assert.match(frame[0], /◆ 1 waiting/);
+  const line = frame.map(plain).find((item) => item.includes("flow-3"));
+  assert.ok(line !== undefined, "run-3 header is shown");
+  assert.match(line, /◆ waiting/, frame.join("\n"));
   host.shutdown();
+});
+
+void test("quiet agents of several runs keep the phase they hang from, and the more-runs count has its own row", () => {
+  const mix = (prefix, count) => Array.from({ length: count }, (_, i) => i % 2 === 0
+    ? silentAgent(`${prefix}q${String(i)}`, `${prefix}q${String(i)}`)
+    : agent(`${prefix}x${String(i)}`, `${prefix}x${String(i)}`, "completed"));
+  for (const [runs, size] of [[3, 7], [5, 3], [4, 5]]) {
+    const host = startRuns(Array.from({ length: runs }, (_, r) => ({ id: `run-${String(r)}`, workflowName: `m${String(r)}`, agents: mix(`r${String(r)}`, size) })));
+    const frame = drawAt(host, 120);
+    assertFits(frame, 120, `${String(runs)} runs: `);
+    const body = frame.slice(1, -1);
+    const text = body.join("\n");
+    assert.doesNotMatch(text, /✓ r\dx/, text);
+    assert.match(text, /… \d+ more/, text);
+    // Every shown agent sits under a shown phase of its own run.
+    let phase = false;
+    for (const line of body) {
+      if (/^│ \S/.test(line)) phase = false;
+      else if (/^│ {3}[├╰]─/.test(line)) phase = true;
+      else if (/⚠ r\dq/.test(line)) assert.ok(phase, `${line} has its phase\n${text}`);
+    }
+    host.shutdown();
+  }
+});
+
+function tallRun(id = "run-1") {
+  return runState({
+    id,
+    agents: [{
+      id: "a1", name: "scout", state: "running", startedAt: Date.now(), tools: [],
+      model: { model: "fixture-model" }, accounting: { input: 1, output: 1, cacheRead: 0, cost: 0 },
+    }],
+    phaseHistory: Array.from({ length: 10 }, (_, index) => ({ phase: `p${String(index)}`, afterAgent: index === 0 ? 0 : 1 })),
+  });
+}
+
+function scrollHost(opener) {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-cursor-"));
+  const host = harness("session-1", { opener: opener ?? { available: () => true, open: () => {} } });
+  host.start();
+  const directory = writeRun(join(root, "run-1"), tallRun());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  // The row on the theme's selection background.
+  const cursorLine = () => host.widgets.at(-1)(host.tui, { ...theme, fg: (_c, text) => text }).render(WIDTH).find((line) => line.includes("\u0001"))?.replaceAll("\u0001", "") ?? "";
+  return { host, draw, cursorLine };
+}
+
+void test("Alt+O reaches the widget before an editor that binds it, in both encodings, only while the hint shows", () => {
+  const { host, draw } = scrollHost();
+  assert.match(draw()[0], /Alt\+O to scroll/);
+  // The harness runs terminal-input listeners first, as Pi does; an editor like
+  // pi-vim's would only see what they leave.
+  assert.equal(host.key("\u001bo"), true, "legacy Alt+O is taken");
+  assert.match(draw()[0], /enter open/);
+  assert.equal(host.key("\u001b"), true);
+  assert.equal(host.key("\u001b[111;3u"), true, "and so is the kitty form");
+  assert.match(draw()[0], /enter open/);
+  // Alt+O leaves scroll mode and is consumed, as esc and q are.
+  assert.equal(host.key("\u001bo"), true, "Alt+O in scroll mode is taken");
+  assert.match(draw()[0], /Alt\+O to scroll/, "and scroll mode is left");
+  host.shutdown();
+
+  const fits = harness();
+  fits.start();
+  const root = mkdtempSync(join(tmpdir(), "widget-alt-o-fit-"));
+  fits.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), runState()), sessionId: "session-1" });
+  const renders = fits.renderRequests;
+  assert.equal(fits.key("\u001bo"), false, "without the hint the key passes through");
+  assert.equal(fits.renderRequests, renders, "and does nothing");
+  fits.shutdown();
+});
+
+void test("the cursor moves with j/k and the arrows and the window follows it", () => {
+  const { host, draw, cursorLine } = scrollHost();
+  host.key("\u001bo");
+  assert.match(cursorLine(), /smoke/, "starts on the run row");
+  host.key("j");
+  assert.match(cursorLine(), /p0/);
+  host.key("\u001b[1;1:1B");
+  assert.match(cursorLine(), /scout/);
+  host.key("k");
+  assert.match(cursorLine(), /p0/);
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  assert.match(cursorLine(), /p9/, "stops on the last row");
+  assert.ok(draw().some((line) => /p9/.test(line)), "and the window shows it");
+  for (let press = 0; press < 30; press += 1) host.key("k");
+  assert.match(cursorLine(), /smoke/);
+  for (const line of draw()) assert.ok(visibleWidth(line) <= WIDTH);
+  host.shutdown();
+});
+
+void test("enter opens the workspace on the node under the cursor and leaves scroll mode", () => {
+  const opened = [];
+  const { host, draw } = scrollHost({ available: () => true, open: (_context, key) => { opened.push(key); } });
+  host.key("\u001bo");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1"]);
+  assert.match(draw()[0], /Alt\+O to scroll/, "scroll mode is left");
+  host.key("\u001bo");
+  host.key("j");
+  host.key("\r");
+  host.key("\u001bo");
+  host.key("j");
+  host.key("j");
+  host.key("\r");
+  assert.deepEqual(opened, ["run:run-1", "run:run-1:node:phase/p0%231", "run:run-1:a1"]);
+  host.shutdown();
+});
+
+void test("enter does nothing when the context cannot open the workspace", () => {
+  const opened = [];
+  const { host, draw } = scrollHost({ available: () => false, open: (_context, key) => { opened.push(key); } });
+  host.key("\u001bo");
+  assert.equal(host.key("\r"), true);
+  assert.deepEqual(opened, []);
+  assert.match(draw()[0], /esc exit/, "still in scroll mode");
+  assert.doesNotMatch(draw()[0], /enter open/, "and the hint does not promise what cannot happen");
+  host.shutdown();
+});
+
+const ALT_O = "\u001bo";
+const JUMPS = [
+  { name: "a repeated phase name opens the occurrence the workspace numbers, declared phases included",
+    names: ["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p0"], declared: ["p0", "p0", "p0"],
+    steps: [[[ALT_O, ...Array(30).fill("j"), "\r"], ["run:run-1:node:phase/p0%232"]], [[ALT_O, "j", "\r"], ["run:run-1:node:phase/p0%232", "run:run-1:node:phase/p0%231"]]] },
+  { name: "a blank phase name in the history has no target and does not shift the next phase's node",
+    names: [" ", "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7", "q8"],
+    steps: [[[ALT_O, "j", "\r"], []], [["j", "\r"], ["run:run-1:node:phase/q0%231"]]] },
+  { name: "a fractional afterAgent in the history does not shift the next phases' targets",
+    names: Array.from({ length: 10 }, (_, index) => `p${String(index)}`), fraction: 1,
+    steps: [[[ALT_O, "j", "j", "\r"], []], [["j", "\r"], ["run:run-1:node:phase/p2%231"]]] },
+];
+for (const { name, names, declared, fraction, steps } of JUMPS) {
+  void test(name, () => {
+    const opened = [];
+    __navigationForTests.enabled = true;
+    const root = mkdtempSync(join(tmpdir(), "widget-jump-"));
+    const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+    host.start();
+    const phaseHistory = names.map((phase, index) => ({ phase, afterAgent: index === fraction ? 0.5 : 0 }));
+    const directory = writeRun(join(root, "run-1"), runState({ agents: [], phaseHistory }));
+    // Declared at launch: a phase that never ran counts toward the numbering.
+    if (declared) writeFileSync(join(directory, "snapshot.json"), JSON.stringify({ phases: declared }));
+    host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+    for (const [keys, expected] of steps) {
+      for (const key of keys) host.key(key);
+      assert.deepEqual(opened, expected);
+    }
+    host.shutdown();
+  });
+}
+
+void test("h/j/k/l/q work when the terminal reports them as escape sequences", () => {
+  const { host, draw, cursorLine } = scrollHost();
+  const kitty = (letter) => `\u001b[${String(letter.charCodeAt(0))}u`;
+  host.key("\u001bo");
+  assert.equal(host.key(kitty("j")), true, "j is taken");
+  assert.match(cursorLine(), /p0/);
+  host.key(kitty("j"));
+  assert.match(cursorLine(), /scout/);
+  host.key(kitty("k"));
+  assert.match(cursorLine(), /p0/);
+  assert.equal(host.key(kitty("q")), true, "q is taken");
+  assert.match(draw()[0], /Alt\+O to scroll/, "and leaves scroll mode");
+  host.shutdown();
+});
+
+void test("in scroll mode a waiting run's header keeps its figures while its checkpoint row is just below the window", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-scroll-waiting-"));
+  const host = harness();
+  host.start();
+  const phases = (prefix) => Array.from({ length: 5 }, (_, index) => ({ phase: `${prefix}${String(index)}`, afterAgent: 0 }));
+  const first = writeRun(join(root, "run-1"), runState({ workflowName: "alpha", agents: [], phaseHistory: phases("a") }));
+  const second = writeRun(join(root, "run-2"), runState({ id: "run-2", workflowName: "beta", agents: [], phaseHistory: phases("b") }));
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: first, sessionId: "session-1" });
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: second, sessionId: "session-1" });
+  host.emit(WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, { runId: "run-2", runDirectory: second, sessionId: "session-1", name: "ok?", state: "awaiting" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  assert.equal(host.key("\u001bo"), true);
+  const frame = draw();
+  const header = frame.find((line) => /beta/.test(line));
+  assert.ok(header, frame.join("\n"));
+  assert.ok(!frame.some((line) => /waiting: ok\?/.test(line)), `the checkpoint row is below the window\n${frame.join("\n")}`);
+  assert.doesNotMatch(header, /◆ waiting/, frame.join("\n"));
+  host.key("q");
+  const rest = draw();
+  assert.ok(rest.slice(1).some((line) => /◆ waiting/.test(line)), `at rest the frame still says it\n${rest.join("\n")}`);
+  host.shutdown();
+});
+
+void test("agents before the first phase open the unassigned node, and a lone current phase opens that phase", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-unphased-"));
+  const names = Array.from({ length: 9 }, (_, index) => `p${String(index)}`);
+  const opened = [];
+  const first = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  first.start();
+  const agentRecord = { id: "a1", name: "scout", state: "running", startedAt: Date.now(), tools: [], model: { model: "fixture-model" }, accounting: { input: 1, output: 1, cacheRead: 0, cost: 0 } };
+  const before = writeRun(join(root, "run-1"), runState({ agents: [agentRecord], phaseHistory: names.map((phase) => ({ phase, afterAgent: 1 })) }));
+  first.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: before, sessionId: "session-1" });
+  first.key("\u001bo");
+  first.key("j");
+  first.key("\r");
+  assert.deepEqual(opened, ["run:run-1:node:phase/unassigned"]);
+  first.shutdown();
+
+  const second = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } } });
+  second.start();
+  const only = writeRun(join(root, "run-2"), runState({ id: "run-2", phase: "llm", phaseHistory: [], agents: Array.from({ length: 12 }, (_, index) => ({ ...agentRecord, id: `b${String(index)}`, name: `w${String(index)}` })) }));
+  second.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-2", runDirectory: only, sessionId: "session-1" });
+  second.key("\u001bo");
+  second.key("j");
+  second.key("\r");
+  assert.equal(opened[1], "run:run-2:node:phase/llm%231");
+  second.shutdown();
+});
+
+void test("Alt+O in scroll mode is consumed also when the tree has shrunk to fit meanwhile", () => {
+  __navigationForTests.enabled = true;
+  const root = mkdtempSync(join(tmpdir(), "widget-alt-o-shrunk-"));
+  const host = harness("session-1", { opener: { available: () => true, open: () => {} } });
+  host.start();
+  const directory = writeRun(join(root, "run-1"), tallRun());
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  assert.equal(host.key("\u001bo"), true);
+  writeRun(directory, runState());
+  host.emit(WORKFLOW_RUN_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+  assert.equal(host.key("\u001bo"), true, "leaving scroll mode keeps the key from the editor");
+  assert.doesNotMatch(drawAt(host, WIDTH)[0], /esc exit/);
+  host.shutdown();
+  rmSync(root, { recursive: true, force: true });
+});
+
+void test("a pi-vim-like editor that swallows Alt+O never sees it while the hint shows", () => {
+  const { host, draw } = scrollHost();
+  const seen = [];
+  const editorKey = (data) => { if (data === "\u001bo") { seen.push(data); return true; } return false; };
+  const press = (data) => host.key(data) || editorKey(data);
+  press("\u001bo");
+  assert.deepEqual(seen, [], "the editor never saw the key");
+  assert.match(draw()[0], /esc exit/);
+  press("q");
+  host.shutdown();
+  // Without the hint the key belongs to the editor.
+  const fits = harness();
+  fits.start();
+  const root = mkdtempSync(join(tmpdir(), "widget-vim-fit-"));
+  fits.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), runState()), sessionId: "session-1" });
+  const reached = [];
+  assert.equal(fits.key("\u001bo") || (reached.push("o"), editorKey("\u001bo")), true);
+  assert.deepEqual(reached, ["o"]);
+  fits.shutdown();
+});
+
+const lane = (id, name, state, structuralPath, extra = {}) => agent(id, name, state, { structuralPath, ...extra });
+
+function lanesRun(extra = {}) {
+  return {
+    id: "run-1",
+    workflowName: "agents-followups",
+    phase: undefined,
+    phaseHistory: [],
+    agents: [
+      lane("s1", "scout", "completed", ["lanes", "source"]),
+      lane("s2", "impl", "completed", ["lanes", "source"]),
+      lane("w1", "widget-impl", "running", ["lanes", "widget"]),
+      lane("k1", "ws-impl", "running", ["lanes", "workspace"]),
+      lane("k2", "ws-review", "running", ["lanes", "workspace", "verify", "review"]),
+    ],
+    ...extra,
+  };
+}
+
+/** A background subagent as the core host observes it: its latest status and the request that started it. */
+function backgroundSubagent(id, label, extra = {}) {
+  const now = Date.now();
+  return {
+    status: {
+      id,
+      sessionId: "session-1",
+      state: "running",
+      startedAt: now - 5_000,
+      progress: { lastEventAt: now, toolCalls: [], accounting: { input: 1_000, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.01 }, state: { model: { provider: "p", model: "sub-model" } } },
+      ...extra.status,
+    },
+    request: { prompt: "work", mode: "background", label, ...extra.request },
+  };
+}
+
+function quietSubagent(id, label, silentMs = 4 * 60_000) {
+  const entry = backgroundSubagent(id, label);
+  return { ...entry, status: { ...entry.status, progress: { ...entry.status.progress, lastEventAt: Date.now() - silentMs } } };
+}
+
+/** Runs and background subagents in one widget; `set` changes a subagent and tells the widget, as the host's observer does. */
+function subagentHost(runs, subagents, options = {}) {
+  const live = new Map(subagents.map((entry) => [entry.status.id, entry]));
+  const host = startRuns(runs, { ...options, subagents: () => live.values() });
+  host.controller.subagentsChanged();
+  return { host, live, set: (entry) => { live.set(entry.status.id, entry); host.controller.subagentsChanged(); } };
+}
+
+void test("background subagents draw as one Subagents group after the runs, a row each, and the title counts them", () => {
+  const { host, set } = subagentHost([{ id: "run-1", workflowName: "flow", agents: [agent("a1", "scout", "running")] }], [
+    backgroundSubagent("s1", "alpha"),
+    backgroundSubagent("s2", "beta", { status: { attempts: 2 } }),
+    backgroundSubagent("s3", "foreground", { request: { mode: "foreground" } }),
+    backgroundSubagent("s4", "finished", { status: { state: "completed" } }),
+  ]);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.match(frame[0], /^╭ Workflows · 1 run · 2 subagents ─/, text);
+  const at = (pattern) => frame.findIndex((line) => pattern.test(line));
+  assert.ok(at(/⣷ flow/) > 0 && at(/scout/) > at(/⣷ flow/), text);
+  assert.ok(at(/Subagents/) > at(/scout/), `the group comes after the runs\n${text}`);
+  assert.match(frame[at(/alpha/)], /^│ {3}├─ ⣷ alpha +sub-model · 1\.2kt · \$0\.01 · 00:00 │$/, text);
+  assert.match(frame[at(/beta/)], /^│ {3}╰─ ⣷ beta +sub-model · 1\.2kt · \$0\.01 · 00:00 · attempt 2 │$/, text);
+  assert.ok(at(/beta/) > at(/alpha/) && at(/alpha/) > at(/Subagents/), text);
+  assert.ok(!/foreground|finished/.test(text), `foreground and settled subagents are not drawn\n${text}`);
+  // A status the observer reports reaches the frame.
+  set(backgroundSubagent("s5", "gamma"));
+  assert.match(drawAt(host, 120)[0], /^╭ Workflows · 1 run · 3 subagents /);
+  assert.ok(drawAt(host, 120).some((line) => /gamma/.test(line)));
+  set(backgroundSubagent("s1", "alpha", { status: { state: "failed" } }));
+  assert.ok(!drawAt(host, 120).some((line) => /alpha/.test(line)), "a settled subagent leaves the group");
+  host.shutdown();
+});
+
+void test("with only subagents running the widget still shows, and clears when the last one settles", () => {
+  const { host, set } = subagentHost([], [backgroundSubagent("s1", "alpha"), quietSubagent("s2", "beta")]);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  assert.match(frame[0], /^╭ Workflows · 2 subagents · ⚠ 1 quiet ─/, frame.join("\n"));
+  assert.match(frame[1], /^│ ⣷ Subagents/);
+  assert.ok(drawAt(host, 120).some((line) => /^│ {3}╰─ ⚠ beta {2}quiet 04:00 /.test(line)), frame.join("\n"));
+  set(backgroundSubagent("s1", "alpha", { status: { state: "completed" } }));
+  set(backgroundSubagent("s2", "beta", { status: { state: "stopped" } }));
+  assert.equal(host.frames.at(-1), undefined, "the frame is cleared");
+  host.shutdown();
+});
+
+void test("subagent progress repaints only when the background subagents shown change: twenty events in a second ask for one repaint at most", (t) => {
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+  const { host, set } = subagentHost([], [backgroundSubagent("s1", "alpha")]);
+  const mounts = host.widgets.length;
+  const renders = host.renderRequests;
+  for (let event = 0; event < 20; event += 1) {
+    set(backgroundSubagent("s1", "alpha", { status: { progress: { lastEventAt: Date.now(), toolCalls: [], accounting: { input: 1_000 + event, output: 200, cacheRead: 0, cacheWrite: 0, cost: 0.01 } } } }));
+    t.mock.timers.tick(50);
+  }
+  assert.equal(host.widgets.length, mounts, "progress does not remount the widget");
+  assert.ok(host.renderRequests - renders <= 1, `twenty progress events in a second ask for ${String(host.renderRequests - renders)} repaints`);
+  const before = host.renderRequests;
+  set(backgroundSubagent("s2", "beta"));
+  assert.equal(host.renderRequests, before + 1, "a new background subagent repaints at once");
+  set(backgroundSubagent("s3", "fore", { request: { mode: "foreground" } }));
+  assert.equal(host.renderRequests, before + 1, "a foreground subagent does not repaint");
+  host.shutdown();
+});
+
+void test("a frame without subagents is byte-identical to one drawn without the subagent reader", () => {
+  const runs = [lanesRun(), { id: "run-2", workflowName: "two", agents: [silentAgent("q1", "asker")] }];
+  const without = startRuns(runs);
+  const { host: empty } = subagentHost(runs, []);
+  // Colours kept: only the spinner glyph and the clocks, which move between two draws, are normalized.
+  const raw = (line) => line.replace(/[⣷⣯⣟⡿⢿⣽⣻]/g, "⣷").replace(/\b\d{2}:\d{2}\b/g, "00:00");
+  for (const width of [120, 70, 40]) assert.deepEqual(empty.widgets.at(-1)(empty.tui, theme).render(width).map(raw), without.widgets.at(-1)(without.tui, theme).render(width).map(raw), `at ${String(width)}`);
+  without.shutdown();
+  empty.shutdown();
+});
+
+void test("many subagents and runs share the ten rows: headers stay and the rest is counted", () => {
+  const runs = [0, 1, 2].map((index) => ({ id: `run-${String(index)}`, workflowName: `flow${String(index)}`, agents: many2(`r${String(index)}a`, 3, "running") }));
+  const subagents = Array.from({ length: 10 }, (_, index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`));
+  const { host } = subagentHost(runs, subagents);
+  for (const width of [120, 70, 40]) {
+    const frame = drawAt(host, width);
+    assertFits(frame, width);
+    const text = frame.join("\n");
+    for (let index = 0; index < 3; index += 1) assert.match(text, new RegExp(`flow${String(index)}`), text);
+    assert.match(text, /Subagents/, text);
+    assert.doesNotMatch(text, /more runs?/, text);
+  }
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.match(frame.at(-2), /│ … \d+ more +│$/, text);
+  assert.match(frame[0], /^╭ Workflows · 3 runs · 10 subagents /, text);
+  host.shutdown();
+});
+
+void test("a quiet subagent ranks like a quiet agent: it is kept when its siblings fold, and the title counts it", () => {
+  const subagents = [...Array.from({ length: 11 }, (_, index) => backgroundSubagent(`s${String(index)}`, `sub-${String(index)}`)), quietSubagent("q", "asker", 11 * 60_000)];
+  const { host } = subagentHost([{ id: "run-1", workflowName: "flow", agents: many2("d", 6, "completed") }], subagents);
+  for (const width of [120, 70, 40]) assertFits(drawAt(host, width), width);
+  const frame = drawAt(host, 120).map(stableLine);
+  const text = frame.join("\n");
+  assert.match(frame[0], /^╭ Workflows · 1 run · 12 subagents · ⚠ 1 quiet /, text);
+  assert.ok(drawAt(host, 120).some((line) => /⚠ asker {2}stalled 11:00/.test(line)), text);
+  assert.ok(frame.some((line) => /flow/.test(line)), text);
+  host.shutdown();
+});
+
+void test("the scroll cursor walks the group and its rows; enter opens subagents or the subagent", () => {
+  __navigationForTests.enabled = true;
+  const opened = [];
+  const root = mkdtempSync(join(tmpdir(), "widget-subagent-cursor-"));
+  const live = new Map([backgroundSubagent("s1", "alpha"), backgroundSubagent("s2", "beta")].map((entry) => [entry.status.id, entry]));
+  const host = harness("session-1", { opener: { available: () => true, open: (_context, key) => { opened.push(key); } }, subagents: () => live.values() });
+  host.start();
+  host.emit(WORKFLOW_RUN_STARTED_EVENT, { runId: "run-1", runDirectory: writeRun(join(root, "run-1"), tallRun()), sessionId: "session-1" });
+  const draw = () => host.widgets.at(-1)(host.tui, theme).render(WIDTH).map(plain);
+  const cursorLine = () => host.widgets.at(-1)(host.tui, { ...theme, fg: (_c, text) => text }).render(WIDTH).find((line) => line.includes("\u0001"))?.replaceAll("\u0001", "") ?? "";
+  assert.match(draw()[0], /Alt\+O to scroll/);
+  host.key("\u001bo");
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  assert.match(cursorLine(), /beta/, "the last row is the last subagent");
+  host.key("\r");
+  assert.deepEqual(opened, ["subagent:s2"]);
+  host.key("\u001bo");
+  for (let press = 0; press < 30; press += 1) host.key("j");
+  host.key("k");
+  assert.match(cursorLine(), /alpha/);
+  host.key("k");
+  assert.match(cursorLine(), /Subagents/);
+  host.key("\r");
+  assert.deepEqual(opened, ["subagent:s2", "subagents"]);
+  for (const line of draw()) assert.ok(visibleWidth(line) <= WIDTH);
+  host.shutdown();
+});
+
+void test("mark draws the spinner for a running unit only while it is live", () => {
+  const paint = (_role, text) => text;
+  assert.notEqual(mark("running", 0, paint), "·");
+  assert.equal(mark("running", 0, paint, true), mark("running", 0, paint));
+  assert.equal(mark("running", 0, paint, false), "·");
+  assert.equal(mark("completed", 0, paint, false), "✓");
 });

@@ -1,6 +1,23 @@
 # Changelog
 ## Unreleased
 
+### Breaking changes
+
+- In Pi's TUI, `/workflow` opens the `/agents` workspace on the session's runs and `/subagents` on its subagents. Their dashboards are removed (#333):
+  - `/workflow`: the run picker while the session has runs (with none it still offers `Model aliases` and `Close`), and the run dashboard: the Workflow root above the phase tree, the details column, the narrow drill-down, `enter` for run or agent actions, the action list on `a` or `A`, the inline Stop and Delete confirmation, `pgup`/`pgdn`, and `esc` back to the picker. `Model aliases` and the bulk deletes are in a run's menu.
+  - `/subagents`: the run list beside the details, the narrow drill-down, `enter` or `a` for actions, the inline Steer editor, and the inline confirmation. The bulk deletes are in the Subagents group's menu.
+  - Both: in the workspace `a` opens a node's menu; `enter` on an agent does not. Stop and deletions confirm in Pi's dialog. Outside the TUI both pickers stay.
+- `createInlineConfirm` is no longer exported. `WorkflowTui.stop()` may return `false` to cancel: `openWorkflowArtifact` then starts no editor and returns `undefined` (#333).
+- Background subagents show live only in the workflow widget: with the workflow extension not loaded, or with `backgroundWidget: false`, no live background subagent rows are shown, only the receipt each leaves when it settles. Alt+O is no longer registered as a Pi shortcut, so `/hotkeys` does not list it and it cannot be rebound: the widget takes it only while its `Alt+O to scroll` hint shows (a narrow title cuts its counts to keep the hint), otherwise the key goes on to the editor (#336).
+
+### New capabilities
+
+- `/agents` opens a full-screen workspace over Pi's TUI: a sidebar with this session's workflow runs (phases, operation scopes, shells, and agents) and its subagents, and beside it the selected agent's full transcript, drawn as Pi's chat draws it and updated live while the agent runs. Other nodes show their details. The hint row lists the keys; `esc` gives Pi its screen back (#332).
+- In `/agents`, `a` opens the selected node's action menu: a run's actions, then `Model aliases` and the bulk deletes; an agent's actions, registered ones such as Herdr's included; a subagent's actions; the Subagents group's bulk deletes. Copies and the external editors run in place; registered actions run detached in the TUI workspace, their working message and failure notice show in its status row (Pi's own working message is cleared when the workspace opens, and an action that settles after `/reload` or `/new` shows nothing), and their dialogs are refused there; any other action closes the workspace, runs with Pi's dialogs, and opens it again on the same node. `d` shows an agent's details instead of its transcript. Steer opens Pi's editor dialog, also in the `/subagents` picker outside the TUI (#333).
+- `/agents` marks what needs a person: `⚠ quiet` or `⚠ stalled` on a running agent or subagent without a sign of life for 3 or 10 minutes, and `◆ waiting` on a run awaiting input. `n`/`N` select the next or previous such node, failed agents and runs that have used up their budget included. The title shows the session totals (running, tokens, cost). `f` follows a running agent with its transcript at the tail, and `/` filters the sidebar by name, ID, or `state:<state>` (#334).
+- In `/agents`, the menu of a workflow agent that owns a worktree offers `Open diff in editor` (#335).
+- The workflow widget shows this session's running background subagents as a "Subagents" group after the runs, and when its tree does not fit it keeps the rows that need attention. In scroll mode Alt+O leaves scroll mode and `enter` opens `/agents` on the row's run, phase, agent, or subagent. The widget draws nothing while an agents workspace is open. A phase whose agents are all done shows the check mark while its run is running, pausing or awaiting input (#336).
+
 ### CLI
 
 - `piewf --version` (`-v`) prints the CLI version, and `piewf --help` (`-h`, `help`) prints structured help with the commands and global options. Every command, including `inspect` and `transcript`, answers `--help`. With no arguments `piewf` prints the help on stderr, and with an unknown command `Unknown command: <name>` followed by the help, instead of the one-line usage on stdout; the exit code stays 1.
@@ -8,6 +25,7 @@
 ### Fixes
 
 - Stopping a run (`workflow_stop`, `/workflow`) while one of its agents waits on the provider error dialog (Retry, Change model, Abort workflow) no longer waits for an answer: the attempt ends as cancelled and the dialog closes, as does Pi's searchable model picker opened from "Change model", so the next agent's provider error dialog is no longer held behind it.
+- The workflow widget no longer repaints every 125 ms: one tick a second, only while background work is live, moves its spinner and clocks, and Pi's renders on keystrokes and streamed tokens read no run file; an interrupted, paused, or budget-exhausted run, which nothing ticks, shows the runtime it recorded, as `/agents` does (#336).
 - A failed run releases its retry lineage before its `failed` state becomes visible, so a `workflow_retry` issued as soon as the state reads `failed` is no longer rejected with "An active retry already owns lineage".
 - Retention no longer stops with "Run inventory contains an unrecognized artifact" when it meets a `summary.json` that is being written. Only the exact temporary name that the atomic write uses is accepted.
 - Session shutdown waits for the terminal delivery of background runs that settled just before it, so a run's files are no longer removed while its delivery state is still being written.
@@ -19,6 +37,14 @@
 
 - Trajectory no longer keeps showing a stale run, for example a finished run as still running, when a run's `state.json` or `journal.json` was written while it was being read or twice within one filesystem timestamp tick. The run cache now stamps those files by inode, modification time and size before it reads them.
 - The Trajectory server no longer drops a publisher whose TCP chunk carries several complete WebSocket frames that together exceed the frame limit. Only the unfinished frame left after parsing is bounded, and an oversized receive buffer is trimmed after each chunk.
+
+### Documentation
+
+- The settings reference lists `codemodeTools` (global settings only) and `retention`, and says that `workflow.js` and the other files opened in the external editor are temporary copies whose edits are not kept (#331).
+
+### Internal
+
+- Core reads a Pi session file whole, as Pi does, and the complete lines its agent appends to it, and draws its records with Pi's own chat components, for the `/agents` transcript pane (#331).
 
 ## [6.2.2] - 2026-10-18
 

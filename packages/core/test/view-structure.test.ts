@@ -59,3 +59,9 @@ void test("token formatting is shared between the progress views and the backgro
   assert.doesNotMatch(view, /^function formatWorkflowTokens\(/m, "host-view must reuse formatTokens from the widget module");
   assert.match(view, /import \{[^}]*\bformatTokens\b[^}]*\} from "\.\/background-widget\.js";/);
 });
+
+void test("subagent labels and models are shared between the subagents tool blocks and the background widget", () => {
+  const view = source("../subagents/src/view.ts");
+  assert.doesNotMatch(view, /^function (?:label|modelName)\(/m, "the subagents view must reuse subagentLabel and subagentModel from the widget module");
+  assert.match(view, /import \{[^}]*\bsubagentLabel\b[^}]*\bsubagentModel\b[^}]*\} from "\.\.\/\.\.\/src\/background-widget\.js";/);
+});

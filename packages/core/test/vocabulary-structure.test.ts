@@ -156,9 +156,9 @@ void test("subagent decoding reuses the shared thinking and number guards", () =
 });
 
 void test("manual deletion and retention derive run dependencies from one function", () => {
-  const navigator = source("host-navigator.ts");
-  assert.equal(importsFrom(navigator, "runDependencyIds", "\\./retention\\.js"), true);
-  assert.doesNotMatch(navigator, /direct\.add\(run\.retry\.lineageRootRunId\)/);
+  const actions = source("workflow-actions.ts");
+  assert.equal(importsFrom(actions, "runDependencyIds", "\\./retention\\.js"), true);
+  assert.doesNotMatch(actions, /direct\.add\(run\.retry\.lineageRootRunId\)/);
   const retention = source("retention.ts");
   assert.match(retention, /export function runDependencyIds\(/);
   assert.doesNotMatch(retention, /dependencies\.add\(loaded\.run\.retry\.lineageRootRunId\)/);
