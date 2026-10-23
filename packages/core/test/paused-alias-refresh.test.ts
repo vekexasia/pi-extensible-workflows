@@ -56,7 +56,7 @@ async function pausedFixture(t: TestContext): Promise<PausedFixture> {
   let command: WorkflowCommand | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: ToolLike) { tools.push(tool); },
-    registerCommand(_name: string, value: { handler: WorkflowCommand }) { command = value.handler; },
+    registerCommand(name: string, value: { handler: WorkflowCommand }) { if (name === "workflow") command = value.handler; },
     on(name: string, handler: unknown) { if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     getActiveTools: () => ["read"],
     getThinkingLevel: () => "off",

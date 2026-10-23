@@ -11,7 +11,7 @@ export * from "./host.js";
 export * from "./workflow-artifacts.js";
 export { formatCost } from "./background-widget.js";
 export { agentActionLabels, formatAgentDetail, formatAgentError, formatNavigatorColumns, formatWorkflowRuntime, navigatorAttentionSortByState, PLAIN_WORKFLOW_PROGRESS_STYLES, progressStyleForState, runStateGlyph, themeWorkflowProgressStyles, visibleStandaloneAgentAttemptActions } from "./host-view.js";
-export { createInlineConfirm, workflowKeyLabel, workflowKeyMatches } from "./host-navigator.js";
+export { workflowKeyLabel, workflowKeyMatches } from "./pi-action-ui.js";
 export type { AgentDetailPresentation, WorkflowProgressStyles } from "./host-view.js";
 export { default } from "./host.js";
 export { acquireSessionLease, hasLiveSessionLease, listPersistedSessionIds, projectSessionsDirectory, projectStorageKey, RunStore, runsDirectory, SessionLease, structuralPath } from "./persistence.js";
