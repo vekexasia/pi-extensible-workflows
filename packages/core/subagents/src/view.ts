@@ -1,8 +1,9 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
+import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText } from "../../src/index.js";
+import { agentSilence } from "../../src/agent-activity.js";
 import { agentActivityLabel, stalledDuration, textBlock } from "../../src/host-view.js";
-import { drawFrame, formatElapsed, formatTokens, mark, QUIET_MS, REPAINT_MS, type Paint } from "../../src/background-widget.js";
+import { drawFrame, formatElapsed, formatTokens, mark, REPAINT_MS, type Paint } from "../../src/background-widget.js";
 import type { SubagentRunRequest, SubagentStatus } from "./contracts.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
@@ -217,11 +218,10 @@ type WidgetRun = { status: Readonly<SubagentStatus>; request: Readonly<SubagentR
 
 /** One run as a workflow agent row: a quiet or stalled warning on the left, model and figures against the right rule. */
 function widgetRow({ status, request }: WidgetRun, now: number, paint: Paint): { text: string; right: string } {
-  const lastEventAt = status.progress?.lastEventAt;
-  const silent = lastEventAt === undefined || !Number.isFinite(lastEventAt) || now - lastEventAt < QUIET_MS ? undefined : now - lastEventAt;
-  const role = silent !== undefined && silent >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? "error" : "warning";
-  const icon = silent === undefined ? mark(status.state, now, paint) : paint(role, "⚠");
-  const warning = silent === undefined ? "" : `  ${paint(role, `${role === "error" ? "stalled" : "quiet"} ${formatElapsed(silent)}`)}`;
+  const silence = agentSilence(status.progress?.lastEventAt, now);
+  const role = silence?.kind === "stalled" ? "error" : "warning";
+  const icon = silence === undefined ? mark(status.state, now, paint) : paint(role, "⚠");
+  const warning = silence === undefined ? "" : `  ${paint(role, `${silence.kind} ${formatElapsed(silence.ms)}`)}`;
   const accounting = status.progress?.accounting;
   const attempts = status.attempts ?? 1;
   const right = [

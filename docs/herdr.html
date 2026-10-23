@@ -64,7 +64,7 @@
             <tr><td>Open session in Herdr pane</td><td>The latest attempt is completed, failed, or cancelled and has a persisted session reference plus a usable cwd.</td><td>Opens the existing session in a separate Herdr pane for inspection without taking workflow ownership.</td></tr>
           </tbody>
         </table></div>
-        <p>Open <code>/workflow</code>, select a run, and select the agent attempt. Only actions valid for the latest attempt are shown.</p>
+        <p>Open <code>/workflow</code>, select the agent in its run, and press <code>a</code> for its actions (<code>enter</code> on an agent does not open the menu); outside the TUI, select the run, then <code>Agents...</code> and the agent. Only actions valid for the latest attempt are shown. In the TUI workspace the action runs detached: the workspace stays usable while the pane is open, the progress messages of a live handoff (for example "queued (waiting for a turn boundary)" and "opening pane") show in the workspace's status row until the action settles, a later failure shows there as a notice, and a Pi dialog the action asks for is refused there with a notice; outside the TUI the picker waits for the action and shows its dialogs.</p>
       </section>
       <section id="inspectable">
         <h2>Fully inspectable mode</h2>

@@ -125,7 +125,7 @@ void test("preparation separates root-resolved dynamic aliases from static setti
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: ToolLike) { tools.push(tool); },
-    registerCommand(_name: string, value: { handler: (args: string, ctx: unknown) => Promise<void> }) { command = value.handler; },
+    registerCommand(name: string, value: { handler: (args: string, ctx: unknown) => Promise<void> }) { if (name === "workflow") command = value.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     getActiveTools: () => ["read"],
     getThinkingLevel: () => "off",
