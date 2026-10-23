@@ -14,6 +14,7 @@
 - A background run's terminal delivery that fails (a store write, reading the result) is reported as a workflow warning entry instead of an unhandled rejection that could end the Pi process. A delivery is still claimed before its content is sent, so a failure after the claim is not retried.
 - A workflow message delivered while the session shuts down (for example the result of a run that settled just before, or the failure of a run the shutdown interrupted) is still recorded in the session but no longer starts a turn in it.
 - A shell command, tool call or agent is recorded in the phase that was current when the script (or a registered function, through `context.phase` with `context.shell` or `context.agent`) started it, even if it is unawaited and a later `phase(name)` follows before it runs. A phase update waits for the calls started before it to record their start, not to finish. A failed phase update still rejects `phase()` and does not stop later work.
+- On macOS and Windows, a session lease or standalone subagent record whose owner was stamped before the last system boot is treated as abandoned, so a pid reused after a reboot no longer keeps it `running`.
 
 ### Trajectory fixes
 

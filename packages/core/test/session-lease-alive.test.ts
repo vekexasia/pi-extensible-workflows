@@ -52,3 +52,8 @@ void test("a spawned child is alive against the running kernel when stamped afte
     assert.equal(await processAlive(child.pid, Date.now() - 3_600_000), false);
   } finally { child.kill(); }
 });
+
+void test("an owner stamped before this boot is not alive, whatever process holds its pid now", async () => {
+  assert.equal(await processAlive(process.pid, 1), false);
+  assert.equal(await processAlive(process.pid, Date.now()), true);
+});
