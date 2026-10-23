@@ -1513,6 +1513,7 @@ test("runs one background subagent with context-derived setup and execution opti
   assert.notEqual(execution.signal, controller.signal);
   assert.equal(root.runContext.runId, launch.details.id);
   await waitFor(async () => (await manager.inspect({ id: launch.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext: context })).state === "completed");
+  await waitForPersistedState(join(cwd, "subagents-storage"), launch.details.id, "completed");
   assert.equal((await manager.inspect({ id: launch.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext: context })).sessionId, "session-1");
   assert.equal(JSON.parse(await readFile(join(cwd, "subagents-storage", launch.details.id, "status.json"), "utf8")).sessionId, "session-1");
   const roleLaunch = await runTool.execute("call-role", { prompt: "review", label: "role", role: "reviewer" }, controller.signal, undefined, context);
@@ -1525,6 +1526,7 @@ test("runs one background subagent with context-derived setup and execution opti
   assert.equal(roleAgentOptions.role, "reviewer");
   assert.equal(typeof roleOnConfiguration, "function");
   assert.equal(roleConfiguration.systemPromptAppend, "");
+  await waitForPersistedState(join(cwd, "subagents-storage"), roleLaunch.details.id, "completed");
   await rm(cwd, { recursive: true, force: true });
 });
 
@@ -1551,6 +1553,7 @@ test("keeps top-level model with a role and persists a background execution fail
   const extensionContext = await executionContext(cwd, controller.signal);
   const launched = await runTool.execute("call-2", { prompt: "inspect", role: "reviewer", model: "fixture/cheap:high" }, controller.signal, undefined, extensionContext);
   await waitFor(async () => (await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).state === "failed");
+  await waitForPersistedState(join(cwd, "subagents-storage"), launched.details.id, "failed");
   assert.equal(launches, 1);
   const { onAttempt, onProgress, onConfiguration, configuration, agentOptions, ...options } = execution;
   assert.equal(typeof onAttempt, "function");
@@ -1757,6 +1760,15 @@ async function waitFor(predicate, onTimeout) {
   throw new Error("Timed out waiting for subagent state");
 }
 
+// A run's live state turns terminal before its last files are written: wait for the persisted status before reading the run's
+// files, starting another manager on them, or removing them.
+async function waitForPersistedState(storageDir, id, state) {
+  await waitFor(async () => {
+    try { return JSON.parse(await readFile(join(storageDir, id, "status.json"), "utf8")).state === state; }
+    catch { return false; }
+  });
+}
+
 function deferredExecution(prompt, pending, started) {
   started.push(prompt);
   return new Promise((resolve, reject) => {
@@ -1813,6 +1825,8 @@ test("runs simultaneous background subagents and settles them independently", as
 
     pending.get("second").resolve({ value: { answer: "two" }, attempts: [], cwd });
     await waitFor(async () => (await manager.inspect({ id: second.id }, context)).state === "completed");
+    await waitForPersistedState(storageDir, first.id, "completed");
+    await waitForPersistedState(storageDir, second.id, "completed");
     const listed = (await manager.inspect({}, context)).map(({ id, state }) => ({ id, state }));
     const expected = await Promise.all([first, second].map(async ({ id }) => ({ id, state: "completed", startedAt: JSON.parse(await readFile(join(storageDir, id, "status.json"), "utf8")).startedAt })));
     expected.sort((left, right) => left.startedAt - right.startedAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
@@ -2066,6 +2080,7 @@ test("persists failed background subagents for repeatable lookup", async () => {
     const manager = createSubagentManager(managerDependencies);
     const launched = await manager.run({ prompt: "fail me", mode: "background", label: "failure" }, context);
     await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "failed");
+    await waitForPersistedState(storageDir, launched.id, "failed");
     const expectedFailure = { code: "AGENT_FAILED", message: "agent failed" };
     assert.deepEqual((await manager.inspect({ id: launched.id }, context)).error, expectedFailure);
     assert.deepEqual((await manager.inspect({ id: launched.id }, context)).error, expectedFailure);
@@ -3093,6 +3108,7 @@ test("bounds storage-owner acquisition under owner-file churn", async () => {
     const launched = await manager.run({ prompt: "bounded" }, context);
     assert.equal(launched.state, "running");
     assert.equal(probes, 8);
+    await waitForPersistedState(storageDir, launched.id, "completed");
   } finally {
     await manager.dispose();
     await rm(cwd, { recursive: true, force: true });
