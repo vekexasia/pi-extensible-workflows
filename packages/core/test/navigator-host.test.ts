@@ -4,19 +4,21 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { registerWorkflowNavigator, manualDeletionPlan, type WorkflowNavigatorDependencies } from "../src/host-navigator.js";
+import { registerWorkflowNavigator, type WorkflowNavigatorDependencies } from "../src/host-navigator.js";
+import { manualDeletionPlan } from "../src/workflow-actions.js";
 import { executeCommand, testExtensionApi } from "./support.js";
-import workflowExtension, { agentActionLabels, createLaunchSnapshot, DEFAULT_SETTINGS, formatAgentDetail, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPhaseDashboard, registerWorkflowExtension, RunStore, openWorkflowArtifact, WorkflowError, WORKFLOW_BLOCKED_EVENT } from "../src/index.js";
+import workflowExtension, { agentActionLabels, createLaunchSnapshot, DEFAULT_SETTINGS, formatAgentDetail, formatNavigatorDashboard, formatNavigatorRun, formatWorkflowPhaseDashboard, registerWorkflowExtension, RunStore, openWorkflowArtifact, WorkflowError, type PersistedRun } from "../src/index.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { structuralPath } from "../src/persistence.js";
+import type { AgentsWorkspaceExit, AgentsWorkspaceOptions, AgentsWorkspaceState } from "../src/agents-workspace.js";
+import type { SessionTreeNode } from "../src/session-agents.js";
+import { clearSubagentManager, setSubagentManager } from "../src/subagent-manager-handle.js";
+import type { SubagentManager } from "../subagents/src/contracts.js";
 
 type OwnershipNodes = Parameters<RunStore["saveOwnership"]>[0];
-const delayedOwnership = new Map<string, { start: () => void; cleanup: Promise<void> }>();
 const failedOwnership = new Set<string>();
 const nativeSaveOwnership = Reflect.get(RunStore.prototype, "saveOwnership");
 RunStore.prototype.saveOwnership = async function (nodes: OwnershipNodes) {
-  const delayed = delayedOwnership.get(this.directory);
-  if (delayed) { delayed.start(); await delayed.cleanup; }
   if (failedOwnership.has(this.directory)) throw new Error("scheduler cleanup failed");
   await nativeSaveOwnership.call(this, nodes);
 };
@@ -239,256 +241,180 @@ void test("host cancellation releases a navigator handoff", async () => {
   assert.equal(actionFinished, true);
   assert.equal(handoffLaunched, false);
 });
-void test("TUI navigator exposes agent-scoped worktree actions without transcript actions", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-actions-"));
-  const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "tracked\n");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
-  const runId = `run-${"x".repeat(40)}`;
-  const transcriptA = join(home, "transcript-a.jsonl");
-  const transcriptB = join(home, "transcript-b.jsonl");
-  const store = new RunStore(repo, "session", runId, home);
-  const snapshot = createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "copy" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: runId, workflowName: "copy", cwd: repo, sessionId: "session", state: "completed", agents: [{ id: "agent", name: "agent", path: "agent", state: "completed", structuralPath: ["issues", "issue-65"], parentBreadcrumb: "developUntilApproved", worktreeOwner: "copy-owner", model: { provider: "openai", model: "gpt" }, tools: [], attempts: 2, attemptDetails: [{ attempt: 1, transport: "local", session: { transport: "local", sessionId: "native-a", locator: { sessionFile: transcriptA } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }, { attempt: 2, transport: "local", session: { transport: "local", sessionId: "native-b", locator: { sessionFile: transcriptB } }, setup: { hookNames: [], model: { provider: "openai", model: "gpt" }, tools: [], cwd: "/repo" }, accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }] }], agentSessions: [] }, snapshot);
-  const worktree = await store.worktree("copy-owner");
-  const copied: string[] = [];
-  const notifications: Array<{ message: string; type: string | undefined }> = [];
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  const pi = { registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] };
-  workflowExtension(testExtensionApi(pi), home, async (value) => { copied.push(value); });
-  let customCalls = 0;
-  let pickerCalls = 0;
-  let detailActions = 0;
-  const ctx = {
-    cwd: repo, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      notify(message: string, type?: string) { notifications.push({ message, type }); },
-      confirm: async () => false,
-      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip";
-        if (prompt === "Workflows\n") { pickerCalls += 1; return pickerCalls === 1 ? options.find((option) => option.includes("copy")) ?? "Close" : "Close"; }
-        if (prompt === "Agents") return options.find((option) => option.includes("#1")) ?? "Back";
-        if (prompt.includes("issue-65")) { const action = ["Copy branch", "Copy worktree path", "Copy agent ID", "Back"][detailActions] ?? "Back"; detailActions += 1; return options.includes(action) ? action : "Back"; }
-        return "Back";
-      },
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        customCalls += 1;
-        let result: string | undefined;
-        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
-        const rendered = component.render(80).join("\n");
-        assert.match(rendered, /issues/);
-        assert.match(rendered, /issue-65/);
-        assert.doesNotMatch(rendered, /Agents\.\.\.|copy-owner|Copy branch|Copy worktree path/);
-        const selectedTreeRow = (): string => component.render(80).find((line) => line.startsWith("→")) ?? "";
-        const initialTreeRow = selectedTreeRow();
-        component.handleInput?.("l");
-        assert.notEqual(selectedTreeRow(), initialTreeRow);
-        component.handleInput?.("h");
-        assert.notEqual(selectedTreeRow(), initialTreeRow);
-        component.handleInput?.("h");
-        assert.equal(selectedTreeRow(), initialTreeRow);
-        component.handleInput?.("l");
-        component.handleInput?.("l");
-        // Drive action menus by label so the assertions do not depend on which
-        // optional actions the environment offers (fork needs herdr).
-        const chooseAction = (label: string): void => {
-          for (let step = 0; step < 12; step += 1) {
-            if (component.render(80).join("\n").includes(`→ ${label}`)) { component.handleInput?.("tui.select.confirm"); return; }
-            component.handleInput?.("j");
-          }
-          throw new Error(`action not reachable: ${label}`);
-        };
-        if (customCalls === 1) {
-          // Select the agent node, then open its actions inline (no separate picker).
-          component.handleInput?.("j");
-          component.handleInput?.("j");
-          component.handleInput?.("j");
-          component.handleInput?.("j");
-          component.handleInput?.("tui.select.confirm");
-          const withActions = component.render(80).join("\n");
-          assert.match(withActions, /Agent actions/);
-          assert.match(withActions, /Copy branch/);
-          assert.match(withActions, /issue-65/, "tree must stay visible beside the actions");
-          component.handleInput?.("h");
-          assert.doesNotMatch(component.render(80).join("\n"), /Agent actions/);
-          component.handleInput?.("tui.select.confirm");
-          assert.match(component.render(80).join("\n"), /Agent actions/);
-          component.handleInput?.("tui.editor.cursorLeft");
-          assert.doesNotMatch(component.render(80).join("\n"), /Agent actions/);
-          component.handleInput?.("tui.select.confirm");
-          const selectedActionRow = (): string => component.render(80).join("\n").split("\n").find((line) => line.includes("| →")) ?? "";
-          const firstActionRow = selectedActionRow();
-          component.handleInput?.("j");
-          component.handleInput?.("k");
-          assert.equal(selectedActionRow(), firstActionRow);
-          chooseAction("Copy branch");
-          chooseAction("Copy worktree path");
-          chooseAction("Copy agent ID");
-          chooseAction("Back");
-          // Back at the tree: climb to the Workflow root so run-level actions apply.
-          for (let step = 0; step < 12 && !component.render(80).join("\n").split("\n").some((line) => line.startsWith("→") && line.includes("Workflow ·")); step += 1) component.handleInput?.("h");
-          component.handleInput?.("tui.select.confirm");
-          chooseAction("Copy run path");
-        } else if (customCalls === 2) {
-          component.handleInput?.("a");
-          chooseAction("Copy run ID");
-        } else component.handleInput?.("tui.select.cancel");
-        component.dispose?.();
-        return result;
-      },
-    },
-  };
-  const command = commands[0]?.handler;
-  assert.ok(command);
-  await executeCommand(command, "", ctx);
-  assert.deepEqual(copied, [worktree.branch, worktree.path, "agent", store.directory, runId]);
-  assert.ok(notifications.some(({ message }) => message === "Copied branch."));
-  assert.ok(notifications.some(({ message }) => message === "Copied worktree path."));
-  assert.ok(notifications.some(({ message }) => message === "Copied agent ID."));
-  assert.doesNotMatch(JSON.stringify(notifications), /transcript/i);
-  assert.equal(customCalls, 3);
-  await store.delete(true);
-});
-
-void test("navigator stop asks for confirmation inside the dashboard and keeps it open when declined", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-confirm-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
-  await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
+type RouteCommand = (args: string, ctx: unknown) => Promise<void>;
+type WorkspaceOpen = { readonly cwd: string; readonly options: AgentsWorkspaceOptions };
+const KEPT_STATE: AgentsWorkspaceState = { selectedKey: "run:run", row: 0, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false };
+/**
+ * The workflow extension with a fake /agents workspace: it records each open and resolves it with the next of `exits`, an action
+ * to step aside for (with the first provider and KEPT_STATE), or none: the user left.
+ */
+function workspaceHost(home: string, exits: readonly (Omit<AgentsWorkspaceExit, "provider" | "state"> | undefined)[] = []): { workflow: RouteCommand; start: (event: unknown, ctx: unknown) => Promise<void>; opened: WorkspaceOpen[] } {
+  const commands = new Map<string, RouteCommand>();
   let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  let dialogCalls = 0;
-  let dashboard: { render(width: number): string[]; handleInput?(data: string): void } | undefined;
-  const blockedEvents: unknown[] = [];
-  let customCalls = 0;
-  let pickerCalls = 0;
-  let disposed = false;
-  let closeNavigator = () => {};
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, events: { emit(name: string, data: unknown) { if (name === WORKFLOW_BLOCKED_EVENT) blockedEvents.push(data); } }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  assert.ok(start && commands[0]);
+  const opened: WorkspaceOpen[] = [];
+  const pending = [...exits];
+  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(name: string, options: { handler: RouteCommand }) { commands.set(name, options.handler); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home, undefined, undefined, join(home, "agent"), [], async (ctx, options) => {
+    opened.push({ cwd: ctx.cwd, options });
+    const next = pending.shift();
+    if (next === undefined) return undefined;
+    const provider = options.actions?.[0];
+    assert.ok(provider, "the workspace got the workflow provider");
+    return { ...next, provider, state: KEPT_STATE };
+  });
+  const workflow = commands.get("workflow");
+  assert.ok(workflow && start);
+  return { workflow, start, opened };
+}
+/** What a TUI command showed: Pi's dialogs ("select <title> | <options>", "confirm <title> | <message>") and notices. */
+type Shown = { readonly dialogs: string[]; readonly notices: string[] };
+function tuiContext(cwd: string, answers: { readonly select?: (title: string, options: readonly string[]) => string | undefined; readonly confirm?: boolean } = {}): { readonly ctx: object; readonly shown: Shown } {
+  const shown: Shown = { dialogs: [], notices: [] };
   const ctx = {
     cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
     ui: {
-      // Pi's dialog would replace the dashboard and restore the editor, leaving the command pending.
-      notify() {}, setStatus() {}, confirm: async () => { dialogCalls += 1; return false; },
-      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean; overlayOptions?: { width?: string; maxHeight?: string } }) => {
-        customCalls += 1;
-        assert.equal(options?.overlay, undefined);
-        assert.equal(options?.overlayOptions, undefined);
-        let result: string | undefined;
-        let resolveCustom!: (value: string | undefined) => void;
-        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
-        const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { disposed = true; result = value; resolveCustom(value); });
-        closeNavigator = () => component.handleInput?.("tui.select.cancel");
-        dashboard = component;
-        if (customCalls === 1) { component.handleInput?.("a"); component.handleInput?.("tui.select.down"); component.handleInput?.("tui.select.confirm"); } else component.handleInput?.("tui.select.cancel");
-        await completed;
-        component.dispose?.();
-        return result;
-      },
+      notify(message: string) { shown.notices.push(message); },
+      setStatus() {},
+      select: async (title: string, options: string[]) => { shown.dialogs.push(`select ${title} | ${options.join(", ")}`); return answers.select?.(title, options); },
+      confirm: async (title: string, message: string) => { shown.dialogs.push(`confirm ${title} | ${message}`); return answers.confirm ?? false; },
     },
   };
-  const command = commands[0];
-  assert.ok(command);
-  await start({}, ctx);
-  const pending = executeCommand(command.handler, "", ctx);
-  const screen = () => dashboard?.render(120).join("\n") ?? "";
-  for (let attempt = 0; attempt < 100 && !screen().includes("Stop workflow?"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.match(screen(), /Stop workflow\?\nStop workflow live \(run\)\? This cannot be undone\.\n→ Yes\n {2}No\n/);
-  assert.deepEqual(blockedEvents, [{ active: true, label: "Stop workflow?" }]);
-  dashboard?.handleInput?.("tui.select.down");
-  dashboard?.handleInput?.("tui.select.confirm");
-  for (let attempt = 0; attempt < 100 && blockedEvents.length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.doesNotMatch(screen(), /Stop workflow\?/);
-  assert.match(screen(), /Run actions/, "declining keeps the dashboard and its action menu");
-  assert.equal(disposed, false);
-  assert.equal(dialogCalls, 0);
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  for (let attempt = 0; attempt < 20; attempt += 1) { closeNavigator(); await new Promise((resolve) => setTimeout(resolve, 10)); }
-  await pending;
-  assert.deepEqual(blockedEvents, [{ active: true, label: "Stop workflow?" }, { active: false }]);
-  assert.equal(customCalls, 1);
-  assert.equal((await store.load()).run.state, "interrupted");
-  assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["running"]);
-});
+  return { ctx, shown };
+}
+async function createRouteRun(home: string, cwd: string, runId: string, workflowName: string, state: "completed" | "running"): Promise<RunStore> {
+  const store = new RunStore(cwd, "session", runId, home);
+  await store.create({ id: runId, workflowName, cwd, sessionId: "session", state, agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true", args: null, metadata: { name: workflowName }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
+  return store;
+}
 
-void test("navigator stop stays visible through cleanup, then closes", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-progress-"));
+void test("TUI /workflow opens the agents workspace on this session's runs with the workflow actions and no picker; leaving it ends the command", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-"));
   const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
+  // A run without agents: /workflow opens on a run node, where /agents would say there is no agent.
+  await createRouteRun(home, cwd, "routed-run", "routed", "completed");
+  const { workflow, opened } = workspaceHost(home);
+  // The workflows scope never lists the subagents: listing them would fail.
+  const manager = { inspect: async () => { throw new Error("the workflows scope lists no subagent"); } } as unknown as SubagentManager;
+  setSubagentManager(manager);
+  try {
+    const { ctx, shown } = tuiContext(cwd);
+    await executeCommand(workflow, "", ctx);
+    assert.deepEqual(shown.dialogs, [], "no picker");
+    assert.deepEqual(shown.notices, []);
+    assert.equal(opened.length, 1, "leaving the workspace ends the command");
+    const options = opened[0]?.options;
+    assert.ok(options);
+    assert.equal(opened[0]?.cwd, cwd);
+    assert.equal(options.initialKey, "run:routed-run", "the run's header is selected, its run actions one key away");
+    // The transcript view /agents gets too (agents-command.test.ts checks it against src/host.ts; src/index.js bundles its own copy).
+    assert.equal(typeof options.createView, "function");
+    assert.equal(typeof options.editorCommand, "function", "the editor command for the in-place editors");
+    const nodes = await options.agents.list();
+    assert.deepEqual(nodes.map(({ key, kind }) => [key, kind]), [["run:routed-run", "run"]]);
+    const providers = options.actions ?? [];
+    assert.equal(providers.length, 1, "the workflow provider only");
+    const labels = (await providers[0]?.actions({ kind: "run", runId: "routed-run" }))?.map(({ label }) => label) ?? [];
+    assert.deepEqual(labels, ["Open script in editor", "Delete", "Copy run path", "Copy run ID", "Model aliases", "Delete all completed"]);
+  } finally { clearSubagentManager(manager); }
+});
+void test("TUI /workflow shows the picker when the session has no run, and once the last run went away through an action in the workspace", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-empty-"));
+  const cwd = join(home, "project");
+  const { workflow, opened } = workspaceHost(home, [{ target: { kind: "run", runId: "last-run" }, label: "Delete" }]);
+  const empty = tuiContext(cwd, { select: () => "Close" });
+  await executeCommand(workflow, "", empty.ctx);
+  assert.deepEqual(empty.shown.dialogs, ["select Workflows\n | Model aliases, Close"], "no run: today's picker");
+  assert.equal(opened.length, 0);
+
+  const store = await createRouteRun(home, cwd, "last-run", "last", "completed");
+  const deleting = tuiContext(cwd, { select: () => "Close", confirm: true });
+  await executeCommand(workflow, "", deleting.ctx);
+  assert.equal(opened.length, 1, "the workspace, then no run left to open it on");
+  assert.deepEqual(deleting.shown.dialogs, ["confirm Delete workflow? | Delete last (last-run) and all owned artifacts? This cannot be undone.", "select Workflows\n | Model aliases, Close"]);
+  assert.deepEqual(deleting.shown.notices, ["Deleted workflow last-run."]);
+  assert.equal(existsSync(store.directory), false);
+});
+void test("TUI /workflow opens the workspace, whose content is a run node", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-open-"));
+  const cwd = join(home, "project");
+  await createRouteRun(home, cwd, "run", "covered", "completed");
+  const events: string[] = [];
+  let handler: RouteCommand | undefined;
+  let loop: Parameters<WorkflowNavigatorDependencies["openWorkflowsWorkspace"]>[1] | undefined;
+  registerWorkflowNavigator({
+    pi: { registerCommand(_name: string, options: { handler: RouteCommand }) { handler = options.handler; } },
+    home, ensureSessionLease: async () => {}, liveAgents: { get: () => undefined, overlay: (run: PersistedRun) => run },
+    openWorkflowsWorkspace: async (_ctx: unknown, workspace: NonNullable<typeof loop>) => { loop = workspace; events.push("workspace"); },
+  } as unknown as WorkflowNavigatorDependencies);
+  const { ctx, shown } = tuiContext(cwd);
+  await executeCommand(handler, "", ctx);
+  assert.deepEqual(events, ["workspace"]);
+  assert.deepEqual(shown.dialogs, []);
+  assert.ok(loop);
+  assert.equal(loop.providers.length, 1);
+  const node = (kind: SessionTreeNode["kind"]): SessionTreeNode => ({ key: kind, parentKey: undefined, depth: 0, kind, label: kind, state: "running", initiallyExpanded: true, line: () => kind, details: () => [], title: () => kind, agent: undefined });
+  assert.equal(loop.hasContent([node("run")]), true);
+  assert.equal(loop.hasContent([node("group")]), false);
+  assert.equal(loop.hasContent([]), false);
+});
+void test("TUI /workflow opens the workspace on the header of the run the picker would list first, as the old dashboard opened on a run's root", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-first-"));
+  const cwd = join(home, "project");
+  await createRouteRun(home, cwd, "done-run", "done", "completed");
+  await createRouteRun(home, cwd, "live-run", "live", "running");
+  let handler: RouteCommand | undefined;
+  let loop: Parameters<WorkflowNavigatorDependencies["openWorkflowsWorkspace"]>[1] | undefined;
+  registerWorkflowNavigator({
+    pi: { registerCommand(_name: string, options: { handler: RouteCommand }) { handler = options.handler; } },
+    home, ensureSessionLease: async () => {}, liveAgents: { get: () => undefined, overlay: (run: PersistedRun) => run },
+    openWorkflowsWorkspace: async (_ctx: unknown, workspace: NonNullable<typeof loop>) => { loop = workspace; },
+  } as unknown as WorkflowNavigatorDependencies);
+  await executeCommand(handler, "", tuiContext(cwd).ctx);
+  assert.equal(loop?.initialKey, "run:live-run", "a running run sorts before a completed one");
+});
+void test("TUI /workflow: once the workspace reports nothing left, the picker shows next without the runs still stored and without opening the workspace again; the turn after it opens the workspace again", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-emptied-"));
+  const cwd = join(home, "project");
+  const store = await createRouteRun(home, cwd, "kept-run", "kept", "completed");
+  let opens = 0;
+  let handler: RouteCommand | undefined;
+  registerWorkflowNavigator({
+    pi: { registerCommand(_name: string, options: { handler: RouteCommand }) { handler = options.handler; } },
+    home, ensureSessionLease: async () => {}, liveAgents: { get: () => undefined, overlay: (run: PersistedRun) => run },
+    // The first open of each command reports that nothing is left while kept-run is still stored; a later open is left at once.
+    openWorkflowsWorkspace: async (_ctx: unknown, loop: Parameters<WorkflowNavigatorDependencies["openWorkflowsWorkspace"]>[1]) => { opens += 1; if (opens === 1) loop.onEmpty(); },
+  } as unknown as WorkflowNavigatorDependencies);
+  const picker = "select Workflows\n | Model aliases, Close, Delete all completed";
+  const closing = tuiContext(cwd, { select: () => "Close" });
+  await executeCommand(handler, "", closing.ctx);
+  assert.equal(opens, 1, "no reopen right after the workspace reported nothing left");
+  assert.deepEqual(closing.shown.dialogs, [picker], "the picker lists no run");
+
+  opens = 0;
+  const declining = tuiContext(cwd, { select: (_title, options) => options.includes("Delete all completed") ? "Delete all completed" : "Close", confirm: false });
+  await executeCommand(handler, "", declining.ctx);
+  assert.deepEqual(declining.shown.dialogs, [picker, "confirm Delete completed runs? | Delete all completed workflow runs and their artifacts? This cannot be undone."]);
+  assert.equal(opens, 2, "the turn after the picker opens the workspace on the run again");
+  assert.equal(existsSync(store.directory), true);
+});
+void test("TUI /workflow: Stop chosen in the workspace runs the host's stop, and the workspace opens again with its notice", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-workflow-workspace-stop-"));
+  const cwd = join(home, "project");
+  const store = await createRouteRun(home, cwd, "run", "broken", "running");
   await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
-  let releaseCleanup = () => {};
-  let cleanupStarted = false;
-  const cleanup = new Promise<void>((resolve) => { releaseCleanup = resolve; });
-  delayedOwnership.set(store.directory, { start: () => { cleanupStarted = true; }, cleanup });
-  const isCleanupStarted = () => cleanupStarted;
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  let dialogCalls = 0;
-  let question = "";
-  const statuses: Array<string | undefined> = [];
-  const notices: string[] = [];
-  let componentDisposed = false;
-  let pickerCalls = 0;
-  let rendered = "";
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  assert.ok(start && commands[0]);
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async () => { dialogCalls += 1; return true; },
-      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
-        assert.equal(options?.overlay, undefined);
-        let result: string | undefined;
-        let resolveCustom!: (value: string | undefined) => void;
-        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
-        const component = factory({ requestRender() { rendered = component.render(200).join("\n"); } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; resolveCustom(value); });
-        if (componentDisposed) component.handleInput?.("tui.select.cancel");
-        else {
-          component.handleInput?.("a"); component.handleInput?.("tui.select.down"); component.handleInput?.("tui.select.confirm");
-          for (let attempt = 0; attempt < 100 && !component.render(200).join("\n").includes("Stop workflow?"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-          question = component.render(200).join("\n");
-          component.handleInput?.("tui.select.confirm");
-        }
-        await completed;
-        component.dispose?.();
-        return result;
-      },
-    },
-  };
-  const command = commands[0];
-  assert.ok(command);
-  await start({}, ctx);
-  const pending = executeCommand(command.handler, "", ctx);
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (isCleanupStarted()) break;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(isCleanupStarted(), true);
-  assert.equal(componentDisposed, false);
-  assert.match(rendered, /Stopping workflow live/);
-  assert.match(question, /Stop workflow live \(run\)\? This cannot be undone\./);
-  assert.equal(dialogCalls, 0);
-  assert.equal((await store.load()).run.state, "stopped");
-  releaseCleanup();
-  await Promise.race([pending, new Promise<never>((_resolve, reject) => setTimeout(() => { reject(new Error("navigator did not close after stop")); }, 1_000))]);
-  assert.equal(componentDisposed, true);
-  delayedOwnership.delete(store.directory);
-  assert.deepEqual((await store.loadOwnership()).map(({ state }) => state), ["cancelled"]);
-  assert.ok(statuses.some((status) => status?.includes("Stopping workflow")));
-  assert.ok(statuses.some((status) => status?.includes("Workflow run stopped")));
-  assert.equal(statuses.at(-1), undefined);
-  assert.ok(notices.some((notice) => notice.includes("Stopped workflow run.")));
+  failedOwnership.add(store.directory);
+  try {
+    const { workflow, start, opened } = workspaceHost(home, [{ target: { kind: "run", runId: "run" }, label: "Stop" }]);
+    await start({}, { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async () => "Skip" } });
+    const { ctx, shown } = tuiContext(cwd, { confirm: true });
+    await executeCommand(workflow, "", ctx);
+    assert.equal(opened.length, 2, "the workspace opens again after the action");
+    assert.equal(shown.notices.length, 1);
+    assert.match(shown.notices[0] ?? "", /^Cannot stop for run: .*scheduler cleanup failed/, "the host's own stop ran");
+    const reopened = opened[1]?.options;
+    assert.ok(reopened);
+    assert.deepEqual(reopened.notices, shown.notices, "the notice in the status row of the workspace");
+    assert.deepEqual(reopened.state, KEPT_STATE);
+  } finally { failedOwnership.delete(store.directory); }
 });
 void test("non-TUI navigator Stop confirms before cancelling", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-select-confirm-"));
@@ -501,11 +427,13 @@ void test("non-TUI navigator Stop confirms before cancelling", async () => {
   let selectCalls = 0;
   let confirmations = 0;
   const notices: string[] = [];
+  const statuses: (string | undefined)[] = [];
   workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
   const ctx = {
     cwd, mode: "rpc", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
     ui: {
       notify(message: string) { notices.push(message); },
+      setStatus(key: string, text?: string) { if (key === "workflow-stop") statuses.push(text); },
       confirm: async () => { confirmations += 1; return true; },
       select: async (_prompt: string, options: string[]) => {
         selectCalls += 1;
@@ -523,266 +451,16 @@ void test("non-TUI navigator Stop confirms before cancelling", async () => {
   assert.equal(confirmations, 1);
   assert.equal((await store.load()).run.state, "stopped");
   assert.ok(notices.some((notice) => notice.includes("Stopped workflow run.")));
+  assert.deepEqual(statuses, ["Stopping workflow select-stop...", "Workflow run stopped."], "the progress line in Pi's status");
 });
 
-void test("navigator dashboard auto-refreshes the selected run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-refresh-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'live',description:'live'}", args: null, metadata: { name: "live", description: "live" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "live", cwd, sessionId: "session", state: "running", phase: "before", agents: [], agentSessions: [] }, snapshot);
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  let selectCall = 0;
-  let refreshRenders = 0;
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      notify() {}, confirm: async () => false,
-      select: async (_prompt: string, options: string[]) => { selectCall += 1; return selectCall === 1 ? options[0] : "Close"; },
-      custom: async (factory: (tui: { terminal: { rows: number }; requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        const component = factory({ terminal: { rows: 8 }, requestRender() { refreshRenders += 1; } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {});
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.down");
-        const before = component.render(200);
-        assert.ok(before.length <= 8);
-        assert.match(before.join("\n"), /phase: before/);
-        assert.match(before.join("\n"), /Tree/);
-        const loaded = await store.load();
-        const agents = Array.from({ length: 12 }, (_, index) => ({ id: `agent-${String(index)}`, name: `agent-${String(index)}`, path: `agent-${String(index)}`, state: "running" as const, model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }));
-        await store.saveState({ ...loaded.run, phase: "after", agents });
-        await new Promise((resolve) => setTimeout(resolve, 1100));
-        const grown = component.render(200);
-        assert.ok(grown.length <= 8);
-        assert.match(grown.join("\n"), /phase: after/);
-        assert.match(grown.join("\n"), /Tree/);
-        component.handleInput?.("tui.editor.cursorRight");
-        component.handleInput?.("tui.editor.cursorRight");
-        for (let index = 0; index < 12; index += 1) component.handleInput?.("tui.select.down");
-        const bottom = component.render(200);
-        assert.ok(bottom.length <= 8);
-        assert.match(bottom.join("\n"), /agent-11/);
-        const terminalRefreshStart = refreshRenders;
-        const mixed = await store.load();
-        await store.saveState({ ...mixed.run, state: "failed", agents: mixed.run.agents });
-        await new Promise((resolve) => setTimeout(resolve, 1100));
-        const mixedTerminalRefreshCount = refreshRenders;
-        assert.ok(mixedTerminalRefreshCount > terminalRefreshStart);
-        const settled = await store.load();
-        await store.saveState({ ...settled.run, agents: settled.run.agents.map((agent) => ({ ...agent, state: "cancelled" as const })) });
-        await new Promise((resolve) => setTimeout(resolve, 1100));
-        const compact = component.render(200);
-        assert.ok(compact.length <= 8);
-        assert.match(compact.join("\n"), /agent-11/);
-        assert.doesNotMatch(compact.join("\n"), /→ Stop/);
-        assert.ok(refreshRenders > mixedTerminalRefreshCount);
-        const terminalRefreshCount = refreshRenders;
-        await new Promise((resolve) => setTimeout(resolve, 1100));
-        assert.equal(refreshRenders, terminalRefreshCount);
-        component.dispose?.();
-        return undefined;
-      },
-    },
-  };
-  await executeCommand(commands[0]?.handler, "", ctx);
-});
-void test("navigator returns to the picker after cancelling a recovered run dashboard", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-actions-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "actions" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "actions", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  const notices: string[] = [];
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  const sessionContext = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notices.push(message); } } };
-  assert.ok(start);
-  await start({}, sessionContext);
-  let pickerCalls = 0;
-  let customCalls = 0;
-  const ctx = { ...sessionContext, mode: "tui", ui: {
-    notify(message: string) { notices.push(message); }, confirm: async () => false,
-    select: async (_prompt: string, options: string[]) => { pickerCalls += 1; return pickerCalls === 1 ? options[0] : "Close"; },
-    custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-      customCalls += 1;
-      let result: string | undefined;
-      const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
-      const dashboard = component.render(200).join("\n");
-      assert.match(dashboard, /interrupted/);
-      assert.match(dashboard, /Tree/);
-      const narrowTree = component.render(79).join("\n");
-      assert.match(narrowTree, /enter run actions/);
-      component.handleInput?.("tui.select.confirm");
-      assert.match(component.render(40).join("\n"), /Run actions/);
-      component.handleInput?.("tui.select.cancel");
-      component.handleInput?.("a");
-      assert.match(component.render(200).join("\n"), /Resume/);
-      component.handleInput?.("tui.select.cancel");
-      component.handleInput?.("tui.select.cancel");
-      assert.equal(result, "Back");
-      component.dispose?.();
-      return result;
-    },
-  } };
-  await executeCommand(commands[0]?.handler, "", ctx);
-  assert.equal(pickerCalls, 2);
-  assert.equal(customCalls, 1);
-  assert.equal((await store.load()).run.state, "interrupted");
-});
-void test("navigator keeps consecutive checkpoint decisions in the same dashboard", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-actions-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "checkpoints" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "checkpoints", cwd, sessionId: "session", state: "awaiting_input", agents: [], agentSessions: [] }, snapshot);
-  await store.awaitCheckpoint({ path: "checkpoint/ship", name: "ship", prompt: "Ship?", context: null });
-  await store.awaitCheckpoint({ path: "checkpoint/deploy", name: "deploy", prompt: "Deploy?", context: null });
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"], sendMessage() {} }), home);
-  const sessionContext = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async () => "Skip" } };
-  assert.ok(start);
-  await start({}, sessionContext);
-  let customCalls = 0;
-  let pickerCalls = 0;
-  const ctx = { ...sessionContext, mode: "tui", ui: {
-    notify() {}, confirm: async () => false, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return options.find((option) => option.startsWith("Review ")) ?? options[0]; pickerCalls += 1; return pickerCalls === 1 ? options[0] : "Close"; },
-    custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-      customCalls += 1;
-      let result: string | undefined;
-      const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
-      const dashboard = component.render(200).join("\n");
-      if (customCalls === 1) {
-        assert.match(dashboard, /Tree/);
-        component.handleInput?.("a");
-        assert.match(component.render(200).join("\n"), /→ Resume/);
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.down");
-        assert.match(component.render(200).join("\n"), /→ Review ship/);
-        component.handleInput?.("tui.select.confirm");
-      } else if (customCalls === 2) {
-        assert.match(dashboard, /Name: ship/);
-        component.handleInput?.("tui.select.confirm");
-      } else if (customCalls === 3) {
-        assert.match(dashboard, /Tree/);
-        component.handleInput?.("a");
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.confirm");
-      } else if (customCalls === 4) {
-        assert.match(dashboard, /Name: deploy/);
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.confirm");
-      } else {
-        assert.match(dashboard, /interrupted/);
-        component.handleInput?.("tui.select.cancel");
-      }
-      component.dispose?.();
-      return result;
-    },
-  } };
-  await executeCommand(commands[0]?.handler, "", ctx);
-  assert.equal(customCalls, 5);
-  assert.deepEqual(await store.replay("checkpoint/ship"), { path: "checkpoint/ship", value: true });
-  assert.deepEqual(await store.replay("checkpoint/deploy"), { path: "checkpoint/deploy", value: false });
-});
-void test("navigator returns to the picker after deleting a run", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-delete-actions-"));
-  const cwd = join(home, "project");
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "delete", }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  const oldStore = new RunStore(cwd, "session", "old", home);
-  const keepStore = new RunStore(cwd, "session", "keep", home);
-  await oldStore.create({ id: "old", workflowName: "old", cwd, sessionId: "session", state: "completed", agents: [], agentSessions: [] }, snapshot);
-  await keepStore.create({ id: "keep", workflowName: "keep", cwd, sessionId: "session", state: "completed", agents: [], agentSessions: [] }, snapshot);
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  const pickerOptions: string[][] = [];
-  let pickerCalls = 0;
-  let customCalls = 0;
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  const ctx = { cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, confirm: async () => true, select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Delete"; pickerCalls += 1; pickerOptions.push(options); return pickerCalls === 1 ? options.find((option) => option.includes("old")) : "Close"; }, custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-      customCalls += 1;
-      let result: string | undefined;
-      const component = factory({ requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
-      assert.match(component.render(200).join("\n"), /Tree/);
-      component.handleInput?.("a");
-      component.handleInput?.("tui.select.down");
-      component.handleInput?.("tui.select.confirm");
-      component.dispose?.();
-      return result;
-    } } };
-  await executeCommand(commands[0]?.handler, "", ctx);
-  assert.equal(customCalls, 1);
-  assert.equal(pickerCalls, 2);
-  assert.ok(pickerOptions[1]?.some((option) => option.includes("keep")));
-  assert.doesNotMatch(pickerOptions[1]?.join("\n") ?? "", /old/);
-  assert.equal(existsSync(oldStore.directory), false);
-  assert.equal(existsSync(keepStore.directory), true);
-});
-void test("navigator opens the workflow script in the configured external editor", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-external-editor-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const script = ["// SCRIPT_START", ...Array.from({ length: 20 }, (_, index) => `const line${String(index)} = ${String(index)};`), "// SCRIPT_END"].join("\n");
-  const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "viewer", description: "viewer" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "viewer", cwd, sessionId: "session", state: "running", phase: "view", agents: [], agentSessions: [] }, snapshot);
-  const editorPath = join(home, "fake-editor.sh");
-  const editedPath = join(home, "edited-content");
-  const openedPath = join(home, "opened-path");
-  writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { encoding: "utf8", mode: 0o755 });
-  const previousVisual = process.env.VISUAL;
-  const previousEditor = process.env.EDITOR;
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
-  process.env.EDITOR = process.env.VISUAL;
-  let stops = 0;
-  let pickerCalls = 0;
-  let starts = 0;
-  let renders = 0;
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home, undefined, undefined, join(home, "agent"));
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      select: async (_prompt: string, options: string[]) => { pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
-      custom: async (factory: (tui: { terminal: { rows: number }; stop(): void; start(): void; requestRender(force?: boolean): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        const component = factory({ terminal: { rows: 8 }, stop() { stops += 1; }, start() { starts += 1; }, requestRender() { renders += 1; } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {});
-        component.handleInput?.("a");
-        for (let step = 0; step < 12; step += 1) {
-          if (component.render(80).join("\n").includes("→ Open script in editor")) { component.handleInput?.("tui.select.confirm"); break; }
-          component.handleInput?.("tui.select.down");
-        }
-        const deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (starts === 1 && existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("SCRIPT_START")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        assert.ok(existsSync(editedPath), "external editor was not invoked");
-        assert.match(readFileSync(editedPath, "utf8"), /SCRIPT_START/);
-        assert.match(readFileSync(editedPath, "utf8"), /SCRIPT_END/);
-        assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.js$/);
-        component.dispose?.();
-        return undefined;
-      },
-    },
-  };
-  try {
-    await executeCommand(commands[0]?.handler, "", ctx);
-    assert.equal(stops, 1);
-    assert.equal(starts, 1);
-    assert.ok(renders > 0);
-    assert.equal(existsSync(join(store.directory, "workflow.js")), true);
-  } finally {
-    if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
-    if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
-  }
-});
 void test("external artifact failures restore the TUI and remove temporary copies", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-external-editor-failure-"));
   const editorPath = join(home, "failing-editor.sh");
   const openedPath = join(home, "opened-path");
   writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\nexit 7\n", { encoding: "utf8", mode: 0o755 });
   const events: string[] = [];
-  const tui = { stop() { events.push("stop"); }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
+  const tui = { stop() { events.push("stop"); return true; }, start() { events.push("start"); }, requestRender() { events.push("render"); } };
   const exitCode = await openWorkflowArtifact(tui, `${editorPath} ${openedPath}`, { extension: ".md", content: "read-only" });
   assert.equal(exitCode, 7);
   const opened = readFileSync(openedPath, "utf8");
@@ -790,105 +468,6 @@ void test("external artifact failures restore the TUI and remove temporary copie
   assert.deepEqual(events, ["stop", "start", "render"]);
   assert.equal(await openWorkflowArtifact(tui, join(home, "missing-editor"), { extension: ".js", content: "return true;" }), null);
   assert.deepEqual(events, ["stop", "start", "render", "stop", "start", "render"]);
-});
-void test("navigator opens a persisted top-level agent prompt and result in the external editor", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-result-editor-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const resultPath = "agent/reviewer/callsite%3Areviewer/occurrence%3A1";
-  const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "agent-result" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "agent-result", cwd, sessionId: "session", state: "completed", phase: "review", agents: [{ id: "agent", name: "reviewer", path: "agent", state: "completed", prompt: "PROMPT_START\nInspect the target\nPROMPT_END", systemPrompt: "SYSTEM_PROMPT_START\nFollow the workflow\nSYSTEM_PROMPT_END", resultPath, structuralPath: ["reviewer"], model: { provider: "openai", model: "gpt" }, tools: [], attempts: 1 }], agentSessions: [] }, snapshot);
-  await store.complete(resultPath, { answer: 42 });
-  const editorPath = join(home, "fake-editor.sh");
-  const editedPath = join(home, "edited-content");
-  const openedPath = join(home, "opened-path");
-  writeFileSync(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { encoding: "utf8", mode: 0o755 });
-  const previousVisual = process.env.VISUAL;
-  const previousEditor = process.env.EDITOR;
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
-  process.env.EDITOR = process.env.VISUAL;
-  let stops = 0;
-  let starts = 0;
-  let pickerCalls = 0;
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      select: async (_prompt: string, options: string[]) => { pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
-      custom: async (factory: (tui: { terminal: { rows: number }; stop(): void; start(): void; requestRender(force?: boolean): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }) => {
-        const component = factory({ terminal: { rows: 10 }, stop() { stops += 1; }, start() { starts += 1; }, requestRender() {} }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, () => {});
-        const phase = component.render(120).join("\n");
-        assert.doesNotMatch(phase, /Open result in editor/);
-        component.handleInput?.("tui.select.down");
-        assert.doesNotMatch(component.render(120).join("\n"), /Open result in editor/);
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.down");
-        component.handleInput?.("tui.select.confirm");
-        const actions = component.render(120).join("\n");
-        assert.match(actions, /Agent actions/);
-        assert.match(actions, /Open prompt in editor/);
-        const waitForStarts = async (expected: number) => {
-          const deadline = Date.now() + 5_000;
-          while (starts < expected && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-          assert.equal(starts, expected);
-        };
-        const openAction = async (label: string) => {
-          const deadline = Date.now() + 5_000;
-          while (Date.now() < deadline) {
-            if (component.render(120).join("\n").includes(`→ ${label}`)) { component.handleInput?.("tui.select.confirm"); return; }
-            component.handleInput?.("tui.select.down");
-            await new Promise((resolve) => setTimeout(resolve, 10));
-          }
-          assert.fail(`Timed out selecting ${label}`);
-        };
-        await openAction("Open system prompt in editor");
-        let deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("SYSTEM_PROMPT_START")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        assert.ok(existsSync(editedPath), "external editor was not invoked for the system prompt");
-        assert.match(readFileSync(editedPath, "utf8"), /SYSTEM_PROMPT_START[\s\S]*SYSTEM_PROMPT_END/);
-        assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.md$/);
-        await waitForStarts(1);
-        await openAction("Open prompt in editor");
-        deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("PROMPT_START")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        assert.ok(existsSync(editedPath), "external editor was not invoked for the prompt");
-        assert.match(readFileSync(editedPath, "utf8"), /PROMPT_START[\s\S]*PROMPT_END/);
-        assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.md$/);
-        await waitForStarts(2);
-        await openAction("Open result in editor");
-        deadline = Date.now() + 5_000;
-        while (Date.now() < deadline) {
-          if (existsSync(editedPath) && readFileSync(editedPath, "utf8").includes("\"answer\": 42")) break;
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        assert.ok(existsSync(editedPath), "external editor was not invoked for the result");
-        assert.match(readFileSync(editedPath, "utf8"), /"answer": 42/);
-        assert.match(readFileSync(openedPath, "utf8"), /artifact.*\.json$/);
-        const artifactPath = readFileSync(openedPath, "utf8");
-        const cleanupDeadline = Date.now() + 5_000;
-        while (existsSync(artifactPath) && Date.now() < cleanupDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
-        assert.equal(existsSync(artifactPath), false);
-        await waitForStarts(3);
-        component.dispose?.();
-        return undefined;
-      },
-    },
-  };
-  try {
-    await executeCommand(commands[0]?.handler, "", ctx);
-    assert.equal(stops, 3);
-    assert.equal(starts, 3);
-  } finally {
-    if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
-    if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
-  }
 });
 void test("navigator omits transcript actions outside and inside Herdr", async () => {
   const previousEnvironment = { HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
@@ -1182,65 +761,4 @@ void test("navigator remains usable when retry provenance is unavailable", async
   await assert.doesNotReject(executeCommand(command, "", ctx));
   assert.ok(selections.length >= 2);
   assert.ok(selections[1]?.includes("Delete"));
-});
-
-void test("navigator stop reports cleanup failures without closing unexpectedly", async () => {
-  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stop-failure-"));
-  const cwd = join(home, "project");
-  const store = new RunStore(cwd, "session", "run", home);
-  const snapshot = createLaunchSnapshot({ script: "export const meta={name:'broken',description:'broken'}", args: null, metadata: { name: "broken", description: "broken" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] });
-  await store.create({ id: "run", workflowName: "broken", cwd, sessionId: "session", state: "running", agents: [], agentSessions: [] }, snapshot);
-  await store.saveOwnership([{ id: "run:1", label: "worker", state: "running", options: { label: "worker", cwd, tools: [] } }]);
-  failedOwnership.add(store.directory);
-  let start: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
-  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
-  const notices: string[] = [];
-  const statuses: Array<string | undefined> = [];
-  let customCalls = 0;
-  let pickerCalls = 0;
-  let componentDisposed = false;
-  let rendered = "";
-  let closeNavigator = () => {};
-  workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home);
-  assert.ok(start && commands[0]);
-  const ctx = {
-    cwd, mode: "tui", hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" },
-    ui: {
-      notify(message: string) { notices.push(message); }, setStatus(_key: string, text: string | undefined) { statuses.push(text); }, confirm: async () => { throw new Error("the dashboard confirms in place"); },
-      select: async (prompt: string, options: string[]) => { if (options.includes("Skip")) return "Skip"; if (prompt === "Workflow actions") return "Stop"; if (prompt !== "Workflows\n") return options[0] ?? "Close"; pickerCalls += 1; return pickerCalls === 1 ? options[0] ?? "Close" : "Close"; },
-      custom: async (factory: (tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }, keybindings: { matches(data: string, binding: string): boolean }, done: (value?: string) => void) => { render(width: number): string[]; handleInput?(data: string): void; dispose?(): void }, options?: { overlay?: boolean }) => {
-        customCalls += 1;
-        assert.equal(options?.overlay, undefined);
-        let result: string | undefined;
-        let resolveCustom!: (value: string | undefined) => void;
-        const completed = new Promise<string | undefined>((resolve) => { resolveCustom = resolve; });
-        const component = factory({ requestRender() { rendered = component.render(200).join("\n"); } }, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { componentDisposed = true; result = value; resolveCustom(value); });
-        closeNavigator = () => component.handleInput?.("tui.select.cancel");
-        if (componentDisposed) component.handleInput?.("tui.select.cancel");
-        else {
-          component.handleInput?.("a"); component.handleInput?.("tui.select.down"); component.handleInput?.("tui.select.confirm");
-          for (let attempt = 0; attempt < 100 && !component.render(200).join("\n").includes("Stop workflow?"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-          component.handleInput?.("tui.select.confirm");
-        }
-        await completed;
-        component.dispose?.();
-        return result;
-      },
-    },
-  };
-  const command = commands[0];
-  assert.ok(command);
-  await start({}, ctx);
-  const pending = executeCommand(command.handler, "", ctx);
-  for (let attempt = 0; attempt < 100 && !statuses.some((status) => status?.includes("Could not stop workflow")); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-  assert.ok(statuses.some((status) => status?.includes("Could not stop workflow")));
-  assert.equal(componentDisposed, false);
-  assert.match(rendered, /scheduler cleanup failed/);
-  assert.ok(statuses.some((status) => status?.includes("scheduler cleanup failed")));
-  failedOwnership.delete(store.directory);
-  await new Promise((resolve) => setTimeout(resolve, 10));
-  for (let attempt = 0; attempt < 20; attempt += 1) { closeNavigator(); await new Promise((resolve) => setTimeout(resolve, 10)); }
-  await pending;
-  assert.equal(customCalls, 1);
-  assert.ok(notices.some((notice) => notice.includes("scheduler cleanup failed")));
 });

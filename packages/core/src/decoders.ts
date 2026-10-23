@@ -1,4 +1,5 @@
 import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { validAgentSpeed } from "./agent-speed.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
 
@@ -237,7 +238,9 @@ function decodeAgentSession(value: unknown): PersistedAgentSession | undefined {
 }
 function decodeAgentAccounting(value: unknown): AgentAccounting | undefined {
   if (!object(value) || !finiteNumber(value.input) || !finiteNumber(value.output) || !finiteNumber(value.cacheRead) || !finiteNumber(value.cacheWrite) || !finiteNumber(value.cost)) return undefined;
-  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost };
+  const speed = value.speed === undefined ? undefined : validAgentSpeed(value.speed);
+  if (value.speed !== undefined && speed === undefined) return undefined;
+  return { input: value.input, output: value.output, cacheRead: value.cacheRead, cacheWrite: value.cacheWrite, cost: value.cost, ...(speed === undefined ? {} : { speed }) };
 }
 function decodeAgentActivity(value: unknown): AgentActivity | undefined {
   if (!object(value) || typeof value.text !== "string") return undefined;

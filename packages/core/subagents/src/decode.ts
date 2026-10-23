@@ -1,6 +1,8 @@
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { finiteNumber, jsonValue, parseThinking } from "../../src/utils.js";
+import { validAgentSpeed } from "../../src/agent-speed.js";
 import type { AgentAttemptSummary } from "../../src/types.js";
-import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, type SubagentProgress, type SubagentStatus } from "./contracts.js";
+import { SUBAGENT_ATTEMPT_DETAILS_LIMIT, type SubagentManagerContext, type SubagentProgress, type SubagentStatus } from "./contracts.js";
 
 function objectValue(value: unknown): Record<string, unknown> | undefined { return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["setup"]["resourceSelectors"]> | undefined {
@@ -20,6 +22,19 @@ function resourceSummaryValue(value: unknown): NonNullable<AgentAttemptSummary["
 }
 function nonnegativeInteger(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value) && value >= 0; }
 function stringArrayValue(value: unknown): readonly string[] | undefined { return Array.isArray(value) && value.length <= 256 && value.every((item) => typeof item === "string") ? value : undefined; }
+/** A subagent id that is safe as one path segment under the storage directory: not "." or "..", only letters, digits, ".", "_" and "-". */
+export function safeSubagentId(id: string): boolean { return id !== "." && id !== ".." && /^[A-Za-z0-9._-]+$/.test(id); }
+/** The id a list shows: its first 8 characters when it is longer than 12. */
+export function shortSubagentId(id: string): string { return id.length > 12 ? id.slice(0, 8) : id; }
+/** The attention order of the /subagents list: running first, then failed, stopped and completed. */
+export const SUBAGENT_ATTENTION_ORDER: Readonly<Record<SubagentStatus["state"], number>> = { running: 0, failed: 1, stopped: 2, completed: 3 };
+export function latestAttempt(attempts: readonly AgentAttemptSummary[] | undefined): AgentAttemptSummary | undefined {
+  return (attempts ?? []).reduce<AgentAttemptSummary | undefined>((latest, candidate) => !latest || candidate.attempt > latest.attempt ? candidate : latest, undefined);
+}
+/** The manager context of a command (`toolCallId` names it); detail inspections carry the attempt metadata and the live activity that tool results leave out. */
+export function managerContext(toolCallId: string, context: ExtensionCommandContext, includeAttemptMetadata = false, waitForForeground = true): SubagentManagerContext {
+  return { toolCallId, signal: undefined, onUpdate: undefined, ...(waitForForeground ? {} : { waitForForeground: false }), ...(includeAttemptMetadata ? { includeAttemptMetadata: true, includeActivity: true } : {}), extensionContext: context };
+}
 export function accountingValue(value: unknown): SubagentProgress["accounting"] | undefined {
   const record = objectValue(value);
   if (!record) return undefined;
@@ -29,7 +44,9 @@ export function accountingValue(value: unknown): SubagentProgress["accounting"] 
   const cacheWrite = record.cacheWrite;
   const cost = record.cost;
   if (!finiteNumber(input) || !finiteNumber(output) || !finiteNumber(cacheRead) || !finiteNumber(cacheWrite) || !finiteNumber(cost)) return undefined;
-  return { input, output, cacheRead, cacheWrite, cost };
+  const speed = record.speed === undefined ? undefined : validAgentSpeed(record.speed);
+  if (record.speed !== undefined && speed === undefined) return undefined;
+  return { input, output, cacheRead, cacheWrite, cost, ...(speed === undefined ? {} : { speed }) };
 }
 export function legacyAccountingValue(record: Record<string, unknown>): SubagentProgress["accounting"] | undefined {
   const accounting = accountingValue(record.accounting);

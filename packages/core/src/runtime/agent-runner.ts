@@ -105,6 +105,7 @@ export interface RuntimeAgentProgress {
   readonly state?: RuntimeAgentState;
   readonly activity?: { readonly kind: "reasoning" | "tool" | "text"; readonly text: string };
   readonly lastEventAt?: number;
+  readonly speed?: { readonly messages: number; readonly outputTokens: number; readonly generationMs: number; readonly firstTokenMs: number };
   readonly persist: boolean;
 }
 

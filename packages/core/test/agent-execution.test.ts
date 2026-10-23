@@ -9,7 +9,7 @@ import { Value } from "typebox/value";
 import type { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { createLocalPiSession, FairAgentScheduler, flushExtensionProviders, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
 import { AgentSession } from "@earendil-works/pi-coding-agent";
-import { reachableTools, WorkflowError, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
+import { reachableTools, sumAccounting, WorkflowError, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
 import type { AgentResourcePolicy, JsonSchema } from "../src/types.js";
 import type { RunStore } from "../src/persistence.js";
 import { testTransport, type TestPiSessionEvent } from "./test-transport.js";
@@ -2700,4 +2700,41 @@ void test("child-owning agents carry the ownership contract in the agent tool on
   scheduler.restoreRun("run", 1, [{ id: "run:1", label: "parent", state: "running" as const, options: { label: "parent", cwd: "/repo", tools: ["agent"] } }, { id: "run:2", label: "leaf", state: "running" as const, options: { label: "leaf", cwd: "/repo", tools: ["read"] } }]);
   assert.match(scheduler.toolsFor("run:1")[0]?.description ?? "", /You own the children you create.*do not leave descendants running/);
   assert.deepEqual(scheduler.toolsFor("run:2"), []);
+});
+void test("each attempt records its own speed counters and a retry does not inherit an unfinished message", async () => {
+  type Listener = (event: import("../src/types.js").WorkflowAgentSessionEvent) => void;
+  let sessions = 0;
+  const message = (output: number) => ({ role: "assistant", content: [], stopReason: "stop", usage: { ...usage, output } });
+  const feed = (listener: Listener | undefined, output: number): void => {
+    listener?.({ type: "turn_start" });
+    listener?.({ type: "message_start", message: { role: "assistant", content: [] } });
+    listener?.({ type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_start" } });
+    listener?.({ type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_delta", delta: "done" } });
+    listener?.({ type: "message_end", message: message(output) });
+  };
+  const transport = testTransport(async () => {
+    sessions += 1;
+    const attempt = sessions;
+    let listener: Listener | undefined;
+    return {
+      sessionId: `speed-${String(attempt)}`, messages: [assistant("done")], getSessionStats: sessionStats,
+      subscribe(next) { listener = next; return () => undefined; },
+      async prompt() {
+        if (attempt === 1) {
+          feed(listener, 120);
+          listener?.({ type: "turn_start" });
+          listener?.({ type: "message_start", message: { role: "assistant", content: [] } });
+          listener?.({ type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_start" } });
+          listener?.({ type: "message_update", message: { role: "assistant", content: [] }, assistantMessageEvent: { type: "text_delta", delta: "partial" } });
+          throw new Error("attempt one fails mid-stream");
+        }
+        feed(listener, 80);
+      },
+      dispose() {},
+    };
+  });
+  const result = await new WorkflowAgentExecutor(root, transport).execute("work", { label: "worker", workflowName: "flow", retries: 1, onProgress: async () => undefined });
+  const counted = result.attempts.map(({ accounting }) => accounting.speed && { messages: accounting.speed.messages, outputTokens: accounting.speed.outputTokens });
+  assert.deepEqual(counted, [{ messages: 1, outputTokens: 120 }, { messages: 1, outputTokens: 80 }]);
+  assert.deepEqual(sumAccounting(result.attempts.map(({ accounting }) => accounting)).speed?.outputTokens, 200);
 });

@@ -30,7 +30,7 @@ async function harness(t: TestContext, mode: "launch" | "cold", script: string) 
   let shutdown: (() => Promise<void>) | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: Tool) { tools.push(tool); },
-    registerCommand(_name: string, value: { handler: Command }) { command = value.handler; },
+    registerCommand(name: string, value: { handler: Command }) { if (name === "workflow") command = value.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     getActiveTools: () => ["workflow"], getThinkingLevel: () => "off",
   }), home);

@@ -1,5 +1,6 @@
 import type { CreateAgentSessionOptions, InlineExtension, SessionManager, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
+import { addSpeed } from "./agent-speed.js";
 export const RUN_STATES = ["queued", "running", "pausing", "paused", "awaiting_input", "completed", "failed", "stopped", "interrupted", "budget_exhausted"] as const;
 export const AGENT_STATES = ["queued", "running", "waiting_for_child", "paused", "retrying", "completed", "failed", "cancelled"] as const;
 export type RunState = (typeof RUN_STATES)[number];
@@ -129,9 +130,13 @@ export interface AgentResourceInspection { selectors: AgentResourceSelectorSet; 
 export interface ContextFile { readonly path: string; readonly content: string }
 export interface AgentActivity { kind: "reasoning" | "tool" | "text"; text: string }
 export const WORKFLOW_AGENT_STALL_THRESHOLD_MS = 10 * 60 * 1000;
-export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
+export interface AgentSpeed { messages: number; outputTokens: number; generationMs: number; firstTokenMs: number }
+export interface AgentAccounting { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; speed?: AgentSpeed }
 export function zeroAccounting(): AgentAccounting { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }; }
-export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting { return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost: left.cost + right.cost }; }
+export function addAccounting(left: AgentAccounting, right: AgentAccounting): AgentAccounting {
+  const speed = addSpeed(left.speed, right.speed);
+  return { input: left.input + right.input, output: left.output + right.output, cacheRead: left.cacheRead + right.cacheRead, cacheWrite: left.cacheWrite + right.cacheWrite, cost: left.cost + right.cost, ...(speed === undefined ? {} : { speed }) };
+}
 export function sumAccounting(values: Iterable<AgentAccounting>): AgentAccounting {
   let total = zeroAccounting();
   for (const value of values) total = addAccounting(total, value);

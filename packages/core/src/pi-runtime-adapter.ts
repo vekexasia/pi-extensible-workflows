@@ -1,6 +1,7 @@
 import type { RuntimeAgentHandoff, RuntimeAgentProgress, RuntimeAgentState, RuntimeHandoffState, RuntimeToolCallProgress } from "./runtime/agent-runner.js";
 import type { AgentProgress } from "./agent-execution.js";
-import type { LiveSessionHandoff, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionState } from "./types.js";
+import type { AgentSpeed, LiveSessionHandoff, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionState } from "./types.js";
+import { SpeedTracker } from "./agent-speed.js";
 import { isThinkingLevel, sanitizeDisplayText } from "./utils.js";
 const TURN_START_EVENTS = new Set(["turn_start", "turn_started", "turnStarted"]);
 const MAX_ACTIVITY_TEXT_CHARS = 200;
@@ -103,6 +104,8 @@ function runtimeUsage(session: WorkflowAgentSession): RuntimeAgentProgress["usag
   return { availability: "complete", input: stats.tokens.input, output: stats.tokens.output, cacheRead: stats.tokens.cacheRead, cacheWrite: stats.tokens.cacheWrite, costUsd: stats.cost };
 }
 
+function speedField(speed: AgentSpeed | undefined): { speed?: AgentSpeed } { return speed === undefined ? {} : { speed }; }
+
 function sameActivity(left: RuntimeAgentProgress["activity"], right: RuntimeAgentProgress["activity"]): boolean { return left?.kind === right?.kind && left?.text === right?.text; }
 
 function runtimeHandoffState(state: LiveSessionHandoff["state"]): RuntimeHandoffState {
@@ -161,9 +164,10 @@ export function createPiRuntimeSessionAdapter(session: WorkflowAgentSession, han
   let lastEventAt: number | undefined;
   let lastReportedEventAt: number | undefined;
   let disposed = false;
+  const tracker = new SpeedTracker();
 
   let toolCallsView: readonly RuntimeToolCallProgress[] = [];
-  const progressAt = (persist: boolean, stateOverride: RuntimeAgentState | undefined, toolCallsValue: readonly RuntimeToolCallProgress[], activityValue: RuntimeAgentProgress["activity"], eventAtValue: number | undefined): RuntimeAgentProgress => ({ usage: runtimeUsage(session), toolCalls: toolCallsValue, state: stateOverride ?? stateFromSession(session), ...(activityValue === undefined ? {} : { activity: activityValue }), ...(eventAtValue === undefined ? {} : { lastEventAt: eventAtValue }), persist });
+  const progressAt = (persist: boolean, stateOverride: RuntimeAgentState | undefined, toolCallsValue: readonly RuntimeToolCallProgress[], activityValue: RuntimeAgentProgress["activity"], eventAtValue: number | undefined): RuntimeAgentProgress => ({ usage: runtimeUsage(session), toolCalls: toolCallsValue, state: stateOverride ?? stateFromSession(session), ...(activityValue === undefined ? {} : { activity: activityValue }), ...(eventAtValue === undefined ? {} : { lastEventAt: eventAtValue }), ...speedField(tracker.speed()), persist });
   const snapshot = (persist: boolean): RuntimeAgentProgress => progressAt(persist, undefined, [...toolCalls.values()], activity, lastEventAt);
   return {
     handoff: neutralHandoff,
@@ -172,6 +176,7 @@ export function createPiRuntimeSessionAdapter(session: WorkflowAgentSession, han
       neutralHandoff.observe(event);
       const eventAt = clock();
       lastEventAt = eventAt;
+      tracker.observe(event, eventAt);
       const eventState = event.state === undefined ? undefined : runtimeState(event.state);
       let report = false;
       let persist = false;
@@ -237,7 +242,7 @@ function requiredUsage(value: number | undefined, name: string): number {
 export function runtimeProgressToAgentProgress(value: RuntimeAgentProgress): AgentProgress {
   if (value.usage.availability !== "complete") throw new Error(`Cannot convert ${value.usage.availability} runtime usage to Pi accounting`);
   return {
-    accounting: { input: requiredUsage(value.usage.input, "input"), output: requiredUsage(value.usage.output, "output"), cacheRead: requiredUsage(value.usage.cacheRead, "cacheRead"), cacheWrite: requiredUsage(value.usage.cacheWrite, "cacheWrite"), cost: requiredUsage(value.usage.costUsd, "costUsd") },
+    accounting: { input: requiredUsage(value.usage.input, "input"), output: requiredUsage(value.usage.output, "output"), cacheRead: requiredUsage(value.usage.cacheRead, "cacheRead"), cacheWrite: requiredUsage(value.usage.cacheWrite, "cacheWrite"), cost: requiredUsage(value.usage.costUsd, "costUsd"), ...speedField(value.speed) },
     toolCalls: value.toolCalls.map(({ id, name, state }) => ({ id, name, state })),
     ...(value.state === undefined ? {} : { state: { model: { ...value.state.model }, ...(value.state.thinking === undefined ? {} : { thinking: value.state.thinking }), tools: [...value.state.tools], ...(value.state.systemPrompt === undefined ? {} : { systemPrompt: value.state.systemPrompt }) } }),
     ...(value.activity === undefined ? {} : { activity: { ...value.activity, text: sanitizeDisplayText(value.activity.text) } }),

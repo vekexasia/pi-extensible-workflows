@@ -1,15 +1,15 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText, WORKFLOW_AGENT_STALL_THRESHOLD_MS } from "../../src/index.js";
+import { formatCost, formatStalledDuration, formatWorkflowRuntime, sanitizeDisplayText } from "../../src/index.js";
 import { agentActivityLabel, stalledDuration, textBlock } from "../../src/host-view.js";
-import { drawFrame, formatElapsed, formatTokens, mark, QUIET_MS, REPAINT_MS, type Paint } from "../../src/background-widget.js";
+import { formatElapsed, formatTokens, subagentLabel, subagentModel } from "../../src/background-widget.js";
 import type { SubagentRunRequest, SubagentStatus } from "./contracts.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const REPAINT_MS = 125;
 const TERMINAL_STATES = new Set<SubagentStatus["state"]>(["completed", "failed", "stopped"]);
 const MAX_INSPECT_VALUE_CHARS = 4000;
 const MAX_INSPECT_TOOL_CALLS = 32;
-const MAX_BACKGROUND_WIDGET_ROWS = 10;
 type SubagentRenderArgs = Partial<SubagentRunRequest> & { id?: string };
 
 type ProgressComponent = ReturnType<typeof subagentProgressBlock>;
@@ -31,14 +31,8 @@ function requestMetadata(args: SubagentRenderArgs, metadataAvailable: boolean): 
   return [mode === undefined ? undefined : `mode=${mode}`].filter((value): value is string => value !== undefined).join(" ");
 }
 
-function label(args: SubagentRenderArgs): string {
-  if (typeof args.label === "string" && args.label.trim()) return args.label.trim();
-  if (typeof args.id === "string" && args.id) return args.id.slice(0, 8);
-  return "subagent";
-}
-
 export function formatSubagentPreview(args: Partial<SubagentRunRequest>): string {
-  return `subagent ${label(args)} ${requestMetadata(args, true)}`;
+  return `subagent ${subagentLabel(args, (args as SubagentRenderArgs).id)} ${requestMetadata(args, true)}`;
 }
 
 export function renderSubagentCall(args: Partial<SubagentRunRequest>, context?: { state?: SubagentRenderState; isError?: boolean }) {
@@ -74,10 +68,6 @@ function usageStats(status: SubagentStatus): string {
   const value = status.progress?.accounting;
   return value ? [formatTokens(value.input + value.output), formatCost(value.cost)].filter(Boolean).join(" · ") : "";
 }
-function modelName(status: SubagentStatus): string {
-  const model = status.progress?.state?.model ?? status.attemptDetails?.at(-1)?.setup.model;
-  return model ? `${model.model}${model.thinking ? `:${model.thinking}` : ""}` : "";
-}
 
 function timestamp(value: number | undefined): string | undefined {
   if (value === undefined || !Number.isFinite(value) || value < 0) return undefined;
@@ -102,7 +92,7 @@ function formatSubagentProgress(status: SubagentStatus, args: SubagentRenderArgs
   const metadata = requestMetadata(args, args.id === undefined);
   const stats = usageStats(status);
   const lines = [
-    `${theme.fg(color, stateGlyph(status.state, "●"))} ${theme.bold(theme.fg("accent", `Subagent: ${label({ ...args, id: status.id })}`))} ${theme.fg(color, `[${status.state}]`)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}${stats ? ` ${stats}` : ""}${elapsed ? ` runtime=${elapsed}` : ""}`,
+    `${theme.fg(color, stateGlyph(status.state, "●"))} ${theme.bold(theme.fg("accent", `Subagent: ${subagentLabel(args, status.id)}`))} ${theme.fg(color, `[${status.state}]`)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}${stats ? ` ${stats}` : ""}${elapsed ? ` runtime=${elapsed}` : ""}`,
   ];
   const current = status.state === "running" ? agentActivityLabel(status.progress ?? {}) : undefined;
   const stalled = stalledDuration({ ...status.progress, state: status.state }, now);
@@ -121,7 +111,7 @@ function formatSubagentProgress(status: SubagentStatus, args: SubagentRenderArgs
 function formatSubagentLaunch(status: SubagentStatus, args: SubagentRenderArgs, theme: Theme, expanded: boolean): string {
   const metadata = requestMetadata(args, args.id === undefined);
   const lines = [
-    `${theme.fg("success", "✓")} ${theme.bold(theme.fg("accent", `Subagent: ${label({ ...args, id: status.id })}`))} ${theme.fg("success", "[launched]")}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}`,
+    `${theme.fg("success", "✓")} ${theme.bold(theme.fg("accent", `Subagent: ${subagentLabel(args, status.id)}`))} ${theme.fg("success", "[launched]")}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}`,
   ];
   if (expanded) lines.push(`  ${theme.fg("dim", `id=${status.id}`)}`);
   return lines.join("\n");
@@ -213,37 +203,16 @@ export function renderSubagentResult(result: AgentToolResult<unknown>, options: 
   return component;
 }
 
-type WidgetRun = { status: Readonly<SubagentStatus>; request: Readonly<SubagentRunRequest> };
-
-/** One run as a workflow agent row: a quiet or stalled warning on the left, model and figures against the right rule. */
-function widgetRow({ status, request }: WidgetRun, now: number, paint: Paint): { text: string; right: string } {
-  const lastEventAt = status.progress?.lastEventAt;
-  const silent = lastEventAt === undefined || !Number.isFinite(lastEventAt) || now - lastEventAt < QUIET_MS ? undefined : now - lastEventAt;
-  const role = silent !== undefined && silent >= WORKFLOW_AGENT_STALL_THRESHOLD_MS ? "error" : "warning";
-  const icon = silent === undefined ? mark(status.state, now, paint) : paint(role, "⚠");
-  const warning = silent === undefined ? "" : `  ${paint(role, `${role === "error" ? "stalled" : "quiet"} ${formatElapsed(silent)}`)}`;
-  const accounting = status.progress?.accounting;
-  const attempts = status.attempts ?? 1;
-  const right = [
-    modelName(status),
-    formatTokens(accounting === undefined ? undefined : accounting.input + accounting.output),
-    formatCost(accounting?.cost),
-    status.startedAt === undefined ? "" : formatElapsed(now - status.startedAt),
-    attempts > 1 ? `attempt ${String(attempts)}` : "",
-  ].filter(Boolean).join(" · ");
-  return { text: `${icon} ${sanitizeDisplayText(label({ ...request, id: status.id }))}${warning}`, right };
-}
-
 const RECEIPT_ENTRY_TYPE = "piewf-subagent-receipt";
 type SubagentReceipt = { readonly id: string; readonly label: string; readonly state: string; readonly model?: string; readonly tools?: readonly string[]; readonly input: number; readonly output: number; readonly cacheRead: number; readonly costUsd: number; readonly durationMs: number; readonly attempts: number; readonly error?: string };
 
 function receiptFor(status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>): SubagentReceipt {
   const accounting = status.progress?.accounting;
-  const model = modelName(status);
+  const model = subagentModel(status);
   const tools = status.progress?.state?.tools ?? status.attemptDetails?.at(-1)?.setup.tools;
   return {
     id: status.id,
-    label: label({ ...request, id: status.id }),
+    label: subagentLabel(request, status.id),
     state: status.state,
     ...(model ? { model } : {}),
     ...(tools === undefined ? {} : { tools: [...tools] }),
@@ -275,8 +244,6 @@ export function renderSubagentReceipt(data: SubagentReceipt, expanded: boolean, 
 type ReceiptHost = { appendEntry?: (customType: string, data: SubagentReceipt) => void; registerEntryRenderer?: ExtensionAPI["registerEntryRenderer"] };
 
 export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
-  const key = "piewf-subagents-background";
-  const runs = new Map<string, WidgetRun>();
   const receipted = new Set<string>();
   host.registerEntryRenderer?.<SubagentReceipt>(RECEIPT_ENTRY_TYPE, (entry, options, theme) => {
     if (!entry.data) return undefined;
@@ -284,78 +251,22 @@ export function createSubagentBackgroundWidget(host: ReceiptHost = {}) {
     // Pi treats an over-wide line as fatal, and an error message has no bound.
     return { render: (width: number): string[] => lines.map((line) => truncateToWidth(line, Math.max(1, width), "…")), invalidate() {} };
   });
-  let context: ExtensionContext | undefined;
-  let requestRender: (() => void) | undefined;
-  let timer: ReturnType<typeof setInterval> | undefined;
-  let showing = false;
-
-  const hide = (): void => {
-    if (timer) clearInterval(timer);
-    timer = undefined;
-    requestRender = undefined;
-    if (showing) {
-      try { context?.ui.setWidget(key, undefined); } catch { /* The session UI may already be closing. */ }
-    }
-    showing = false;
-  };
-  const paint = (): void => {
-    if (context?.mode !== "tui" || runs.size === 0) {
-      hide();
-      return;
-    }
-    if (showing) {
-      requestRender?.();
-      return;
-    }
-    try {
-      context.ui.setWidget(key, (tui, theme) => {
-        requestRender = () => { tui.requestRender(); };
-        return {
-          render(width: number): string[] {
-            const now = Date.now();
-            const paintRole: Paint = (role, text) => theme.fg(role, text);
-            // One row per run, so the default concurrency of eight fills the frame exactly.
-            // ponytail: no Alt+O scrolling as in the workflow widget; add it if runs routinely exceed the frame.
-            const budget = MAX_BACKGROUND_WIDGET_ROWS - 2;
-            const rows = [...runs.values()].map((run) => widgetRow(run, now, paintRole));
-            const body = rows.length <= budget ? rows : [...rows.slice(0, budget - 1), { text: theme.fg("muted", `… ${String(rows.length - budget + 1)} more`) }];
-            const title = runs.size === 1 ? "Subagent" : `Subagents · ${String(runs.size)} runs`;
-            return drawFrame(title, "", body, width, paintRole, (text) => theme.fg("accent", text)).map((line) => truncateToWidth(line, Math.max(1, width), ""));
-          },
-          invalidate() {},
-        };
-      }, { placement: "belowEditor" });
-      showing = true;
-      timer = setInterval(() => { requestRender?.(); }, REPAINT_MS);
-      timer.unref();
-    } catch {
-      hide();
-    }
-  };
+  let tui = false;
 
   return {
     start(next: ExtensionContext): void {
-      hide();
-      runs.clear();
       receipted.clear();
-      context = next.mode === "tui" ? next : undefined;
+      tui = next.mode === "tui";
     },
     update(status: Readonly<SubagentStatus>, request: Readonly<SubagentRunRequest>): void {
-      if (request.mode !== "background" || context === undefined) return;
-      if (TERMINAL_STATES.has(status.state)) {
-        runs.delete(status.id);
-        // A foreground run already has its tool block; a background one leaves a receipt, once, like a workflow run.
-        if (!receipted.has(status.id)) {
-          receipted.add(status.id);
-          try { host.appendEntry?.(RECEIPT_ENTRY_TYPE, receiptFor(status, request)); } catch { /* A receipt is display-only. */ }
-        }
-      } else runs.set(status.id, { status, request });
-      paint();
+      // The core workflow widget draws running background subagents; this leaves their receipts.
+      if (request.mode !== "background" || !tui || !TERMINAL_STATES.has(status.state) || receipted.has(status.id)) return;
+      // A foreground run already has its tool block; a background one leaves a receipt, once, like a workflow run.
+      receipted.add(status.id);
+      try { host.appendEntry?.(RECEIPT_ENTRY_TYPE, receiptFor(status, request)); } catch { /* A receipt is display-only. */ }
     },
     dispose(): void {
-      hide();
-      runs.clear();
-      context = undefined;
+      tui = false;
     },
   };
 }

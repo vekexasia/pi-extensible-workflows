@@ -1187,6 +1187,9 @@ export class WorkflowAgentExecutor {
         },
       });
       let lastKnownAccounting: AgentAccounting = zeroAccounting();
+      // The attempt's counted speed from its last progress; #runOnce reports a final snapshot before onComplete and onFailure.
+      let lastSpeed: AgentAccounting["speed"];
+      const withSpeed = (value: AgentAccounting): AgentAccounting => lastSpeed === undefined ? value : { ...value, speed: lastSpeed };
       const accountingFromRuntime = (usage: RuntimeUsage, active: WorkflowAgentSession): AgentAccounting => {
         const input = usage.input;
         const output = usage.output;
@@ -1202,6 +1205,7 @@ export class WorkflowAgentExecutor {
         const complete = value.usage.availability === "complete" && values.every((entry): entry is number => typeof entry === "number" && Number.isFinite(entry));
         const reportable = complete ? value : { ...value, usage: { availability: "complete" as const, input: lastKnownAccounting.input, output: lastKnownAccounting.output, cacheRead: lastKnownAccounting.cacheRead, cacheWrite: lastKnownAccounting.cacheWrite, costUsd: lastKnownAccounting.cost } };
         const update = runtimeProgressToAgentProgress(reportable);
+        if (update.accounting.speed !== undefined) lastSpeed = update.accounting.speed;
         if (complete) lastKnownAccounting = { ...update.accounting };
         await progressHandler(update);
       } : undefined;
@@ -1272,7 +1276,7 @@ export class WorkflowAgentExecutor {
             },
             ...(runStore ? { onSystemPrompt: (entry: { readonly sessionId: string; readonly turn: number; readonly prompt: string }) => runStore.recordSystemPrompt({ ...entry, attempt }) } : {}),
             onComplete: async (result, completedSession) => {
-              const completedAccounting = accountingFromRuntime(result.usage, completedSession);
+              const completedAccounting = withSpeed(accountingFromRuntime(result.usage, completedSession));
               completedAttempt = attemptRecord(attemptSetup.transport.id, attempt, completedSession, setupSummary, completedAccounting, result.value);
               attempts.push(completedAttempt);
               try { await options.onAttempt?.(completedAttempt); }
@@ -1281,7 +1285,7 @@ export class WorkflowAgentExecutor {
             },
             onFailure: async (failure, failedSession) => {
               releaseHandoff("attempt failed");
-              const failedAccounting = accounting(failedSession.getSessionStats());
+              const failedAccounting = withSpeed(accounting(failedSession.getSessionStats()));
               const failedAttempt = attemptRecord(attemptSetup.transport.id, attempt, failedSession, setupSummary, failedAccounting, undefined, { code: failure.code, message: failure.message });
               attempts.push(failedAttempt);
               try { await options.onAttempt?.(failedAttempt); }

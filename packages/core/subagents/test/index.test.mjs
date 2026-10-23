@@ -1,4 +1,4 @@
-/* global setTimeout, setImmediate, structuredClone */
+/* global setTimeout, clearTimeout, setImmediate, structuredClone */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fsPromises, { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -6,7 +6,6 @@ import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { visibleWidth } from "@earendil-works/pi-tui";
 import { Value } from "typebox/value";
 import { WORKFLOW_AGENT_STALL_THRESHOLD_MS, WorkflowError, prepareAgentSetupForInspection, registerWorkflowExtension, resetWorkflowRegistry } from "pi-extensible-workflows";
 import extension, {
@@ -22,6 +21,8 @@ import extension, {
   SUBAGENTS_STOP_PARAMETERS,
 } from "../../dist/subagents/index.js";
 import { getSubagentManager } from "../../dist/src/subagent-manager-handle.js";
+import { registerSubagentNavigator } from "../../dist/subagents/src/navigator.js";
+import { choose, escapes, fakePi, KEY, shown, workspaceOpen } from "../../dist/test/agents-workspace-harness.js";
 
 const toolNames = [
   "subagents_run",
@@ -35,22 +36,24 @@ function testContext() {
   return {};
 }
 
-/** Presses down until `label` is the selected action; the dashboard ignores keys while an action runs, so ignored presses are retried. */
-async function selectAction(component, label) {
-  await waitFor(() => {
-    if (component.render(140).join("\n").includes(`→ ${label}`)) return true;
-    component.handleInput("tui.select.down");
-    return false;
-  });
+/**
+ * Runs /subagents in Pi's TUI: the fake Pi of the agents workspace tests, which shows one custom component at a time, with this
+ * command context. `end` ends the command as Pi does when the session ends (its signal aborts, Pi closes what it still shows) and
+ * waits for it (bounded); a test awaits it before its cleanup, so a case that failed half way leaves no workspace loop behind.
+ */
+function tuiCommand(handler, context, columns = 140, rows = 24) {
+  const session = new AbortController();
+  const pi = fakePi({ columns, rows, signal: session.signal, context: { ...context, mode: "tui", hasUI: true } });
+  const done = handler("", pi.ctx);
+  const end = async () => {
+    session.abort();
+    for (const custom of [...pi.customs]) custom.close();
+    let timer;
+    await Promise.race([done, new Promise((resolve) => { timer = setTimeout(resolve, 2000); })]);
+    clearTimeout(timer);
+  };
+  return { pi, done, end };
 }
-/** Presses escape until the dashboard closes, for the same reason. */
-async function closeDashboard(component, isClosed) {
-  await waitFor(() => {
-    if (!isClosed()) component.handleInput("escape");
-    return isClosed();
-  });
-}
-
 /** A notify that fails the test on warnings; the navigator reports caught errors, assertion failures included, as warnings. */
 function strictNotify(notices = []) {
   return (message, level) => {
@@ -219,7 +222,7 @@ test("renders subagent calls and background or foreground progress consistently"
   assert.match(inspection, /value:.*"answer": 42/s);
 });
 
-test("pins live background subagents below the editor in the workflow frame and leaves one receipt each", async () => {
+test("leaves one receipt for each background subagent and draws no frame of its own", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-widget-"));
   await mkdir(join(cwd, ".pi", "pi-extensible-workflows"), { recursive: true });
   await writeFile(join(cwd, ".pi", "pi-extensible-workflows", "settings.json"), JSON.stringify({ concurrency: 16 }));
@@ -231,8 +234,6 @@ test("pins live background subagents below the editor in the workflow frame and 
   const tools = [];
   const handlers = new Map();
   const widgetCalls = [];
-  let widgetComponent;
-  let renders = 0;
   const theme = { fg: (_color, text) => text, bold: (text) => text };
   const receipts = [];
   const entryRenderers = new Map();
@@ -272,10 +273,7 @@ test("pins live background subagents below the editor in the workflow frame and 
     mode: "tui",
     hasUI: true,
     ui: {
-      setWidget(key, value, options) {
-        widgetCalls.push({ key, value, options });
-        widgetComponent = typeof value === "function" ? value({ requestRender() { renders += 1; } }, theme) : undefined;
-      },
+      setWidget(key) { widgetCalls.push(key); },
     },
   };
 
@@ -285,44 +283,18 @@ test("pins live background subagents below the editor in the workflow frame and 
     const launch = await run.execute("widget-call", { prompt: "watch", label: "scout", mode: "background", worktree: "widget" }, undefined, undefined, context);
     await started.promise;
     assert.equal(launch.details.state, "running");
-    assert.deepEqual(widgetCalls[0].options, { placement: "belowEditor" });
-    assert.match(widgetComponent.render(80).join("\n"), /^╭ Subagent ─+╮\n│ \S scout +00:00 │\n╰─+╯$/);
     for (let index = 1; index < 16; index += 1) {
       const additional = await run.execute(`widget-call-${String(index)}`, { prompt: `watch ${String(index)}`, label: `scout-${String(index)}`, mode: "background" }, undefined, undefined, context);
       assert.equal(additional.details.state, "running");
     }
-    for (const [index, options] of executionOptions.entries()) {
-      await options.onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text: `read-${String(index)}` }, lastEventAt: Date.now(), persist: false });
-    }
-    const freshFrame = widgetComponent.render(80).join("\n");
-    assert.doesNotMatch(freshFrame, /quiet|stalled/);
-    await executionOptions[1].onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], lastEventAt: Date.now() - 3 * 60 * 1000 - 1, persist: false });
-    await executionOptions[0].onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text: "read-0" }, lastEventAt: Date.now() - WORKFLOW_AGENT_STALL_THRESHOLD_MS - 1, persist: false });
-    const frame = widgetComponent.render(80);
-    assert.equal(frame.length, 10);
-    assert.ok(frame.every((line) => visibleWidth(line) === 80), frame.join("\n"));
-    assert.match(frame[0], /^╭ Subagents · 16 runs ─+╮$/);
-    assert.match(frame[1], /^│ ⚠ scout {2}stalled 10:00 +3t · 00:0\d │$/);
-    assert.match(frame[2], /^│ ⚠ scout-1 {2}quiet 03:00 +3t · 00:0\d │$/);
-    assert.match(frame[3], /^│ \S scout-2 +3t · 00:0\d │$/);
-    assert.match(frame[7], /^│ \S scout-6 +3t · 00:0\d │$/);
-    assert.match(frame[8], /^│ … 9 more +│$/);
-    assert.match(frame[9], /^╰─+╯$/);
-    const narrowFrame = widgetComponent.render(24);
-    assert.equal(narrowFrame.length, 10);
-    assert.ok(narrowFrame.every((line) => visibleWidth(line) <= 24), narrowFrame.join("\n"));
-    assert.match(narrowFrame[1], /…/);
-
-    assert.ok(renders > 0);
-
+    for (const options of executionOptions) await options.onProgress({ accounting: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], lastEventAt: Date.now(), persist: false });
     pending.resolve({ value: "done", attempts: [], cwd });
     await cleanupStarted.promise;
     releaseCleanup.resolve();
-    await waitFor(() => widgetCalls.at(-1)?.value === undefined);
-    assert.equal(widgetCalls.at(-1)?.value, undefined);
     // The worktree run reports completed twice (before and after cleanup) but leaves one receipt.
     await waitFor(() => receipts.length === 16);
     assert.equal(new Set(receipts.map(({ data }) => data.id)).size, 16);
+    assert.deepEqual(widgetCalls, [], "the core workflow widget draws background subagents");
     assert.ok(receipts.every(({ customType }) => customType === "piewf-subagent-receipt"));
     const renderer = entryRenderers.get("piewf-subagent-receipt");
     assert.ok(renderer);
@@ -338,7 +310,7 @@ test("pins live background subagents below the editor in the workflow frame and 
   }
 });
 
-test("opens the /subagents dashboard and picker and inspects durable status without an agent call", async () => {
+test("opens the /subagents picker outside the TUI and inspects durable status without an agent call", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-command-"));
   const storageDir = join(cwd, "subagents-storage");
   const firstId = "run-1";
@@ -374,8 +346,6 @@ test("opens the /subagents dashboard and picker and inspects durable status with
   const commands = [];
   const pickerOptions = [];
   const detailScreens = [];
-  const dashboards = [];
-  const theme = { fg: (_color, text) => text, bold: (text) => text };
   const pi = {
     registerTool() {},
     registerCommand(name, options) { commands.push({ name, options }); },
@@ -392,25 +362,6 @@ test("opens the /subagents dashboard and picker and inspects durable status with
         if (!title.startsWith("Subagents")) { detailScreens.push(title); return Promise.resolve("Back"); }
         pickerOptions.push([...options]);
         return Promise.resolve(pickerOptions.length === 1 ? options[2] : "Close");
-      },
-      notify: strictNotify(),
-    },
-  };
-  const tuiContext = {
-    ...context,
-    mode: "tui",
-    ui: {
-      select() { throw new Error("the TUI dashboard replaces the picker"); },
-      async custom(factory) {
-        const component = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, () => undefined);
-        dashboards.push(component.render(120).join("\n"));
-        component.handleInput("tui.select.down");
-        component.handleInput("j");
-        component.handleInput("a");
-        // The full inspection of the new selection brings its result, and with it the editor action.
-        await waitFor(() => component.render(120).join("\n").includes("Open result in editor"));
-        dashboards.push(component.render(120).join("\n"));
-        component.dispose();
       },
       notify: strictNotify(),
     },
@@ -434,18 +385,6 @@ test("opens the /subagents dashboard and picker and inspects durable status with
     assert.doesNotMatch(detailScreens[0], /Role:/);
     assert.doesNotMatch(detailScreens[0], /Result|done/, "the prompt and result open in the editor, as in /workflow");
 
-    await command.options.handler("", tuiContext);
-    const [initial, selected] = dashboards;
-    assert.match(initial, /Runs +\| Selected subagent: reviewer/);
-    assert.match(initial, /→ • reviewer/);
-    assert.ok(initial.indexOf("reviewer ·") < initial.indexOf("newest ·") && initial.indexOf("newest ·") < initial.indexOf("run-2 ·"), initial);
-    assert.doesNotMatch(initial, /Role:/);
-    assert.doesNotMatch(initial, /run-other|run-malformed/);
-    assert.match(selected, /→ • run-2/);
-    assert.match(selected, /Selected subagent: run-2/);
-    assert.doesNotMatch(selected, /\| done/);
-    assert.match(selected, /Copy run path/);
-    assert.doesNotMatch(selected, /Delete/, "a manager without delete offers no deletion");
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -497,155 +436,10 @@ test("emits terminal status before cleanup and a cleaned status after worktree c
   }
 });
 
-test("refreshes an open running subagent dashboard without overlap and stops once everything settles", async () => {
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const timerCallbacks = [];
-  const clearedTimers = [];
-  globalThis.setInterval = (callback, delay) => {
-    assert.equal(delay, 1000);
-    timerCallbacks.push(callback);
-    return { unref() {} };
-  };
-  globalThis.clearInterval = (timer) => { clearedTimers.push(timer); };
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-refresh-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-refresh";
-  const refresh = deferred();
-  let detailCalls = 0;
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "refresh", label: "refresh", mode: "background" }));
-  const running = { id, sessionId: "session-1", state: "running", startedAt: 1, progress: { accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text: "before" } } };
-  let listCalls = 0;
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) {
-      if (!params.id) { listCalls += 1; return [running]; }
-      detailCalls += 1;
-      if (detailCalls === 1) return running;
-      if (detailCalls === 2) return refresh.promise;
-      return { id, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 2, activity: { kind: "text", text: "done" } };
-    },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  };
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  const flush = async () => { for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setImmediate(resolve)); };
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        let finish;
-        const completed = new Promise((resolve) => { finish = resolve; });
-        let renders = 0;
-        const component = factory({ terminal: { rows: 20 }, requestRender() { renders += 1; } }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
-        assert.equal(timerCallbacks.length, 1);
-        assert.match(component.render(120).join("\n"), /before/);
-        assert.match(component.render(120).join("\n"), /auto-refresh 1s/);
-        timerCallbacks[0]();
-        timerCallbacks[0]();
-        await waitFor(() => detailCalls === 2);
-        await flush();
-        assert.equal(detailCalls, 2);
-        refresh.resolve({ ...running, state: "completed", finishedAt: 2, progress: { ...running.progress, activity: { kind: "text", text: "done" } } });
-        await waitFor(() => component.render(120).join("\n").includes("done"));
-        assert.equal(detailCalls, 2);
-        assert.equal(listCalls, 1, "a tick re-reads the active runs, not the whole list");
-        assert.equal(clearedTimers.length, 1);
-        assert.doesNotMatch(component.render(120).join("\n"), /auto-refresh/);
-        const rendersAtTerminal = renders;
-        timerCallbacks[0]();
-        await flush();
-        assert.equal(detailCalls, 2);
-        assert.equal(renders, rendersAtTerminal);
-        component.handleInput("escape");
-        await completed;
-        return completed;
-      },
-      notify(message) { throw new Error(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
 
-test("ignores an in-flight detail refresh after the panel closes", async () => {
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const timerCallbacks = [];
-  const clearedTimers = [];
-  globalThis.setInterval = (callback, delay) => { assert.equal(delay, 1000); timerCallbacks.push(callback); return {}; };
-  globalThis.clearInterval = (timer) => { clearedTimers.push(timer); };
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-refresh-close-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-refresh-close";
-  const refresh = deferred();
-  let detailCalls = 0;
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "refresh close", mode: "background" }));
-  const running = { id, sessionId: "session-1", state: "running", startedAt: 1 };
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) {
-      if (!params.id) return [running];
-      detailCalls += 1;
-      if (detailCalls === 1) return running;
-      return refresh.promise;
-    },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  };
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  const flush = async () => { for (let index = 0; index < 8; index += 1) await new Promise((resolve) => setImmediate(resolve)); };
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        let finish;
-        const completed = new Promise((resolve) => { finish = resolve; });
-        let renders = 0;
-        const component = factory({ terminal: { rows: 20 }, requestRender() { renders += 1; } }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
-        assert.equal(timerCallbacks.length, 1);
-        timerCallbacks[0]();
-        component.handleInput("escape");
-        await completed;
-        refresh.resolve({ ...running, state: "completed", finishedAt: 2 });
-        await flush();
-        assert.equal(detailCalls, 2);
-        assert.equal(renders, 0);
-        assert.equal(clearedTimers.length, 1);
-        return completed;
-      },
-      notify(message) { throw new Error(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("matches workflow agent detail fields and runs standalone registered and copy actions with live context", async () => {
+test("the agents workspace steps aside for a subagent's registered standalone action with the live context", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const escaped = escapes(t);
   resetWorkflowRegistry();
   const cwd = await mkdtemp(join(tmpdir(), "subagents-agent-actions-"));
   const storageDir = join(cwd, "storage");
@@ -658,7 +452,7 @@ test("matches workflow agent detail fields and runs standalone registered and co
     setup: { hookNames: ["setup"], model: { provider: "fixture", model: "model" }, tools: ["read"], cwd },
     accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 },
   };
-  const liveSession = { reference: attempt.session };
+  const liveSession = { reference: attempt.session, subscribe() { return () => {}; } };
   const prepared = { cwd, model: { provider: "fixture", model: "model" }, tools: ["read"], sessionLabel: "scout", systemPrompt: "SYSTEM" };
   const handoff = { state: "local-running", transferred: false };
   const status = {
@@ -692,566 +486,127 @@ test("matches workflow agent detail fields and runs standalone registered and co
     },
   } });
   const commands = [];
-  const copied = [];
-  const renders = [];
-  const pi = {
-    registerTool() {},
-    registerCommand(name, options) { commands.push({ name, options }); },
-  };
-  registerSubagentsExtension(pi, { manager, managerDependencies: { storageDir }, clipboard: async (value) => { copied.push(value); } });
+  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
   const command = commands.find(({ name }) => name === "subagents");
   assert.ok(command);
-  const theme = { fg: (_color, text) => text, bold: (text) => text };
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        let component;
-        let finish;
-        const completed = new Promise((resolve) => { finish = resolve; });
-        let closed = false;
-        component = factory({ terminal: { rows: 30 }, requestRender() {} }, theme, { matches(data, binding) { return (data === "escape" && binding === "tui.select.cancel") || data === binding; } }, (value) => { closed = true; finish(value); });
-        renders.push(component.render(140).join("\n"));
-        assert.match(renders.at(-1), /Activity: read/);
-        assert.match(renders.at(-1), /stalled\? 10m/);
-        assert.match(renders.at(-1), /Model: fixture\/model/);
-        assert.doesNotMatch(renders.at(-1), /Role:/);
-        assert.match(renders.at(-1), /Tools: read/);
-        assert.match(renders.at(-1), /Attempts: 2/);
-        assert.match(renders.at(-1), /Duration: 10m/);
-        assert.match(renders.at(-1), /Tokens: ∑10/);
-        component.handleInput("a");
-        const actionScreen = component.render(140).join("\n");
-        assert.match(actionScreen, /Standalone fixture action/);
-        assert.match(actionScreen, /Copy branch/);
-        assert.match(actionScreen, /Copy worktree path/);
-        assert.match(actionScreen, /Open prompt in editor/);
-        assert.match(actionScreen, /Open system prompt in editor/);
-        assert.match(actionScreen, /Steer/);
-        assert.match(actionScreen, /Stop/);
-        assert.match(actionScreen, /Copy run path\n.*Copy agent ID/, "Copy run path sits before Copy agent ID, as in /workflow");
-        assert.doesNotMatch(actionScreen, /Delete/, "a running run cannot be deleted");
-        component.handleInput("tui.select.confirm");
-        await waitFor(() => actionContext !== undefined);
-        assert.equal(actionContext.liveSession, liveSession);
-        assert.equal(actionContext.prepared, prepared);
-        assert.equal(actionContext.handoff, handoff);
-        assert.equal(actionContext.session.sessionId, "agent-session");
-        await waitFor(() => !component.render(140).join("\n").includes("Agent actions"));
-        const copyAction = async (label) => {
-          await selectAction(component, label);
-          const count = copied.length;
-          component.handleInput("tui.select.confirm");
-          await waitFor(() => copied.length === count + 1);
-          return copied.at(-1);
-        };
-        component.handleInput("a");
-        assert.equal(await copyAction("Copy agent ID"), status.id);
-        // Copying leaves the menu open, as in /workflow: selecting the next action needs the menu still there.
-        assert.equal(await copyAction("Copy run path"), join(storageDir, status.id));
-        assert.match(component.render(140).join("\n"), /Agent actions/);
-        await closeDashboard(component, () => closed);
-        return completed;
-      },
-      notify: strictNotify(),
-    },
-  };
+  const { pi, done: opened, end } = tuiCommand(command.options.handler, await executionContext(cwd));
   try {
-    await command.options.handler("", context);
+    await shown(pi, /^#1\/1 scout running/);
+    const mark = pi.events.length;
+    await choose(pi, "Standalone fixture action");
+    await waitFor(() => pi.events.length > mark + 1 && workspaceOpen(pi));
+    assert.deepEqual(pi.events.slice(mark), ["done", "status workflow-stop -", "custom"], "it runs once the workspace stepped aside, which then opens again");
+    assert.equal(actionContext.liveSession, liveSession);
+    assert.equal(actionContext.prepared, prepared);
+    assert.equal(actionContext.handoff, handoff);
+    assert.equal(actionContext.session.sessionId, "agent-session");
+    await shown(pi, /^#1\/1 scout running/);
+    pi.send(KEY.ctrlC);
+    await opened;
+    assert.deepEqual(pi.violations, [], "no dialog over a pending custom component");
+    assert.deepEqual(escaped, []);
   } finally {
+    await end();
     resetWorkflowRegistry();
     await rm(cwd, { recursive: true, force: true });
   }
 });
-test("captures steering text inside the dashboard without nesting UI prompts", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-steer-focus-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-steer-focus";
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `control\n${Array.from({ length: 40 }, (_, index) => `detail-${String(index)}`).join("\n")}`, label: "control", mode: "background" }));
-  const steers = [];
-  const status = { id, sessionId: "session-1", state: "running", startedAt: 1 };
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? status : [status]; },
-    async steer(request) { steers.push(request.message); return { id, accepted: true }; },
-    async stop() {},
-    async retry() {},
-  };
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  let customCount = 0;
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        customCount += 1;
-        let finish;
-        const completed = new Promise((resolve) => { finish = resolve; });
-        const component = factory({ terminal: { rows: 8 }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
-        if (customCount === 1) {
-          component.handleInput("a");
-          for (let index = 0; index < 10 && !component.render(140).join("\n").includes("→ Steer"); index += 1) component.handleInput("tui.select.down");
-          assert.match(component.render(140).join("\n"), /→ Steer/);
-          component.handleInput("tui.select.confirm");
-          assert.match(component.render(140).join("\n"), /Steer subagent/);
-          for (const character of "continue inside the panel") component.handleInput(character);
-          assert.match(component.render(140).join("\n"), /Steer subagent/);
-          assert.match(component.render(140).join("\n"), /continue inside the panel/);
-          component.handleInput("\r");
-        } else {
-          component.handleInput("escape");
-        }
-        const result = await completed;
-        return result;
-      },
-      async input() { throw new Error("nested input must not be used"); },
-      notify: strictNotify(),
-    },
-  };
-  try {
-    await command.options.handler("", context);
-    assert.deepEqual(steers, ["continue inside the panel"]);
-    assert.equal(customCount, 1);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
 
-function dashboardFixture(storageDir, manager) {
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  return command;
-}
-function openDashboard(factory, rows = 30) {
-  let finish;
-  const completed = new Promise((resolve) => { finish = resolve; });
-  const component = factory({ terminal: { rows }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => finish(value));
-  return { component, completed, text: (width = 140) => component.render(width).join("\n") };
-}
-function chooseAction(component, label) {
-  component.handleInput("a");
-  for (let index = 0; index < 16 && !component.render(140).join("\n").includes(`→ ${label}`); index += 1) component.handleInput("tui.select.down");
-  assert.match(component.render(140).join("\n"), new RegExp(`→ ${label}`));
-  component.handleInput("tui.select.confirm");
-}
-
-test("confirms a dashboard stop and shows the fresh list when the selection cannot be re-read", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-reload-failure-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-reload-failure";
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "stop me", label: "stop-me", mode: "background" }));
-  let stops = 0;
-  const notices = [];
-  const status = { id, sessionId: "session-1", state: "running", startedAt: 1 };
-  const command = dashboardFixture(storageDir, {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) {
-      if (!params.id) return [{ ...status, state: stops ? "stopped" : "running" }];
-      if (stops) throw new Error("detail unavailable");
-      return status;
-    },
-    async steer() {},
-    async stop() { stops += 1; return { ...status, state: "stopped" }; },
-    async retry() {},
-  });
-  let afterStop = "";
-  let question = "";
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async confirm() { throw new Error("Pi's confirm dialog would replace the dashboard"); },
-      async custom(factory) {
-        const { component, completed, text } = openDashboard(factory);
-        chooseAction(component, "Stop");
-        await waitFor(() => text().includes("Stop subagent?"));
-        question = text();
-        component.handleInput("tui.select.down");
-        component.handleInput("tui.select.confirm");
-        await waitFor(() => !text().includes("Stop subagent?"));
-        assert.equal(stops, 0, "declining the confirmation keeps the run");
-        // Declining leaves the menu on Stop, so confirming again once the first attempt settles asks again.
-        await waitFor(() => { if (!text().includes("Stop subagent?")) component.handleInput("tui.select.confirm"); return text().includes("Stop subagent?"); });
-        assert.match(text(), /→ Yes/);
-        component.handleInput("tui.select.confirm");
-        await waitFor(() => !text().includes("Agent actions"));
-        afterStop = text();
-        component.handleInput("escape");
-        return completed;
-      },
-      notify(message) { notices.push(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-    assert.equal(stops, 1);
-    assert.match(question, new RegExp(`Stop subagent\\?\\nStop subagent stop-me \\(${id}\\)\\? This cannot be undone\\.\\n→ Yes\\n  No\\n`));
-    assert.match(afterStop, /• stop-me · ✗/, "the fresh list shows even though the selection could not be re-read");
-    assert.match(notices.join("\n"), /Stopped subagent/);
-    assert.match(notices.join("\n"), /Cannot refresh subagents: detail unavailable/);
-    assert.doesNotMatch(notices.join("\n"), /Cannot stop/);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("refreshes the action menu after a failed dashboard action", async () => {
-  // The refresh timer never fires here, so only the post-failure reload can update the menu.
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const fakeTimer = {};
-  globalThis.setInterval = (callback, delay, ...args) => delay === 1000 ? fakeTimer : originalSetInterval(callback, delay, ...args);
-  globalThis.clearInterval = (timer) => { if (timer !== fakeTimer) originalClearInterval(timer); };
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-action-failure-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-action-failure";
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "settles", label: "settles", mode: "background" }));
-  let state = "running";
-  const notices = [];
-  const command = dashboardFixture(storageDir, {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { const status = { id, sessionId: "session-1", state, startedAt: 1, ...(state === "running" ? {} : { finishedAt: 2 }) }; return params.id ? status : [status]; },
-    async steer() {},
-    async stop() { throw new Error("unexpected stop"); },
-    async retry() {},
-  });
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async confirm() { throw new Error("an unavailable action must not ask"); },
-      async custom(factory) {
-        const { component, completed, text } = openDashboard(factory);
-        component.handleInput("a");
-        for (let index = 0; index < 16 && !text().includes("→ Stop"); index += 1) component.handleInput("tui.select.down");
-        state = "completed";
-        component.handleInput("tui.select.confirm");
-        await waitFor(() => notices.length === 1 && !text().includes("Stop"));
-        assert.match(text(), /Agent actions/, "the menu stays open on the fresh options");
-        assert.match(text(), /Delete|Copy agent ID/);
-        component.handleInput("escape");
-        component.handleInput("escape");
-        return completed;
-      },
-      notify(message) { notices.push(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-    assert.deepEqual(notices, ["Cannot stop: Action Stop is no longer available"]);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("a dashboard tick keeps the last known row of a run it cannot read", async () => {
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const ticks = [];
-  const fakeTimer = {};
-  globalThis.setInterval = (callback, delay, ...args) => { if (delay !== 1000) return originalSetInterval(callback, delay, ...args); ticks.push(callback); return fakeTimer; };
-  globalThis.clearInterval = (timer) => { if (timer !== fakeTimer) originalClearInterval(timer); };
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-unreadable-"));
-  const storageDir = join(cwd, "storage");
-  const progress = (text) => ({ accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: [], activity: { kind: "tool", text } });
-  const readable = { id: "run-readable", sessionId: "session-1", state: "running", startedAt: 2, progress: progress("before") };
-  const unreadable = { id: "run-unreadable", sessionId: "session-1", state: "running", startedAt: 1 };
-  for (const status of [readable, unreadable]) {
-    await mkdir(join(storageDir, status.id), { recursive: true });
-    await writeFile(join(storageDir, status.id, "request.json"), JSON.stringify({ prompt: status.id, label: status.id, mode: "background" }));
-  }
-  let ticked = false;
-  const command = dashboardFixture(storageDir, {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) {
-      if (!params.id) return [readable, unreadable];
-      if (params.id === unreadable.id) throw new Error("unreadable");
-      return ticked ? { ...readable, progress: progress("after") } : readable;
-    },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  });
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        const { component, text } = openDashboard(factory);
-        assert.match(text(), /→ • run-readable/);
-        assert.match(text(), /Activity: before/);
-        assert.equal(ticks.length, 1);
-        ticked = true;
-        ticks[0]();
-        await waitFor(() => text().includes("Activity: after"));
-        assert.match(text(), /• run-unreadable · \S/, "the unreadable run keeps its last known row");
-        assert.match(text(), /auto-refresh 1s/);
-        component.dispose();
-      },
-      notify: strictNotify(),
-    },
-  };
-  try {
-    await command.options.handler("", context);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("deletes a settled run and the settled runs of one state from the dashboard", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-delete-"));
-  const storageDir = join(cwd, "storage");
-  const statuses = [
-    { id: "run-failed", sessionId: "session-1", state: "failed", startedAt: 1, finishedAt: 30, error: { code: "AGENT_FAILED", message: "boom" } },
-    { id: "run-done-a", sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 20 },
-    { id: "run-done-b", sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 10 },
-  ];
-  for (const status of statuses) {
-    await mkdir(join(storageDir, status.id), { recursive: true });
-    await writeFile(join(storageDir, status.id, "request.json"), JSON.stringify({ prompt: status.id, label: status.id, mode: "background" }));
-  }
-  const deleted = [];
-  const questions = [];
-  const notices = [];
-  const live = () => statuses.filter((status) => !deleted.includes(status.id));
-  const command = dashboardFixture(storageDir, {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? live().find((status) => status.id === params.id) ?? Promise.reject(new Error("gone")) : live(); },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-    async delete(request) { deleted.push(request.id); return { id: request.id, deleted: true }; },
-  });
-  let closed = false;
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async confirm() { throw new Error("Pi's confirm dialog would replace the dashboard"); },
-      async custom(factory) {
-        const { component, completed, text } = openDashboard(factory);
-        void completed.then(() => { closed = true; });
-        const accept = async (title) => {
-          await waitFor(() => text().includes(title));
-          questions.push(text().split("\n").slice(-5, -3).join("\n"));
-          component.handleInput("tui.select.confirm");
-        };
-        assert.match(text(), /→ • run-failed/);
-        component.handleInput("a");
-        assert.match(text(), /Delete\n.*Delete all completed\n.*Delete all failed\n.*Copy run path/);
-        component.handleInput("escape");
-        chooseAction(component, "Delete");
-        await accept("Delete subagent?");
-        await waitFor(() => deleted.length === 1 && text().includes("→ • run-done-a"));
-        assert.doesNotMatch(text(), /run-failed|Delete all failed/);
-        chooseAction(component, "Delete all completed");
-        await accept("Delete completed runs?");
-        await waitFor(() => closed);
-        return completed;
-      },
-      notify(message) { notices.push(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-    assert.deepEqual(deleted, ["run-failed", "run-done-a", "run-done-b"]);
-    assert.deepEqual(questions, ["Delete subagent?\nDelete run-failed (run-failed) and its record? This cannot be undone.", "Delete completed runs?\nDelete all completed subagent runs and their records? This cannot be undone."]);
-    assert.deepEqual(notices, ["Deleted subagent run-failed.", "Deleted 2 completed subagent run(s).", "No durable subagent runs in this session."]);
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("tells repeated names apart with the short ID in the dashboard list, as the /workflow picker does", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-twins-"));
-  const storageDir = join(cwd, "storage");
-  const statuses = [
-    { id: "aaaaaaaa-0001", label: "twin", finishedAt: 30 },
-    { id: "bbbbbbbb-0002", label: "twin", finishedAt: 20 },
-    { id: "cccccccc-0003", label: "solo", finishedAt: 10 },
-  ].map(({ id, label, finishedAt }) => ({ id, label, status: { id, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt } }));
-  for (const { id, label } of statuses) {
+/** Two settled runs of this session, alpha first, and a manager that inspects them. */
+async function workspaceRuns(cwd) {
+  const storageDir = join(cwd, "subagents-storage");
+  const statuses = [];
+  for (const [id, label, finishedAt] of [["run-alpha", "alpha", 2], ["run-beta", "beta", 1]]) {
     await mkdir(join(storageDir, id), { recursive: true });
-    await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: id, label, mode: "background" }));
+    await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `${label} prompt`, label, mode: "background" }));
+    statuses.push({ id, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt });
   }
-  const command = dashboardFixture(storageDir, {
+  const manager = {
     async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? statuses.find(({ id }) => id === params.id)?.status : statuses.map(({ status }) => status); },
+    async inspect(params) { return params.id ? statuses.find(({ id }) => id === params.id) : statuses; },
     async steer() {},
     async stop() {},
     async retry() {},
+  };
+  return { storageDir, manager };
+}
+
+test("/subagents in the TUI hands its workspace this session's subagents, their actions with its clipboard and the configured editor; a session with none gets the notice and no workspace", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-workspace-opener-"));
+  const { storageDir, manager: listed } = await workspaceRuns(cwd);
+  const inspections = [];
+  const manager = { ...listed, async inspect(params, inspectContext) { inspections.push(inspectContext); return listed.inspect(params, inspectContext); } };
+  const opens = [];
+  const copied = [];
+  let command;
+  registerSubagentNavigator((name, options) => { if (name === "subagents") command = options; }, manager, storageDir, async (value) => { copied.push(value); }, async (context, options) => {
+    opens.push({ context, options });
+    return undefined;
   });
-  let screen = "";
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        const { component, text } = openDashboard(factory);
-        screen = text();
-        component.dispose();
-      },
-      notify: strictNotify(),
-    },
-  };
+  assert.ok(command);
+  const notices = [];
+  const context = { ...(await executionContext(cwd)), mode: "tui", hasUI: true, ui: { notify(message, level) { notices.push(`${level ?? "info"}: ${message}`); }, async select() { throw new Error("no picker in the TUI"); } } };
+  const previous = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR };
+  process.env.VISUAL = "configured-editor --wait";
   try {
-    await command.options.handler("", context);
-    assert.match(screen, /→ • twin aaaaaaaa · ✓/);
-    assert.match(screen, / {2}• twin bbbbbbbb · ✓/);
-    assert.match(screen, / {2}• solo · ✓/);
+    await command.handler("", context);
+    assert.deepEqual(notices, []);
+    assert.equal(opens.length, 1);
+    const { context: openedContext, options } = opens[0];
+    assert.equal(openedContext, context);
+    assert.equal(options.initialKey, undefined);
+    assert.deepEqual((await options.agents.list()).map(({ key, agent }) => [key, agent?.name]), [["subagents", undefined], ["subagent:run-alpha", "alpha"], ["subagent:run-beta", "beta"]], "the Subagents group alone, named as the /subagents list names them");
+    assert.ok(inspections.length > 0 && inspections.every((inspectContext) => inspectContext.extensionContext === context), "every inspection of the TUI route gets the command's context");
+    assert.equal(options.actions.length, 1);
+    assert.deepEqual((await options.actions[0].actions({ kind: "subagent", id: "run-alpha" })).map(({ label }) => label), ["Open prompt in editor", "Copy run path", "Copy agent ID"]);
+    await options.actions[0].run({ kind: "subagent", id: "run-alpha" }, "Copy agent ID", { notify() {} });
+    assert.deepEqual(copied, ["run-alpha"], "a copy uses the extension's clipboard");
+    assert.equal(options.editorCommand(), "configured-editor --wait");
+    // No subagent in this session: the notice, and no workspace.
+    registerSubagentNavigator((name, registered) => { if (name === "subagents") command = registered; }, { ...manager, async inspect() { return []; } }, storageDir, async () => {}, async () => { throw new Error("no workspace for an empty session"); });
+    await command.handler("", context);
+    assert.deepEqual(notices, ["info: No durable subagent runs in this session."]);
   } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) Reflect.deleteProperty(process.env, name);
+      else process.env[name] = value;
+    }
     await rm(cwd, { recursive: true, force: true });
   }
 });
 
-test("keeps the selected run in view after leaving the action menu", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-selection-"));
+test("in the TUI session_shutdown closes the open /subagents workspace: Pi's screen back with mouse tracking off, Pi left stopped, the command settled", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const escaped = escapes(t);
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-workspace-shutdown-"));
   const storageDir = join(cwd, "storage");
-  const statuses = Array.from({ length: 12 }, (_, index) => ({ id: `run-${String(index).padStart(2, "0")}`, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 100 - index }));
-  for (const status of statuses) {
-    await mkdir(join(storageDir, status.id), { recursive: true });
-    await writeFile(join(storageDir, status.id, "request.json"), JSON.stringify({ prompt: status.id, label: `label-${status.id}`, mode: "background" }));
-  }
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? statuses.find((status) => status.id === params.id) : statuses; },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  };
+  await mkdir(join(storageDir, "run-done"), { recursive: true });
+  await writeFile(join(storageDir, "run-done", "request.json"), JSON.stringify({ prompt: "done prompt", label: "done", mode: "background" }));
+  const status = { id: "run-done", sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 2 };
+  const manager = { async run() { throw new Error("unexpected run"); }, async inspect(params) { return params.id ? status : [status]; }, async steer() {}, async stop() {}, async retry() {} };
   const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
+  let shutdown;
+  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); }, on(name, handler) { if (name === "session_shutdown") shutdown = handler; } }, { manager, managerDependencies: { storageDir } });
   const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        const component = factory({ terminal: { rows: 10 }, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, () => undefined);
-        component.handleInput("tui.select.up");
-        assert.match(component.render(120).join("\n"), /→ • label-run-11/, "moving to the last run scrolls it into view");
-        component.handleInput("a");
-        component.handleInput("escape");
-        assert.match(component.render(120).join("\n"), /→ • label-run-11/, "leaving the action menu scrolls back to the selection");
-        component.dispose();
-      },
-      notify(message) { throw new Error(message); },
-    },
-  };
+  assert.ok(command && shutdown);
+  const { pi, done, end } = tuiCommand(command.options.handler, await executionContext(cwd));
+  let settled = false;
+  void done.then(() => { settled = true; });
   try {
-    await command.options.handler("", context);
+    await shown(pi, /^#1\/1 done completed/);
+    const opened = pi.terminal.written.length;
+    assert.ok(pi.terminal.written.includes("\x1b[?1049h") && pi.terminal.written.includes("\x1b[?1000h"), "the workspace is on the alternate screen with mouse tracking on");
+    await shutdown({ type: "session_shutdown", reason: "quit" });
+    await waitFor(() => settled, () => { throw new Error(`/subagents still runs; Pi saw: ${pi.events.join(", ")}`); });
+    const closed = pi.terminal.written.slice(opened);
+    assert.ok(closed.includes("\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l"), "mouse tracking off");
+    assert.ok(closed.endsWith("\x1b[?1049l\x1b[?25h\x1b[?2026l"), "the alternate screen left with Pi's screen kept");
+    assert.deepEqual(pi.parent, ["stop:true"], "Pi left stopped for its shutdown");
+    assert.equal(globalThis[Symbol.for("pi-extensible-workflows.agents-workspace-loop")], undefined, "the loop ended");
+    assert.deepEqual(pi.notified, []);
+    assert.deepEqual(escaped, []);
   } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
-
-test("bounds every narrow dashboard row while drilling from the list to details, actions, and steering", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-narrow-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-narrow";
-  const originalSetInterval = globalThis.setInterval;
-  const originalClearInterval = globalThis.clearInterval;
-  const timerCallbacks = [];
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: `narrow\n${Array.from({ length: 40 }, (_, index) => `detail-${String(index)}`).join("\n")}`, label: "narrow", mode: "background" }));
-  const status = { id, sessionId: "session-1", state: "running", startedAt: 1 };
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? status : [status]; },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  };
-  const fakeTimer = {};
-  globalThis.setInterval = (callback, delay, ...args) => { if (delay !== 1000) return originalSetInterval(callback, delay, ...args); timerCallbacks.push(callback); return fakeTimer; };
-  globalThis.clearInterval = (timer) => { if (timer !== fakeTimer) originalClearInterval(timer); };
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  const width = 12;
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        let closed = false;
-        let renders = 0;
-        const tui = { terminal: { rows: 5 }, requestRender() { renders += 1; } };
-        const component = factory(tui, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, () => { closed = true; });
-        assert.equal(timerCallbacks.length, 1);
-        const refreshWithToolCalls = async (count) => {
-          status.progress = { accounting: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }, toolCalls: Array.from({ length: count }, (_, index) => ({ id: `tool-${String(index)}`, name: `tool-${String(index)}`, state: "completed" })) };
-          const rendersBefore = renders;
-          timerCallbacks[0]();
-          for (let index = 0; index < 400 && renders === rendersBefore; index += 1) await new Promise((resolve) => setTimeout(resolve, 5));
-          assert.equal(renders, rendersBefore + 1);
-        };
-        const assertNarrowRows = (rows) => assert.ok(rows.every((row) => visibleWidth(row) <= width), rows.join("\n"));
-        const list = component.render(width);
-        assertNarrowRows(list);
-        assert.equal(list.some((row) => row.includes("→ • narrow")), true);
-        component.handleInput("tui.select.confirm");
-        for (let index = 0; index < 60; index += 1) component.handleInput("tui.select.down");
-        const detailBottom = component.render(width);
-        assertNarrowRows(detailBottom);
-        assert.equal(detailBottom.some((row) => row === "actions"), true, "scrolling reaches the hint that ends the details");
-        assert.equal(detailBottom.some((row) => row.includes("detail-")), false, "the prompt opens in the editor instead");
-        for (let index = 0; index < 3; index += 1) component.handleInput("tui.select.up");
-        assert.notDeepEqual(component.render(width), detailBottom);
-        component.handleInput("a");
-        const actionScreen = component.render(width);
-        assertNarrowRows(actionScreen);
-        assert.equal(actionScreen.some((row) => row.startsWith("→ Open")), true);
-        await refreshWithToolCalls(6);
-        const refreshed = component.render(width);
-        assertNarrowRows(refreshed);
-        assert.equal(refreshed.some((row) => row.startsWith("→ Open")), true);
-        for (let index = 0; index < 10 && !component.render(width).join("\n").includes("→ Steer"); index += 1) component.handleInput("tui.select.down");
-        assert.match(component.render(width).join("\n"), /→ Steer/);
-        component.handleInput("tui.select.confirm");
-        const steer = component.render(width);
-        assertNarrowRows(steer);
-        assert.match(steer.join("\n"), /Steer/);
-        component.handleInput("escape");
-        component.handleInput("escape");
-        component.handleInput("escape");
-        assert.equal(closed, false, "escape steps back from steering, actions, and details before closing");
-        component.handleInput("escape");
-        assert.equal(closed, true);
-        return undefined;
-      },
-      notify(message) { throw new Error(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    globalThis.clearInterval = originalClearInterval;
+    await end();
     await rm(cwd, { recursive: true, force: true });
   }
 });
@@ -1267,6 +622,7 @@ test("runs navigator steer, stop, and non-blocking retry actions with state reva
   const retryContexts = [];
   const selectedOptions = [];
   const confirms = [];
+  const editors = [];
   const manager = {
     async run() { throw new Error("unexpected run"); },
     async inspect(params) {
@@ -1297,7 +653,7 @@ test("runs navigator steer, stop, and non-blocking retry actions with state reva
         if (options.includes("Stop")) return "Stop";
         return "Retry";
       },
-      async input() { return "continue with the checklist"; },
+      async editor(title) { editors.push(title); return "  continue with the checklist\n"; },
       async confirm(title) { confirms.push(title); return confirms.length > 1; },
       notify: strictNotify(),
     },
@@ -1305,6 +661,7 @@ test("runs navigator steer, stop, and non-blocking retry actions with state reva
   try {
     await command.options.handler("", context);
     assert.deepEqual(steers, ["continue with the checklist"]);
+    assert.deepEqual(editors, ["Steer subagent"], "the picker steers through Pi's editor dialog");
     assert.equal(state, "stopped");
     assert.deepEqual(confirms, ["Stop subagent?", "Stop subagent?"], "a declined stop asks again the next time");
     assert.equal(retryContexts.length, 1);
@@ -1356,71 +713,6 @@ test("reports an invalid navigator retry result without leaving the picker", asy
   }
 });
 
-test("opens bounded prompt and result artifacts while terminal runs hide system prompts", async () => {
-  const cwd = await mkdtemp(join(tmpdir(), "subagents-navigator-editors-"));
-  const storageDir = join(cwd, "storage");
-  const id = "run-editors";
-  await mkdir(join(storageDir, id), { recursive: true });
-  await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: "PROMPT_START", label: "editor", mode: "background" }));
-  const attempt = { attempt: 1, transport: "fixture", setup: { hookNames: [], model: { provider: "fixture", model: "model" }, tools: [], cwd }, accounting: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5 } };
-  const status = { id, sessionId: "session-1", state: "completed", startedAt: 1, finishedAt: 2, attempts: 1, attemptDetails: [attempt] };
-  const manager = {
-    async run() { throw new Error("unexpected run"); },
-    async inspect(params) { return params.id ? { ...status, value: { answer: 42 } } : [status]; },
-    async steer() {},
-    async stop() {},
-    async retry() {},
-  };
-  const editorPath = join(cwd, "fake-editor.sh");
-  const editedPath = join(cwd, "edited-content");
-  const openedPath = join(cwd, "opened-path");
-  await writeFile(editorPath, "#!/bin/sh\nprintf '%s' \"$3\" > \"$2\"\ncat \"$3\" > \"$1\"\n", { mode: 0o755 });
-  const previous = { VISUAL: process.env.VISUAL, EDITOR: process.env.EDITOR, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
-  process.env.VISUAL = `${editorPath} ${editedPath} ${openedPath}`;
-  process.env.EDITOR = process.env.VISUAL;
-  process.env.PI_CODING_AGENT_DIR = cwd;
-  const commands = [];
-  registerSubagentsExtension({ registerTool() {}, registerCommand(name, options) { commands.push({ name, options }); } }, { manager, managerDependencies: { storageDir } });
-  const command = commands.find(({ name }) => name === "subagents");
-  assert.ok(command);
-  const context = {
-    ...(await executionContext(cwd)),
-    mode: "tui",
-    hasUI: true,
-    ui: {
-      async custom(factory) {
-        let finish;
-        const completed = new Promise((resolve) => { finish = resolve; });
-        let closed = false;
-        const component = factory({ terminal: { rows: 30 }, stop() {}, start() {}, requestRender() {} }, { fg: (_color, text) => text, bold: (text) => text }, { matches(data, binding) { return data === binding || data === "escape" && binding === "tui.select.cancel"; } }, (value) => { closed = true; finish(value); });
-        const waitForArtifact = async (label, marker) => {
-          await selectAction(component, label);
-          component.handleInput("tui.select.confirm");
-          await waitFor(async () => { try { return (await readFile(editedPath, "utf8")).includes(marker); } catch { return false; } });
-          assert.match(await readFile(openedPath, "utf8"), /artifact\.(md|json)$/);
-        };
-        component.handleInput("a");
-        assert.doesNotMatch(component.render(140).join("\n"), /Open system prompt in editor/);
-        await waitForArtifact("Open prompt in editor", "PROMPT_START");
-        // Back from the editor the menu stays open, as in /workflow, so the result is one keypress away.
-        await waitForArtifact("Open result in editor", '"answer": 42');
-        assert.match(component.render(140).join("\n"), /Agent actions[\s\S]*→ Open result in editor/);
-        await closeDashboard(component, () => closed);
-        return completed;
-      },
-      notify(message) { throw new Error(message); },
-    },
-  };
-  try {
-    await command.options.handler("", context);
-  } finally {
-    for (const [name, value] of Object.entries(previous)) {
-      if (value === undefined) Reflect.deleteProperty(process.env, name);
-      else process.env[name] = value;
-    }
-    await rm(cwd, { recursive: true, force: true });
-  }
-});
 test("exposes extensible run options and closed control schemas and minimal prompt guidance", () => {
   assert.deepEqual(Object.keys(SUBAGENTS_RUN_PARAMETERS.properties), ["prompt", "mode", "label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "worktree", "outputSchema", "retries", "timeoutMs"]);
   assert.deepEqual(SUBAGENTS_RUN_PARAMETERS.required, ["prompt"]);
@@ -1560,6 +852,10 @@ test("keeps top-level model with a role and persists a background execution fail
   assert.ok(agentOptions);
   assert.deepEqual(options, { label: "subagent", workflowName: "subagents", model: "fixture/cheap:high" });
   assert.deepEqual((await manager.inspect({ id: launched.details.id }, { toolCallId: "lookup", signal: undefined, extensionContext })).error, { code: "AGENT_FAILED", message: "agent failed" });
+  const runDirectory = join(cwd, "subagents-storage", launched.details.id);
+  const persisted = async (name) => JSON.parse(await readFile(join(runDirectory, name), "utf8").catch(() => "null"));
+  await waitFor(async () => (await persisted("status.json"))?.state === "failed");
+  assert.deepEqual(await persisted("failure.json"), { code: "AGENT_FAILED", message: "agent failed" });
   await rm(cwd, { recursive: true, force: true });
 });
 test("returns foreground terminal envelopes, preserves mode for retry, and suppresses follow-ups", async () => {
@@ -2075,6 +1371,7 @@ test("persists failed background subagents for repeatable lookup", async () => {
     assert.equal((await stat(runDirectory)).mode & 0o777, 0o700);
     assert.equal((await stat(join(runDirectory, "request.json"))).mode & 0o777, 0o600);
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "request.json"), "utf8")), { prompt: "fail me", mode: "background", label: "failure" });
+    await waitFor(async () => stat(join(runDirectory, "failure.json")).then(() => true, () => false));
     assert.deepEqual(JSON.parse(await readFile(join(runDirectory, "failure.json"), "utf8")), expectedFailure);
 
     const restarted = createSubagentManager(managerDependencies);
@@ -2239,6 +1536,45 @@ test("persists progress under one snapshot without duplicate accounting fields",
     await waitFor(async () => (await manager.inspect({ id: run.id }, context)).state === "completed");
     const restarted = createSubagentManager({ storageDir });
     assert.deepEqual((await restarted.inspect({ id: run.id }, context)).progress?.accounting, accounting);
+    await restarted.dispose();
+  } finally {
+    pending.resolve({ value: "cleanup", attempts: [], cwd });
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+test("sums speed counters across retried attempts live, in status.json and after a restart", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-speed-"));
+  const storageDir = join(cwd, "subagents-storage");
+  const base = { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  const one = { messages: 1, outputTokens: 120, generationMs: 3_000, firstTokenMs: 800 };
+  const two = { messages: 1, outputTokens: 80, generationMs: 2_000, firstTokenMs: 200 };
+  const setup = { hookNames: [], model: { provider: "fixture", model: "model" }, tools: [], cwd };
+  const pending = deferred();
+  const manager = createSubagentManager({
+    storageDir,
+    createExecutor() {
+      return {
+        async execute(_prompt, options) {
+          await options.onAttempt?.({ attempt: 1, transport: "fixture", setup, accounting: { ...base, speed: one }, error: { code: "AGENT_FAILED", message: "first" } });
+          await options.onAttempt?.({ attempt: 2, transport: "fixture", setup, accounting: base });
+          await options.onProgress?.({ accounting: { ...base, speed: two }, toolCalls: [], lastEventAt: 1, persist: true });
+          return pending.promise;
+        },
+      };
+    },
+  });
+  const context = await managerContext(cwd);
+  try {
+    const run = await manager.run({ prompt: "speed" }, context);
+    await waitFor(async () => (await manager.inspect({ id: run.id }, context)).progress?.accounting.speed?.messages === 2);
+    assert.deepEqual((await manager.inspect({ id: run.id }, context)).progress?.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
+    pending.resolve({ value: "done", attempts: [], cwd });
+    await waitFor(async () => (await manager.inspect({ id: run.id }, context)).state === "completed");
+    const status = JSON.parse(await readFile(join(storageDir, run.id, "status.json"), "utf8"));
+    assert.deepEqual(status.progress.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
+    const restarted = createSubagentManager({ storageDir });
+    assert.deepEqual((await restarted.inspect({ id: run.id }, context)).progress?.accounting.speed, { messages: 2, outputTokens: 200, generationMs: 5_000, firstTokenMs: 1_000 });
     await restarted.dispose();
   } finally {
     pending.resolve({ value: "cleanup", attempts: [], cwd });
@@ -2801,6 +2137,54 @@ test("retries an interrupted persisted subagent as a new run", async () => {
     await rm(cwd, { recursive: true, force: true });
   }
 });
+test("a listing reads a settled subagent's status from disk once, whatever its session", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "subagents-settled-listing-"));
+  const storageDir = join(cwd, "storage");
+  const startedAt = Date.now() - 1000;
+  const otherPi = { pid: 999999, processStart: 1, sessionId: "other-pi", token: "other-pi", acquiredAt: 1 };
+  const records = {
+    "11111111-1111-4111-8111-111111111111": { sessionId: "session-1", state: "completed", finishedAt: startedAt + 10 },
+    "22222222-2222-4222-8222-222222222222": { sessionId: "session-2", state: "completed", finishedAt: startedAt + 20 },
+    "33333333-3333-4333-8333-333333333333": { sessionId: "session-2", state: "failed", finishedAt: startedAt + 30, error: { code: "AGENT_FAILED", message: "failed" } },
+    "44444444-4444-4444-8444-444444444444": { sessionId: "session-3", state: "stopped", finishedAt: startedAt + 40 },
+    // Another live Pi runs this one: its status is read on every listing.
+    "55555555-5555-4555-8555-555555555555": { sessionId: "session-1", state: "running", owner: otherPi },
+  };
+  for (const [id, record] of Object.entries(records)) {
+    await mkdir(join(storageDir, id), { recursive: true });
+    await writeFile(join(storageDir, id, "request.json"), JSON.stringify({ prompt: id }));
+    await writeFile(join(storageDir, id, "status.json"), JSON.stringify({ id, startedAt, ...record }));
+  }
+  const manager = createSubagentManager({ storageDir, liveness: { isLive: (owner) => owner.token === otherPi.token } });
+  const context = await managerContext(cwd);
+  const originalReadFile = fsPromises.readFile;
+  const reads = [];
+  try {
+    // Initialization reconciles storage before any listing; count only what the listings read.
+    assert.equal((await manager.inspect({ id: "55555555-5555-4555-8555-555555555555" }, context)).state, "running");
+    t.mock.method(fsPromises, "readFile", async (path, options) => {
+      if (String(path).endsWith("status.json")) reads.push(String(path));
+      return originalReadFile(path, options);
+    });
+    syncBuiltinESMExports();
+    const listed = async (request = {}) => (await manager.inspect(request, context)).map(({ id, state }) => `${id.slice(0, 1)}:${state}`);
+    assert.deepEqual(await listed(), ["1:completed", "5:running"]);
+    assert.equal(reads.length, 5, "the first listing reads every status");
+    reads.length = 0;
+    assert.deepEqual(await listed(), ["1:completed", "5:running"]);
+    assert.deepEqual(reads, [join(storageDir, "55555555-5555-4555-8555-555555555555", "status.json")], "the second listing reads only the running status");
+    reads.length = 0;
+    await rm(join(storageDir, "22222222-2222-4222-8222-222222222222"), { recursive: true, force: true });
+    assert.deepEqual(await listed({ scope: "all" }), ["1:completed", "3:failed", "4:stopped", "5:running"]);
+    assert.equal(reads.length, 1);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await manager.dispose();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test("removes legacy persisted worktree metadata without cleanup context", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-legacy-worktree-metadata-"));
   const storageDir = join(cwd, "storage");
