@@ -3,12 +3,15 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { testExtensionApi, waitForIssue105 } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, RunStore, runWorkflow, validateCheckpoint, WorkflowError } from "../src/index.js";
 import { listRunIds } from "../src/persistence.js";
 
+// The review's key hints are Pi's, drawn in Pi's theme, which Pi sets up before any command runs.
+initTheme("dark", false);
 const waitForTurn = async (): Promise<void> => { await new Promise<void>((resolve) => setImmediate(resolve)); };
-void test("navigator reviews each pending checkpoint before answering", async () => {
+void test("/workflow reviews each pending checkpoint in Pi's overlay before answering, once the workspace stepped aside", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-review-"));
   const cwd = join(home, "project");
   const runId = "checkpoint-review";
@@ -25,35 +28,41 @@ void test("navigator reviews each pending checkpoint before answering", async ()
   const notices: string[] = [];
   const pi = {
     registerTool() {},
-    registerCommand(_name: string, options: { handler: NonNullable<typeof command> }) { command = options.handler; },
+    registerCommand(name: string, options: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = options.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; },
     getThinkingLevel: () => "medium" as const,
     getActiveTools: () => ["workflow"],
     sendMessage() {},
   };
-  workflowExtension(testExtensionApi(pi), home);
+  // The workspace steps aside for each Review in turn, the second one twice, then the user leaves it; each open notes the Reviews its menu offers.
+  const target = { kind: "run", runId } as const;
+  const exits = ["Review first", "Review second", "Review second"];
+  const offered: string[][] = [];
+  let pendingAfterCancel = -1;
+  workflowExtension(testExtensionApi(pi), home, undefined, undefined, undefined, [], async (_ctx, options) => {
+    const provider = options.actions?.[0];
+    assert.ok(provider);
+    offered.push((await provider.actions(target)).map(({ label }) => label).filter((label) => label.startsWith("Review ")));
+    if (offered.length === 3) pendingAfterCancel = (await store.awaitingCheckpoints()).length;
+    const label = exits.shift();
+    return label === undefined ? undefined : { target, label, provider, state: { selectedKey: `run:${runId}`, row: 0, expansion: [], focus: "sidebar", sidebarVisible: true, toolsExpanded: false, detailsShown: false } };
+  });
 
-  let selectCalls = 0;
+  const selects: string[] = [];
+  const overlays: (boolean | undefined)[] = [];
   let customCalls = 0;
-  let pendingAfterCancel = 0;
   const ctx = {
     cwd, mode: "tui", hasUI: true, sessionManager: { getSessionId: () => "session" },
     ui: {
       notify(message: string) { notices.push(message); },
-      select: async (prompt: string, options: string[]) => { selectCalls += 1; return prompt === "Workflow actions" ? options.find((option) => option.startsWith("Review ")) ?? options[0] : prompt.includes("interrupted") ? "Skip" : selectCalls === 2 ? options[0] : "Close"; },
-      custom: async (factory: Factory) => {
+      select: async (prompt: string) => { selects.push(prompt); return undefined; },
+      custom: async (factory: Factory, options?: { overlay?: boolean }) => {
         customCalls += 1;
+        overlays.push(options?.overlay);
         let result: string | undefined;
         const tui = { terminal: { rows: 12 }, requestRender() {} };
         const component = factory(tui, { fg: (_color, text) => text }, { matches: (data, binding) => data === binding }, (value) => { result = value; });
         if (customCalls === 1) {
-          const dashboard = component.render(80).join("\n");
-          assert.match(dashboard, /Tree/);
-          component.handleInput?.("a");
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.confirm");
-        } else if (customCalls === 2) {
           const reviewLines = component.render(40);
           const initial = reviewLines.join("\n");
           assert.match(reviewLines[0] ?? "", /^─+$/);
@@ -79,44 +88,30 @@ void test("navigator reviews each pending checkpoint before answering", async ()
           assert.ok(scrolled.split("\n").length <= 12);
           assert.match(scrolled, /OBJECT_CONTEXT_END/);
           component.handleInput?.("tui.select.confirm");
-        } else if (customCalls === 3) {
-          const dashboard = component.render(80).join("\n");
-          assert.doesNotMatch(dashboard, /Review first/);
-          assert.match(dashboard, /Tree/);
-          component.handleInput?.("a");
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.confirm");
-        } else if (customCalls === 4) {
+        } else if (customCalls === 2) {
           const review = component.render(80).join("\n");
           assert.match(review, /Name: second/);
           assert.match(review, /Review the second artifact\?/);
           assert.match(review, /Context:\s*null/);
+          component.handleInput?.("tui.select.cancel");
+        } else {
+          assert.match(component.render(80).join("\n"), /Name: second/);
           component.handleInput?.("j");
           component.handleInput?.("tui.select.confirm");
-          pendingAfterCancel = (await store.awaitingCheckpoints()).length;
-        } else if (customCalls === 5) {
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.confirm");
-        } else if (customCalls === 6) {
-          assert.match(component.render(80).join("\n"), /Name: second/);
-          component.handleInput?.("tui.select.down");
-          component.handleInput?.("tui.select.confirm");
-        } else {
-          component.handleInput?.("tui.select.cancel");
         }
         component.dispose?.();
         return result;
       },
     },
   };
-  await start({}, ctx);
+  await start({}, { cwd, hasUI: true, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async () => "Skip" } });
   await command("", ctx);
 
-  assert.equal(selectCalls, 3);
-  assert.equal(customCalls, 5);
-  assert.equal(pendingAfterCancel, 1);
+  assert.deepEqual(selects, [], "no picker");
+  assert.equal(customCalls, 3);
+  assert.deepEqual(overlays, [true, true, true], "Pi's bordered overlay");
+  assert.deepEqual(offered, [["Review first", "Review second"], ["Review second"], ["Review second"], []]);
+  assert.equal(pendingAfterCancel, 1, "esc answers nothing");
   assert.deepEqual(await store.replay("checkpoint/first"), { path: "checkpoint/first", value: true });
   assert.deepEqual(await store.replay("checkpoint/second"), { path: "checkpoint/second", value: false });
   assert.deepEqual(await store.awaitingCheckpoints(), []);

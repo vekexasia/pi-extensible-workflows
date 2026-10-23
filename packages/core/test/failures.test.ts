@@ -337,7 +337,7 @@ void test("background and cold-resumed terminal failures deliver artifacts witho
   let command: ((args: string, ctx: unknown) => Promise<void>) | undefined;
   workflowExtension(testExtensionApi({
     registerTool(tool: Tool) { tools.push(tool); },
-    registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; },
+    registerCommand(name: string, value: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = value.handler; },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; },
     sendMessage(message: { content: string }) { messages.push(message.content); },
     getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"],

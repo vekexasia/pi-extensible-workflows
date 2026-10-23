@@ -55,7 +55,7 @@ function install(home: string, probe: TrajectoryProbe, agentDir?: string): { wor
   const shutdowns: Array<() => Promise<void>> = [];
   const api = testExtensionApi({
     registerTool(tool) { tools.push(tool); },
-    registerCommand(_name, options) { command = options.handler as WorkflowHandler; },
+    registerCommand(name, options) { if (name === "workflow") command = options.handler as WorkflowHandler; },
     on(name, handler) {
       if (name === "session_start") start = handler;
       if (name === "session_shutdown") shutdowns.push(handler);

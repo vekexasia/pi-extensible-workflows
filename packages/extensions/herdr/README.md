@@ -25,7 +25,7 @@ The extension activates only when Herdr is available. It registers workflow atte
 | Open live session in Herdr pane | The latest attempt has a transferable live session and fully inspectable mode is off. | Suspends local ownership at a turn boundary, opens the same session in Herdr, and returns ownership after handback. |
 | Open session in Herdr pane | The latest attempt is completed, failed, or cancelled and has a persisted session reference. | Opens the existing session in a separate Herdr pane for inspection without taking workflow ownership. |
 
-Open `/workflow`, select a run, then select the agent attempt to see the applicable action.
+Open `/workflow`, select the agent in its run, and press `a` (`enter` on an agent does not open the menu) to see the applicable action; outside the TUI, select the run, then `Agents...` and the agent. In the TUI workspace the action runs detached: the workspace stays usable while the pane is open, the progress messages of a live handoff (for example "queued (waiting for a turn boundary)" and "opening pane") show in the workspace's status row until the action settles, a later failure shows there as a notice, and a Pi dialog the action asks for is refused there with a notice; outside the TUI the picker waits for the action and shows its dialogs.
 
 ## Fully inspectable mode
 

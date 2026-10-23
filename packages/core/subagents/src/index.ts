@@ -1,8 +1,11 @@
 import { join } from "node:path";
-import { defineTool, getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, defineTool, getAgentDir, type AgentToolResult, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { WorkflowError, loadCodemodeToolsSetting, loadingRegistry, reachableTools, workflowToolExposure, type JsonValue } from "../../src/index.js";
+import type { SubagentsHandle } from "../../src/agents-actions-contract.js";
+import { clearSubagentsHandle, setSubagentsHandle } from "../../src/subagent-actions-handle.js";
 import { clearSubagentManager, setSubagentManager } from "../../src/subagent-manager-handle.js";
+import { createSubagentActionProvider, createSubagentPresenter } from "./actions.js";
 import type { SubagentIdRequest, SubagentInspectRequest, SubagentManager, SubagentManagerContext, SubagentNotification, SubagentsExtension, SubagentsExtensionOptions, SubagentRunRequest, SubagentStatus, SubagentSteerRequest } from "./contracts.js";
 import { createSubagentManager } from "./manager.js";
 import { registerSubagentNavigator } from "./navigator.js";
@@ -183,16 +186,27 @@ export function registerSubagentsExtension(pi: SubagentsExtensionAPI, options: S
   const extension = createSubagentsExtension(options, activeTools, notify, (status, request) => { widget.update(status, request); const registry = loadingRegistry(); if (typeof registry.observeSubagentStatus === "function") registry.observeSubagentStatus(status, request); }, onResourceWarning);
   const codemodeTools = loadCodemodeToolsSetting(options.managerDependencies?.agentDir);
   for (const tool of extension.tools) pi.registerTool({ ...tool, ...workflowToolExposure(tool.name, codemodeTools) });
-  if (pi.registerCommand !== undefined) registerSubagentNavigator(pi.registerCommand.bind(pi), extension.manager, storageDirectory(options), options.clipboard);
+  const storage = storageDirectory(options);
+  /** Aborted by session_shutdown: the agents workspace /subagents holds open closes (AgentsWorkspaceOptions.shutdown). */
+  const workspaceShutdown = new AbortController();
+  if (pi.registerCommand !== undefined) registerSubagentNavigator(pi.registerCommand.bind(pi), extension.manager, storage, options.clipboard, undefined, workspaceShutdown.signal);
   if (pi.on !== undefined) {
     setSubagentManager(extension.manager);
+    // The /agents workspace of the core host reads the subagent actions and names through this handle.
+    const handle: SubagentsHandle = {
+      actions: (context) => createSubagentActionProvider({ manager: extension.manager, storageDirectory: storage, clipboard: options.clipboard ?? copyToClipboard }, context),
+      presenter: (context) => createSubagentPresenter({ manager: extension.manager, storageDirectory: storage }, context),
+    };
+    setSubagentsHandle(handle);
     pi.on("session_start", (_event, context) => { widget.start(context); });
-    pi.on("session_shutdown", async () => {
+    pi.on("session_shutdown", async (event) => {
+      workspaceShutdown.abort(event);
       try {
         widget.dispose();
         await extension.manager.dispose?.();
       } finally {
         clearSubagentManager(extension.manager);
+        clearSubagentsHandle(handle);
       }
     });
   }

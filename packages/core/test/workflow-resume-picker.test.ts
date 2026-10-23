@@ -25,7 +25,7 @@ function setup(home: string, cwd: string, input?: string): TestSetup {
   const notices: string[] = [];
   const context = { cwd, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify(message: string) { notices.push(message); }, select: async (_prompt: string, options: string[]) => options.find((option) => option === "Skip") ?? "Close", ...(input === undefined ? {} : { input: async () => input }) } };
   workflowExtension(testExtensionApi({
-    registerCommand(_name: string, options: { handler: (args: string, context: unknown) => Promise<void> }) { command = options.handler; },
+    registerCommand(name: string, options: { handler: (args: string, context: unknown) => Promise<void> }) { if (name === "workflow") command = options.handler; },
     registerTool(tool: TestTool) { tools.push(tool); },
     on(name: string, handler: unknown) { if (name === "session_start") start = handler as TestSetup["start"]; if (name === "session_shutdown") shutdown = handler as TestSetup["shutdown"]; },
     getThinkingLevel: () => "medium",
