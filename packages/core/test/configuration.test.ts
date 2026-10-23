@@ -89,9 +89,9 @@ void test("workflow extension wires the background widget from global settings",
     return { renderers, shortcuts };
   };
 
-  assert.deepEqual(install(undefined), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: ["alt+o"] });
+  assert.deepEqual(install(undefined), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: [] });
   assert.deepEqual(install(JSON.stringify({ backgroundWidget: false })), { renderers: ["workflow-log", "workflow-warning"], shortcuts: [] });
-  assert.deepEqual(install("{"), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: ["alt+o"] });
+  assert.deepEqual(install("{"), { renderers: ["workflow-log", "workflow-warning", "piewf-run-receipt"], shortcuts: [] });
 });
 
 void test("composes trusted resource selectors and ignores untrusted project selectors", () => {
@@ -235,7 +235,7 @@ void test("workflow TUI manages aliases without runs and preserves settings", as
     },
   };
   try {
-    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(name: string, value: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
     assert.ok(start && command);
     await start({}, ctx);
     await command("", ctx);
@@ -309,7 +309,7 @@ void test("resume reloads aliases for pending and retried calls while replaying 
   };
   try {
     const events: Array<{ channel: string; data: unknown }> = [];
-    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(_name: string, value: { handler: NonNullable<typeof command> }) { command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, async () => {}, testTransport(createSession));
+    workflowExtension(testExtensionApi({ registerTool() {}, registerCommand(name: string, value: { handler: NonNullable<typeof command> }) { if (name === "workflow") command = value.handler; }, on(name: string, handler: unknown) { if (name === "session_start") start = handler as typeof start; if (name === "session_shutdown") shutdown = handler as typeof shutdown; }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"], events: { emit(channel: string, data: unknown) { events.push({ channel, data }); } } }), home, async () => {}, testTransport(createSession));
     assert.ok(start && command);
     await start({}, ctx);
     await command("", ctx);

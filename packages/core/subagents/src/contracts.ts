@@ -80,6 +80,7 @@ export const SUBAGENTS_INSPECT_OUTPUT = Type.Union([SUBAGENT_STATUS_OUTPUT, Type
 export const SUBAGENTS_STEER_OUTPUT = Type.Object({ id: Type.String(), accepted: Type.Boolean() });
 
 export type SubagentRunRequest = Static<typeof SUBAGENTS_RUN_PARAMETERS> & { readonly [key: string]: unknown };
+export type SubagentRetryEdits = Readonly<Partial<Pick<SubagentRunRequest, "prompt" | "model" | "retries">>>;
 export function normalizeSubagentRunRequest(value: unknown): SubagentRunRequest {
   if (!Value.Check(SUBAGENTS_RUN_PARAMETERS, value)) throw new WorkflowError("INVALID_METADATA", "Invalid subagents_run parameters");
   if (typeof value.worktree === "string" && !value.worktree.trim()) throw new WorkflowError("INVALID_METADATA", "worktree name must be a non-empty string");
@@ -171,7 +172,8 @@ export interface SubagentManager {
   inspect(request: Readonly<SubagentInspectRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;
   steer(request: Readonly<SubagentSteerRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;
   stop(request: Readonly<SubagentIdRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;
-  retry(request: Readonly<SubagentIdRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;
+  //NOTE: an injected manager that ignores `edits` retries the run unchanged.
+  retry(request: Readonly<SubagentIdRequest>, context: Readonly<SubagentManagerContext>, edits?: SubagentRetryEdits): Promise<unknown>;
   /** Removes a settled run record; used by the /subagents navigator only. */
   delete?(request: Readonly<SubagentIdRequest>, context: Readonly<SubagentManagerContext>): Promise<unknown>;
   getAttemptActionData?(id: string): Readonly<SubagentAttemptActionData> | undefined;

@@ -16,6 +16,8 @@ Install the core workflow extension for deterministic orchestration:
 pi install npm:pi-extensible-workflows
 ```
 
+In Pi's TUI, `/workflow` opens the `/agents` workspace scoped to the session's runs, and `/subagents` opens it scoped to the session's subagents. Actions run from `a`, or `enter` on a node that is not an agent, through `src/workflow-actions.ts` and `subagents/src/actions.ts`.
+
 The core installation includes workflow orchestration, the `reviewLoop` starter, standalone subagent tools, and Trajectory. The starter ships `reviewLoop`, dynamic `developer-model`/`reviewer-model`/`scout-model`/`oracle-model`/`researcher-model` aliases, and slash-command prompts (`/scout`, `/parallel-scout`, `/oracle`, `/council`, `/review`, `/parallel-review`, `/review-loop`, `/deep-research`) that launch subagents or workflows with those roles. Role behavior requires explicitly installing and enabling the independent `@piewf/pi-ext-roles` Pi extension; core and CLI have no roles dependency. Static settings `modelAliases` shadow the dynamic resolvers. `reviewLoop` cannot be overridden: a duplicate name is `GLOBAL_COLLISION`. Disable optional entries with Pi package filters `"-dist/starter/index.js"`, `"-dist/subagents/index.js"`, and `"-dist/trajectory/index.js"`; keep `dist/src/index.js` for workflow tools. Package prompts are declared in the package manifest and are not removed by the starter filter. The same package-root paths apply to `pi install "$PWD/packages/core"`, which loads the checkout's own copy of Pi's packages; a source install for development uses the repository root (`pi install "$PWD"`), whose filters are `"-packages/core/starter/index.ts"`, `"-packages/core/subagents/index.ts"`, and `"-packages/core/trajectory/index.ts"`, keeping `packages/core/src/index.ts`. See `docs/extensions.html#bundled-filters`. Add companion packages only for the capability you need:
 
 ```sh
@@ -73,6 +75,7 @@ Supported settings shape:
 {
   "concurrency": 8,
   "backgroundWidget": true,
+  "codemodeTools": "all",
   "modelAliases": {
     "reviewer-model": "anthropic/claude-fable-5:high"
   },
@@ -84,7 +87,7 @@ Supported settings shape:
 }
 ```
 The supported resource fields are direct `skills`, `extensions`, and `tools` arrays. `skills` matches discovered skill names, `extensions` matches discovered normalized extension paths, and `tools` matches only the current root or parent tool boundary. Selectors never create unavailable resources. The legacy `disabledAgentResources` field is rejected; it is not an alias for these fields. `extensionSettings` is an arbitrary map of safe extension-owned JSON values; the core validates only its structure and built-in settings. A trusted project `extensionSettings` field replaces the complete global map, including `{}`. Registered extension validators receive the complete effective map plus source context. The obsolete `extensions.herdr` object is rejected.
-The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` is accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
+The strict top-level settings keys are exactly `concurrency`, `backgroundWidget`, `codemodeTools` (`"all"` default, `"read-only"`, or `"none"`; global only), `modelAliases`, `skills`, `extensions`, `extensionSettings`, `tools`, and `retention`. `backgroundWidget` and `codemodeTools` are accepted only in the global file, and project settings may use the other keys. `retention` accepts positive integer `olderThanDays` and `maxTerminalRuns` limits. It is applied best-effort at session start to hard-terminal runs only (`completed`, `failed`, `stopped`); dependency and worktree safety rules can retain additional runs.
 
 ### Trajectory
 
@@ -97,7 +100,7 @@ Trajectory also publishes current-session durable standalone subagents as first-
 
 ### Background workflow widget
 
-`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and durable background-run transcript receipts. Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts.
+`backgroundWidget` is a global boolean that defaults to `true`. Set it to `false` to disable the live background-run tree and the transcript receipts workflow runs leave (background subagents' receipts are written regardless). Foreground workflow rendering is unchanged. Headless and non-TUI hosts do not draw the widget or append receipts. Background subagents show in the same widget as a "Subagents" group; the cursor and `enter` open `/agents` on any row (a run, a phase, an agent, the Subagents group, or a subagent). While an agents workspace is open the widget is quiet. Live background subagent rows show only in this widget; the subagents extension draws no frame of its own. With the workflow extension not loaded or `backgroundWidget: false`, no live subagent rows show, only the receipt each background subagent leaves in the transcript when it settles. Rows that do not fit collapse into one `… N more` row. `Alt+O` scrolls the widget only while its `Alt+O to scroll` hint shows; otherwise the key passes through. It is not a Pi shortcut and cannot be rebound.
 
 ### Models and aliases
 
@@ -203,7 +206,7 @@ export default function extension() {
 | `functions` | Named host functions with JSON schemas and `run(input, context)`. |
 | `modelAliases` | Named dynamic resolvers with `resolve(context)`. |
 | `agentSetupHooks` | Named trusted setup hooks with optional finite `priority`. |
-| `agentAttemptActions` | Named `/workflow` actions, optionally shared with `/subagents` through paired `visibleStandalone(context)` and `runStandalone(context)`, alongside `label`, synchronous `visible(context)`, and `run(context)`. |
+| `agentAttemptActions` | Named `/workflow` actions (in the workspace's `a` menu on an agent), optionally shared with `/subagents` through paired `visibleStandalone(context)` and `runStandalone(context)`, alongside `label`, synchronous `visible(context)`, and `run(context)`. In the TUI workspace they run detached and their dialogs are refused; the pickers outside the TUI await them. |
 
 Unknown top-level extension keys are rejected. Function names must be identifier-shaped, globally unique, and must not be reserved globals such as `agent`, `args`, `JSON`, `extensions`, or `workflow_catalog`. Model alias names must match `[A-Za-z][A-Za-z0-9_-]*`. Hook and action names must be identifier-shaped and globally unique.
 

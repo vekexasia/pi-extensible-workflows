@@ -234,7 +234,7 @@ void test("registers the workflow tool, command, and conditional skill", async (
   };
   workflowExtension(testExtensionApi(pi));
   assert.deepEqual(tools.map(({ name }) => name), ["workflow_respond", "workflow_stop", "workflow_status", "workflow_retry", "workflow_resume", "workflow"]);
-  assert.deepEqual(commands.map(({ name }) => name), ["workflow"]);
+  assert.deepEqual(commands.map(({ name }) => name), ["workflow", "agents"]);
   const tool = tools.find(({ name }) => name === "workflow");
   assert.ok(tool);
   assert.equal(tool.promptGuidelines, undefined);
