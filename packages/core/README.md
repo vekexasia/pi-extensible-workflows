@@ -33,6 +33,18 @@ return agent(prompt("Summarize these reports:\n\n{reports}", { reports }));
 
 Launch with a non-empty `name` and exactly one of `script` or `scriptPath`. Registered functions are available as globals, and JSON-compatible launch values are available through `args`. Runs are backgrounded by default; set `foreground: true` to wait for the final value.
 
+## Require explicit roles (opt-in)
+
+In `~/.pi/agent/pi-extensible-workflows/settings.json` (or the configured Pi agent directory), set:
+
+```json
+{ "extensionSettings": { "workflow": { "requireExplicitRole": true } } }
+```
+
+The default is `false`. Trusted projects can configure the same setting in `.pi/pi-extensible-workflows/settings.json`, using normal settings precedence. Enable the optional `@piewf/pi-ext-roles` integration in the parent Pi session: without a preparation hook declaring the `role` option, enabled-policy launches fail with a configuration error.
+
+Every standalone subagent, workflow agent, handle, and dynamically launched/nested agent must supply its own non-empty, valid `role` option (a display label does not count). Validation happens before the affected session starts; dynamic requests are checked when launched. The integration still resolves role names and defaults; explicit model overrides and frozen replay configurations retain their existing behavior. A child cannot disable an enabled run policy through inherited extension settings. Absent/false leaves role-less launches unchanged. See the [Roles guide](https://vekexasia.github.io/pi-extensible-workflows/roles.html#explicit-roles).
+
 ## Programmatic integration
 
 The package exports the workflow registry, runtime, persistence, validation, settings, generic agent preparation, lifecycle, and local Pi session APIs used by trusted hosts and extensions.

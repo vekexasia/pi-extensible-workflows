@@ -102,6 +102,11 @@ export function decodeWorkflowExtensions(value: unknown): WorkflowExtensionSetti
   const normalized: Record<string, JsonValue> = {};
   for (const [namespace, raw] of Object.entries(value)) {
     if (!validWorkflowExtensionNamespace(namespace)) return undefined;
+    if (namespace === "workflow") {
+      if (!object(raw) || Object.keys(raw).some((key) => key !== "requireExplicitRole") || raw.requireExplicitRole !== undefined && typeof raw.requireExplicitRole !== "boolean") return undefined;
+      normalized.workflow = { ...(raw.requireExplicitRole === undefined ? {} : { requireExplicitRole: raw.requireExplicitRole }) };
+      continue;
+    }
     if (namespace === "herdr") {
       if (!object(raw) || Object.keys(raw).some((key) => key !== "enableFullyInspectableMode") || raw.enableFullyInspectableMode !== undefined && typeof raw.enableFullyInspectableMode !== "boolean") return undefined;
       normalized.herdr = { ...(raw.enableFullyInspectableMode === undefined ? {} : { enableFullyInspectableMode: raw.enableFullyInspectableMode }) };

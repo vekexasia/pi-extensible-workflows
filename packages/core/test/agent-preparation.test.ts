@@ -9,6 +9,8 @@ import { WorkflowRegistry, registerWorkflowExtension } from "../src/registry.js"
 import workflowExtension from "../src/index.js";
 import { testExtensionApi } from "./support.js";
 import { testTransport } from "./test-transport.js";
+import { decodeWorkflowExtensions } from "../src/decoders.js";
+import { validateWorkflowExtensionSettings } from "../src/settings.js";
 import { validateAgentOptions } from "../src/validation.js";
 import { FairAgentScheduler, WorkflowAgentExecutor, createLocalPiSession, prepareAgentSetupForInspection, type AgentExecutionRoot } from "../src/agent-execution.js";
 import { createLaunchSnapshot } from "../src/utils.js";
@@ -25,6 +27,50 @@ function fixture(t: TestContext): AgentExecutionRoot {
   t.after(() => { rmSync(cwd, { recursive: true, force: true }); });
   return { cwd, agentDir, projectTrusted: false, model, tools: new Set(["read"]), knownModels: new Set(["test/model"]), availableModels: new Set(["test/model"]) };
 }
+void test("explicit-role setting accepts only a boolean and defaults to disabled", () => {
+  assert.equal(validateWorkflowExtensionSettings(undefined, "settings.json"), undefined);
+  for (const requireExplicitRole of [false, true]) assert.deepEqual(validateWorkflowExtensionSettings({ workflow: { requireExplicitRole } }, "settings.json"), { workflow: { requireExplicitRole } });
+  for (const requireExplicitRole of ["true", 1, null]) assert.throws(() => validateWorkflowExtensionSettings({ workflow: { requireExplicitRole } }, "settings.json"), /requireExplicitRole.*boolean/);
+  assert.deepEqual(decodeWorkflowExtensions({ workflow: { requireExplicitRole: true } }), { workflow: { requireExplicitRole: true } });
+  assert.equal(decodeWorkflowExtensions({ workflow: { requireExplicitRole: "true" } }), undefined);
+});
+void test("explicit-role policy rejects missing, empty and malformed options before preparation or launch", async (t) => {
+  const root = fixture(t);
+  let preparations = 0;
+  const executor = new WorkflowAgentExecutor({ ...root, extensionSettings: { workflow: { requireExplicitRole: true } }, agentPreparationHooks: [{ name: "roles", priority: 0, optionsSchema: { type: "object", properties: { role: { type: "string" } } }, prepare() { preparations++; } }] }, transport);
+  for (const agentOptions of [{}, { label: "reviewer" }, { role: "" }, { role: "  " }, { role: 42 }, { role: null }]) {
+    await assert.rejects(executor.prepare(options(agentOptions)), /explicit.*role.*required/i);
+  }
+  assert.equal(preparations, 0);
+});
+void test("explicit-role policy needs an integration that owns role validation", async (t) => {
+  await assert.rejects(new WorkflowAgentExecutor({ ...fixture(t), extensionSettings: { workflow: { requireExplicitRole: true } } }, transport).prepare(options({ role: "reviewer" })), /role.*integration|pi-ext-roles/i);
+});
+void test("explicit-role policy delegates valid and unknown names without changing model overrides", async (t) => {
+  const registry = new WorkflowRegistry();
+  registry.register({ version: "1.0.0", headline: "Roles fixture", agentPreparationHooks: {
+    roles: { optionsSchema: { type: "object", properties: { role: { type: "string", minLength: 1 } }, additionalProperties: true }, prepare(configuration, context) {
+      if (context.options.role !== "reviewer") throw Object.assign(new Error("Unknown role; choose reviewer"), { code: "INVALID_METADATA" });
+      configuration.systemPromptAppend = "review instructions";
+    } },
+  } });
+  const root = { ...fixture(t), extensionSettings: { workflow: { requireExplicitRole: true } }, agentPreparationHooks: registry.agentPreparationHooks(), modelAliases: { selected: "test/model:off" } };
+  const executor = new WorkflowAgentExecutor(root, transport);
+  await assert.rejects(executor.prepare(options({ role: "unknown" })), /explicit.*role.*required.*Unknown role/i);
+  const prepared = await executor.prepare(options({ role: "reviewer", model: "selected" }));
+  assert.deepEqual(prepared.model, model);
+  assert.equal(prepared.systemPromptAppend, "review instructions");
+  const replay = new WorkflowAgentExecutor({ ...root, agentPreparationHooks: registry.agentPreparationHooks().map((hook) => ({ ...hook, prepare() { throw new Error("frozen role resolution must not rerun"); } })) }, transport);
+  assert.deepEqual(await replay.prepare({ ...options({ role: "reviewer", model: "removed-alias" }), configuration: prepared }), prepared);
+  await assert.rejects(replay.prepare({ ...options({}), configuration: prepared }), /explicit.*role.*required/i);
+  await assert.rejects(executor.prepare({ ...options({}), parent: "parent", inheritedExtensionSettings: { workflow: { requireExplicitRole: false } } }), /explicit.*role.*required/i);
+});
+void test("absent and disabled explicit-role policy preserve opaque role-less preparation", async (t) => {
+  for (const extensionSettings of [{}, { workflow: { requireExplicitRole: false } }]) {
+    const prepared = await new WorkflowAgentExecutor({ ...fixture(t), extensionSettings }, transport).prepare(options({}));
+    assert.deepEqual(prepared.model, model);
+  }
+});
 void test("unknown extension options remain opaque JSON without a plugin", async (t) => {
   assert.deepEqual(validateAgentOptions({ role: 42 }), { role: 42 });
   const prepared = await prepareAgentSetupForInspection(fixture(t), "task", options({ role: 42 }), transport);

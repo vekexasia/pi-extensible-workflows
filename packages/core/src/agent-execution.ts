@@ -1053,6 +1053,15 @@ export class WorkflowAgentExecutor {
   }
 
   async prepare(options: AgentExecutionOptions, cwd = this.root.cwd, signal = this.root.runContext?.signal ?? new AbortController().signal, mode: "execution" | "inspection" = "execution"): Promise<PreparedAgentConfiguration> {
+    const requireExplicitRole = this.root.extensionSettings?.workflow?.requireExplicitRole === true || options.inheritedExtensionSettings?.workflow?.requireExplicitRole === true;
+    const roleHooks = (this.root.agentPreparationHooks ?? []).filter(({ optionsSchema }) => object(optionsSchema?.properties) && Object.hasOwn(optionsSchema.properties, "role"));
+    const roleError = "An explicit valid role is required by extensionSettings.workflow.requireExplicitRole; pass role: \"name\" (not just a label)";
+    if (requireExplicitRole) {
+      const role = options.agentOptions?.role;
+      if (typeof role !== "string" || !role.trim()) throw new WorkflowError("INVALID_METADATA", roleError);
+      if (!roleHooks.length) throw new WorkflowError("CONFIG_ERROR", `${roleError}; enable the optional pi-ext-roles integration in the parent Pi session`);
+      for (const hook of roleHooks) if (hook.optionsSchema !== undefined && !Value.Check(hook.optionsSchema, options.agentOptions)) throw new WorkflowError("INVALID_METADATA", `${roleError}; agent options do not match preparation schema: ${hook.name}`);
+    }
     const root = { ...this.root, projectTrusted: Boolean(this.root.projectTrusted) && options.projectTrusted !== false };
     const policy = await this.root.agentResourcePolicy?.();
     const capabilities = await authorizedResources(root, cwd, options);
@@ -1093,7 +1102,14 @@ export class WorkflowAgentExecutor {
     }
     for (const hook of hooks) if (hook.optionsSchema !== undefined && !Value.Check(hook.optionsSchema, original)) throw new WorkflowError("INVALID_METADATA", `Agent options do not match preparation schema: ${hook.name}`);
     if (typeof original.model === "string" && this.root.blockedAliases?.has(original.model.split(":")[0] ?? "")) throw new WorkflowError("UNKNOWN_MODEL", `Unknown model alias ${original.model} resolved to ${this.root.blockedAliasTargets?.[original.model.split(":")[0] ?? ""] ?? "an unavailable target"}`);
-    for (const hook of hooks) { if (signal.aborted) throw new WorkflowError("CANCELLED", "Agent preparation cancelled"); await hook.prepare(configuration, context); }
+    for (const hook of hooks) {
+      if (signal.aborted) throw new WorkflowError("CANCELLED", "Agent preparation cancelled");
+      try { await hook.prepare(configuration, context); }
+      catch (error) {
+        if (requireExplicitRole && roleHooks.includes(hook) && errorCode(error) === "INVALID_METADATA") throw new WorkflowError("INVALID_METADATA", `${roleError}; ${errorText(error)}`);
+        throw error;
+      }
+    }
     if (signal.aborted) throw new WorkflowError("CANCELLED", "Agent preparation cancelled");
     const { model: preparedModel, ...preparedOptions } = configuration;
     validateAgentOptions(preparedOptions);

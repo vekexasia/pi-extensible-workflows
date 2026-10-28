@@ -71,6 +71,13 @@ export function validateWorkflowExtensionSettings(value: unknown, settingsPath: 
   const base = `${settingsPath}.extensionSettings`;
   const normalized: Record<string, JsonValue> = {};
   for (const [namespace, raw] of Object.entries(generic)) {
+    if (namespace === "workflow") {
+      if (!object(raw)) fail(errorCode, `${base}.workflow must be an object`);
+      if (Object.keys(raw).some((key) => key !== "requireExplicitRole")) fail(errorCode, `${base}.workflow contains an unsupported setting`);
+      if (raw.requireExplicitRole !== undefined && typeof raw.requireExplicitRole !== "boolean") fail(errorCode, `${base}.workflow.requireExplicitRole must be a boolean`);
+      normalized.workflow = Object.freeze({ ...(raw.requireExplicitRole === undefined ? {} : { requireExplicitRole: raw.requireExplicitRole }) });
+      continue;
+    }
     if (namespace === "herdr") {
       if (!object(raw)) fail(errorCode, `${base}.herdr must be an object`);
       if (Object.keys(raw).some((key) => key !== "enableFullyInspectableMode")) fail(errorCode, `${base}.herdr contains an unsupported setting`);
