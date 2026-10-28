@@ -84,9 +84,18 @@ export interface AgentOptions {
   outputSchema?: JsonSchema; // structured result for a later phase
   retries?: number; // extra same-run retries for this agent
   timeoutMs?: number | null; // attempt timeout; null = none
+  brief?: GovernedChildBrief; // structured execution governance (prompt, intent, changes: none|commit|keep, report)
   [key: string]: JsonValue;
 }
 ```
+
+A `brief` (`GovernedChildBrief`) provides declarative governance for child agents:
+- `prompt`: task instruction;
+- `intent`?: declarative outcome goal;
+- `changes`?: `"none"` (read-only; mutating tools are stripped automatically), `"commit"`, or `"keep"`;
+- `tools`? / `excludeTools`?: explicit tool ceilings;
+- `outputSchema`?: structured schema;
+- `report`?: `"minimal"` | `"full"` | `"evidence"`.
 
 Restrict resource selectors with `["!*", "read", "grep"]`; `["*"]` selects every resource allowed by the parent ceiling.
 

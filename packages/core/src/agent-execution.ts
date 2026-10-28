@@ -46,7 +46,7 @@ export interface PiResourceInspection {
   readonly diagnostics: readonly { type: "warning" | "error" | "collision"; message: string; source?: string }[];
   readonly systemPromptSource?: string;
 }
-import type { AgentPreparation, AgentPreparationContext, PreparedAgentConfiguration, RegisteredAgentPreparationHook, AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowRunContext, WorkflowSessionStartEvent } from "./types.js";
+import type { AgentPreparation, AgentPreparationContext, PreparedAgentConfiguration, RegisteredAgentPreparationHook, AgentAccounting, AgentActivity, AgentContinuity, AgentIdentity, AgentResourceInspection, AgentResourcePolicy, AgentResourceSelectors, AgentResourceSelectorSources, AgentSetup, AgentSetupSummary, AgentTransport, AgentTransportContext, ContextFileScope, GovernedChildBrief, JsonSchema, JsonValue, LiveSessionHandoff, ModelSpec, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult, WorkflowExtensionSettings, WorkflowExtensionSettingsValidatorContext, WorkflowRunContext, WorkflowSessionStartEvent } from "./types.js";
 import { SerialLane, assertModelThinking, byPriorityThenName, deepFreeze, errorCode, errorText, jsonObject, jsonValue, object, physicalModel, resolveModelReference, resourcePatternHasMagic, selectResourcesByLayers, modelCapability, unmatchedResourcePatterns } from "./utils.js";
 import { SETTLED_AGENT_STATES, WorkflowError, isContextFileScope, zeroAccounting, type AgentState, type WorkflowErrorCode } from "./types.js";
 import { createLiveSessionHandoff } from "./session-handoff.js";
@@ -762,7 +762,15 @@ export const localAgentTransport: AgentTransport = Object.freeze({ id: "local", 
 /** Like Pi's excludeTools, exclusions name tools exactly and apply to every tool the session would get, custom tools included. */
 function excludedToolNames(options: Pick<AgentExecutionOptions, "agentOptions" | "inheritedExcludeTools">): Set<string> {
   const own = options.agentOptions?.excludeTools;
-  return new Set([...(options.inheritedExcludeTools ?? []), ...(Array.isArray(own) ? own.filter((tool): tool is string => typeof tool === "string") : [])]);
+  const brief = options.agentOptions?.brief as GovernedChildBrief | undefined;
+  const briefExclude = brief?.excludeTools;
+  const mutatingTools = brief?.changes === "none" ? ["write", "edit", "replace_in_file", "apply_patch"] : [];
+  return new Set([
+    ...(options.inheritedExcludeTools ?? []),
+    ...(Array.isArray(own) ? own.filter((tool): tool is string => typeof tool === "string") : []),
+    ...(Array.isArray(briefExclude) ? briefExclude.filter((tool): tool is string => typeof tool === "string") : []),
+    ...mutatingTools,
+  ]);
 }
 function changedOption(options: Readonly<Record<string, JsonValue>>, baseline: Readonly<Record<string, JsonValue>>, key: string): boolean { return JSON.stringify(options[key]) !== JSON.stringify(baseline[key]); }
 interface ChildAgentToolParams {

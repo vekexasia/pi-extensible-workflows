@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as acorn from "acorn";
 import { Script } from "node:vm";
-import type { CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
+import type { CheckpointInput, ChildBriefChangesPolicy, ChildBriefReportMode, GovernedChildBrief, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
 import type { WorkflowRegistryApi } from "./registry.js";
 import { assertModelThinking, validateSchema, deepFreeze, errorText, fail, jsonObject, jsonValue, object, positiveInteger, resourcePatternHasMagic } from "./utils.js";
-import { WORKFLOW_CALL_KINDS } from "./types.js";
+import { CHILD_BRIEF_CHANGES_POLICIES, CHILD_BRIEF_REPORT_MODES, WORKFLOW_CALL_KINDS } from "./types.js";
 export { validateSchema } from "./utils.js";
 
 import { validateContextFileScopes, validateSelectorList } from "./settings.js";
@@ -290,7 +290,28 @@ export function workflowPrompt(template: string, values: Readonly<Record<string,
   });
 }
 
-const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "outputSchema", "retries", "timeoutMs"]);
+const CHILD_BRIEF_KEYS = new Set(["prompt", "intent", "changes", "tools", "excludeTools", "outputSchema", "report", "timeoutMs"]);
+export function validateChildBrief(value: unknown, label = "child brief"): GovernedChildBrief {
+  if (!object(value) || !jsonValue(value)) fail("INVALID_METADATA", `${label} must be a JSON object`);
+  for (const key of Object.keys(value)) {
+    if (!CHILD_BRIEF_KEYS.has(key)) fail("INVALID_METADATA", `Unknown ${label} property: "${key}"`);
+  }
+  const brief = value as Record<string, unknown>;
+  if (typeof brief.prompt !== "string" || !brief.prompt.trim()) fail("INVALID_METADATA", `${label}.prompt must be a non-empty string`);
+  if (brief.intent !== undefined && (typeof brief.intent !== "string" || !brief.intent.trim())) fail("INVALID_METADATA", `${label}.intent must be a non-empty string`);
+  if (brief.changes !== undefined && !CHILD_BRIEF_CHANGES_POLICIES.includes(brief.changes as ChildBriefChangesPolicy)) fail("INVALID_METADATA", `${label}.changes must be "none", "commit", or "keep"`);
+  if (brief.report !== undefined && !CHILD_BRIEF_REPORT_MODES.includes(brief.report as ChildBriefReportMode)) fail("INVALID_METADATA", `${label}.report must be "minimal", "full", or "evidence"`);
+  if (brief.timeoutMs !== undefined && brief.timeoutMs !== null && !positiveInteger(brief.timeoutMs)) fail("INVALID_METADATA", `${label}.timeoutMs must be null or a positive integer`);
+  if (brief.tools !== undefined) validateSelectorList(brief.tools, label, "tools", "INVALID_METADATA", true);
+  if (brief.excludeTools !== undefined) {
+    if (!Array.isArray(brief.excludeTools) || brief.excludeTools.some((tool) => typeof tool !== "string" || !tool.trim() || tool !== tool.trim() || tool.startsWith("!") || resourcePatternHasMagic(tool))) fail("INVALID_METADATA", `${label}.excludeTools must be an array of exact tool names`);
+    if (brief.excludeTools.includes("workflow_result")) fail("INVALID_METADATA", `${label}.excludeTools cannot remove workflow_result`);
+  }
+  if (brief.outputSchema !== undefined) validateSchema(brief.outputSchema, `${label}.outputSchema`);
+  return brief as unknown as GovernedChildBrief;
+}
+
+const AGENT_OPTION_KEYS = new Set(["label", "model", "tools", "excludeTools", "skills", "extensions", "contextFiles", "outputSchema", "retries", "timeoutMs", "brief"]);
 export function isCoreAgentOption(key: string): boolean { return AGENT_OPTION_KEYS.has(key); }
 function validateAgentOption(key: string, value: unknown): void {
   switch (key) {
@@ -321,6 +342,9 @@ function validateAgentOption(key: string, value: unknown): void {
       break;
     case "timeoutMs":
       if (value !== null && !positiveInteger(value)) fail("INVALID_METADATA", "agent timeoutMs must be null or a positive integer");
+      break;
+    case "brief":
+      validateChildBrief(value, "agent brief");
       break;
   }
 }

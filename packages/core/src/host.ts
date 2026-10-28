@@ -31,7 +31,7 @@ import { openAgentsWorkspace, type OpenAgentsWorkspace } from "./agents-workspac
 import { createSessionAgentsSource, type SessionAgentsScope } from "./session-agents.js";
 import { openSessionTranscript } from "./session-transcript.js";
 import { createTranscriptView } from "./transcript-components.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type CheckpointResponseDetails, type GovernedChildBrief, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
 import type { SubagentManagerContext } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
 import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
@@ -144,7 +144,7 @@ const WORKFLOW_LAUNCH_OUTPUT = Type.Object({ runId: Type.String(), state: Type.S
 const WORKFLOW_STATUS_OUTPUT = Type.Object({ runId: Type.String(), workflowName: Type.String(), state: Type.String(), error: Type.Optional(WORKFLOW_ERROR_OUTPUT), failedAt: Type.Optional(Type.String()), budget: Type.Optional(Type.Unknown()), usage: Type.Optional(Type.Unknown()), phase: Type.Optional(Type.String()), delivery: Type.Optional(Type.Object({ mode: Type.String(), state: Type.String() })), agents: Type.Array(Type.Object({ id: Type.String(), label: Type.Optional(Type.String()), path: Type.String(), state: Type.String(), lastEventAt: Type.Optional(Type.Number()), accounting: Type.Optional(Type.Unknown()) })) });
 const WORKFLOW_STOP_OUTPUT = Type.Object({ runId: Type.String(), state: Type.String(), stopped: Type.Boolean(), reason: Type.Optional(Type.String()) });
 const WORKFLOW_RECOVERY_OUTPUT = Type.Object({ state: Type.String(), runId: Type.Optional(Type.String()), parentRunId: Type.Optional(Type.String()), proposalId: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()) });
-const WORKFLOW_RESPOND_OUTPUT = Type.Object({ state: Type.String(), approved: Type.Boolean(), reason: Type.String(), accepted: Type.Optional(Type.Boolean()), runId: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()) });
+const WORKFLOW_RESPOND_OUTPUT = Type.Object({ state: Type.String(), approved: Type.Boolean(), reason: Type.String(), accepted: Type.Optional(Type.Boolean()), runId: Type.Optional(Type.String()), choice: Type.Optional(Type.String()), feedback: Type.Optional(Type.String()), value: Type.Optional(Type.Unknown()) });
 const WORKFLOW_CATALOG_ALIAS_OUTPUT = Type.Object({ name: Type.String(), kind: Type.String(), provenance: Type.String(), version: Type.Optional(Type.String()), headline: Type.Optional(Type.String()) });
 // The index without a name; with one, the function, the model alias, or { error }.
 const WORKFLOW_CATALOG_OUTPUT = Type.Union([
@@ -846,7 +846,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         const lastEventAt = node.state === "running" ? previous?.state === "running" && previous.lastEventAt !== undefined ? previous.lastEventAt : now : previous?.lastEventAt;
         const startedAt = previous?.startedAt ?? (node.state === "running" ? now : undefined);
         const durationMs = previous?.durationMs ?? (SETTLED_AGENT_STATES.has(node.state) && startedAt !== undefined ? Math.max(0, now - startedAt) : undefined);
-        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.agentIdentity?.handle === undefined ? {} : { handle: node.options.agentIdentity.handle, ...(node.options.agentIdentity.turn === undefined ? {} : { turn: node.options.agentIdentity.turn }), ...(node.options.continuity ? { continuity: node.options.continuity } : {}) }), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
+        return { ...(previous?.systemPrompt === undefined ? {} : { systemPrompt: previous.systemPrompt }), ...(node.prompt !== undefined ? { prompt: node.prompt } : previous?.prompt !== undefined ? { prompt: previous.prompt } : {}), id: node.id, name: node.label, ...(node.options.requestedLabel ? { label: node.options.requestedLabel } : {}), ...(node.options.agentOptions?.brief ? { brief: node.options.agentOptions.brief as GovernedChildBrief } : {}), path: node.id, state: node.state, ...(node.parentId ? { parentId: node.parentId } : {}), structuralPath: [...(node.options.agentIdentity?.structuralPath ?? [])], ...(resultPath ? { resultPath } : {}), ...(node.options.parentBreadcrumb ? { parentBreadcrumb: node.options.parentBreadcrumb } : {}), ...(node.options.worktreeOwner ? { worktreeOwner: node.options.worktreeOwner } : {}), ...(node.options.agentIdentity?.handle === undefined ? {} : { handle: node.options.agentIdentity.handle, ...(node.options.agentIdentity.turn === undefined ? {} : { turn: node.options.agentIdentity.turn }), ...(node.options.continuity ? { continuity: node.options.continuity } : {}) }), ...(effective.requestedModel ? { requestedModel: effective.requestedModel } : {}), model: effective.model, tools: effective.tools, attempts: previous?.attempts ?? 0, ...(startedAt === undefined ? {} : { startedAt }), ...(durationMs === undefined ? {} : { durationMs }), ...(previous?.attemptDetails ? { attemptDetails: previous.attemptDetails } : {}), ...(previous?.accounting ? { accounting: previous.accounting } : {}), ...(previous?.toolCalls ? { toolCalls: previous.toolCalls } : {}), ...(previous?.activity ? { activity: previous.activity } : {}), ...(lastEventAt === undefined ? {} : { lastEventAt }) };
       });
       return { ...current, agents };
     });
@@ -909,16 +909,22 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     }
     throw new WorkflowError("RUN_NOT_FOUND", `Unknown workflow run ${runId} in the current project`);
   };
-  const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false) => {
+  const answerCheckpoint = async (runId: string, name: string, approved: boolean, silent = false, choice?: string, feedback?: string) => {
     const run = runs.get(runId);
     if (!run) return false;
-    const checkpoint = await run.store.answerCheckpoint(name, approved);
+    const checkpoint = await run.store.answerCheckpoint(name, approved, choice, feedback);
     if (!checkpoint) return false;
     await eventPublisher.checkpoint(run.store, run.metadata, checkpoint.name, approved ? "approved" : "rejected");
     if ((await run.store.awaitingCheckpoints()).length === 0) await run.lifecycle.resolveAwaitingInput();
-    run.checkpointResolvers.get(checkpoint.path)?.(approved);
+    const resolutionValue: boolean | CheckpointResponseDetails = (choice !== undefined || feedback !== undefined)
+      ? { approved, ...(choice !== undefined ? { choice } : {}), ...(feedback !== undefined ? { feedback } : {}) }
+      : approved;
+    run.checkpointResolvers.get(checkpoint.path)?.(resolutionValue);
     run.checkpointResolvers.delete(checkpoint.path);
-    if (!silent) deliver(pi, `Workflow ${run.metadata.name} checkpoint ${name}: ${approved ? "Approved" : "Rejected"}.`, !shuttingDown);
+    if (!silent) {
+      const extra = choice ? ` (choice: ${choice})` : feedback ? ` (${feedback})` : "";
+      deliver(pi, `Workflow ${run.metadata.name} checkpoint ${name}: ${approved ? "Approved" : "Rejected"}${extra}.`, !shuttingDown);
+    }
     return true;
   };
   const backgroundCheckpointDeliveries = new Set<string>();
@@ -931,7 +937,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const checkpointBridge = (runId: string, store: RunStore, metadata: WorkflowMetadata, foreground: boolean | (() => boolean), ui?: { select?: (prompt: string, options: string[]) => Promise<string | undefined> }, headless = false) => {
     const checkpointCounters = new Map<string, number>();
     const isForeground = () => typeof foreground === "function" ? foreground() : foreground;
-    return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean> => {
+    return async (raw: Readonly<Record<string, JsonValue>>, signal: AbortSignal): Promise<boolean | CheckpointResponseDetails> => {
       const input = validateCheckpoint(raw);
       const label = nextNamedOccurrence(checkpointCounters, input.name);
       const path = operationPath("checkpoint", label);
@@ -944,7 +950,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const run = runs.get(runId);
       await run?.lifecycle.enterAwaitingInput();
       if (!alreadyAwaiting && (!isForeground() || !ui?.select)) deliverBackgroundCheckpoint(metadata.name, runId, { ...input, name: label, path });
-      const decision = new Promise<boolean>((resolve, reject) => {
+      const decision = new Promise<boolean | CheckpointResponseDetails>((resolve, reject) => {
         run?.checkpointResolvers.set(path, resolve);
         if (signal.aborted) reject(new WorkflowError("CANCELLED", "Workflow cancelled"));
         else signal.addEventListener("abort", () => { run?.checkpointResolvers.delete(path); reject(new WorkflowError("CANCELLED", "Workflow cancelled")); }, { once: true });
@@ -1003,7 +1009,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     "workflow_respond",
     "Workflow Respond",
     "Approve or reject one pending workflow checkpoint or budget decision",
-    Type.Object({ runId: Type.String(), name: Type.Optional(Type.String()), proposalId: Type.Optional(Type.String()), approved: Type.Boolean() }, { additionalProperties: false }),
+    Type.Object({
+      runId: Type.String(),
+      name: Type.Optional(Type.String()),
+      proposalId: Type.Optional(Type.String()),
+      approved: Type.Boolean(),
+      choice: Type.Optional(Type.String({ description: "Optional specific choice key or disposition" })),
+      feedback: Type.Optional(Type.String({ description: "Optional explanation or review feedback" })),
+    }, { additionalProperties: false }),
     WORKFLOW_RESPOND_OUTPUT,
     async (params, signal, ctx) => {
       if (params.proposalId) {
@@ -1013,8 +1026,15 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         return { text: completionControlContent(result, params.runId), details: { ...result, reason }, structured: { ...completionControlValue(result, params.runId), reason } };
       }
       if (!params.name) throw new WorkflowError("INVALID_METADATA", "workflow_respond requires name or proposalId");
-      const accepted = await answerCheckpoint(params.runId, params.name, params.approved);
-      const details = { accepted, state: accepted ? "checkpoint_answered" : "not_pending", approved: params.approved, reason: "checkpoint" };
+      const accepted = await answerCheckpoint(params.runId, params.name, params.approved, false, params.choice, params.feedback);
+      const details = {
+        accepted,
+        state: accepted ? "checkpoint_answered" : "not_pending",
+        approved: params.approved,
+        ...(params.choice !== undefined ? { choice: params.choice } : {}),
+        ...(params.feedback !== undefined ? { feedback: params.feedback } : {}),
+        reason: "checkpoint",
+      };
       return { text: accepted ? "Checkpoint response accepted." : "Checkpoint is not awaiting a response.", details, structured: details };
     },
   );

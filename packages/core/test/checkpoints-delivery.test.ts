@@ -574,3 +574,51 @@ void test("background workflow logs persist and append capped TUI transcript ent
   assert.ok(renderer);
   assert.equal(renderer({ data: entries[0].data }, {}, {}).render(100).join("\n"), "Workflow logger: working");
 });
+
+void test("workflow_respond accepts optional choice and feedback and resolves checkpoint with structured response details", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-checkpoint-structured-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const pi = {
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {},
+    getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow", "workflow_respond"],
+    sendMessage() {},
+  };
+  workflowExtension(testExtensionApi(pi), home);
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const respond = tools.find(({ name }) => name === "workflow_respond");
+  assert.ok(workflow && respond);
+
+  const base = { cwd: home, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session" } };
+  const script = `export const meta={name:'structured-gate',description:'gate'}; return checkpoint({name:'deploy',prompt:'Deploy?',context:{env:'prod'}});`;
+
+  const background = await workflow.execute("id", { name: "structured-gate", script }, new AbortController().signal, undefined, base) as { details: { runId: string } };
+  const { runId } = background.details;
+  const store = new RunStore(home, "session", runId, home);
+
+  for (let attempt = 0; attempt < 1000 && (await store.awaitingCheckpoints()).length < 1; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  const response = await respond.execute("id", {
+    runId,
+    name: "deploy",
+    approved: true,
+    choice: "canary",
+    feedback: "deploying to 10% first",
+  }) as { details: { accepted: boolean; approved: boolean; choice?: string; feedback?: string } };
+
+  assert.equal(response.details.accepted, true);
+  assert.equal(response.details.approved, true);
+  assert.equal(response.details.choice, "canary");
+  assert.equal(response.details.feedback, "deploying to 10% first");
+
+  for (let attempt = 0; attempt < 1000 && (await store.load()).run.state !== "completed"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  const completed = await store.load();
+  assert.equal(completed.run.state, "completed");
+  const replayed = await store.replay("checkpoint/deploy");
+  assert.deepEqual(replayed?.value, { approved: true, choice: "canary", feedback: "deploying to 10% first" });
+});
+

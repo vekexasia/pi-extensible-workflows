@@ -1,4 +1,4 @@
-import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
+import { AGENT_STATES, BUDGET_DIMENSIONS, BUDGET_EVENT_TYPES, RUN_STATES, isContextFileScope, type AgentAccounting, type AgentActivity, type AgentAttemptSummary, type AgentContinuity, type CheckpointResponseDetails, type PreparedAgentConfiguration, LAUNCH_SNAPSHOT_IDENTITY_VERSION, type AgentRecord, type AgentResourceInspection, type AgentResourceSelectors, type BudgetApprovalRequest, type BudgetDimension, type BudgetEvent, type BudgetEventType, type ContextFileScope, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunRecord, type WorkflowBudgetUsage, type WorkflowExtensionSettings, type WorkflowRetentionSettings, type WorkflowRunEvent } from "./types.js";
 import { validAgentSpeed } from "./agent-speed.js";
 import type { OwnershipRecord, ScheduledAgentOptions } from "./agent-execution.js";
 import { finiteNumber, isThinkingLevel, isWorkflowErrorCode, jsonValue, object, positiveInteger, validWorkflowExtensionNamespace } from "./utils.js";
@@ -556,7 +556,23 @@ export function decodeJournal(value: unknown): Journal | undefined {
   if (!completed || value.awaiting !== undefined && !awaiting || value.decisions !== undefined && !decisions) return undefined;
   return { completed, ...(awaiting === undefined ? {} : { awaiting }), ...(decisions === undefined ? {} : { decisions }) };
 }
-export function decodeBooleanCheckpointResult(value: unknown): boolean | undefined { return typeof value === "boolean" ? value : undefined; }
+export function decodeCheckpointResult(value: unknown): boolean | CheckpointResponseDetails | undefined {
+  if (typeof value === "boolean") return value;
+  if (object(value) && typeof value.approved === "boolean") {
+    const choice = typeof value.choice === "string" ? value.choice : undefined;
+    const feedback = typeof value.feedback === "string" ? value.feedback : undefined;
+    return {
+      approved: value.approved,
+      ...(choice !== undefined ? { choice } : {}),
+      ...(feedback !== undefined ? { feedback } : {}),
+    };
+  }
+  return undefined;
+}
+export function decodeBooleanCheckpointResult(value: unknown): boolean | undefined {
+  const result = decodeCheckpointResult(value);
+  return typeof result === "boolean" ? result : result?.approved;
+}
 export function decodeSummaryProjection(value: unknown): Partial<RunSummary> | undefined {
   if (!object(value)) return undefined;
   const createdAt = optionalString(value.createdAt);
