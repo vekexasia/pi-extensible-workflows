@@ -1050,7 +1050,7 @@ export class WorkflowAgentExecutor {
   setRunContext(runContext: Readonly<WorkflowRunContext>): void { this.root.runContext = runContext; }
 
   resolve(options: AgentExecutionOptions, inheritedTools?: readonly string[]): { model: ModelSpec; requestedModel?: string; tools: readonly string[]; systemPrompt?: string; systemPromptAppend: string; contextFiles?: readonly ContextFileScope[] } {
-    if (options.configuration) return { ...options.configuration, ...(options.modelOverride ? { model: options.modelOverride } : {}) };
+    if (options.configuration) return { ...options.configuration, ...(options.modelOverride ? { model: physicalModel(options.modelOverride, this.root.modelAliases, this.root.knownModels, this.root.settingsPath) } : {}) };
     const ceiling = inheritedTools ?? [...this.root.tools];
     for (const pattern of options.tools ?? []) if (!pattern.startsWith("!") && !resourcePatternHasMagic(pattern) && !ceiling.includes(pattern)) throw new WorkflowError("UNKNOWN_TOOL", `Tool is outside the prepared agent policy: ${pattern}`);
     const tools = options.effectiveTools ?? selectResourcesByLayers([this.root.resourceSelectors?.tools, options.tools], [...(inheritedTools ?? this.root.tools)]);
