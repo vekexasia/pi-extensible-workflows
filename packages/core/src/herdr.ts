@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { isObject } from "./utils.js";
+import { errorText, isObject } from "./utils.js";
 
 export type HerdrPaneAction = "live";
 export type HerdrAgentState = "idle" | "working" | "blocked" | "unknown";
@@ -8,10 +8,20 @@ export interface HerdrPaneStatus { state: HerdrAgentStatus }
 export interface HerdrPaneRequest { action: HerdrPaneAction; cwd: string; command: string; paneId?: string }
 export interface HerdrWorkspacePaneRequest { cwd: string; workspaceLabel?: string; workspaceId?: string; tabLabel: string; command: string }
 export interface HerdrWorkspacePane { workspaceId: string; tabId: string; paneId: string }
+export interface HerdrWorktreeRequest { cwd: string; branch: string; base: string; label?: string }
+export interface HerdrWorktree { workspaceId: string; path: string; branch: string }
+export interface HerdrListedWorktree { workspaceId: string; path: string; branch: string }
+export interface HerdrWorktreeList { repoKey: string; worktrees: readonly HerdrListedWorktree[] }
 export type HerdrCommandRunner = (args: readonly string[]) => Promise<string>;
+export class HerdrCommandError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HerdrCommandError";
+  }
+}
 
 export const herdrCommandRunner: HerdrCommandRunner = (args) => new Promise<string>((resolve, reject) => {
-  execFile("herdr", [...args], { encoding: "utf8", maxBuffer: 1024 * 1024 }, (error, stdout) => {
+  execFile("herdr", [...args], { encoding: "utf8", maxBuffer: 1024 * 1024, timeout: 10_000 }, (error, stdout) => {
     if (error) { reject(new Error(error.message)); return; }
     resolve(stdout);
   });
@@ -80,25 +90,74 @@ function resourceId(value: unknown, resource: string, field: string): string {
   return id;
 }
 
+export function herdrWorkspaceEnvironment(env: NodeJS.ProcessEnv = process.env): boolean { return env.HERDR_ENV === "1" && Boolean(env.HERDR_SOCKET_PATH); }
+
+export async function createHerdrWorktree(request: HerdrWorktreeRequest, runner: HerdrCommandRunner = herdrCommandRunner): Promise<HerdrWorktree> {
+  if (!herdrWorkspaceEnvironment() || !request.cwd || !request.branch || !request.base) throw new Error("Herdr worktree creation is unavailable or missing required data.");
+  let output: string;
+  try {
+    output = await runner(["worktree", "create", "--cwd", request.cwd, "--branch", request.branch, "--base", request.base, "--no-focus", ...(request.label ? ["--label", request.label] : [])]);
+  } catch (error) {
+    throw new HerdrCommandError(errorText(error));
+  }
+  const parsed = json(output);
+  const result = record(record(parsed)?.result);
+  const workspace = record(result?.workspace);
+  const worktree = record(result?.worktree);
+  const workspaceId = workspace?.workspace_id;
+  const path = worktree?.path;
+  const branch = worktree?.branch;
+  if (typeof workspaceId !== "string" || !workspaceId || typeof path !== "string" || !path) throw new Error("Herdr returned an invalid worktree.");
+  return { workspaceId, path, branch: typeof branch === "string" && branch ? branch : request.branch };
+}
+
+export async function listHerdrWorktrees(workspaceId: string, runner: HerdrCommandRunner = herdrCommandRunner): Promise<HerdrWorktreeList> {
+  if (!workspaceId) throw new Error("Herdr worktree workspace ID is missing.");
+  const output = json(await runner(["worktree", "list", "--workspace", workspaceId]));
+  const result = record(record(output)?.result);
+  const source = record(result?.source);
+  const worktrees = result?.worktrees;
+  if (typeof source?.repo_key !== "string" || !source.repo_key || !Array.isArray(worktrees)) throw new Error("Herdr returned an invalid worktree list.");
+  const listed = worktrees.map((candidate): HerdrListedWorktree => {
+    const item = record(candidate);
+    const listedWorkspaceId = item?.open_workspace_id;
+    const path = item?.path;
+    const branch = item?.branch;
+    if (typeof listedWorkspaceId !== "string" || !listedWorkspaceId || typeof path !== "string" || !path || typeof branch !== "string" || !branch) throw new Error("Herdr returned an invalid worktree list.");
+    return { workspaceId: listedWorkspaceId, path, branch };
+  });
+  return { repoKey: source.repo_key, worktrees: listed };
+}
+
+export async function removeHerdrWorktree(workspaceId: string, runner: HerdrCommandRunner = herdrCommandRunner): Promise<void> {
+  if (!workspaceId) throw new Error("Herdr worktree workspace ID is missing.");
+  await runner(["worktree", "remove", "--workspace", workspaceId]);
+}
+
 export async function openHerdrWorkspacePane(request: HerdrWorkspacePaneRequest, runner: HerdrCommandRunner = herdrCommandRunner): Promise<HerdrWorkspacePane> {
   if (!request.cwd || !request.tabLabel || !request.command || !request.workspaceId && !request.workspaceLabel) throw new Error("Herdr workspace pane is missing required data.");
-  const created = json(await runner(request.workspaceId
-    ? ["tab", "create", "--workspace", request.workspaceId, "--cwd", request.cwd, "--label", request.tabLabel, "--no-focus"]
-    : ["workspace", "create", "--cwd", request.cwd, "--label", request.workspaceLabel ?? "", "--no-focus"]));
-  const workspaceId = request.workspaceId ?? resourceId(created, "workspace", "workspace_id");
-  let tabId = resourceId(created, "tab", "tab_id");
-  let paneId = resourceId(created, "root_pane", "pane_id");
+  let workspaceId = request.workspaceId;
+  let tabId: string | undefined;
+  let paneId: string | undefined;
   try {
+    const created = json(await runner(request.workspaceId
+      ? ["tab", "create", "--workspace", request.workspaceId, "--cwd", request.cwd, "--label", request.tabLabel, "--no-focus"]
+      : ["workspace", "create", "--cwd", request.cwd, "--label", request.workspaceLabel ?? "", "--no-focus"]));
+    workspaceId ??= resourceId(created, "workspace", "workspace_id");
+    tabId = resourceId(created, "tab", "tab_id");
+    paneId = resourceId(created, "root_pane", "pane_id");
     if (!request.workspaceId) {
       await runner(["tab", "rename", tabId, request.workspaceLabel ?? ""]);
       const tab = json(await runner(["tab", "create", "--workspace", workspaceId, "--cwd", request.cwd, "--label", request.tabLabel, "--no-focus"]));
       tabId = resourceId(tab, "tab", "tab_id");
       paneId = resourceId(tab, "root_pane", "pane_id");
     }
+    if (!workspaceId || !tabId || !paneId) throw new Error("Herdr returned incomplete workspace pane IDs.");
     await runner(["pane", "run", paneId, commandFor({ action: "live", cwd: request.cwd, command: request.command })]);
     return { workspaceId, tabId, paneId };
   } catch (error) {
-    await runner(request.workspaceId ? ["tab", "close", tabId] : ["workspace", "close", workspaceId]).catch(() => undefined);
+    const cleanup = request.workspaceId ? tabId && ["tab", "close", tabId] : workspaceId && ["workspace", "close", workspaceId];
+    if (cleanup) await runner(cleanup).catch(() => undefined);
     throw error;
   }
 }

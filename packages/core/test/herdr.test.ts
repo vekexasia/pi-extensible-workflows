@@ -1,11 +1,48 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import test from "node:test";
-import { createHerdrAgentReporter, herdrPaneCommand, herdrPaneId, openHerdrPane, openHerdrWorkspacePane, waitForHerdrPane } from "../src/herdr.js";
+import { createHerdrAgentReporter, createHerdrWorktree, herdrCommandRunner, herdrPaneCommand, herdrPaneId, herdrWorkspaceEnvironment, openHerdrPane, openHerdrWorkspacePane, removeHerdrWorktree, waitForHerdrPane } from "../src/herdr.js";
 
 void test("gates Herdr actions on the managed pane environment", () => {
   assert.equal(herdrPaneId({ HERDR_ENV: "0", HERDR_PANE_ID: "pane" }), undefined);
   assert.equal(herdrPaneId({ HERDR_ENV: "1" }), undefined);
   assert.equal(herdrPaneId({ HERDR_ENV: "1", HERDR_PANE_ID: " opaque-pane " }), "opaque-pane");
+});
+
+void test("turns a hung Herdr command into a normal failure", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-herdr-timeout-"));
+  const command = join(directory, "herdr");
+  writeFileSync(command, "#!/bin/sh\nexec node -e 'setInterval(() => {}, 1000)'\n");
+  chmodSync(command, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${directory}${delimiter}${previousPath ?? ""}`;
+  try {
+    await assert.rejects(herdrCommandRunner(["worktree", "create"]), (error: unknown) => error instanceof Error);
+  } finally {
+    if (previousPath === undefined) Reflect.deleteProperty(process.env, "PATH"); else process.env.PATH = previousPath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+void test("detects the Herdr workspace environment and creates/removes managed worktrees", async () => {
+  const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH };
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_SOCKET_PATH = "/tmp/herdr.sock";
+  try {
+    assert.equal(herdrWorkspaceEnvironment(), true);
+    const calls: string[][] = [];
+    const runner = async (args: readonly string[]): Promise<string> => { calls.push([...args]); return args[1] === "create" ? JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" }, worktree: { path: "/trees/feature", branch: "feature" } } }) : ""; };
+    assert.deepEqual(await createHerdrWorktree({ cwd: "/repo", branch: "feature", base: "abc" }, runner), { workspaceId: "workspace-1", path: "/trees/feature", branch: "feature" });
+    await removeHerdrWorktree("workspace-1", runner);
+    assert.deepEqual(calls, [
+      ["worktree", "create", "--cwd", "/repo", "--branch", "feature", "--base", "abc", "--no-focus"],
+      ["worktree", "remove", "--workspace", "workspace-1"],
+    ]);
+  } finally {
+    for (const [name, value] of Object.entries(previous)) { if (value === undefined) Reflect.deleteProperty(process.env, name); else process.env[name] = value; }
+  }
 });
 
 void test("targets the declared Herdr pane, chooses geometry, escapes live commands, and forwards agent environments", async () => {
@@ -108,6 +145,20 @@ void test("creates a dedicated labeled workspace and reports ordered agent lifec
     }
   }
 });
+void test("closes a created workspace when Herdr omits its tab or pane ID", async () => {
+  const calls: string[][] = [];
+  const runner = async (args: readonly string[]): Promise<string> => {
+    calls.push([...args]);
+    if (args[0] === "workspace") return JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" } } });
+    return "";
+  };
+  await assert.rejects(openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow", tabLabel: "agent", command: "pi" }, runner));
+  assert.deepEqual(calls, [
+    ["workspace", "create", "--cwd", "/repo", "--label", "flow", "--no-focus"],
+    ["workspace", "close", "workspace-1"],
+  ]);
+});
+
 void test("waits for Pi startup before reporting an exit", async () => {
   let processReports = 0;
   let statusReports = 0;

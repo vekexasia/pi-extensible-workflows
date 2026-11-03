@@ -47,6 +47,10 @@ The effective value uses the global map unless a trusted project declares `exten
 
 ## Live handoff and ownership
 
+### Worktrees
+
+When Pi runs inside a Herdr-managed pane (`HERDR_ENV=1` with a Herdr socket), a workflow or subagent worktree is created with `herdr worktree create` from the repository root, on the branch and base the run already planned. Herdr registers the checkout, so it appears in its own workspace list beside the pane that owns it, and teardown goes through `herdr worktree remove --workspace <id>`. The workspace id is recorded in the run's `worktrees.json` next to the worktree record, which is what lets an interrupted run be reclaimed. Outside Herdr, or when the command fails, the plain Git path runs instead and nothing is registered.
+
 Live handoff pauses the local SDK at a turn boundary while the Herdr pane owns the task. A generated bridge reports Pi's `agent_settled` event directly to the transport, independently of user extension filters and Herdr screen detection. This returns ownership to the local SDK and closes the owned pane; accepting `workflow_result` alone does not end the execution. Pane exit, `/quit`, and cancellation remain fallback paths.
 
 The extension preserves the originating Pi executable and entrypoint, model, tools, role/resource policy, context selection, prompt configuration, custom result tools, and transferable inline extensions. Temporary bridge files use private permissions; files and sockets are cleaned after the pane closes.
