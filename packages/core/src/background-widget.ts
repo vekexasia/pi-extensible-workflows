@@ -1108,6 +1108,8 @@ export function renderReceipt(data: Receipt, expanded: boolean, theme: Theme): s
 export interface BackgroundWidgetController {
   /** A subagent status changed: the frame is drawn again when the background subagents shown changed. */
   subagentsChanged(): void;
+  /** A foreground run moved to the background: no event says so, and a widget that hid for it has no timer to notice. */
+  runMovedToBackground(runId: string, runDirectory: string, sessionId: string): void;
 }
 
 /**
@@ -1115,7 +1117,7 @@ export interface BackgroundWidgetController {
  * group after the runs.
  */
 export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?: AgentsOpener, subagents?: () => Iterable<BackgroundSubagent>): BackgroundWidgetController {
-  if (!enabled || typeof pi.registerEntryRenderer !== "function" || !pi.events || typeof pi.events.on !== "function") return { subagentsChanged() {} };
+  if (!enabled || typeof pi.registerEntryRenderer !== "function" || !pi.events || typeof pi.events.on !== "function") return { subagentsChanged() {}, runMovedToBackground() {} };
   const eventBus = pi.events;
   const subscribe = (name: string, handler: (event: unknown) => void): (() => void) => eventBus.on?.(name, handler) ?? (() => {});
   const registerEntryRenderer = pi.registerEntryRenderer;
@@ -1639,5 +1641,8 @@ export default function widget(pi: BackgroundWidgetAPI, enabled = true, opener?:
     subagentSignature = signature;
     try { paint(true); } catch { hide(); }
   };
-  return { subagentsChanged };
+  const runMovedToBackground = (runId: string, runDirectory: string, runSessionId: string): void => {
+    onRunEvent({ runId, runDirectory, sessionId: runSessionId });
+  };
+  return { subagentsChanged, runMovedToBackground };
 }
