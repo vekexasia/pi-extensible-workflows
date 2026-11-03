@@ -15,6 +15,7 @@
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
 - The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
 - Package verification no longer exempts any advisory: the brace-expansion and the 6.3.0 undici exceptions are removed, so a passing gate means `npm audit` is clean (#354).
+- The core package now depends on minimatch 11, which fixes GHSA-g3hv-75wg-m249 (denial of service through glob patterns).
 
 ## [6.3.0] - 2026-10-25
 

@@ -204,7 +204,7 @@ export function validateResourcePattern(pattern: string): void {
   const body = resourcePatternBody(pattern);
   if (!body) throw new Error(`Empty minimatch pattern ${JSON.stringify(pattern)}`);
   const matcher = new Minimatch(resourcePatternPath(body), RESOURCE_PATTERN_OPTIONS);
-  if (matcher.makeRe() === false) throw new Error(`Invalid minimatch pattern ${JSON.stringify(pattern)}`);
+  if (matcher.set.length === 0) throw new Error(`Invalid minimatch pattern ${JSON.stringify(pattern)}`);
 }
 export function resourcePatternMatches(resource: string, pattern: string): boolean {
   const body = resourcePatternBody(pattern);
