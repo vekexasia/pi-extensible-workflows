@@ -1368,6 +1368,35 @@ void test("a foreground run is left to the workflow tool that is already drawing
   host.shutdown();
 });
 
+void test("a foreground run moved to the background is drawn at once, or on the first tick after an agents workspace open meanwhile closes", (t) => {
+  // The move rewrites the state file and emits no event, and the widget that hid for the foreground run has no timer running.
+  const root = mkdtempSync(join(tmpdir(), "widget-detached-"));
+  t.mock.timers.enable({ apis: ["Date", "setInterval"], now: Date.now() });
+  const workspaceLoop = Symbol.for("pi-extensible-workflows.agents-workspace-loop");
+  for (const workspaceOpen of [false, true]) {
+    const host = harness();
+    host.start();
+    const directory = writeRun(join(root, `run-${String(workspaceOpen)}`), { ...runState(), delivery: { mode: "foreground", state: "attached" } });
+    host.emit(WORKFLOW_AGENT_STATE_CHANGED_EVENT, { runId: "run-1", runDirectory: directory, sessionId: "session-1" });
+    t.mock.timers.tick(3000);
+    assert.equal(host.widgets.length, 0, "no widget for the foreground run");
+    writeRun(directory, { ...runState(), delivery: { mode: "background", state: "pending" } });
+    if (workspaceOpen) Reflect.set(globalThis, workspaceLoop, true);
+    try {
+      host.controller.runMovedToBackground("run-1", directory, "session-1");
+      if (workspaceOpen) {
+        t.mock.timers.tick(3000);
+        assert.equal(host.widgets.length, 0, "nothing is drawn under the workspace");
+      }
+    } finally { Reflect.deleteProperty(globalThis, workspaceLoop); }
+    if (workspaceOpen) t.mock.timers.tick(1000);
+    assert.equal(typeof host.widgets.at(-1), "function", `the run is drawn (workspace open: ${String(workspaceOpen)})`);
+    assert.ok(drawAt(host, WIDTH).some((line) => line.includes("smoke")), drawAt(host, WIDTH).join("\n"));
+    host.shutdown();
+  }
+  rmSync(root, { recursive: true, force: true });
+});
+
 void test("a foreground run leaves no receipt either", async () => {
   const root = mkdtempSync(join(tmpdir(), "widget-foreground-receipt-"));
   const host = harness();

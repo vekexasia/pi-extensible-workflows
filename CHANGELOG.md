@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- A foreground workflow moved to the background now shows in the workflow widget: at once, or within a second of closing `/workflow` or `/agents` when it was moved from there. Before, the widget stayed hidden until some agent, phase, or subagent changed state.
+
 ## [6.4.0] - 2026-11-16
 
 **This minor version contains a breaking change.** Shipping it as 6.4.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
