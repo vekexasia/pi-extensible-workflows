@@ -1,9 +1,8 @@
-import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { WorkflowError } from "../../src/types.js";
 import type { AgentActivity, AgentAccounting, AgentAttemptSummary, AgentExecutionOptions, AgentExecutionResult, AgentExecutionRoot, AgentProgress, AgentToolCallProgress, AgentTransport, LiveSessionHandoff, PreparedAgentSession, WorkflowAgentSession, WorkflowAgentSessionReference } from "../../src/index.js";
 import { validateAgentOptions } from "../../src/validation.js";
-import type { Static } from "typebox";
+import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import type { SubagentWorktreeAdapter } from "./worktree.js";
 

@@ -112,12 +112,12 @@ interface MatchSets { readonly direct: ReadonlySet<string>; readonly shown: Read
 /** The alt screen's own scroll and search actions: it acts on them before any input listener. */
 const ALT_SCREEN_ACTIONS = (Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[]).filter((id) => id.startsWith("tui.altScreen."));
 /**
- * A keypress: what parseKey names, what the alt screen takes for one of its actions (with the keybindings it reads, so also the
- * legacy home and end \x1b[1~ and \x1b[4~ of tmux and screen), text without a control character (é), or a bracketed paste. What
+ * A keypress: what parseKey names, home and end in any encoding (also the legacy \x1b[1~ and \x1b[4~ of tmux and screen, which
+ * parseKey does not name), what the alt screen takes for one of its actions, text without a control character (é), or a bracketed paste. What
  * else the terminal sends, a focus report or a query's answer, is not one.
  */
 function isKey(data: string): boolean {
-  if (parseKey(data) !== undefined || data.startsWith("\x1b[200~")) return true;
+  if (parseKey(data) !== undefined || matchesKey(data, "home") || matchesKey(data, "end") || data.startsWith("\x1b[200~")) return true;
   const keybindings = getKeybindings();
   return ALT_SCREEN_ACTIONS.some((id) => keybindings.matches(data, id)) || isText(data);
 }

@@ -3,7 +3,7 @@ import { copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { Compile } from "typebox/compile";
 import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, loadSkills, type InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -269,7 +269,7 @@ async function buildSystemPromptForInspection(options: unknown): Promise<string>
   return (await loadNativeCoreModule("system-prompt.js", "system prompt builder") as { buildSystemPrompt(options: unknown): string }).buildSystemPrompt(options);
 }
 type NativePromptSession = PiSession & {
-  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(prompt: string, images: undefined, options: unknown): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
+  readonly _extensionRunner?: { hasHandlers(event: string): boolean; emitInput(text: string, images: undefined, source: "interactive"): Promise<unknown>; emitBeforeAgentStart(trigger: { messageType: "user"; prompt: string }, options: unknown): Promise<unknown>; onError(listener: (error: unknown) => void): () => void };
   readonly _baseSystemPromptOptions?: unknown;
   readonly _expandSkillCommand?: (text: string) => string;
   readonly promptTemplates?: readonly { name: string; content: string }[];
@@ -304,7 +304,7 @@ async function preparePiPrompt(native: PiSession, text: string): Promise<PiPromp
       try { expandedPrompt = await expandPromptTemplateForInspection(skillExpanded, Array.isArray(templates) ? templates : []); }
       catch (error) { diagnostics.push({ type: "error", message: `Pi prompt template expansion is unavailable: ${errorText(error)}`, source: "Pi session" }); }
     }
-    const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart(expandedPrompt, undefined, baseOptions) : undefined;
+    const result = !inputHandled && runner && baseOptions !== undefined ? await runner.emitBeforeAgentStart({ messageType: "user", prompt: expandedPrompt }, baseOptions) : undefined;
     const prepared = result as { messages?: readonly unknown[]; systemPromptOptions?: unknown } | undefined;
     const systemPromptOptions = prepared?.systemPromptOptions ?? baseOptions;
     const systemPrompt = prepared?.systemPromptOptions === undefined ? baseSystemPrompt : await buildSystemPromptForInspection(prepared.systemPromptOptions);

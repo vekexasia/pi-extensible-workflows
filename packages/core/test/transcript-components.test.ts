@@ -40,6 +40,7 @@ class FakeTerminal implements Terminal {
   clearFromCursor(): void { /* captured writes only */ }
   clearScreen(): void { /* captured writes only */ }
   setTitle(): void { /* captured writes only */ }
+  setProgramStatus(): void { /* captured writes only */ }
   setProgress(): void { /* captured writes only */ }
 }
 

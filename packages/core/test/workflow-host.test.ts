@@ -745,6 +745,10 @@ void test("registers workflow_catalog only for active non-empty registries", asy
     expanded,
     showImages: false,
     isError: false,
+    durationMs: undefined,
+    outputPad: 0,
+    keyText: () => "",
+    keyHint: (_keybinding, description) => description,
   });
   const themeColors = {
     accent: "", border: "", borderAccent: "", borderMuted: "", success: "", error: "", warning: "", muted: "", dim: "", text: "",
