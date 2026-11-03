@@ -1403,6 +1403,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
             for (const checkpoint of await store.awaitingCheckpoints()) deliverBackgroundCheckpoint(checked.metadata.name, runId, checkpoint);
             signal?.removeEventListener("abort", onForegroundAbort);
             const run = (await store.load()).run;
+            backgroundWidgetController.runMovedToBackground(runId, store.directory, store.sessionId);
             const result = { runId, state: "running" as const, detached: true as const, run };
             resolveDetached?.(result);
             return result;
