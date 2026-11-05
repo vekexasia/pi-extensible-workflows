@@ -252,16 +252,14 @@ void test("registers Herdr-created worktrees and removes them through Herdr", as
   }
 });
 
-void test("falls back to a Git worktree when Herdr creation fails", async () => {
+void test("fails instead of falling back to a Git worktree when Herdr creation fails", async () => {
   const fixture = herdrFixture("create-fails");
   try {
-    const store = new RunStore(fixture.repo, "session-a", "run-herdr-fallback", fixture.home, fixture.runner);
-    await store.create({ ...run(fixture.repo), id: "run-herdr-fallback" }, snapshot);
-    const worktree = await store.worktree("agent");
-    assert.equal(worktree.workspaceId, undefined);
-    assert.equal(existsSync(join(worktree.path, "tracked.txt")), true);
-    assert.equal(execFileSync("git", ["-C", fixture.repo, "branch", "--list", worktree.branch], { encoding: "utf8" }).trim().endsWith(worktree.branch), true);
-    await store.delete(true);
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-failure", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-failure" }, snapshot);
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.equal(execFileSync("git", ["-C", fixture.repo, "branch", "--list", "pi-extensible-workflows/run-herdr-failure/*"], { encoding: "utf8" }).trim(), "");
+    assert.equal(existsSync(fixture.tree), false);
   } finally {
     fixture.restore();
   }
@@ -334,11 +332,25 @@ void test("rejects a missing Herdr record unless its listing matches the reposit
 void test("preserves the Git worktree marker when removal fails after setup", async () => {
   const fixture = herdrFixture("git-remove-fails");
   try {
+    Reflect.deleteProperty(process.env, "HERDR_ENV");
+    Reflect.deleteProperty(process.env, "HERDR_SOCKET_PATH");
     const store = new RunStore(fixture.repo, "session-a", "run-git-remove-fails", fixture.home, fixture.runner);
     const cleanupCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(fixture.cleanupScript)}`;
     await store.create({ ...run(fixture.repo), id: "run-git-remove-fails" }, createLaunchSnapshot({ ...snapshot, settings: { ...snapshot.settings, worktreeSetup: [cleanupCommand] } }));
     await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && /fatal|validation failed/i.test(error.message));
     assert.equal(readdirSync(store.directory).some((name) => name.endsWith(".creating")), true);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("does not leave a Git worktree marker when Herdr creation fails", async () => {
+  const fixture = herdrFixture("git-remove-fails");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-git-remove-fails", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-git-remove-fails" }, snapshot);
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.equal(readdirSync(store.directory).some((name) => name.endsWith(".creating")), false);
   } finally {
     fixture.restore();
   }
@@ -1181,10 +1193,11 @@ void test("evidence deduplication verifies raw bytes and rejects non-JSON conten
   writeFileSync(record.path, Buffer.from([0xff]));
   await assert.rejects(store.saveEvidence("\uFFFD"), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   assert.deepEqual([...readFileSync(record.path)], [0xff]);
+  assert.equal((await store.listEvidence()).length, 0);
   for (const bad of [undefined, Number.NaN, { value: Number.POSITIVE_INFINITY }, { value: undefined }, 1n, () => 1, Promise.resolve("x")]) {
     await assert.rejects(callUnchecked(store.saveEvidence.bind(store), undefined, [bad]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
-  assert.equal((await store.listEvidence()).length, 1);
+  assert.equal((await store.listEvidence()).length, 0);
 });
 void test("evidence deduplication rejects artifacts modified after saving", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-tamper-"));

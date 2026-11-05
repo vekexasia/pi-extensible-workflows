@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, jsonValue, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
@@ -14,8 +14,8 @@ import {
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference, type EvidenceRecord,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json, runWorktreeSetup } from "./io.js";
-import { createHerdrWorktree, HerdrCommandError, herdrCommandRunner, herdrWorkspaceEnvironment, listHerdrWorktrees, removeHerdrWorktree, type HerdrCommandRunner } from "./herdr.js";
-import { canonicalPath, piResourceContains, runsDirectory, safePart, sameFilesystemPath, structuralPath } from "./paths.js";
+import { createHerdrWorktree, herdrCommandRunner, herdrWorkspaceEnvironment, listHerdrWorktrees, listHerdrWorktreesByCwd, removeHerdrWorktree, type HerdrCommandRunner } from "./herdr.js";
+import { canonicalPath, canonicalPathFrom, piResourceContains, runsDirectory, safePart, sameFilesystemPath, structuralPath } from "./paths.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -132,6 +132,7 @@ export class RunStore {
     const journal = decodeJournal(await json(join(this.directory, "journal.json")));
     const previous = await json(join(this.directory, "summary.json")).then(decodeSummaryProjection).catch(() => undefined);
     if (!run || !journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run or journal is invalid");
+    this.#assertRunIdentity(run, "RESUME_INCOMPATIBLE", "Persisted run does not belong to this project");
     const [stateStat, journalStat] = await Promise.all([stat(join(this.directory, "state.json")), stat(join(this.directory, "journal.json"))]);
     const fallbackCreatedAt = new Date(stateStat.mtimeMs).toISOString();
     const previousUpdatedAt = previous?.updatedAt === undefined ? Number.NaN : Date.parse(previous.updatedAt);
@@ -217,8 +218,8 @@ export class RunStore {
     const previous = Number(await readFile(systemPromptSequencePath(this.directory), "utf8"));
     if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) throw new Error("Persisted system-prompt sequence is invalid");
     const sequence = previous + 1;
-    await atomicWriteFile(systemPromptSequencePath(this.directory), `${String(sequence)}\n`);
     await atomicJson(join(systemPromptRecordsPath(this.directory), systemPromptRecordName(sequence)), { sessionId: entry.sessionId, attempt: entry.attempt, turn: entry.turn, sha256 });
+    await atomicWriteFile(systemPromptSequencePath(this.directory), `${String(sequence)}\n`);
   }
   private async migrateSystemPrompts(legacy: { version: number; entries?: EffectiveSystemPrompt[] }): Promise<void> {
     await rm(systemPromptStoragePath(this.directory), { recursive: true, force: true });
@@ -229,7 +230,8 @@ export class RunStore {
   private async prepareSystemPromptStorage(): Promise<void> {
     const artifact = await this.readSystemPromptArtifact();
     if (artifact === undefined) {
-      await rm(systemPromptStoragePath(this.directory), { recursive: true, force: true });
+      const entries = await readdir(systemPromptStoragePath(this.directory)).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return []; throw error; });
+      if (entries.length > 0) throw new Error("Persisted system prompts are invalid");
       await createSystemPromptStorage(this.directory, true);
     } else if (artifact.version === 1) {
       if (!Array.isArray(artifact.entries)) throw new Error("Persisted system prompts are invalid");
@@ -244,11 +246,14 @@ export class RunStore {
     const names = (await readdir(systemPromptRecordsPath(this.directory))).filter((name) => !name.endsWith(".tmp")).sort();
     const entries: EffectiveSystemPrompt[] = [];
     let highest = 0;
+    let expected = 1;
     for (const name of names) {
       const match = /^(\d{20})\.json$/.exec(name);
       if (!match) throw new Error("Persisted system-prompt records are invalid");
       const recordSequence = Number(match[1]);
       if (!Number.isSafeInteger(recordSequence) || recordSequence < 1) throw new Error("Persisted system-prompt records are invalid");
+      if (recordSequence > sequence) continue;
+      if (recordSequence !== expected++) throw new Error("Persisted system-prompt records are invalid");
       highest = Math.max(highest, recordSequence);
       const record = await json(join(systemPromptRecordsPath(this.directory), name));
       if (!object(record)) throw new Error("Persisted system-prompt record is invalid");
@@ -261,7 +266,7 @@ export class RunStore {
       if (createHash("sha256").update(prompt).digest("hex") !== sha256) throw new Error("Persisted system-prompt body is invalid");
       entries.push({ sessionId, attempt, turn, sha256, prompt });
     }
-    if (sequence < highest) throw new Error("Persisted system-prompt sequence is invalid");
+    if (sequence < highest || expected - 1 !== sequence) throw new Error("Persisted system-prompt sequence is invalid");
     return entries;
   }
   async recordSystemPrompt(entry: Omit<EffectiveSystemPrompt, "sha256">): Promise<void> {
@@ -447,16 +452,22 @@ export class RunStore {
         git(this.cwd, ["rev-parse", "--show-toplevel"]),
         git(path, ["rev-parse", "--show-toplevel"]),
       ]);
-      const sourceRoot = resolve(this.cwd, storeRoot.trim());
-      const returnedRoot = resolve(path, worktreeRoot.trim());
-      return sameFilesystemPath(resolve(this.cwd, storeCommonDir.trim()), resolve(path, worktreeCommonDir.trim())) && !sameFilesystemPath(sourceRoot, returnedRoot) && sameFilesystemPath(path, returnedRoot);
+      const sourceRoot = canonicalPathFrom(storeRoot.trim(), this.cwd);
+      const returnedRoot = canonicalPathFrom(worktreeRoot.trim(), path);
+      return sameFilesystemPath(canonicalPathFrom(storeCommonDir.trim(), this.cwd), canonicalPathFrom(worktreeCommonDir.trim(), path)) && !sameFilesystemPath(sourceRoot, returnedRoot) && sameFilesystemPath(path, returnedRoot);
+    } catch { return false; }
+  }
+
+  private async nativeWorktreeMatches(path: string, branch: string): Promise<boolean> {
+    try {
+      return await this.herdrWorktreeBelongsToRepository(path) && (await git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"])).trim() === branch;
     } catch { return false; }
   }
 
   private async herdrWorktreeStatus(workspaceId: string, path: string, branch: string): Promise<"owned" | "missing" | "invalid"> {
     try {
       const [listed, commonDir] = await Promise.all([listHerdrWorktrees(workspaceId, this.herdrRunner), git(this.cwd, ["rev-parse", "--git-common-dir"])]);
-      if (!sameFilesystemPath(resolve(this.cwd, commonDir.trim()), resolve(this.cwd, listed.repoKey))) return "invalid";
+      if (!sameFilesystemPath(canonicalPathFrom(commonDir.trim(), this.cwd), canonicalPathFrom(listed.repoKey, this.cwd))) return "invalid";
       const matches = listed.worktrees.filter((worktree) => worktree.workspaceId === workspaceId);
       if (matches.length === 0) {
         const pathExists = await stat(path).then(() => true).catch(() => false);
@@ -472,7 +483,7 @@ export class RunStore {
     const herdrStatus = workspaceId === undefined ? undefined : await this.herdrWorktreeStatus(workspaceId, record.path, record.branch);
     const validPath = workspaceId !== undefined
       ? (herdrStatus === "owned" || allowMissingHerdr && herdrStatus === "missing") && (!requireDirectory || await this.herdrWorktreeBelongsToRepository(record.path))
-      : sameFilesystemPath(record.path, expected.path) && piResourceContains(this.directory, record.path);
+      : sameFilesystemPath(record.path, expected.path) && piResourceContains(this.directory, record.path) && (!requireDirectory || await this.nativeWorktreeMatches(record.path, record.branch));
     if (record.owner !== owner || !validPath || record.branch !== expected.branch || !piResourceContains(record.path, record.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
     return record;
   }
@@ -599,7 +610,7 @@ export class RunStore {
   }
   async validateDeletionWorktrees(): Promise<void> {
     try {
-      const records = await this.#loadWorktreeRecords(false);
+      const records = await this.#loadWorktreeRecords();
       const owners = new Set<string>();
       const paths: string[] = [];
       for (const record of records) {
@@ -653,9 +664,19 @@ export class RunStore {
     } catch { return; }
     if (typeof marker.owner !== "string" || typeof marker.base !== "string" || !sameFilesystemPath(markerPath, this.markerPath(marker.owner))) return;
     const expected = this.expectedWorktree(marker.owner);
+    if ((await this.#loadWorktreeRecords()).some((record) => record.owner === marker.owner)) {
+      await rm(markerPath, { force: true });
+      return;
+    }
     if (marker.herdr === true && !(typeof marker.workspaceId === "string" && marker.workspaceId)) {
+      if (marker.branchCreated !== false) return;
       const root = await git(this.cwd, ["rev-parse", "--show-toplevel"]).then((value) => value.trim()).catch(() => "");
-      if (!root || await stat(expected.path).then(() => true).catch(() => false) || await git(root, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).then(() => true).catch(() => false)) return;
+      if (!root) return;
+      const commonDir = await git(root, ["rev-parse", "--git-common-dir"]).then((value) => canonicalPathFrom(value.trim(), root)).catch(() => "");
+      const listed = await listHerdrWorktreesByCwd(root, this.herdrRunner).catch(() => undefined);
+      const orphan = listed && commonDir && sameFilesystemPath(listed.repoKey, commonDir) ? listed.worktrees.find((worktree) => worktree.branch === expected.branch) : undefined;
+      if (orphan && await this.herdrWorktreeBelongsToRepository(orphan.path)) await removeHerdrWorktree(orphan.workspaceId, this.herdrRunner);
+      else if (await stat(expected.path).then(() => true).catch(() => false) || await git(root, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).then(() => true).catch(() => false)) return;
       await rm(markerPath, { force: true });
       return;
     }
@@ -737,12 +758,12 @@ export class RunStore {
       let worktreeCreated = false;
       let herdrWorkspaceId: string | undefined;
       let markerWritten = false;
-      let preserveMarker = false;
+      let recordPersisted = false;
       try {
         const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
         const [canonicalRoot, canonicalCwd] = [canonicalPath(root), canonicalPath(this.cwd)];
+        if (!piResourceContains(canonicalRoot, canonicalCwd)) throw new Error("launch cwd is outside the repository");
         const launchRelative = relative(canonicalRoot, canonicalCwd);
-        if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
         await this.cleanupMarker(markerPath);
         const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
         if (dirty) {
@@ -757,33 +778,21 @@ export class RunStore {
         } catch {
           throw new Error("repository has no commits");
         }
+        if (await git(root, ["rev-parse", "--verify", `${branch}^{commit}`]).then(() => true).catch(() => false)) throw new Error(`worktree branch already exists: ${branch}`);
         await mkdir(dirname(path), { recursive: true, mode: 0o700 });
         let record: WorktreeReference = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
         await atomicJson(markerPath, { owner, path, branch, base: commit, branchCreated: false, herdr: herdrWorkspaceEnvironment() });
         markerWritten = true;
         if (herdrWorkspaceEnvironment()) {
-          try {
-            const created = await createHerdrWorktree({ cwd: root, branch, base: commit, label: `${loaded.run.workflowName} > ${owner}` }, this.herdrRunner);
-            herdrWorkspaceId = created.workspaceId;
-            path = created.path;
-            branch = created.branch;
-            worktreeCreated = true;
-            if (branch !== record.branch) throw new Error("Herdr created a worktree on a different branch than requested");
-            await atomicJson(markerPath, { owner, path, branch, base: commit, workspaceId: herdrWorkspaceId });
-            record = { ...record, path, cwd: join(path, launchRelative), workspaceId: herdrWorkspaceId };
-            if (!(await this.herdrWorktreeBelongsToRepository(path))) throw new Error("Herdr returned a worktree outside the repository");
-          } catch (error) {
-            if (herdrWorkspaceId) throw error;
-            if (!(error instanceof HerdrCommandError)) {
-              preserveMarker = true;
-              throw error;
-            }
-            const branchExists = await git(root, ["rev-parse", "--verify", `${branch}^{commit}`]).then(() => true).catch(() => false);
-            if (branchExists) {
-              preserveMarker = true;
-              throw error;
-            }
-          }
+          const created = await createHerdrWorktree({ cwd: root, branch, base: commit, label: `${loaded.run.workflowName} > ${owner}` }, this.herdrRunner);
+          herdrWorkspaceId = created.workspaceId;
+          path = created.path;
+          branch = created.branch;
+          worktreeCreated = true;
+          if (branch !== record.branch) throw new Error("Herdr created a worktree on a different branch than requested");
+          await atomicJson(markerPath, { owner, path, branch, base: commit, workspaceId: herdrWorkspaceId });
+          record = { ...record, path, cwd: join(path, launchRelative), workspaceId: herdrWorkspaceId };
+          if (!(await this.herdrWorktreeBelongsToRepository(path))) throw new Error("Herdr returned a worktree outside the repository");
         }
         if (!worktreeCreated) {
           path = this.expectedWorktree(owner).path;
@@ -799,11 +808,12 @@ export class RunStore {
         const setup = loaded.snapshot.settings.worktreeSetup;
         if (setup?.length) await runWorktreeSetup(setup, path, { PIEWF_WORKTREE_PATH: path, PIEWF_SOURCE_ROOT: root, PIEWF_WORKTREE_BRANCH: branch });
         await atomicJson(recordsPath, [...records, record]);
+        recordPersisted = true;
         await rm(markerPath, { force: true });
         return record;
       } catch (error) {
         let cleanupError: unknown;
-        if (worktreeCreated) {
+        if (!recordPersisted && worktreeCreated) {
           if (herdrWorkspaceId) {
             try { await removeHerdrWorktree(herdrWorkspaceId, this.herdrRunner); }
             catch (removalError) { cleanupError = removalError; }
@@ -812,12 +822,15 @@ export class RunStore {
             catch (removalError) { cleanupError = removalError; }
           }
         }
-        if (branchCreated) {
+        if (!recordPersisted && branchCreated) {
           try { await git(this.cwd, ["branch", "-D", branch]); }
           catch (removalError) { cleanupError ??= removalError; }
         }
-        if (markerWritten && cleanupError === undefined && !preserveMarker) await rm(markerPath, { force: true });
-        try {
+        if (!recordPersisted && markerWritten && cleanupError === undefined) {
+          try { await this.cleanupMarker(markerPath); }
+          catch (markerError) { cleanupError = markerError; }
+        }
+        if (!recordPersisted) try {
           const persisted = await this.#loadWorktreeRecords();
           const match = persisted.filter((candidate) => candidate.owner === owner);
           const candidate = match.length === 1 ? match[0] : undefined;
@@ -851,16 +864,8 @@ export class RunStore {
     try {
       const write = this.snapshotLane.run(async () => {
         const record = await this.worktree(owner);
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          await git(record.path, ["add", "-A"]);
-          if (!(await git(record.path, ["status", "--porcelain"])).trim()) break;
-          try {
-            await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
-            break;
-          } catch (error) {
-            if (attempt === 2) throw error;
-          }
-        }
+        await git(record.path, ["add", "-A"]);
+        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
         return (await git(record.path, ["rev-parse", "HEAD"])).trim();
       });
       return await write;
@@ -915,6 +920,16 @@ export class RunStore {
 
   evidenceDirectory(): string { return join(this.directory, "evidence"); }
 
+  private async lineageEvidencePath(path: string, sha256: string, seen = new Set<string>()): Promise<boolean> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    const nextSeen = new Set(seen);
+    nextSeen.add(this.runId);
+    if (sameFilesystemPath(path, join(this.evidenceDirectory(), `${sha256}.txt`))) return true;
+    const loaded = await this.load();
+    const sourceRunId = loaded.run.retry?.sourceRunId;
+    return sourceRunId === undefined ? false : (await this.sourceRun(sourceRunId)).lineageEvidencePath(path, sha256, nextSeen);
+  }
+
   /** Content-addressed and journaled by digest, so a resumed or retried run gets back the record its lineage first stored. */
   async saveEvidence(content: string | JsonValue): Promise<EvidenceRecord> {
     if (typeof content !== "string" && !jsonValue(content)) throw new WorkflowError("INVALID_METADATA", "Evidence content must be a string or JSON-compatible value");
@@ -923,19 +938,25 @@ export class RunStore {
     const sha256 = createHash("sha256").update(raw).digest("hex");
     const ref = `ref:sha256:${sha256.slice(0, 16)}`;
     const operation = structuralPath("evidence", sha256);
+    const dir = this.evidenceDirectory();
+    const targetPath = join(dir, `${sha256}.txt`);
     const replayed = await this.replay(operation);
     if (replayed) {
       const value = replayed.value;
-      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== raw.length || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== raw.length || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt` || !(await this.lineageEvidencePath(value.path, sha256))) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+      const info = await lstat(value.path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is not a regular file: ${operation}`);
       assertEvidenceIntegrity(await readFile(value.path), sha256, value.path);
       return { ref, sha256, path: value.path, bytes: raw.length };
     }
-    const dir = this.evidenceDirectory();
-    const targetPath = join(dir, `${sha256}.txt`);
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const existing = await readFile(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
     if (existing === undefined) await atomicWriteFile(targetPath, text);
-    else assertEvidenceIntegrity(existing, sha256, targetPath);
+    else {
+      const info = await lstat(targetPath);
+      if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError("RESULT_INVALID", `Evidence artifact is not a regular file: ${targetPath}`);
+      assertEvidenceIntegrity(existing, sha256, targetPath);
+    }
     const record = { ref, sha256, path: targetPath, bytes: raw.length };
     // Identical content stored concurrently journals once; every caller returns the same record.
     await this.updateJournal((journal) => { journal.completed[operation] ??= { path: operation, value: record }; });
@@ -952,7 +973,10 @@ export class RunStore {
       if (!/^[0-9a-f]{64}$/.test(sha256)) continue;
       const targetPath = join(dir, name);
       try {
-        const fileStat = await stat(targetPath);
+        const fileStat = await lstat(targetPath);
+        if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
+        const content = await readFile(targetPath);
+        if (createHash("sha256").update(content).digest("hex") !== sha256) continue;
         results.push({ ref: `ref:sha256:${sha256.slice(0, 16)}`, sha256, path: targetPath, bytes: fileStat.size });
       } catch { /* Ignore concurrently removed files. */ }
     }
@@ -981,6 +1005,7 @@ export class RunStore {
 
   async delete(confirmed: boolean): Promise<void> {
     if (!confirmed) throw new WorkflowError("CANCELLED", "Run deletion requires confirmation");
+    await this.validateDeletionWorktrees();
     const records = await this.#loadWorktreeRecords();
     const validated: WorktreeReference[] = [];
     const owners = new Set<string>();

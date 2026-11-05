@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
-import { createHerdrAgentReporter, createHerdrWorktree, herdrCommandRunner, herdrPaneCommand, herdrPaneId, herdrWorkspaceEnvironment, openHerdrPane, openHerdrWorkspacePane, removeHerdrWorktree, waitForHerdrPane } from "../src/herdr.js";
+import { createHerdrWorktree, herdrCommandRunner, herdrPaneCommand, herdrPaneId, herdrWorkspaceEnvironment, openHerdrPane, removeHerdrWorktree, waitForHerdrPane } from "../src/herdr.js";
 
 void test("gates Herdr actions on the managed pane environment", () => {
   assert.equal(herdrPaneId({ HERDR_ENV: "0", HERDR_PANE_ID: "pane" }), undefined);
@@ -107,57 +107,6 @@ void test("targets the declared Herdr pane, chooses geometry, escapes live comma
   }
 });
 
-void test("creates a dedicated labeled workspace and reports ordered agent lifecycle", async () => {
-  const previousEnvironment = { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_CODING_AGENT_SESSION_DIR: process.env.PI_CODING_AGENT_SESSION_DIR };
-  Reflect.deleteProperty(process.env, "PI_CODING_AGENT_DIR");
-  Reflect.deleteProperty(process.env, "PI_CODING_AGENT_SESSION_DIR");
-  try {
-  const calls: string[][] = [];
-  const runner = async (args: readonly string[]): Promise<string> => {
-    calls.push([...args]);
-    if (args[0] === "workspace") return JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" }, tab: { tab_id: "tab-1" }, root_pane: { pane_id: "pane-1" } } });
-    if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { tab: { tab_id: "tab-2" }, root_pane: { pane_id: "pane-2" } } });
-    if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
-    return "";
-  };
-  const pane = await openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow > review #1", tabLabel: "flow > review #1", command: "pi --session /tmp/session.jsonl" }, runner);
-  assert.deepEqual(pane, { workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-2" });
-  const reporter = createHerdrAgentReporter(pane.paneId, "review", runner);
-  await reporter.reportSession({ sessionPath: "/tmp/session.jsonl" }, "workflow-agent");
-  await reporter.reportState("working", undefined, { sessionPath: "/tmp/session.jsonl" });
-  await reporter.release();
-  await reporter.release();
-  assert.deepEqual(calls.slice(0, 4), [
-    ["workspace", "create", "--cwd", "/repo", "--label", "flow > review #1", "--no-focus"],
-    ["tab", "rename", "tab-1", "flow > review #1"],
-    ["tab", "create", "--workspace", "workspace-1", "--cwd", "/repo", "--label", "flow > review #1", "--no-focus"],
-    ["pane", "run", "pane-2", "cd '/repo' && pi --session /tmp/session.jsonl"],
-  ]);
-  const reportCalls = calls.filter(([command, subcommand]) => command === "pane" && ["report-agent-session", "report-agent", "release-agent"].includes(subcommand ?? ""));
-  assert.equal(reportCalls.length, 3);
-  const sequences = reportCalls.map((call) => Number(call[call.indexOf("--seq") + 1]));
-  const [first, second, third] = sequences;
-  assert.ok(first !== undefined && second !== undefined && third !== undefined && first < second && second < third);
-  } finally {
-    for (const [name, value] of Object.entries(previousEnvironment)) {
-      if (value === undefined) Reflect.deleteProperty(process.env, name);
-      else process.env[name] = value;
-    }
-  }
-});
-void test("closes a created workspace when Herdr omits its tab or pane ID", async () => {
-  const calls: string[][] = [];
-  const runner = async (args: readonly string[]): Promise<string> => {
-    calls.push([...args]);
-    if (args[0] === "workspace") return JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" } } });
-    return "";
-  };
-  await assert.rejects(openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow", tabLabel: "agent", command: "pi" }, runner));
-  assert.deepEqual(calls, [
-    ["workspace", "create", "--cwd", "/repo", "--label", "flow", "--no-focus"],
-    ["workspace", "close", "workspace-1"],
-  ]);
-});
 
 void test("waits for Pi startup before reporting an exit", async () => {
   let processReports = 0;
@@ -190,6 +139,22 @@ void test("tolerates a transient process gap while Pi starts", async () => {
   assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0 }), "idle");
   assert.equal(processReports, 3);
 });
+void test("tolerates a transient process-info failure", async () => {
+  let processReports = 0;
+  let statusReports = 0;
+  const runner = async (args: readonly string[]): Promise<string> => {
+    if (args[0] === "pane") {
+      processReports += 1;
+      if (processReports === 2) throw new Error("temporary Herdr failure");
+      return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "pi", argv: ["pi"] }] } } });
+    }
+    statusReports += 1;
+    return JSON.stringify({ result: { agent: { agent_status: statusReports === 1 ? "working" : "idle" } } });
+  };
+  assert.equal(await waitForHerdrPane("pane", runner, { intervalMs: 0 }), "idle");
+  assert.equal(processReports, 3);
+});
+
 void test("accepts Herdr-normalized Pi processes after exact startup", async () => {
   let processReports = 0;
   const originatingEntrypoint = "/workspace/pi/packages/coding-agent/dist/cli.js";
