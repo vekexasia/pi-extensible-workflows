@@ -6,6 +6,7 @@ import { object } from "./utils.js";
 
 /** Pi bounds its own session header scan to 1 MiB (MAX_SESSION_HEADER_SCAN_BYTES). */
 const HEADER_LIMIT_BYTES = 1024 * 1024;
+const READ_CHUNK_BYTES = 64 * 1024;
 const NEWLINE = 0x0a;
 //NOTE: Windows has no O_NONBLOCK; there the open is a plain read-only open.
 const { O_NONBLOCK = 0 } = constants as Partial<typeof constants>;
@@ -32,16 +33,18 @@ export interface TranscriptPoll {
 }
 
 /**
- * Callers never overlap calls on one source. Every read goes through the one descriptor the identity checks ran on.
+ * Callers never overlap polls on one source; close waits for its active poll. Every read uses the checked descriptor.
  * A trailing line without a newline is not returned until it is complete.
  */
 export interface TranscriptSource {
   poll(): Promise<TranscriptPoll>;
+  /** Requests a poll to stop without closing its descriptor; close still waits for the poll. */
+  cancel?(): void;
   /** Closes the descriptor; later calls return status `unavailable`. */
   close(): Promise<void>;
 }
 
-interface OpenFile { readonly handle: FileHandle; readonly dev: bigint; readonly ino: bigint; size: number; end: number }
+interface OpenFile { readonly handle: FileHandle; readonly dev: bigint; readonly ino: bigint; readonly header: Buffer; size: number; end: number }
 interface Closed { readonly status: "waiting" | "unavailable"; readonly reason?: string }
 
 function errorCode(error: unknown): string | undefined { return object(error) && typeof error.code === "string" ? error.code : undefined; }
@@ -57,7 +60,7 @@ let readObserver: ((bytes: number) => void) | undefined;
 /** Test hook: `observer` receives the byte count of every read the readers make; undefined removes it. */
 export function observeSessionTranscriptReads(observer: ((bytes: number) => void) | undefined): void { readObserver = observer; }
 
-async function readAt(handle: FileHandle, position: number, length: number): Promise<Buffer> {
+async function readAt(handle: FileHandle, position: number, length: number, observe = true): Promise<Buffer> {
   const buffer = Buffer.allocUnsafe(length);
   let filled = 0;
   while (filled < length) {
@@ -65,7 +68,7 @@ async function readAt(handle: FileHandle, position: number, length: number): Pro
     if (bytesRead === 0) break;
     filled += bytesRead;
   }
-  readObserver?.(filled);
+  if (observe) readObserver?.(filled);
   return buffer.subarray(0, filled);
 }
 /** Opens `path` once and runs the identity checks on that descriptor; on success the descriptor is the only way the file is read. */
@@ -88,7 +91,7 @@ async function openChecked(path: string, sessionId: string): Promise<OpenFile | 
     const header = parseValue(head.subarray(0, headerEnd));
     if (!object(header) || header.type !== "session" || typeof header.id !== "string") return await rejected(unavailable("the file does not start with a pi session header"));
     if (header.id !== sessionId) return await rejected(unavailable("the file belongs to another session"));
-    return { handle, dev: stats.dev, ino: stats.ino, size, end: 0 };
+    return { handle, dev: stats.dev, ino: stats.ino, header: Buffer.from(head.subarray(0, headerEnd + 1)), size, end: 0 };
   } catch (error) { return await rejected(failure(error)); }
 }
 
@@ -97,41 +100,68 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
   const path = sessionFile(reference);
   let closed = false;
   let file: OpenFile | undefined;
+  let pendingOpens = Promise.resolve();
+  let pendingPoll = Promise.resolve();
+  let pendingCloses = Promise.resolve();
 
   /** The complete lines of [end, size). */
   const linesTo = async (current: OpenFile, size: number): Promise<TranscriptRecord[]> => {
     //NOTE: a short read means the file shrank since the last poll; the next poll resets.
-    const buffer = await readAt(current.handle, current.end, size - current.end);
     const records: TranscriptRecord[] = [];
-    let start = 0;
-    for (let index = buffer.indexOf(NEWLINE); index !== -1; index = buffer.indexOf(NEWLINE, start)) {
-      records.push(parseRecord(buffer.subarray(start, index)));
-      start = index + 1;
+    let position = current.end;
+    let carry: Uint8Array = Buffer.from([]);
+    while (!closed && position < size) {
+      const requested = Math.min(READ_CHUNK_BYTES, size - position);
+      const buffer = await readAt(current.handle, position, requested);
+      if (buffer.length === 0) break;
+      position += buffer.length;
+      const data = carry.length === 0 ? buffer : Buffer.concat([carry, buffer]);
+      let start = 0;
+      for (let index = data.indexOf(NEWLINE); index !== -1; index = data.indexOf(NEWLINE, start)) {
+        records.push(parseRecord(data.subarray(start, index)));
+        start = index + 1;
+      }
+      carry = data.subarray(start);
+      if (buffer.length < requested) break;
     }
-    current.end += start;
+    current.end = position - carry.length;
     current.size = size;
     return records;
+  };
+  const closeHandle = (handle: FileHandle): void => {
+    const closing = handle.close().catch(() => undefined);
+    pendingCloses = Promise.all([pendingCloses, closing]).then(() => undefined);
   };
   const drop = async (): Promise<void> => {
     const current = file;
     file = undefined;
-    await current?.handle.close().catch(() => undefined);
+    if (current) closeHandle(current.handle);
+    await pendingCloses;
   };
   const closedPoll = (closedState: Closed, reset: boolean): TranscriptPoll => ({ status: closedState.status, reset, appended: [], ...(closedState.reason === undefined ? {} : { reason: closedState.reason }) });
   const openPoll = async (filePath: string, sessionId: string, reset: boolean): Promise<TranscriptPoll> => {
-    const opened = await openChecked(filePath, sessionId);
+    const opening = openChecked(filePath, sessionId);
+    pendingOpens = opening.then(() => undefined, () => undefined);
+    const opened = await opening;
     if (!("handle" in opened)) return closedPoll(opened, reset);
+    if (closed) { closeHandle(opened.handle); await pendingCloses; return closedPoll({ status: "unavailable", reason: "the transcript source is closed" }, reset); }
     file = opened;
     return { status: "available", reset, appended: await linesTo(opened, opened.size) };
   };
   const poll = async (filePath: string, sessionId: string): Promise<TranscriptPoll> => {
     const current = file;
     if (current === undefined) return openPoll(filePath, sessionId, false);
+    const header = await readAt(current.handle, 0, Math.min(current.size, HEADER_LIMIT_BYTES + 1), false);
+    const headerEnd = header.indexOf(NEWLINE);
+    const headerValue = parseValue(header.subarray(0, headerEnd));
+    if (headerEnd === -1 || !object(headerValue) || headerValue.type !== "session" || headerValue.id !== sessionId || !header.subarray(0, headerEnd + 1).equals(current.header)) {
+      await drop();
+      return openPoll(filePath, sessionId, true);
+    }
     const descriptor = await current.handle.stat({ bigint: true });
     const named = await stat(filePath, { bigint: true }).catch(() => undefined);
     const size = Number(descriptor.size);
-    // Pi appends to a session file it wrote, but rewrites one in place when it migrates an older session version on open, and another file can be renamed over the path.
-    //NOTE: a rewrite in place that leaves the file at least as long as before is not detected.
+    // Pi appends to a session file it wrote, but rewrites its header in place when it migrates an older session version on open, and another file can be renamed over the path.
     if (named === undefined || named.dev !== current.dev || named.ino !== current.ino || size < current.size) {
       await drop();
       return openPoll(filePath, sessionId, true);
@@ -141,17 +171,24 @@ export function openSessionTranscript(reference: WorkflowAgentSessionReference |
   };
 
   return {
-    async poll() {
-      if (closed) return closedPoll(unavailable("the transcript source is closed"), false);
-      if (path === undefined || reference === undefined) return closedPoll({ status: "waiting" }, false);
-      const hadFile = file !== undefined;
-      try { return await poll(path, reference.sessionId); } catch (error) {
-        await drop();
-        return closedPoll(failure(error), hadFile);
-      }
+    poll() {
+      const operation = (async (): Promise<TranscriptPoll> => {
+        if (closed) return closedPoll(unavailable("the transcript source is closed"), false);
+        if (path === undefined || reference === undefined) return closedPoll({ status: "waiting" }, false);
+        const hadFile = file !== undefined;
+        try { return await poll(path, reference.sessionId); } catch (error) {
+          await drop();
+          return closedPoll(failure(error), hadFile);
+        }
+      })();
+      pendingPoll = operation.then(() => undefined, () => undefined);
+      return operation;
     },
+    cancel() { closed = true; },
     async close() {
       closed = true;
+      await pendingPoll;
+      await pendingOpens;
       await drop();
     },
   };

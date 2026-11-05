@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { open as openFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
@@ -8,6 +9,7 @@ import { KeybindingsManager, stripTerminalSequences, TUI_KEYBINDINGS, visibleWid
 import type { ActionUi, AgentsAction, AgentsActionProvider, AgentsActionTarget } from "../src/agents-actions-contract.js";
 import { formatWorkflowPhaseDashboard, PLAIN_WORKFLOW_PROGRESS_STYLES, type AgentRecord, type PersistedRun, type RunState } from "../src/index.js";
 import { openAgentsWorkspace, type AgentsWorkspaceState } from "../src/agents-workspace.js";
+import { observeSessionTranscriptReads, openSessionTranscript } from "../src/session-transcript.js";
 import { FakeTerminal } from "./agents-workspace-harness.js";
 import { navigatorSidebarWidth } from "../src/host-view.js";
 import { createSessionAgentsSource, type SessionTreeNode } from "../src/session-agents.js";
@@ -61,6 +63,15 @@ void test("the workspace opens over Pi on the alternate screen and restores Pi o
     assert.equal(harness.source("alpha").count("poll"), polls, "no poll after leaving");
     assert.equal(harness.listCalls, lists, "no refresh after leaving");
   }
+});
+
+void test("the title shows the selected agent's worktree branch as sanitized display text", async (t) => {
+  timers(t);
+  const listed = { ...agent("alpha"), branch: "feature/worker\u001b[31m" };
+  const harness = await open([listed]);
+  assert.match(title(harness), /branch=feature\/worker/);
+  assert.ok(!title(harness).includes("\u001b"));
+  await leave(harness);
 });
 
 void test("the title shows the persisted average of an agent, else nothing", async (t) => {
@@ -430,7 +441,7 @@ void test("ten quick moves down the tree start one read, where the selection sto
   await leave(harness);
 });
 
-void test("moves in separate turns while the first read is held start no read; the agent shown when it settles is read, none passed over", async (t) => {
+void test("moves in separate turns while the first read is held: closing it frees later first reads", async (t) => {
   timers(t);
   let release = (): void => undefined;
   const held = new Promise<void>((resolve) => { release = resolve; });
@@ -443,10 +454,10 @@ void test("moves in separate turns while the first read is held start no read; t
     await settle();
   }
   assert.match(title(harness), /^#21\/21 a20/);
-  assert.deepEqual(harness.sources.slice(2).map((source) => source.count("poll")), Array.from({ length: 19 }, () => 0), "no read while a1's is held");
+  assert.deepEqual(harness.sources.slice(2).map((source) => source.count("poll")), Array.from({ length: 19 }, () => 1), "each shown agent starts after the previous source closes");
   release();
   await settle();
-  assert.deepEqual(harness.sources.map((source) => source.count("poll")), [1, 1, ...Array.from({ length: 18 }, () => 0), 1]);
+  assert.deepEqual(harness.sources.map((source) => source.count("poll")), Array.from({ length: 21 }, () => 1));
   assert.deepEqual(harness.sources.slice(0, -1).map((source) => source.calls.at(-1)), Array.from({ length: 20 }, () => "close"));
   await leave(harness);
 });
@@ -607,6 +618,17 @@ void test("the initial key is selected by the first list that contains it", asyn
   await advance(t, 5);
   assert.match(title(harness), /^#2\/3 beta/);
   assert.deepEqual(harness.opened, ["beta"]);
+  await leave(harness);
+});
+
+void test("an initial key that is missing from the first nonempty list is selected when it appears later", async (t) => {
+  timers(t);
+  const harness = await open([agent("alpha")], { initialKey: "beta" });
+  assert.deepEqual(harness.opened, ["alpha"], "the first list selects a fallback");
+  harness.agents = AGENTS();
+  await advance(t, 5);
+  assert.match(title(harness), /^#2\/3 beta/);
+  assert.deepEqual(harness.opened, ["alpha", "beta"]);
   await leave(harness);
 });
 
@@ -839,6 +861,114 @@ void test("a list() that throws synchronously, at open or on a later tick, ends 
   assert.equal(harness.source("alpha").calls.includes("close"), false);
   await leave(harness);
   assert.deepEqual(escaped, []);
+});
+
+void test("a transcript source close waits for an active read of an already-open file", async () => {
+  const root = temporary("close-transcript");
+  const path = join(root, "session.jsonl");
+  writeFileSync(path, `${JSON.stringify({ type: "session", id: "close" })}\n`);
+  const source = openSessionTranscript({ transport: "local", sessionId: "close", locator: { sessionFile: path } });
+  await source.poll();
+  const probe = await openFile(path);
+  const prototype: object = Object.getPrototypeOf(probe) as object;
+  const read = probe.read;
+  await probe.close();
+  let release = (): void => undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  Reflect.set(prototype, "read", async function (this: FileHandle, ...args: unknown[]) { await held; return Reflect.apply(read, this, args); });
+  let closed = false;
+  const polling = source.poll();
+  const closing = source.close().then(() => { closed = true; });
+  try {
+    await settle();
+    assert.equal(closed, false, "close cannot finish while the read is held");
+    release();
+    assert.equal((await polling).status, "available");
+    await closing;
+  } finally {
+    Reflect.set(prototype, "read", read);
+    release();
+    await polling;
+    await closing;
+  }
+});
+
+void test("a same-session migration rewrite restarts a transcript even when the file grows", async () => {
+  const root = temporary("rewrite-transcript");
+  const path = join(root, "session.jsonl");
+  const header = JSON.stringify({ type: "session", id: "rewrite" });
+  const first = `${header}\n${JSON.stringify({ type: "message", text: "before" })}\n`;
+  writeFileSync(path, first);
+  const source = openSessionTranscript({ transport: "local", sessionId: "rewrite", locator: { sessionFile: path } });
+  try {
+    const initial = await source.poll();
+    assert.equal(initial.reset, false);
+    assert.equal(initial.appended.length, 2);
+    const migrated = `${JSON.stringify({ type: "session", id: "rewrite", version: 3 })}\n${JSON.stringify({ type: "message", text: "after migration" })}\n`;
+    assert.ok(migrated.length >= first.length);
+    writeFileSync(path, migrated);
+    const restarted = await source.poll();
+    assert.equal(restarted.reset, true);
+    assert.equal(restarted.appended.length, 2);
+    assert.deepEqual(restarted.appended[1], { kind: "entry", bytes: migrated.split("\n")[1]?.length ?? 0, value: { type: "message", text: "after migration" } });
+  } finally {
+    await source.close();
+  }
+});
+
+void test("cancelling a transcript poll leaves its descriptor open until the poll settles", async () => {
+  const root = temporary("cancel-transcript");
+  const path = join(root, "session.jsonl");
+  writeFileSync(path, `${JSON.stringify({ type: "session", id: "cancel" })}\n${`${JSON.stringify({ type: "message", text: "x".repeat(4096) })}\n`.repeat(80)}`);
+  const source = openSessionTranscript({ transport: "local", sessionId: "cancel", locator: { sessionFile: path } });
+  let reads = 0;
+  observeSessionTranscriptReads(() => { if (++reads === 2) source.cancel?.(); });
+  try {
+    const result = await source.poll();
+    assert.equal(result.status, "available", result.reason);
+    assert.equal(reads, 2, "cancellation stops before another chunk is read");
+  } finally {
+    observeSessionTranscriptReads(undefined);
+    await source.close();
+  }
+});
+
+void test("closing waits for a queued poll before touching its source", async (t) => {
+  timers(t);
+  let release = (): void => undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let cancelled = false;
+  const harness = await open([agent("alpha")], { setup: (source) => {
+    source.pollGate = held;
+    Object.assign(source, { cancel: () => { cancelled = true; } });
+  } });
+  harness.send(KEY.escape);
+  await settle();
+  assert.equal(cancelled, true, "cancellation is requested without closing the descriptor");
+  assert.equal(harness.left, false, "leaving waits for the poll");
+  assert.equal(harness.source("alpha").count("close"), 0);
+  release();
+  await harness.done;
+  assert.equal(harness.source("alpha").calls.at(-1), "close");
+  assert.equal(harness.source("alpha").overlapped, false);
+});
+
+void test("a partially throwing append is rebuilt without losing or duplicating records, even on the final poll", async (t) => {
+  timers(t);
+  const harness = await open([agent("alpha")], { setup: (source) => {
+    source.polls.push(polled(entries(0, 2)), polled(entries(2, 2)), polled(entries(4, 2)));
+  } });
+  const view = harness.view("alpha");
+  const append = view.append.bind(view);
+  let throws = true;
+  view.append = (records) => {
+    if (throws) { throws = false; append(records.slice(0, 1)); throw new Error("partial append"); }
+    append(records);
+  };
+  harness.agents = [agent("alpha", { running: false, state: "completed" })];
+  await advance(t, 3);
+  assert.deepEqual(view.items, entries(0, 6), "all records are recovered exactly once");
+  await leave(harness);
 });
 
 void test("a view whose append or live throws shows the error as the status line and polling goes on", async (t) => {
@@ -1818,6 +1948,40 @@ void test("an in-place label runs inside the workspace: other keys are ignored a
   assert.deepEqual(escaped, []);
 });
 
+void test("a refresh requested while a list is in flight is not lost when an in-place action ends", async (t) => {
+  timers(t);
+  const settled = TARGETED().map((spec): Spec => spec.agent ? { ...spec, agent: { ...spec.agent, state: "completed", running: false } } : spec);
+  let sourceLists = 0;
+  let releaseList = (): void => undefined;
+  const source = {
+    list: async () => {
+      sourceLists += 1;
+      if (sourceLists === 2) await new Promise<void>((resolve) => { releaseList = resolve; });
+      return tree(settled);
+    },
+  };
+  let releaseAction = (): void => undefined;
+  const provider = new FakeProvider({ "workflow-agent": inPlace("Copy agent ID") }, async () => {
+    await new Promise<void>((resolve) => { releaseAction = resolve; });
+  });
+  const harness = await open([], { nodes: tree(settled), source, initialKey: "a", actions: [provider] });
+  await settle();
+  await advance(t);
+  assert.equal(harness.listCalls, 2, "the next tick starts a second list");
+  harness.send("a");
+  await settle();
+  harness.send(KEY.enter);
+  await settle();
+  releaseAction();
+  await settle();
+  assert.equal(harness.listCalls, 2, "the action end waits for the in-flight list");
+  releaseList();
+  await settle();
+  await settle();
+  assert.equal(harness.listCalls, 3, "the pending refresh runs after the list settles");
+  await leave(harness);
+});
+
 void test("while nothing runs a change during an in-place action lists nothing, and the action's end lists at once", async (t) => {
   timers(t);
   const listeners = new Set<() => void>();
@@ -2187,6 +2351,30 @@ void test("a poll that is not available gives up a pending restore: later conten
   second.send(KEY.pageDown);
   second.screen();
   assert.ok(second.alt().viewportTop > 0, "page down moves the view");
+  await leave(second);
+});
+
+void test("a partial available poll keeps a pending restore for later content", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled(entries(0, 20)), polled(entries(20, 180)));
+  } });
+  for (let round = 0; round < 6; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 200 - 18 - (120 - 18 - saved.top), "the saved place is applied after later content arrives");
+  await leave(second);
+});
+
+void test("an unavailable poll without content abandons a pending restore", async (t) => {
+  timers(t);
+  const saved = await savedPlace();
+  const second = await open([], { nodes: saved.nodes, actions: [saved.provider], state: saved.state, setup: (source) => {
+    source.polls.push(polled([], { status: "unavailable" }), polled(entries(0, 200)));
+  } });
+  for (let round = 0; round < 6; round += 1) { second.screen(); await advance(t); }
+  second.screen();
+  assert.equal(second.alt().viewportTop, 0, "later content does not restore the abandoned place");
   await leave(second);
 });
 
@@ -3028,6 +3216,9 @@ void test("the hint names the keys the user's bindings resolve to", async (t) =>
   assert.equal(hint(), "u/d scroll · ctrl+q back · f follow · [ ] agent · tab focus · ctrl+shift+f search · s sidebar · ctrl+o tools");
   harness.send(KEY.tab, "/");
   assert.equal(hint(), "enter keep filter · ctrl+q clear", "the input submits with Pi's submit key");
+  harness.send("\x11");
+  assert.equal(harness.left, false, "the cancel binding clears the filter instead of leaving");
+  assert.equal(harness.screen().some((line) => line.startsWith("/ ")), false, "the cancel binding closes the filter input");
   await leave(harness);
 });
 
