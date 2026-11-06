@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, jsonValue, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
@@ -14,7 +14,8 @@ import {
   type PersistedRun, type RunSummary, type RunSummaryArtifacts, type WorktreeReference, type EvidenceRecord,
 } from "./decoders.js";
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json, runWorktreeSetup } from "./io.js";
-import { runsDirectory, safePart, structuralPath } from "./paths.js";
+import { createHerdrWorktree, herdrCommandRunner, herdrWorkspaceEnvironment, listHerdrWorktrees, listHerdrWorktreesByCwd, removeHerdrWorktree, type HerdrCommandRunner } from "./herdr.js";
+import { canonicalPath, canonicalPathFrom, piResourceContains, runsDirectory, safePart, sameFilesystemPath, structuralPath } from "./paths.js";
 
 const SYSTEM_PROMPT_STORAGE = ".system-prompts";
 const SYSTEM_PROMPT_RECORDS = "records";
@@ -57,12 +58,12 @@ export class RunStore {
   private launchSnapshotLane = new SerialLane();
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
   private systemPromptLane = new SerialLane();
-  constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
+  constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir(), private readonly herdrRunner: HerdrCommandRunner = herdrCommandRunner) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
   }
   #assertRunIdentity(run: PersistedRun, code: WorkflowErrorCode, message: string): void {
-    if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
+    if (!sameFilesystemPath(run.cwd, this.cwd) || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
   }
 
   async create(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
@@ -131,6 +132,7 @@ export class RunStore {
     const journal = decodeJournal(await json(join(this.directory, "journal.json")));
     const previous = await json(join(this.directory, "summary.json")).then(decodeSummaryProjection).catch(() => undefined);
     if (!run || !journal) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted run or journal is invalid");
+    this.#assertRunIdentity(run, "RESUME_INCOMPATIBLE", "Persisted run does not belong to this project");
     const [stateStat, journalStat] = await Promise.all([stat(join(this.directory, "state.json")), stat(join(this.directory, "journal.json"))]);
     const fallbackCreatedAt = new Date(stateStat.mtimeMs).toISOString();
     const previousUpdatedAt = previous?.updatedAt === undefined ? Number.NaN : Date.parse(previous.updatedAt);
@@ -216,8 +218,8 @@ export class RunStore {
     const previous = Number(await readFile(systemPromptSequencePath(this.directory), "utf8"));
     if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) throw new Error("Persisted system-prompt sequence is invalid");
     const sequence = previous + 1;
-    await atomicWriteFile(systemPromptSequencePath(this.directory), `${String(sequence)}\n`);
     await atomicJson(join(systemPromptRecordsPath(this.directory), systemPromptRecordName(sequence)), { sessionId: entry.sessionId, attempt: entry.attempt, turn: entry.turn, sha256 });
+    await atomicWriteFile(systemPromptSequencePath(this.directory), `${String(sequence)}\n`);
   }
   private async migrateSystemPrompts(legacy: { version: number; entries?: EffectiveSystemPrompt[] }): Promise<void> {
     await rm(systemPromptStoragePath(this.directory), { recursive: true, force: true });
@@ -228,7 +230,8 @@ export class RunStore {
   private async prepareSystemPromptStorage(): Promise<void> {
     const artifact = await this.readSystemPromptArtifact();
     if (artifact === undefined) {
-      await rm(systemPromptStoragePath(this.directory), { recursive: true, force: true });
+      const entries = await readdir(systemPromptStoragePath(this.directory)).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return []; throw error; });
+      if (entries.length > 0) throw new Error("Persisted system prompts are invalid");
       await createSystemPromptStorage(this.directory, true);
     } else if (artifact.version === 1) {
       if (!Array.isArray(artifact.entries)) throw new Error("Persisted system prompts are invalid");
@@ -243,11 +246,14 @@ export class RunStore {
     const names = (await readdir(systemPromptRecordsPath(this.directory))).filter((name) => !name.endsWith(".tmp")).sort();
     const entries: EffectiveSystemPrompt[] = [];
     let highest = 0;
+    let expected = 1;
     for (const name of names) {
       const match = /^(\d{20})\.json$/.exec(name);
       if (!match) throw new Error("Persisted system-prompt records are invalid");
       const recordSequence = Number(match[1]);
       if (!Number.isSafeInteger(recordSequence) || recordSequence < 1) throw new Error("Persisted system-prompt records are invalid");
+      if (recordSequence > sequence) continue;
+      if (recordSequence !== expected++) throw new Error("Persisted system-prompt records are invalid");
       highest = Math.max(highest, recordSequence);
       const record = await json(join(systemPromptRecordsPath(this.directory), name));
       if (!object(record)) throw new Error("Persisted system-prompt record is invalid");
@@ -260,7 +266,7 @@ export class RunStore {
       if (createHash("sha256").update(prompt).digest("hex") !== sha256) throw new Error("Persisted system-prompt body is invalid");
       entries.push({ sessionId, attempt, turn, sha256, prompt });
     }
-    if (sequence < highest) throw new Error("Persisted system-prompt sequence is invalid");
+    if (sequence < highest || expected - 1 !== sequence) throw new Error("Persisted system-prompt sequence is invalid");
     return entries;
   }
   async recordSystemPrompt(entry: Omit<EffectiveSystemPrompt, "sha256">): Promise<void> {
@@ -436,11 +442,49 @@ export class RunStore {
     }
   }
 
-  private structuralWorktree(owner: string, record: WorktreeReference): WorktreeReference {
+  private async herdrWorktreeBelongsToRepository(path: string): Promise<boolean> {
+    if (!isAbsolute(path)) return false;
+    try {
+      if (!(await stat(path)).isDirectory()) return false;
+      const [storeCommonDir, worktreeCommonDir, storeRoot, worktreeRoot] = await Promise.all([
+        git(this.cwd, ["rev-parse", "--git-common-dir"]),
+        git(path, ["rev-parse", "--git-common-dir"]),
+        git(this.cwd, ["rev-parse", "--show-toplevel"]),
+        git(path, ["rev-parse", "--show-toplevel"]),
+      ]);
+      const sourceRoot = canonicalPathFrom(storeRoot.trim(), this.cwd);
+      const returnedRoot = canonicalPathFrom(worktreeRoot.trim(), path);
+      return sameFilesystemPath(canonicalPathFrom(storeCommonDir.trim(), this.cwd), canonicalPathFrom(worktreeCommonDir.trim(), path)) && !sameFilesystemPath(sourceRoot, returnedRoot) && sameFilesystemPath(path, returnedRoot);
+    } catch { return false; }
+  }
+
+  private async nativeWorktreeMatches(path: string, branch: string): Promise<boolean> {
+    try {
+      return await this.herdrWorktreeBelongsToRepository(path) && (await git(path, ["symbolic-ref", "--quiet", "--short", "HEAD"])).trim() === branch;
+    } catch { return false; }
+  }
+
+  private async herdrWorktreeStatus(workspaceId: string, path: string, branch: string): Promise<"owned" | "missing" | "invalid"> {
+    try {
+      const [listed, commonDir] = await Promise.all([listHerdrWorktrees(workspaceId, this.herdrRunner), git(this.cwd, ["rev-parse", "--git-common-dir"])]);
+      if (!sameFilesystemPath(canonicalPathFrom(commonDir.trim(), this.cwd), canonicalPathFrom(listed.repoKey, this.cwd))) return "invalid";
+      const matches = listed.worktrees.filter((worktree) => worktree.workspaceId === workspaceId);
+      if (matches.length === 0) {
+        const pathExists = await stat(path).then(() => true).catch(() => false);
+        return pathExists || listed.worktrees.some((worktree) => sameFilesystemPath(worktree.path, path)) ? "invalid" : "missing";
+      }
+      return matches.every((worktree) => worktree.branch === branch && sameFilesystemPath(worktree.path, path)) ? "owned" : "invalid";
+    } catch { return "invalid"; }
+  }
+
+  private async structuralWorktree(owner: string, record: WorktreeReference, requireDirectory = true, allowMissingHerdr = false): Promise<WorktreeReference> {
     const expected = this.expectedWorktree(owner);
-    const relativePath = relative(this.directory, record.path);
-    const relativeCwd = relative(record.path, record.cwd);
-    if (record.owner !== owner || resolve(record.path) !== expected.path || record.branch !== expected.branch || relativePath === ".." || relativePath.startsWith(`..${sep}`) || relativeCwd === ".." || relativeCwd.startsWith(`..${sep}`)) throw new Error(`Invalid worktree record for ${owner}`);
+    const workspaceId = typeof record.workspaceId === "string" && record.workspaceId.length > 0 ? record.workspaceId : undefined;
+    const herdrStatus = workspaceId === undefined ? undefined : await this.herdrWorktreeStatus(workspaceId, record.path, record.branch);
+    const validPath = workspaceId !== undefined
+      ? (herdrStatus === "owned" || allowMissingHerdr && herdrStatus === "missing") && (!requireDirectory || await this.herdrWorktreeBelongsToRepository(record.path))
+      : sameFilesystemPath(record.path, expected.path) && piResourceContains(this.directory, record.path) && (!requireDirectory || await this.nativeWorktreeMatches(record.path, record.branch));
+    if (record.owner !== owner || !validPath || record.branch !== expected.branch || !piResourceContains(record.path, record.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
     return record;
   }
 
@@ -472,7 +516,7 @@ export class RunStore {
 
   private async sourceRun(sourceRunId: string): Promise<RunStore> {
     if (!sourceRunId || sourceRunId === this.runId) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree source run is invalid");
-    const source = new RunStore(this.cwd, this.sessionId, sourceRunId, this.home);
+    const source = new RunStore(this.cwd, this.sessionId, sourceRunId, this.home, this.herdrRunner);
     try {
       const loaded = await source.load();
       if (!HARD_TERMINAL_RUN_STATES.has(loaded.run.state)) throw new Error(`Source run ${sourceRunId} is not terminal`);
@@ -505,14 +549,14 @@ export class RunStore {
     catch (error) { throw coerceWorkflowError("RESUME_INCOMPATIBLE", error); }
   }
 
-  private async ownedWorktree(owner: string, cwd?: string, requireDirectory = true): Promise<WorktreeReference> {
+  private async ownedWorktree(owner: string, cwd?: string, requireDirectory = true, allowMissingHerdr = false): Promise<WorktreeReference> {
     const records = await this.#loadWorktreeRecords(false);
     const matches = records.filter((candidate) => candidate.owner === owner);
     if (matches.length !== 1) throw new Error(`Missing or duplicate worktree record for ${owner}`);
     const record = matches[0];
     if (!record) throw new Error(`Missing or duplicate worktree record for ${owner}`);
-    const validated = this.structuralWorktree(owner, record);
-    if (cwd !== undefined && resolve(cwd) !== resolve(validated.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
+    const validated = await this.structuralWorktree(owner, record, requireDirectory, allowMissingHerdr);
+    if (cwd !== undefined && !sameFilesystemPath(cwd, validated.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
     if (requireDirectory) await access(validated.cwd);
     return validated;
   }
@@ -552,7 +596,7 @@ export class RunStore {
       return parent.findNamedWorktree(name, nextSeen, requireDirectory);
     }
     try {
-      const reference = await this.ownedWorktree(owner, undefined, requireDirectory);
+      const reference = await this.ownedWorktree(owner, undefined, requireDirectory, !requireDirectory);
       return { reference, sourceRunId: this.runId, owner };
     } catch (error) {
       throw coerceWorkflowError("WORKTREE_FAILED", error);
@@ -566,18 +610,18 @@ export class RunStore {
   }
   async validateDeletionWorktrees(): Promise<void> {
     try {
-      const records = await this.#loadWorktreeRecords(false);
+      const records = await this.#loadWorktreeRecords();
       const owners = new Set<string>();
-      const paths = new Set<string>();
+      const paths: string[] = [];
       for (const record of records) {
         const owner = record.owner;
         if (owners.has(owner)) throw new Error(`Duplicate worktree record for ${owner}`);
         owners.add(owner);
-        const reference = this.structuralWorktree(owner, record);
-        paths.add(resolve(reference.path));
+        const reference = await this.structuralWorktree(owner, record, false, true);
+        paths.push(reference.path);
       }
       const entries = await readdir(join(this.directory, "worktrees"), { withFileTypes: true }).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return [] as import("node:fs").Dirent[]; throw error; });
-      for (const entry of entries) if (!entry.isDirectory() || entry.isSymbolicLink() || !paths.has(resolve(join(this.directory, "worktrees", entry.name)))) throw new Error(`Unrecorded worktree artifact: ${join(this.directory, "worktrees", entry.name)}`);
+      for (const entry of entries) if (!entry.isDirectory() || entry.isSymbolicLink() || !paths.some((path) => sameFilesystemPath(path, join(this.directory, "worktrees", entry.name)))) throw new Error(`Unrecorded worktree artifact: ${join(this.directory, "worktrees", entry.name)}`);
     } catch (error) {
       throw coerceWorkflowError("WORKTREE_FAILED", error);
     }
@@ -618,22 +662,60 @@ export class RunStore {
       if (!object(parsed)) return;
       marker = parsed;
     } catch { return; }
-    if (typeof marker.owner !== "string" || typeof marker.base !== "string") return;
+    if (typeof marker.owner !== "string" || typeof marker.base !== "string" || !sameFilesystemPath(markerPath, this.markerPath(marker.owner))) return;
     const expected = this.expectedWorktree(marker.owner);
-    if (marker.path !== expected.path || marker.branch !== expected.branch) return;
+    if ((await this.#loadWorktreeRecords()).some((record) => record.owner === marker.owner)) {
+      await rm(markerPath, { force: true });
+      return;
+    }
+    if (marker.herdr === true && !(typeof marker.workspaceId === "string" && marker.workspaceId)) {
+      if (marker.branchCreated !== false) return;
+      const root = await git(this.cwd, ["rev-parse", "--show-toplevel"]).then((value) => value.trim()).catch(() => "");
+      if (!root) return;
+      const commonDir = await git(root, ["rev-parse", "--git-common-dir"]).then((value) => canonicalPathFrom(value.trim(), root)).catch(() => "");
+      const listed = await listHerdrWorktreesByCwd(root, this.herdrRunner).catch(() => undefined);
+      const orphan = listed && commonDir && sameFilesystemPath(listed.repoKey, commonDir) ? listed.worktrees.find((worktree) => worktree.branch === expected.branch) : undefined;
+      if (orphan && await this.herdrWorktreeBelongsToRepository(orphan.path)) await removeHerdrWorktree(orphan.workspaceId, this.herdrRunner);
+      else if (await stat(expected.path).then(() => true).catch(() => false) || await git(root, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).then(() => true).catch(() => false)) return;
+      await rm(markerPath, { force: true });
+      return;
+    }
+    if (typeof marker.workspaceId === "string" && marker.workspaceId) {
+      if (typeof marker.branch !== "string" || marker.branch !== expected.branch || typeof marker.path !== "string") return;
+      const status = await this.herdrWorktreeStatus(marker.workspaceId, marker.path, marker.branch);
+      if (status === "invalid") return;
+      if (status === "owned") {
+        try {
+          await removeHerdrWorktree(marker.workspaceId, this.herdrRunner);
+        } catch (error) {
+          throw new WorkflowError("WORKTREE_FAILED", errorText(error));
+        }
+      }
+      await rm(markerPath, { force: true });
+      return;
+    }
+    if (typeof marker.path !== "string" || !sameFilesystemPath(marker.path, expected.path) || marker.branch !== expected.branch) return;
     const root = await git(this.cwd, ["rev-parse", "--show-toplevel"]).then((value) => value.trim()).catch(() => "");
     if (!root) return;
     const branchBase = await git(root, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).then((value) => value.trim()).catch(() => "");
     if (branchBase !== marker.base) return;
-    await git(root, ["worktree", "remove", "--force", expected.path]).catch(() => undefined);
-    await git(root, ["branch", "-D", expected.branch]).catch(() => undefined);
+    try {
+      if (await stat(expected.path).then((info) => info.isDirectory()).catch(() => false)) await git(root, ["worktree", "remove", "--force", expected.path]);
+      if (marker.branchCreated === true) await git(root, ["branch", "-D", expected.branch]);
+    } catch (error) {
+      throw new WorkflowError("WORKTREE_FAILED", errorText(error));
+    }
     await rm(expected.path, { recursive: true, force: true });
     await rm(markerPath, { force: true });
   }
 
   private async cleanupOrphanWorktrees(): Promise<void> {
     const entries = await readdir(this.directory).catch(() => [] as string[]);
-    for (const entry of entries.filter((name) => name.endsWith(".creating"))) await this.cleanupMarker(join(this.directory, entry));
+    for (const entry of entries.filter((name) => name.endsWith(".creating"))) {
+      const markerPath = join(this.directory, entry);
+      await this.cleanupMarker(markerPath);
+      if (await stat(markerPath).then(() => true).catch(() => false)) throw new WorkflowError("WORKTREE_FAILED", `Unresolved worktree creation marker: ${markerPath}`);
+    }
   }
 
   async validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
@@ -643,7 +725,7 @@ export class RunStore {
       const binding = name ? await this.borrowedWorktree(name) : undefined;
       if (binding) {
         const resolved = await this.resolveBorrowedWorktree(binding, new Set([this.runId]));
-        if (cwd !== undefined && resolve(cwd) !== resolve(resolved.reference.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
+        if (cwd !== undefined && !sameFilesystemPath(cwd, resolved.reference.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
         return resolved.reference;
       }
       return await this.ownedWorktree(owner, cwd);
@@ -670,16 +752,18 @@ export class RunStore {
       if (name && Array.isArray(loaded.run.retry?.namedWorktrees) && loaded.run.retry.namedWorktrees.includes(name)) throw new WorkflowError("WORKTREE_FAILED", `Missing inherited named worktree ${name}`);
       const existing = records.find((record) => record.owner === owner);
       if (existing) return this.validateWorktree(owner);
-      const { path, branch } = this.expectedWorktree(owner);
+      let { path, branch } = this.expectedWorktree(owner);
       const markerPath = this.markerPath(owner);
       let branchCreated = false;
       let worktreeCreated = false;
+      let herdrWorkspaceId: string | undefined;
       let markerWritten = false;
+      let recordPersisted = false;
       try {
         const root = (await git(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
-        const [canonicalRoot, canonicalCwd] = await Promise.all([realpath(root), realpath(this.cwd)]);
+        const [canonicalRoot, canonicalCwd] = [canonicalPath(root), canonicalPath(this.cwd)];
+        if (!piResourceContains(canonicalRoot, canonicalCwd)) throw new Error("launch cwd is outside the repository");
         const launchRelative = relative(canonicalRoot, canonicalCwd);
-        if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
         await this.cleanupMarker(markerPath);
         const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
         if (dirty) {
@@ -694,32 +778,65 @@ export class RunStore {
         } catch {
           throw new Error("repository has no commits");
         }
+        if (await git(root, ["rev-parse", "--verify", `${branch}^{commit}`]).then(() => true).catch(() => false)) throw new Error(`worktree branch already exists: ${branch}`);
         await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-        const record = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
-        await atomicJson(markerPath, { owner, path, branch, base: commit });
+        let record: WorktreeReference = { owner, path, branch, cwd: join(path, launchRelative), base: commit };
+        await atomicJson(markerPath, { owner, path, branch, base: commit, branchCreated: false, herdr: herdrWorkspaceEnvironment() });
         markerWritten = true;
-        await git(root, ["branch", branch, commit]);
-        branchCreated = true;
-        await git(root, ["worktree", "add", "--no-checkout", path, branch]);
-        worktreeCreated = true;
-        await git(path, ["checkout", "--force", branch]);
+        if (herdrWorkspaceEnvironment()) {
+          const created = await createHerdrWorktree({ cwd: root, branch, base: commit, label: `${loaded.run.workflowName} > ${owner}` }, this.herdrRunner);
+          herdrWorkspaceId = created.workspaceId;
+          path = created.path;
+          branch = created.branch;
+          worktreeCreated = true;
+          if (branch !== record.branch) throw new Error("Herdr created a worktree on a different branch than requested");
+          await atomicJson(markerPath, { owner, path, branch, base: commit, workspaceId: herdrWorkspaceId });
+          record = { ...record, path, cwd: join(path, launchRelative), workspaceId: herdrWorkspaceId };
+          if (!(await this.herdrWorktreeBelongsToRepository(path))) throw new Error("Herdr returned a worktree outside the repository");
+        }
+        if (!worktreeCreated) {
+          path = this.expectedWorktree(owner).path;
+          branch = this.expectedWorktree(owner).branch;
+          await git(root, ["branch", branch, commit]);
+          branchCreated = true;
+          await atomicJson(markerPath, { owner, path, branch, base: commit, branchCreated: true });
+          await git(root, ["worktree", "add", "--no-checkout", path, branch]);
+          worktreeCreated = true;
+          await git(path, ["checkout", "--force", branch]);
+        }
         // Only a physically new worktree runs the launch's setup; existing, borrowed, and inherited worktrees returned above.
         const setup = loaded.snapshot.settings.worktreeSetup;
         if (setup?.length) await runWorktreeSetup(setup, path, { PIEWF_WORKTREE_PATH: path, PIEWF_SOURCE_ROOT: root, PIEWF_WORKTREE_BRANCH: branch });
         await atomicJson(recordsPath, [...records, record]);
+        recordPersisted = true;
         await rm(markerPath, { force: true });
         return record;
       } catch (error) {
-        if (worktreeCreated) await git(this.cwd, ["worktree", "remove", "--force", path]).catch(() => undefined);
-        if (branchCreated) await git(this.cwd, ["branch", "-D", branch]).catch(() => undefined);
-        if (markerWritten) await rm(markerPath, { force: true });
-        try {
+        let cleanupError: unknown;
+        if (!recordPersisted && worktreeCreated) {
+          if (herdrWorkspaceId) {
+            try { await removeHerdrWorktree(herdrWorkspaceId, this.herdrRunner); }
+            catch (removalError) { cleanupError = removalError; }
+          } else {
+            try { await git(this.cwd, ["worktree", "remove", "--force", path]); }
+            catch (removalError) { cleanupError = removalError; }
+          }
+        }
+        if (!recordPersisted && branchCreated) {
+          try { await git(this.cwd, ["branch", "-D", branch]); }
+          catch (removalError) { cleanupError ??= removalError; }
+        }
+        if (!recordPersisted && markerWritten && cleanupError === undefined) {
+          try { await this.cleanupMarker(markerPath); }
+          catch (markerError) { cleanupError = markerError; }
+        }
+        if (!recordPersisted) try {
           const persisted = await this.#loadWorktreeRecords();
           const match = persisted.filter((candidate) => candidate.owner === owner);
           const candidate = match.length === 1 ? match[0] : undefined;
-          if (candidate) { this.structuralWorktree(owner, candidate); records = persisted.filter((current) => current !== candidate); await atomicJson(recordsPath, records); }
+          if (candidate) { await this.structuralWorktree(owner, candidate); records = persisted.filter((current) => current !== candidate); await atomicJson(recordsPath, records); }
         } catch { /* Ownership changed or disappeared: do not delete anything. */ }
-        throw new WorkflowError("WORKTREE_FAILED", errorText(error));
+        throw new WorkflowError("WORKTREE_FAILED", errorText(cleanupError ?? error));
       }
     });
     return write;
@@ -747,16 +864,8 @@ export class RunStore {
     try {
       const write = this.snapshotLane.run(async () => {
         const record = await this.worktree(owner);
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          await git(record.path, ["add", "-A"]);
-          if (!(await git(record.path, ["status", "--porcelain"])).trim()) break;
-          try {
-            await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
-            break;
-          } catch (error) {
-            if (attempt === 2) throw error;
-          }
-        }
+        await git(record.path, ["add", "-A"]);
+        if ((await git(record.path, ["status", "--porcelain"])).trim()) await git(record.path, ["commit", "-m", "pi-extensible-workflows runtime snapshot"], gitIdentity);
         return (await git(record.path, ["rev-parse", "HEAD"])).trim();
       });
       return await write;
@@ -811,6 +920,16 @@ export class RunStore {
 
   evidenceDirectory(): string { return join(this.directory, "evidence"); }
 
+  private async lineageEvidencePath(path: string, sha256: string, seen = new Set<string>()): Promise<boolean> {
+    if (seen.has(this.runId)) throw new WorkflowError("RESUME_INCOMPATIBLE", "Retry provenance contains a cycle");
+    const nextSeen = new Set(seen);
+    nextSeen.add(this.runId);
+    if (sameFilesystemPath(path, join(this.evidenceDirectory(), `${sha256}.txt`))) return true;
+    const loaded = await this.load();
+    const sourceRunId = loaded.run.retry?.sourceRunId;
+    return sourceRunId === undefined ? false : (await this.sourceRun(sourceRunId)).lineageEvidencePath(path, sha256, nextSeen);
+  }
+
   /** Content-addressed and journaled by digest, so a resumed or retried run gets back the record its lineage first stored. */
   async saveEvidence(content: string | JsonValue): Promise<EvidenceRecord> {
     if (typeof content !== "string" && !jsonValue(content)) throw new WorkflowError("INVALID_METADATA", "Evidence content must be a string or JSON-compatible value");
@@ -819,19 +938,25 @@ export class RunStore {
     const sha256 = createHash("sha256").update(raw).digest("hex");
     const ref = `ref:sha256:${sha256.slice(0, 16)}`;
     const operation = structuralPath("evidence", sha256);
+    const dir = this.evidenceDirectory();
+    const targetPath = join(dir, `${sha256}.txt`);
     const replayed = await this.replay(operation);
     if (replayed) {
       const value = replayed.value;
-      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== raw.length || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt`) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+      if (!object(value) || value.ref !== ref || value.sha256 !== sha256 || value.bytes !== raw.length || typeof value.path !== "string" || basename(value.path) !== `${sha256}.txt` || !(await this.lineageEvidencePath(value.path, sha256))) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence record is invalid: ${operation}`);
+      const info = await lstat(value.path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError("RESUME_INCOMPATIBLE", `Persisted evidence artifact is not a regular file: ${operation}`);
       assertEvidenceIntegrity(await readFile(value.path), sha256, value.path);
       return { ref, sha256, path: value.path, bytes: raw.length };
     }
-    const dir = this.evidenceDirectory();
-    const targetPath = join(dir, `${sha256}.txt`);
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const existing = await readFile(targetPath).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
     if (existing === undefined) await atomicWriteFile(targetPath, text);
-    else assertEvidenceIntegrity(existing, sha256, targetPath);
+    else {
+      const info = await lstat(targetPath);
+      if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError("RESULT_INVALID", `Evidence artifact is not a regular file: ${targetPath}`);
+      assertEvidenceIntegrity(existing, sha256, targetPath);
+    }
     const record = { ref, sha256, path: targetPath, bytes: raw.length };
     // Identical content stored concurrently journals once; every caller returns the same record.
     await this.updateJournal((journal) => { journal.completed[operation] ??= { path: operation, value: record }; });
@@ -848,7 +973,10 @@ export class RunStore {
       if (!/^[0-9a-f]{64}$/.test(sha256)) continue;
       const targetPath = join(dir, name);
       try {
-        const fileStat = await stat(targetPath);
+        const fileStat = await lstat(targetPath);
+        if (!fileStat.isFile() || fileStat.isSymbolicLink()) continue;
+        const content = await readFile(targetPath);
+        if (createHash("sha256").update(content).digest("hex") !== sha256) continue;
         results.push({ ref: `ref:sha256:${sha256.slice(0, 16)}`, sha256, path: targetPath, bytes: fileStat.size });
       } catch { /* Ignore concurrently removed files. */ }
     }
@@ -877,15 +1005,32 @@ export class RunStore {
 
   async delete(confirmed: boolean): Promise<void> {
     if (!confirmed) throw new WorkflowError("CANCELLED", "Run deletion requires confirmation");
+    await this.validateDeletionWorktrees();
     const records = await this.#loadWorktreeRecords();
-    const validated = records.map((record) => {
-      try { return this.structuralWorktree(record.owner, record); }
+    const validated: WorktreeReference[] = [];
+    const owners = new Set<string>();
+    for (const record of records) {
+      if (owners.has(record.owner)) throw new WorkflowError("WORKTREE_FAILED", `Duplicate worktree record for ${record.owner}`);
+      owners.add(record.owner);
+      try { validated.push(await this.structuralWorktree(record.owner, record, false, true)); }
       catch (error) { throw new WorkflowError("WORKTREE_FAILED", errorText(error)); }
-    });
+    }
     await this.cleanupOrphanWorktrees();
     for (const record of validated) {
-      await git(this.cwd, ["worktree", "remove", "--force", record.path]).catch(() => undefined);
-      await git(this.cwd, ["branch", "-D", record.branch]).catch(() => undefined);
+      if (record.workspaceId) {
+        try {
+          const status = await this.herdrWorktreeStatus(record.workspaceId, record.path, record.branch);
+          if (status === "invalid") throw new Error(`Invalid Herdr worktree record for ${record.owner}`);
+          if (status === "owned") await removeHerdrWorktree(record.workspaceId, this.herdrRunner);
+        } catch (error) { throw new WorkflowError("WORKTREE_FAILED", errorText(error)); }
+      } else {
+        try {
+          const listed = await git(this.cwd, ["worktree", "list", "--porcelain"]);
+          const registered = listed.split("\n").some((line) => line.startsWith("worktree ") && sameFilesystemPath(line.slice("worktree ".length), record.path));
+          if (registered) await git(this.cwd, ["worktree", "remove", "--force", record.path]);
+          await git(this.cwd, ["branch", "-D", record.branch]);
+        } catch (error) { throw new WorkflowError("WORKTREE_FAILED", errorText(error)); }
+      }
     }
     await rm(this.directory, { recursive: true, force: true });
   }

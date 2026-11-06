@@ -520,8 +520,8 @@ function decodeOwnershipRecord(value: unknown): OwnershipRecord | undefined {
 }
 export function decodeOwnershipRecords(value: unknown): OwnershipRecord[] | undefined { return decodeArray(value, decodeOwnershipRecord); }
 function decodeWorktreeReference(value: unknown): WorktreeReference | undefined {
-  if (!object(value) || typeof value.owner !== "string" || typeof value.path !== "string" || typeof value.branch !== "string" || typeof value.cwd !== "string" || typeof value.base !== "string") return undefined;
-  return { owner: value.owner, path: value.path, branch: value.branch, cwd: value.cwd, base: value.base };
+  if (!object(value) || typeof value.owner !== "string" || typeof value.path !== "string" || typeof value.branch !== "string" || typeof value.cwd !== "string" || typeof value.base !== "string" || value.workspaceId !== undefined && typeof value.workspaceId !== "string") return undefined;
+  return { owner: value.owner, path: value.path, branch: value.branch, cwd: value.cwd, base: value.base, ...(value.workspaceId === undefined ? {} : { workspaceId: value.workspaceId }) };
 }
 export function decodeWorktreeReferences(value: unknown): WorktreeReference[] | undefined { return decodeArray(value, decodeWorktreeReference); }
 function decodeBorrowedWorktreeBinding(value: unknown): BorrowedWorktreeBinding | undefined {
@@ -577,6 +577,6 @@ export function decodeSystemPromptArtifact(value: unknown): { version: number; f
   if (value.entries !== undefined && !entries) return undefined;
   return { version: value.version, ...(value.format === undefined ? {} : { format: value.format }), ...(value.storage === undefined ? {} : { storage: value.storage }), ...(entries === undefined ? {} : { entries }) };
 }
-export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
+export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string; workspaceId?: string }
 export interface BorrowedWorktreeBinding { name: string; sourceRunId: string; owner: string }
 export type SessionOwner = { pid: number; token: string; startedAt: number };

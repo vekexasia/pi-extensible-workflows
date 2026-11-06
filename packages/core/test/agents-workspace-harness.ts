@@ -105,8 +105,10 @@ export class FakeSource implements TranscriptSource {
   pollGate: Promise<void> | undefined;
   overlapped = false;
   private active = 0;
+  private releasePoll: (() => void) | undefined;
   constructor(readonly key: string) {}
-  async poll(): Promise<TranscriptPoll> { return await this.run("poll", async () => { if (this.pollGate) await this.pollGate; const next = this.polls.shift(); if (next instanceof Error) throw next; return next ?? polled([]); }); }
+  async poll(): Promise<TranscriptPoll> { return await this.run("poll", async () => { if (this.pollGate) await Promise.race([this.pollGate, new Promise<void>((resolve) => { this.releasePoll = resolve; })]); const next = this.polls.shift(); if (next instanceof Error) throw next; return next ?? polled([]); }); }
+  cancel(): void { this.releasePoll?.(); this.releasePoll = undefined; }
   close(): Promise<void> { return this.run("close", () => undefined); }
   count(name: string): number { return this.calls.filter((call) => call === name).length; }
   /** Every call settles a turn of the event loop later, so overlapping calls would be seen. */
@@ -115,8 +117,9 @@ export class FakeSource implements TranscriptSource {
     this.active += 1;
     if (this.active > 1) this.overlapped = true;
     await tick();
+    const value = await result();
     this.active -= 1;
-    return result();
+    return value;
   }
 }
 

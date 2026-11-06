@@ -8,7 +8,7 @@ import { navigateWorkflowPhaseTree, workflowPhaseTreeVisibleNodes, type Workflow
 import { navigatorSidebarWidth, progressStyleForState, themeWorkflowProgressStyles, type WorkflowProgressStyles } from "./host-view.js";
 import type { SessionAgent, SessionAgentsSource, SessionTreeNode } from "./session-agents.js";
 import type { CreateTranscriptView, TranscriptView } from "./transcript-components.js";
-import type { TranscriptPoll, TranscriptSource, TranscriptSourceStatus } from "./session-transcript.js";
+import type { TranscriptPoll, TranscriptRecord, TranscriptSource, TranscriptSourceStatus } from "./session-transcript.js";
 import { errorText, sanitizeDisplayText } from "./utils.js";
 import { openArtifactInEditor, type WorkflowTui } from "./workflow-artifacts.js";
 
@@ -127,7 +127,7 @@ function isText(data: string): boolean {
   return true;
 }
 /** What makes a fresh transcript: another attempt, another session reference or another owner verdict. */
-function identity(agent: SessionAgent): string { return JSON.stringify([agent.attempt ?? null, agent.owned, agent.session ?? null]); }
+function identity(agent: SessionAgent): string { return JSON.stringify([agent.key, agent.attempt ?? null, agent.owned, agent.session ?? null]); }
 /** A component of one row, truncated to the width; nothing when the text is empty. */
 function row(text: () => string): Component {
   return { render: (width) => { const value = text(); return value ? [truncateToWidth(value, Math.max(1, width), "…")] : []; }, invalidate() {} };
@@ -168,7 +168,10 @@ class TranscriptScroll extends ScrollView {
   /** All the content is read: a saved place beyond the laid-out content is dropped, the view stays clamped at the top. */
   giveUpRestore(): void {
     this.atStart = true;
-    if (this.laidContent > 0) this.pendingFromEnd = undefined;
+    if (this.pendingFromEnd !== undefined) {
+      this.pendingFromEnd = undefined;
+      this.scrollTo(0, { disableFollow: true });
+    }
   }
   /** The content was replaced: a saved place no longer applies. */
   cancelRestore(): void { this.pendingFromEnd = undefined; this.restoredAt = undefined; this.laidTop = undefined; }
@@ -202,7 +205,8 @@ interface Menu {
   entries: readonly MenuEntry[] | undefined;
   /** Pi's select list of the entries, its item values their indexes; undefined while there are none. */
   list: SelectList | undefined;
-  /** The selected label: also kept while a read lacks it because a provider could not be read. */
+  /** The selected action: also kept while a read lacks it because a provider could not be read. */
+  selected: MenuEntry | undefined;
   label: string | undefined;
   /** Counts the reads of the labels: only the latest one's answer is taken. */
   generation: number;
@@ -226,6 +230,8 @@ interface Shown {
   /** Poll on every tick; cleared by the first poll that started with the agent stopped. */
   polling: boolean;
   pollInFlight: boolean;
+  records: readonly TranscriptRecord[];
+  rebuildTranscript: boolean;
   /** No read started yet: the first waits while another agent's first read is in flight. */
   unread: boolean;
   status: TranscriptSourceStatus | undefined;
@@ -249,13 +255,16 @@ class Workspace {
   private listed = false;
   /** options.initialKey until a node was selected. */
   private initialKey: string | undefined;
+  private deferredInitialKey: string | undefined;
   /** options.state until a node was selected: its selection is taken after the initial key's. */
   private restore: AgentsWorkspaceState | undefined;
   /** Where the transcript was scrolled when the workspace stepped aside; taken by the next transcript opened. */
   private place: TranscriptPlace | undefined;
   private listing = false;
+  private refreshPending = false;
   /** A failed list, or a throw while no transcript is shown; in the title until the next list succeeds. */
   private failure: string | undefined;
+  private disposeFailure: unknown;
   /** The transcript of the selected node when it is an agent. */
   private shown: Shown | undefined;
   /** The right pane of the selected node when it is not an agent, or an agent's on d; a new one for each selection. */
@@ -298,13 +307,15 @@ class Workspace {
   private timer: ReturnType<typeof setInterval> | undefined;
   /** The ticks run IDLE_POLL_MS apart: the last list showed no agent running and the shown transcript was read to its end. */
   private idle = false;
+  private closing = Promise.resolve();
+  private closeFailure: unknown;
   /** Stops options.changes calling the workspace. */
   private readonly unsubscribe: (() => void) | undefined;
   /** The working message of a detached action, kept by options.detached; unlike the notices a key does not end it. */
   private working: string | undefined;
   private readonly unsubscribeWorking: (() => void) | undefined;
   /** An agent's first read is in flight: no other agent's starts until it settles, then only the agent shown then is read. */
-  private firstReading = false;
+  private firstReading: Pick<Shown, "source" | "view" | "unsubscribe" | "queue"> | undefined;
   private readonly title: Component = { render: (width) => [this.titleRow(Math.max(1, width))], invalidate() {} };
   /** A click on the open input row places its cursor; the keys reach it through filterKey(). */
   private readonly filterRow: Component = { render: (width) => this.filtering ? this.filterInput.render(Math.max(1, width)) : [], handleMouse: (event) => this.filtering && this.filterInput.handleMouse(event) ? { handled: true } : undefined, invalidate() {} };
@@ -338,11 +349,20 @@ class Workspace {
     this.filterInput.onSubmit = () => { this.closeFilter(this.filter.trim()); };
     this.filterInput.onEscape = () => { this.closeFilter(""); };
     this.notices = (options.notices ?? []).map((text) => ({ text: clean(text), level: undefined }));
+    this.rebuild();
     // Runs after the alt screen's viewport listener (pgup/pgdn, search, the wheel): the terminal openAgentsWorkspace gives the alt screen puts gate() before both.
     alt.addInputListener((data) => this.input(data));
-    this.unsubscribe = options.changes?.(() => { this.wake(); });
-    this.unsubscribeWorking = options.detached?.({ working: (message) => { this.working = message === undefined ? undefined : clean(message); if (!this.finished) this.alt.requestRender(); }, notice: (message, level) => { this.notify(message, level); } });
-    this.rebuild();
+    const unsubscribe = options.changes?.(() => { this.wake(); });
+    let unsubscribeWorking: (() => void) | undefined;
+    try {
+      const sink: DetachedSink = { working: (message) => { this.working = message === undefined ? undefined : clean(message); if (!this.finished) this.alt.requestRender(); }, notice: (message, level) => { this.notify(message, level); } };
+      unsubscribeWorking = options.detached?.(sink);
+    } catch (error) {
+      try { unsubscribe?.(); } catch { /* Preserve the setup error. */ }
+      throw error;
+    }
+    this.unsubscribe = unsubscribe;
+    this.unsubscribeWorking = unsubscribeWorking;
     this.refresh();
   }
 
@@ -355,18 +375,24 @@ class Workspace {
   /** Throws only what the alt screen's stop threw (a terminal that cannot stop), and only after everything else was let go. */
   dispose(): void {
     this.finished = true;
+    let failure: unknown;
+    const attempt = (step: () => void): void => { try { step(); } catch (error) { failure ??= error; } };
     try {
       if (this.timer) clearInterval(this.timer);
       this.timer = undefined;
       const shown = this.shown;
       this.shown = undefined;
-      if (shown) this.close(shown);
-      this.unsubscribe?.();
-      this.unsubscribeWorking?.();
+      if (shown) attempt(() => { this.close(shown); });
+      attempt(() => { this.unsubscribe?.(); });
+      attempt(() => { this.unsubscribeWorking?.(); });
+    } catch (error) {
+      failure = error;
     } finally {
       // Last, so its throw skips nothing here; the caller restores Pi after it. Stopped already while the in-place editor runs.
-      if (!this.editing) this.alt.stop({ preserveScreen: true });
+      try { if (!this.editing) this.alt.stop({ preserveScreen: true }); } catch (error) { failure ??= error; }
     }
+    if (this.disposeFailure !== undefined) throw new Error(errorText(this.disposeFailure));
+    if (failure !== undefined) throw new Error(errorText(failure));
   }
 
   start(): void { this.alt.start(); }
@@ -409,8 +435,13 @@ class Workspace {
     if (menu) { this.menuKey(menu, data); this.alt.requestRender(); return { consume: true }; }
     // While an overlay (the search box) is open, every other key is its input.
     if (this.alt.hasOverlay()) return undefined;
-    if (this.filtering) { this.filterKey(data); this.alt.requestRender(); return { consume: true }; }
     const is = (keybinding: Keybinding): boolean => this.keybindings.matches(data, keybinding);
+    if (this.filtering) {
+      if (is("tui.select.cancel")) this.closeFilter("");
+      else this.filterKey(data);
+      this.alt.requestRender();
+      return { consume: true };
+    }
     // In the sidebar j, k, h and l move as the arrows do, as in /workflow.
     const sidebar = this.focus === "sidebar";
     const moves = (keybinding: Keybinding): boolean => sidebar ? workflowKeyMatches(this.keybindings, data, keybinding) : is(keybinding);
@@ -580,6 +611,7 @@ class Workspace {
   }
   /** Moves the selection to the follow target and keeps its transcript at the tail. */
   private follow(): void {
+    this.deferredInitialKey = undefined;
     const target = this.followTarget();
     if (target && target.key !== this.selectedKey) { this.reveal(target); this.select(target); }
     this.shown?.scroll.scrollToEnd();
@@ -638,18 +670,22 @@ class Workspace {
   private hasChildren(node: SessionTreeNode): boolean { return (this.tree.byId.get(node.key)?.children.length ?? 0) > 0; }
 
   private refresh(): void {
-    if (this.listing || this.finished) return;
+    if (this.finished) return;
+    if (this.listing) { this.refreshPending = true; return; }
     this.listing = true;
     // A list() that throws synchronously rejects this promise, as one that returns a rejected promise does.
     void new Promise<readonly SessionTreeNode[]>((resolve) => { resolve(this.options.agents.list()); }).then((nodes) => {
       this.listing = false;
       if (this.finished) return;
+      if (this.editing) { this.refreshPending = true; return; }
       this.failure = undefined;
       this.guard(() => { this.apply(nodes); });
       this.startTicks();
+      if (this.refreshPending) { this.refreshPending = false; this.refresh(); }
     }, (error: unknown) => {
       this.listing = false;
       if (this.finished) return;
+      if (this.editing) { this.refreshPending = true; return; }
       const failure = `agents unavailable: ${errorText(error)}`;
       if (failure !== this.failure) {
         this.failure = failure;
@@ -657,6 +693,7 @@ class Workspace {
         this.alt.requestRender();
       }
       this.startTicks();
+      if (this.refreshPending) { this.refreshPending = false; this.refresh(); }
     });
   }
   /**
@@ -702,7 +739,9 @@ class Workspace {
     // Follow stays on its agent while it runs, as a switch reloads the transcript: only a settled or gone one gives way.
     const followed = this.following && this.selectedNode()?.agent?.running !== true ? this.followTarget() : undefined;
     if (followed) this.reveal(followed);
-    let wanted = followed ?? this.selectedNode();
+    const deferred = this.deferredInitialKey === undefined ? undefined : this.byKey.get(this.deferredInitialKey);
+    if (deferred) { this.reveal(deferred); this.deferredInitialKey = undefined; }
+    let wanted = deferred ?? followed ?? this.selectedNode();
     if (!wanted && this.selectedKey !== undefined) {
       const visible = this.visible();
       wanted = visible[Math.min(Math.max(0, row), visible.length - 1)];
@@ -733,6 +772,9 @@ class Workspace {
     else if (menu && menuNode && target && this.readFor(menuNode) !== menu.readFor) {
       menu.target = target;
       menu.readFor = this.readFor(menuNode);
+      menu.entries = undefined;
+      menu.list = undefined;
+      menu.failures = undefined;
       this.loadMenu(menu);
     }
     if (this.following && this.shown) this.shown.scroll.scrollToEnd();
@@ -748,6 +790,7 @@ class Workspace {
   }
   private firstSelection(nodes: readonly SessionTreeNode[]): SessionTreeNode | undefined {
     const initial = this.initialKey === undefined ? undefined : this.byKey.get(this.initialKey);
+    if (!initial && this.initialKey !== undefined) this.deferredInitialKey = this.initialKey;
     const restore = this.restore;
     if (!initial && restore) {
       const kept = restore.selectedKey === undefined ? undefined : this.byKey.get(restore.selectedKey);
@@ -791,7 +834,7 @@ class Workspace {
     this.following = false;
     // The list draws under the heading row: a mouse report on the menu reaches it a row up.
     const component: Component = { render: (width) => this.menuLines(width), handleMouse: (event) => this.menu?.list?.handleMouse({ ...event, y: event.y - 1 }), invalidate() {} };
-    const menu: Menu = { key: node.key, target, readFor: this.readFor(node), handle: this.alt.showOverlay(component, MENU_OVERLAY), entries: undefined, list: undefined, label: undefined, generation: 0, failures: undefined };
+    const menu: Menu = { key: node.key, target, readFor: this.readFor(node), handle: this.alt.showOverlay(component, MENU_OVERLAY), entries: undefined, list: undefined, selected: undefined, label: undefined, generation: 0, failures: undefined };
     this.menu = menu;
     this.loadMenu(menu);
   }
@@ -815,11 +858,14 @@ class Workspace {
       if (!current()) return;
       const entries = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
       const failures = results.flatMap((result) => result.status === "rejected" ? [this.styles.warning(`actions unavailable: ${clean(errorText(result.reason))}`)] : []);
-      const kept = entries.findIndex((entry) => entry.action.label === menu.label);
-      // The first label until one was selected; the last one when the selected label went away.
-      const index = kept >= 0 ? kept : menu.label === undefined ? 0 : Math.max(0, entries.length - 1);
-      // A label missing because its provider could not be read is still the one to select when the next read has it.
-      if (kept >= 0 || failures.length === 0) menu.label = entries[index]?.action.label;
+      const kept = entries.findIndex((entry) => entry.provider === menu.selected?.provider && entry.action.label === menu.selected.action.label);
+      // The first action until one was selected; the last one when the selected action went away.
+      const index = kept >= 0 ? kept : menu.selected === undefined ? 0 : Math.max(0, entries.length - 1);
+      // An action missing because its provider could not be read is still the one to select when the next read has it.
+      if (menu.selected === undefined || kept >= 0 || failures.length === 0) {
+        menu.selected = entries[index];
+        menu.label = menu.selected?.action.label;
+      }
       menu.entries = entries;
       menu.failures = failures.length > 0 ? new Text(failures.join("\n"), 0, 0) : undefined;
       menu.list = entries.length > 0 ? this.menuList(menu, entries, index, failures.length) : undefined;
@@ -835,7 +881,7 @@ class Workspace {
     const list = new SelectList(items, entries.length > room ? Math.max(1, room - 1) : room, getSelectListTheme(), { truncatePrimary: ({ text, maxWidth }) => truncateToWidth(text, maxWidth, "…") });
     list.setSelectedIndex(index);
     const entryOf = (item: SelectItem): MenuEntry | undefined => entries[Number(item.value)];
-    list.onSelectionChange = (item) => { menu.label = entryOf(item)?.action.label; };
+    list.onSelectionChange = (item) => { menu.selected = entryOf(item); menu.label = menu.selected?.action.label; };
     // A click runs it from pi-tui's mouse dispatch, outside input()'s try/catch.
     list.onSelect = (item) => { this.guard(() => { const entry = entryOf(item); if (entry && this.menu === menu) this.choose(menu, entry); }); };
     return list;
@@ -851,7 +897,8 @@ class Workspace {
       // The list's own keys are Pi's bindings, without j and k: the workspace moves it.
       const next = (index + (is("tui.select.up") ? -1 : 1) + entries.length) % entries.length;
       list.setSelectedIndex(next);
-      menu.label = entries[next]?.action.label;
+      menu.selected = entries[next];
+      menu.label = menu.selected?.action.label;
     } else if (list && is("tui.select.confirm")) {
       const entry = entries[index];
       if (entry) this.choose(menu, entry);
@@ -880,7 +927,7 @@ class Workspace {
     }
   }
   private notify(message: string, level?: "info" | "warning" | "error"): void {
-    if (this.finished) return;
+    if (this.finished) { this.disposeFailure ??= new Error(clean(message)); return; }
     this.notices.push({ text: clean(message), level });
     this.alt.requestRender();
   }
@@ -918,16 +965,20 @@ class Workspace {
         if (this.finished || !this.editing) return;
         if (this.leaveAfterEditor) { this.leave(); return; }
         this.editing = false;
-        //NOTE: a terminal that cannot start again after the editor leaves Pi stopped and the workspace without keys until an abort.
-        this.start();
-        // The terminal reported no resize while the editor had it: this frame measures it again.
-        this.alt.renderNow(true);
+        try {
+          this.start();
+          // The terminal reported no resize while the editor had it: this frame measures it again.
+          this.alt.renderNow(true);
+          if (this.refreshPending) { this.refreshPending = false; this.refresh(); }
+        } catch (error) {
+          this.leave(undefined, error);
+        }
       },
       requestRender: (force) => { if (!this.finished && !this.editing) this.alt.requestRender(force); },
     };
   }
   private open(agent: SessionAgent): Shown {
-    const base = { agent, identity: identity(agent), queue: Promise.resolve(), polling: true, pollInFlight: false, unread: true, status: undefined, reason: undefined, failure: undefined };
+    const base = { agent, identity: identity(agent), queue: Promise.resolve(), polling: true, pollInFlight: false, records: [], rebuildTranscript: false, unread: true, status: undefined, reason: undefined, failure: undefined };
     // The session file of an agent that is not owned is never opened.
     if (!agent.owned) return { ...base, source: undefined, view: undefined, unsubscribe: undefined, scroll: new TranscriptScroll(new Text("transcript unavailable", 0, 0), this.scrollbar) };
     let source: TranscriptSource | undefined;
@@ -965,8 +1016,16 @@ class Workspace {
     this.guard(() => { shown.unsubscribe?.(); });
     this.guard(() => { shown.view?.dispose(); });
     const source = shown.source;
-    // Closing waits for the call in flight: the descriptor must not close under a read.
-    if (source) void this.call(shown, () => source.close()).catch(() => undefined);
+    if (this.firstReading === shown) this.firstReading = undefined;
+    if (source) {
+      this.guard(() => { source.cancel?.(); });
+      const closing = this.call(shown, () => source.close());
+      this.closing = Promise.all([this.closing, closing]).then(() => undefined, (error: unknown) => { this.closeFailure ??= error; });
+    }
+  }
+  async waitForClose(): Promise<void> {
+    await this.closing;
+    if (this.closeFailure !== undefined) throw new Error(errorText(this.closeFailure));
   }
 
   private call<T>(shown: Pick<Shown, "queue">, operation: () => Promise<T>): Promise<T> {
@@ -991,7 +1050,7 @@ class Workspace {
   }
   /** The shown transcript's status line, or the title while none is shown; nothing once the workspace is left. */
   private report(error: unknown): void {
-    if (this.finished) return;
+    if (this.finished) { this.disposeFailure ??= error; return; }
     if (this.shown) this.shown.failure = `transcript failed: ${errorText(error)}`;
     else this.failure = `agents workspace failed: ${errorText(error)}`;
     this.lastListedRows = undefined;
@@ -1002,45 +1061,54 @@ class Workspace {
     if (!source || !view || !shown.polling || shown.pollInFlight) return;
     const first = shown.unread;
     //NOTE: a first read that never settles holds the first read of every agent shown after it.
-    if (first && this.firstReading) return;
+    if (first && this.firstReading !== undefined) return;
     shown.unread = false;
-    if (first) this.firstReading = true;
+    if (first) this.firstReading = shown;
     shown.pollInFlight = true;
     let last = false;
     void this.call(shown, () => { last = !shown.agent.running; return source.poll(); }).then((result) => {
       shown.pollInFlight = false;
-      if (last) shown.polling = false;
-      if (first) this.firstSettled();
-      if (this.shown === shown) this.guard(() => { this.applyPoll(shown, view, result); });
+      if (last && result.status === "available") shown.polling = false;
+      if (first) this.firstSettled(shown);
+      if (this.shown === shown && !this.guard(() => { this.applyPoll(shown, view, result); })) shown.polling = true;
     }, (error: unknown) => {
       shown.pollInFlight = false;
-      if (last) shown.polling = false;
-      if (first) this.firstSettled();
+      if (first) this.firstSettled(shown);
       this.failed(shown, error);
     });
   }
   /** The first read in flight settled: the agent shown now is read if it was not; the ones passed over meanwhile never are. */
-  private firstSettled(): void {
-    this.firstReading = false;
+  private firstSettled(shown: Pick<Shown, "source" | "view" | "unsubscribe" | "queue">): void {
+    if (this.firstReading !== shown) return;
+    this.firstReading = undefined;
     if (this.shown?.unread) this.poll(this.shown);
   }
   /**
-   * The source's state is taken first: a view that throws leaves its error as the status line, and the next poll goes on from the
-   * source. A frame is drawn only for a reset, appended records or a change of what the status row and the scroll read.
+   * Keep the source's records until the view accepts them; an append may throw after a partial mutation.
+   * The next poll rebuilds the view, including on a settled agent's final read.
    */
   private applyPoll(shown: Shown, view: TranscriptView, result: TranscriptPoll): void {
     const before = JSON.stringify([shown.status, shown.reason, shown.failure]);
     shown.status = result.status;
     shown.reason = result.reason;
-    shown.scroll.giveUpRestore();
+    if (result.status !== "available") shown.scroll.giveUpRestore();
     shown.failure = undefined;
-    if (result.reset) {
-      view.reset();
-      shown.scroll.cancelRestore();
-      shown.scroll.scrollToEnd();
+    shown.records = result.reset ? result.appended : shown.records.concat(result.appended);
+    const rebuild = result.reset || shown.rebuildTranscript;
+    try {
+      if (rebuild) {
+        view.reset();
+        shown.scroll.cancelRestore();
+        shown.scroll.scrollToEnd();
+      }
+      const appended = rebuild ? shown.records : result.appended;
+      if (appended.length > 0) view.append(appended);
+      shown.rebuildTranscript = false;
+    } catch (error) {
+      shown.rebuildTranscript = true;
+      throw error;
     }
-    if (result.appended.length > 0) view.append(result.appended);
-    if (result.reset || result.appended.length > 0 || JSON.stringify([shown.status, shown.reason, shown.failure]) !== before) this.alt.requestRender();
+    if (rebuild || result.appended.length > 0 || JSON.stringify([shown.status, shown.reason, shown.failure]) !== before) this.alt.requestRender();
   }
 
   /** The width the layout gives the transcript pane: the terminal less a sidebar beside it. */
@@ -1069,7 +1137,7 @@ class Workspace {
     const position = `#${String(agents.findIndex((candidate) => candidate.key === this.selectedKey) + 1)}/${String(agents.length)}`;
     // An agent a crash left active in a run that is not live is not running: no state, as the widget's mark draws none.
     const state = agent.leftover ? "" : clean(agent.state);
-    return [position, this.styles.bold(clean(agent.name)), state && progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary)), this.speedTitle(agent)].filter((part) => part).join(" ") + failure;
+    return [position, this.styles.bold(clean(agent.name)), state && progressStyleForState(state, this.styles)(state), this.styles.muted(clean(agent.summary)), agent.branch === undefined ? "" : this.styles.muted(`branch=${clean(agent.branch)}`), this.speedTitle(agent)].filter((part) => part).join(" ") + failure;
   }
   /** The persisted average rate, else nothing. */
   private speedTitle(agent: SessionAgent): string {
@@ -1249,6 +1317,7 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
     const signal = ctx.signal;
     const shutdown = options.shutdown;
     let workspace: Workspace | undefined;
+    let pendingClose: Promise<void> | undefined;
     /** Set before parent.stop(): from then on leaving restarts Pi, exactly once. */
     let stopped = false;
     // A quit stops Pi's TUI (before session_shutdown, or after it on a signal): the workspace leaves now, whatever it is doing, and
@@ -1274,11 +1343,20 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
       shutdown?.removeEventListener("abort", shut);
       process.off("exit", exited);
       process.off("uncaughtExceptionMonitor", exited);
-      //NOTE: a terminal that cannot stop or start (setRawMode on a closed TTY) throws out of leave and may leave Pi stopped.
-      workspace?.dispose();
-      if (stopped) { parent.start(); parent.renderNow(false); }
-      done(exit);
-      if (cause !== undefined) ctx.ui.notify(`agents workspace failed: ${errorText(cause)}`, "error");
+      let failure = cause;
+      const closing = workspace;
+      try { closing?.dispose(); } catch (error) { failure ??= error; }
+      const finish = (closeError?: unknown): void => {
+        failure ??= closeError;
+        let restored = !stopped;
+        try {
+          if (stopped) { parent.start(); parent.renderNow(false); }
+          restored = true;
+        } catch (error) { failure ??= error; }
+        done(restored ? exit : undefined);
+        if (failure !== undefined) ctx.ui.notify(`agents workspace failed: ${errorText(failure)}`, "error");
+      };
+      void Promise.all([pendingClose ?? Promise.resolve(), closing?.waitForClose() ?? Promise.resolve()]).then(() => { finish(); }, (error: unknown) => { finish(error); });
     };
     signal?.addEventListener("abort", abort, { once: true });
     shutdown?.addEventListener("abort", shut, { once: true });
@@ -1322,9 +1400,13 @@ export const openAgentsWorkspace: OpenAgentsWorkspace = async (ctx, options) => 
         // Pi must not stay stopped: drop what started, then leave gives the terminal back to Pi, settles and reports this error first, once.
         const started = workspace;
         workspace = undefined;
-        //NOTE: a dispose or stop that throws here replaces this error and skips leave.
-        if (started) started.dispose(); else alt?.stop({ preserveScreen: true });
-        leave(undefined, error);
+        let failure = error;
+        try {
+          if (started) {
+            try { started.dispose(); } finally { pendingClose = started.waitForClose(); }
+          } else alt?.stop({ preserveScreen: true });
+        } catch (cleanupError) { failure = cleanupError; }
+        finally { leave(undefined, failure); }
       }
     });
     return { render: (width) => [truncateToWidth("opening agents…", Math.max(1, width), "…")], invalidate() {} };

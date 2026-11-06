@@ -94,6 +94,43 @@ function fakePresenter(names: Readonly<Record<string, string>>, calls: (readonly
 
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
 
+void test("lists persisted workflow and standalone worktree branches and refreshes changed worktree metadata", async () => {
+  const { home, cwd } = project("session-agents-branches");
+  const worktree = join(home, "worktree");
+  const store = await createRun({ home, cwd }, "run", "running", { agents: [agent("a", "worker", "running", [attempt(1, "a-1", worktree)], { worktreeOwner: "owner" })] });
+  const reference = { owner: "owner", path: worktree, cwd: worktree, branch: "feature/worker", base: "base" };
+  writeFileSync(join(store.directory, "worktrees.json"), JSON.stringify([reference]));
+  const manager = fakeManager([{ id: "solo", sessionId: "session", state: "completed", cwd, startedAt: 1, attempts: 1, worktree: { path: worktree, branch: "feature/solo" } }]);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager }));
+  assert.deepEqual(agentsOf(await source.list()).map((agent) => Reflect.get(agent, "branch")), ["feature/worker", "feature/solo"]);
+  writeFileSync(join(store.directory, "worktrees.json"), JSON.stringify([{ ...reference, branch: "feature/worker-renamed" }]));
+  assert.equal(Reflect.get(agentsOf(await source.list())[0]!, "branch"), "feature/worker-renamed");
+});
+
+void test("a running run refreshes its runtime when only an initially missing summary is written", async () => {
+  const { home, cwd } = project("session-agents-summary");
+  const store = await createRun({ home, cwd }, "run", "running", { agents: [agent("a", "worker", "running", [])] });
+  setCreatedAt(store, new Date(Date.now() - 10_000).toISOString());
+  const path = join(store.directory, "summary.json");
+  const summary = readFileSync(path);
+  fs.unlinkSync(path);
+  const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
+  await source.list();
+  writeFileSync(path, summary);
+  const nodes = await source.list();
+  assert.match(nodes[0]!.line(PLAIN, false, true), /10s|11s/);
+});
+
+void test("an inspected subagent requires matching id and an explicit matching cwd to own its transcript", async () => {
+  const { home, cwd } = project("session-agents-owner");
+  for (const extra of [{ id: "another", cwd }, {}, { cwd: 42 }, { cwd: join(home, "elsewhere") }, { cwd }]) {
+    const row = { id: "solo", sessionId: "session", state: "running", startedAt: 1, attempts: 1 };
+    const manager = fakeManager([row], { solo: { ...row, ...extra } });
+    const [listed] = agentsOf(await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list());
+    assert.equal(listed?.owned, typeof extra.cwd === "string" && extra.cwd === cwd && !("id" in extra), JSON.stringify(extra));
+  }
+});
+
 void test("lists this session's workflow runs in attention order, each as its /workflow tree, with the agents' summary, attempt and keys", async () => {
   const { home, cwd } = project("session-agents");
   // Whatever order readdir returns: the running run first, then the settled runs by the time they settled, newest first.
@@ -381,7 +418,7 @@ void test("lists the subagents of this session after the runs and owns only thos
   await createRun({ home, cwd }, "run", "running", { workflowName: "flow", agents: [agent("a", "a", "running", [attempt(1, "a-1")])] });
   const accounting = { input: 1000, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0.25 };
   const row = (id: string, state: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({ id, sessionId: "session", state, startedAt: 1, attempts: 1, progress: { accounting, toolCalls: [] }, ...extra });
-  const detailed = (id: string, state: string, extra: Record<string, unknown> = {}): Record<string, unknown> => row(id, state, { attemptDetails: [attempt(1, `${id}-1`, cwd)], ...extra });
+  const detailed = (id: string, state: string, extra: Record<string, unknown> = {}): Record<string, unknown> => row(id, state, { cwd, attemptDetails: [attempt(1, `${id}-1`, cwd)], ...extra });
   // Ids are not UUIDs: the owner check is the /subagents dashboard's safe-id check, not the manager's id format.
   const listed = [
     row("run-owned", "running"),
@@ -400,7 +437,7 @@ void test("lists the subagents of this session after the runs and owns only thos
     "bad/id": detailed("bad/id", "failed", { finishedAt: 20 }),
     "run-elsewhere": detailed("run-elsewhere", "stopped", { finishedAt: 40, cwd: join(home, "elsewhere"), progress: { accounting, toolCalls: [{ id: "call", name: "bash", state: "running" }], activity: { kind: "tool", text: "stale" } } }),
     "run-here": detailed("run-here", "completed", { finishedAt: 10, cwd: join(cwd, ".") }),
-    "run-nosession": row("run-nosession", "running", { attemptDetails: [attempt(1, undefined, cwd)] }),
+    "run-nosession": row("run-nosession", "running", { cwd, attemptDetails: [attempt(1, undefined, cwd)] }),
   }, {
     getAttemptActionData: (id) => {
       if (id === "run-owned") return { attempt: attempt(2, "run-owned-2", join(cwd, "worktree")), liveSession: ownedLive, signal: new AbortController().signal };
@@ -470,7 +507,7 @@ void test("a subagent whose inspection fails or returns no status stays listed w
   const listed = [row("sub-rejects"), row("sub-invalid"), row("sub-ok")];
   // Each one runs in this process with a matching session: only the owner check keeps its stream away.
   const sessions: Readonly<Record<string, WorkflowAgentSession>> = { "sub-rejects": liveSession("sub-rejects-1"), "sub-invalid": liveSession("sub-invalid-1"), "sub-ok": liveSession("sub-ok-1") };
-  const base = fakeManager(listed, { "sub-invalid": { id: "sub-invalid", state: "unknown" } }, {
+  const base = fakeManager(listed, { "sub-invalid": { id: "sub-invalid", state: "unknown" }, "sub-ok": { ...row("sub-ok"), cwd } }, {
     getAttemptActionData: (id) => { const session = sessions[id]; return session && { attempt: attempt(1, `${id}-1`, cwd), liveSession: session, signal: new AbortController().signal }; },
   });
   const manager: SubagentManager = {
@@ -493,7 +530,7 @@ void test("a subagent whose inspection fails or returns no status stays listed w
   assert.equal(byKey.get("subagent:sub-ok")?.live, sessions["sub-ok"]);
 });
 
-void test("a custom storageDir changes nothing: a real manager's run of this session is owned", async () => {
+void test("a custom storageDir proves no project ownership when a real manager omits cwd", async () => {
   const { home, cwd } = project("session-agents");
   const storageDir = join(home, "custom", "subagents");
   const id = "0f0e0d0c-0b0a-4908-8706-050403020100";
@@ -507,7 +544,7 @@ void test("a custom storageDir changes nothing: a real manager's run of this ses
     const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager })).list();
     assert.deepEqual(nodes.map(({ key }) => key), ["subagents", `subagent:${id}`], "the group, without workflow runs");
     const agents = agentsOf(nodes);
-    assert.deepEqual(agents.map(({ key, owned, attempt: number, state }) => ({ key, owned, attempt: number, state })), [{ key: `subagent:${id}`, owned: true, attempt: 1, state: "stopped" }]);
+    assert.deepEqual(agents.map(({ key, owned, attempt: number, state }) => ({ key, owned, attempt: number, state })), [{ key: `subagent:${id}`, owned: false, attempt: 1, state: "stopped" }]);
     assert.deepEqual(agents[0]?.session, attempt(1, `${id}-1`).session);
     assert.equal(agents[0]?.name, "0f0e0d0c", "an id longer than 12 characters shows its first 8");
     assert.equal(agents[0].cwd, cwd);
@@ -559,7 +596,7 @@ void test("the Subagents group takes a summary state: running while one runs, el
   assert.equal(await title(["stopped"]), "Subagents stopped");
 });
 
-void test("a run that has reached a terminal state is read once: a later list reuses the time it settled", async () => {
+void test("a settled run is cached until its persisted stamp changes, including its snapshot and summary", async () => {
   const { home, cwd } = project("session-agents");
   const a = await createRun({ home, cwd }, "run-a", "completed", { workflowName: "flow", agents: [agent("a", "a", "completed", [attempt(1, "a-1")])] });
   const b = await createRun({ home, cwd }, "run-b", "completed", { workflowName: "flow", agents: [agent("b", "b", "completed", [attempt(1, "b-1")])] });
@@ -569,13 +606,34 @@ void test("a run that has reached a terminal state is read once: a later list re
   const source = createSessionAgentsSource(commandContext(cwd), dependencies(home));
   const first = await order(source);
   setTerminalAt(a, "2025-01-01T00:00:00.000Z");
-  assert.deepEqual(await order(source), first, "the settled time is not read again");
+  assert.notDeepEqual(await order(source), first, "a changed summary refreshes the settled time");
   const before = (await source.list()).map(({ key, agent }) => [key, agent?.state]);
   writeFileSync(join(a.directory, "snapshot.json"), "{ not json");
   writeFileSync(join(b.directory, "snapshot.json"), "{ not json");
-  assert.deepEqual((await source.list()).map(({ key, agent }) => [key, agent?.state]), before, "a settled run's snapshot is not read again");
+  assert.deepEqual((await source.list()).map(({ key, agent }) => [key, agent?.state]), [], "a changed snapshot invalidates the settled cache and skips the damaged run");
   assert.equal((await createSessionAgentsSource(commandContext(cwd), dependencies(home)).list()).some(({ key }) => key === "run:run-a"), false, "a new source reads the damaged file");
   assert.notDeepEqual(await order(createSessionAgentsSource(commandContext(cwd), dependencies(home))), first, "a new source reads the file");
+});
+
+void test("a settled subagent revalidates cached ownership before exposing its live session", async () => {
+  const { home, cwd } = project("session-agents-owner-cache");
+  const row = { id: "solo", sessionId: "session", state: "completed", startedAt: 1, finishedAt: 2, attempts: 1 };
+  const live = liveSession("solo-1");
+  for (const change of [{ cwd: join(home, "elsewhere") }, { sessionId: "other-session", cwd }]) {
+    let inspected: Record<string, unknown> = { ...row, cwd };
+    const base = fakeManager([row], {}, { getAttemptActionData: () => ({ attempt: attempt(1, "solo-1", cwd), liveSession: live, signal: new AbortController().signal }) });
+    const manager: SubagentManager = { ...base, async inspect(request, context) {
+      if (request.id === "solo") return inspected;
+      return base.inspect(request, context);
+    } };
+    const source = createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager }));
+    const first = agentsOf(await source.list()).find(({ key }) => key === "subagent:solo");
+    assert.ok(first?.owned);
+    assert.equal(first.live, live);
+    inspected = { ...row, ...change };
+    const second = agentsOf(await source.list()).find(({ key }) => key === "subagent:solo");
+    assert.deepEqual({ key: second?.key, state: second?.state, owned: second?.owned, live: second?.live }, { key: "subagent:solo", state: "completed", owned: false, live: undefined });
+  }
 });
 
 void test("a cached settled run still goes through the host's overlay on every list", async () => {
@@ -644,7 +702,7 @@ void test("a run resumed after it was cached is read again: state.json is read o
   assert.equal(await expanded(), true);
 });
 
-void test("an unsettled run is read once while its state and journal are unchanged; its runtime and overlay are of each list", async () => {
+void test("an unsettled run is read once while its state, journal and snapshot are unchanged; its runtime and overlay are of each list", async () => {
   const { home, cwd } = project("session-agents");
   const store = await createRun({ home, cwd }, "run-a", "running", { workflowName: "flow", agents: [agent("a", "a", "running", [attempt(1, "a-1")])] });
   setCreatedAt(store, new Date(Date.now() - 7_200_000).toISOString());
@@ -660,7 +718,7 @@ void test("an unsettled run is read once while its state and journal are unchang
   const intact = readFileSync(snapshotPath, "utf8");
   writeFileSync(snapshotPath, "{ not json");
   label = "second";
-  assert.equal(await root(), "  ▾ second run-a  ⠦ 0/1 2h", "not read again: the overlay and the runtime of this list");
+  assert.equal(await root(), undefined, "a changed snapshot is read again");
   for (const [name, at] of [["state.json", 25], ["journal.json", 20]] as const) {
     utimesSync(join(store.directory, name), base - at, base - at);
     assert.equal(await root(), undefined, `a changed ${name} is read again`);
@@ -849,7 +907,7 @@ void test("the presenter is asked for every subagent this Pi session lists with 
   const row = (id: string): Record<string, unknown> => ({ id, sessionId: "session", state: "running", startedAt: 1, attempts: 1, progress: { accounting: ZERO, toolCalls: [] } });
   const ids = ["sub-safe", "bad/id", "..", "sub-foreign", "sub-away", "sub-rejected"];
   // The list rows all claim this session; the inspected records name another session and another cwd, and one inspection rejects.
-  const base = fakeManager(ids.map(row), { "sub-foreign": { ...row("sub-foreign"), sessionId: "other-session" }, "sub-away": { ...row("sub-away"), cwd: join(cwd, "elsewhere") } });
+  const base = fakeManager(ids.map(row), { "sub-safe": { ...row("sub-safe"), cwd }, "sub-foreign": { ...row("sub-foreign"), sessionId: "other-session" }, "sub-away": { ...row("sub-away"), cwd: join(cwd, "elsewhere") } });
   const manager: SubagentManager = { ...base, inspect: async (request, context) => request.id === "sub-rejected" ? Promise.reject(new Error("unreadable record")) : base.inspect(request, context) };
   const described: (readonly string[])[] = [];
   const nodes = await createSessionAgentsSource(commandContext(cwd), dependencies(home, { subagents: () => manager, subagentPresenter: () => fakePresenter(Object.fromEntries(ids.map((id) => [id, `named ${id}`])), described) })).list();
