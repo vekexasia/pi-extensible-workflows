@@ -1,6 +1,7 @@
 import { Type } from "typebox";
 import { defineWorkflowFunction, errorText } from "../src/index.js";
-import { parseSpecDocument, parseTaskSpecLinks, validateSpecCoverage, type SpecVerdict } from "./spec-contract.js";
+import { contextPolicyFor } from "./context-policy.js";
+import { parseSpecDocument, parseTaskSpecLinks, validateSpecCoverage } from "./spec-contract.js";
 
 const verdictSchema = Type.Object(
   {
@@ -51,7 +52,7 @@ export const specRedGreen = defineWorkflowFunction({
     if (!approved) return { ok: false, requirements: spec.length, verdicts: [], problems: ["Spec was not approved."] };
 
     try {
-      return await context.withWorktree(worktree, async (reference) => {
+      return await context.withWorktree(normalizedWorktree, async (reference) => {
         let red;
         try {
           red = await context.shell(redCommand, { timeoutMs });
@@ -61,16 +62,17 @@ export const specRedGreen = defineWorkflowFunction({
         if (red.exitCode === 0) return { ok: false, requirements: spec.length, verdicts: [], problems: ["RED passed, which proves nothing."] };
 
         const outputSchema = Type.Object({ verdicts: Type.Array(verdictSchema) }, { additionalProperties: false });
+        const developerPolicy = contextPolicyFor("developer");
         let written;
         try {
           written = await context.agent(
             `Implement the pinned spec by reference. Read the spec at ${specPath}. Cover requirement ids ${spec.map(({ id }) => id).join(", ")} in worktree ${reference.path}. Return one verdict per requirement with concise evidence.`,
-            { label: "Spec writer", role: "developer", outputSchema, timeoutMs },
+            { label: "Spec writer", role: "developer", contextFiles: [...developerPolicy.contextFiles], skills: [...developerPolicy.skills], outputSchema, timeoutMs },
           );
         } catch (error) {
           return { ok: false, requirements: spec.length, verdicts: [], problems: [`Agent failed: ${errorText(error)}`] };
         }
-        const verdicts = written.verdicts as SpecVerdict[];
+        const verdicts = written.verdicts;
         const serializableVerdicts = verdicts.map(({ requirementId, verdict, evidence }) => ({ requirementId, verdict, evidence: [...evidence] }));
         let green;
         try {

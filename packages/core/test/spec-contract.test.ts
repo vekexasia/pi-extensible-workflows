@@ -104,7 +104,7 @@ void test("rejects a task that repeats a spec id with its document line and no p
   assert.equal(result, undefined);
 });
 
-void test("accepts exact spec coverage", () => {
+void test("reports an unverified verdict by spec id and its recorded value", () => {
   const spec = [
     { id: "S1", statement: "First." },
     { id: "S2", statement: "Second." },
@@ -118,7 +118,36 @@ void test("accepts exact spec coverage", () => {
     { requirementId: "S2", verdict: "unverified", evidence: ["not run"] },
   ] as const;
 
-  assert.deepEqual(validateSpecCoverage(spec, tasks, verdicts), { ok: true, problems: [] });
+  assert.deepEqual(validateSpecCoverage(spec, tasks, verdicts), {
+    ok: false,
+    problems: ["Verdict for spec S2 is unverified, not pass."],
+  });
+});
+
+void test("reports a fail verdict by spec id and its recorded value", () => {
+  const result = validateSpecCoverage(
+    [{ id: "S1", statement: "First." }],
+    [{ taskId: "T1", specIds: ["S1"] }],
+    [{ requirementId: "S1", verdict: "fail", evidence: ["n/a"] }],
+  );
+
+  assert.deepEqual(result, {
+    ok: false,
+    problems: ["Verdict for spec S1 is fail, not pass."],
+  });
+});
+
+void test("reports blank evidence entries by spec id", () => {
+  const result = validateSpecCoverage(
+    [{ id: "S1", statement: "First." }],
+    [{ taskId: "T1", specIds: ["S1"] }],
+    [{ requirementId: "S1", verdict: "pass", evidence: ["  ", "ran the login test"] }],
+  );
+
+  assert.deepEqual(result, {
+    ok: false,
+    problems: ["Verdict for spec S1 has blank evidence."],
+  });
 });
 
 void test("reports a missing verdict by spec id", () => {
@@ -149,7 +178,10 @@ void test("reports duplicate verdicts by spec id", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Duplicate verdict for spec S1."],
+    problems: [
+      "Duplicate verdict for spec S1.",
+      "Verdict for spec S1 is fail, not pass.",
+    ],
   });
 });
 
@@ -167,6 +199,7 @@ void test("reports a verdict for an unknown spec id", () => {
     ok: false,
     problems: [
       "Verdict for spec S1 has no evidence.",
+      "Verdict for spec S9 is fail, not pass.",
       "Verdict references unknown spec id S9.",
     ],
   });
@@ -237,6 +270,9 @@ void test("reports a verdict with no evidence by spec id", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Verdict for spec S1 has no evidence."],
+    problems: [
+      "Verdict for spec S1 has no evidence.",
+      "Verdict for spec S2 is fail, not pass.",
+    ],
   });
 });
