@@ -134,6 +134,84 @@ void test("a baseRef with a disallowed character fails before any host call", as
   assert.equal(harness.worktrees, 0);
 });
 
+void test("a baseRef of two dashes fails before any host call", async () => {
+  const harness = contextFor([]);
+
+  const result = await closureGate.run({ ...input, baseRef: "--" }, harness.context);
+
+  assert.deepEqual(result, { ok: false, head: "", digest: "", problems: ["baseRef must start with an alphanumeric character."] });
+  assert.equal(harness.calls.length, 0);
+  assert.equal(harness.worktrees, 0);
+});
+
+void test("an empty baseRef fails before any host call", async () => {
+  const harness = contextFor([]);
+
+  const result = await closureGate.run({ ...input, baseRef: "" }, harness.context);
+
+  assert.deepEqual(result, { ok: false, head: "", digest: "", problems: ["baseRef must be non-empty when supplied."] });
+  assert.equal(harness.calls.length, 0);
+  assert.equal(harness.worktrees, 0);
+});
+
+void test("an empty HEAD is a problem instead of a clean tree", async () => {
+  const harness = contextFor([{ exitCode: 0, stdout: "\n", stderr: "" }]);
+
+  const result = await closureGate.run(input, harness.context);
+
+  assert.deepEqual(result, {
+    ok: false,
+    head: "",
+    digest: "",
+    problems: ["git rev-parse HEAD returned an empty or truncated commit id."],
+  });
+  assert.equal(harness.calls.length, 1);
+});
+
+void test("an empty diff with tracked modifications is an inconsistency", async () => {
+  const harness = contextFor([
+    { exitCode: 0, stdout: `${head}\n`, stderr: "" },
+    { exitCode: 0, stdout: " M file.txt\n", stderr: "" },
+    { exitCode: 0, stdout: "", stderr: "" },
+  ]);
+
+  const result = await closureGate.run({ ...input, expectedDigest: closureDigest(head, "") }, harness.context);
+
+  assert.deepEqual(result, {
+    ok: false,
+    head,
+    digest: closureDigest(head, ""),
+    problems: ["git diff produced no output while git status lists tracked modifications: file.txt"],
+  });
+});
+
+void test("a dirty tracked tree without an expected digest is a problem", async () => {
+  const harness = contextFor([
+    { exitCode: 0, stdout: `${head}\n`, stderr: "" },
+    { exitCode: 0, stdout: " M file.txt\n", stderr: "" },
+    { exitCode: 0, stdout: diff, stderr: "" },
+  ]);
+
+  const result = await closureGate.run(input, harness.context);
+
+  assert.deepEqual(result, {
+    ok: false,
+    head,
+    digest,
+    problems: ["Tracked modifications without a pinned expectedDigest cannot establish provenance: file.txt"],
+  });
+});
+
+void test("a dot-segment worktree fails before any host call", async () => {
+  const harness = contextFor([]);
+
+  const result = await closureGate.run({ worktree: ".." }, harness.context);
+
+  assert.deepEqual(result, { ok: false, head: "", digest: "", problems: ["worktree must not be a dot segment."] });
+  assert.equal(harness.calls.length, 0);
+  assert.equal(harness.worktrees, 0);
+});
+
 void test("closureDigest is deterministic and changes when the diff changes", () => {
   const first = closureDigest(head, diff);
   const second = closureDigest(head, diff);
