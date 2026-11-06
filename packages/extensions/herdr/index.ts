@@ -57,7 +57,7 @@ type LifecycleState = "idle" | "working" | "blocked";
 type LifecycleReport = { state: LifecycleState; message: string | undefined };
 type HerdrBlockedEvent = { active: boolean; label?: string };
 type ExtensionBridge = { extensionPath: string; settled?: Promise<void>; close(): Promise<void> };
-type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; settingsFile: string; command(value: string): string; close(): Promise<void> };
+type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; promptIsFile: boolean; settingsFile: string; command(value: string): string; close(): Promise<void> };
 type HerdrToolDefinition = NonNullable<PreparedAgentSession["customTools"]>[number];
 type HerdrCommandResult = Awaited<ReturnType<typeof openHerdrLivePane>>;
 type ToolBridgeRequest = { toolCallId: string; name: string; params: unknown };
@@ -97,6 +97,13 @@ export function breadcrumbLabel(identity: Readonly<HerdrBreadcrumbIdentity>, att
 }
 
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
+const MAX_INLINE_ARGUMENT_BYTES = 65_536;
+/*
+ * Inline only non-empty, NUL-free, bounded values: empty values are ambiguous, NUL cannot cross argv, the byte cap bounds launcher size, @ and - preserve Pi's file/option parsing, and existing paths must remain file references.
+ */
+function inlineSafe(text: string): boolean {
+  return text.length > 0 && !text.includes("\0") && Buffer.byteLength(text, "utf8") <= MAX_INLINE_ARGUMENT_BYTES && !text.startsWith("@") && !text.startsWith("-") && !existsSync(text);
+}
 function messageContent(message: unknown): unknown { return message !== null && typeof message === "object" && !Array.isArray(message) ? (message as Record<string, unknown>).content : undefined; }
 function hasToolCall(message: unknown): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall"); }
 function hasNamedToolCall(message: unknown, name: string): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall" && (part as ToolCallContent).name === name); }
@@ -109,20 +116,24 @@ function completedSessionCwd(context: Readonly<CompletedSessionContext>): string
 function formatContextFiles(files: readonly ContextFile[]): string { return files.length ? `<project_context>\n\nProject-specific instructions and guidelines:\n\n${files.map(({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`).join("\n\n")}\n</project_context>\n` : ""; }
 function createCommandFiles(prepared: Readonly<PreparedAgentSession>, prompt: string | undefined, directPrompt: boolean, contextFiles: readonly ContextFile[] | undefined): CommandFiles {
   const paths: string[] = [];
-  const create = (kind: string, value: string): string => {
-    const path = join(tmpdir(), `pi-herdr-${kind}-${String(process.pid)}-${randomBytes(6).toString("hex")}.txt`);
+  const create = (kind: string, value: string, extension: string): string => {
+    const path = join(tmpdir(), `pi-herdr-${kind}-${String(process.pid)}-${randomBytes(6).toString("hex")}.${extension}`);
     writeFileSync(path, value, { encoding: "utf8", mode: 0o600 });
     paths.push(path);
     return path;
   };
+  const inlineOrFile = (kind: string, value: string): string => inlineSafe(value) ? value : create(kind, value, "md");
+  const contextPrompt = contextFiles ? formatContextFiles(contextFiles) : "";
+  const promptIsFile = prompt !== undefined && !directPrompt && !inlineSafe(prompt);
   const files = {
-    systemPrompt: prepared.systemPrompt === undefined ? undefined : create("system-prompt", prepared.systemPrompt),
-    appendPrompt: prepared.systemPromptAppend ? create("append-prompt", prepared.systemPromptAppend) : undefined,
-    contextPrompt: contextFiles && formatContextFiles(contextFiles) ? create("context-prompt", formatContextFiles(contextFiles)) : undefined,
-    prompt: prompt === undefined || directPrompt ? undefined : create("prompt", prompt),
-    settingsFile: create("settings", JSON.stringify(prepared.settings ?? {})),
+    systemPrompt: prepared.systemPrompt === undefined ? undefined : inlineOrFile("system-prompt", prepared.systemPrompt),
+    appendPrompt: prepared.systemPromptAppend ? inlineOrFile("append-prompt", prepared.systemPromptAppend) : undefined,
+    contextPrompt: contextPrompt ? inlineOrFile("context-prompt", contextPrompt) : undefined,
+    prompt: prompt === undefined || directPrompt ? undefined : promptIsFile ? create("prompt", prompt, "md") : prompt,
+    promptIsFile,
+    settingsFile: create("settings", JSON.stringify(prepared.settings ?? {}), "json"),
   };
-  return { ...files, command(value: string): string { return `sh ${quote(create("command", `${value}\n`))}`; }, async close(): Promise<void> { for (const path of paths) { try { unlinkSync(path); } catch { /* Cleanup is best effort after the child exits. */ } } } };
+  return { ...files, command(value: string): string { return `sh ${quote(create("command", `${value}\n`, "sh"))}`; }, async close(): Promise<void> { for (const path of paths) { try { unlinkSync(path); } catch { /* Cleanup is best effort after the child exits. */ } } } };
 }
 function resourcePaths(session: HerdrSession): HerdrResourcePaths {
   const value = session.getHerdrResourcePaths?.();
@@ -302,7 +313,7 @@ function sessionCommand(session: HerdrSession, prepared: Readonly<PreparedAgentS
   const extensions = prepared.resourcePolicy ? ` --no-extensions${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}` : `${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}`;
   const trust = prepared.resourcePolicy?.projectTrusted === false ? " --no-approve" : prepared.resourcePolicy?.projectTrusted === true ? " --approve" : "";
   const environment = [prepared.agentDir ? `PI_CODING_AGENT_DIR=${quote(prepared.agentDir)}` : "", `PI_EXTENSIBLE_WORKFLOWS_SETTINGS_FILE=${quote(files.settingsFile)}`, "PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER=1"].filter(Boolean).join(" ");
-  const message = prompt === undefined ? "" : directPrompt ? ` ${quote(prompt)}` : ` @${quote(files.prompt ?? "")}`;
+  const message = prompt === undefined ? "" : directPrompt ? ` ${quote(prompt)}` : files.promptIsFile ? ` @${quote(files.prompt ?? "")}` : ` ${quote(files.prompt ?? "")}`;
   return `${environment} ${quote(runtime.executable)}${entrypoint ? ` ${quote(entrypoint)}` : ""} ${sessionArg} --model ${quote(model)}${tools}${systemPrompt}${appendPrompt}${contextPrompt}${contextFiles}${skills}${extensions}${trust}${message}`;
 }
 

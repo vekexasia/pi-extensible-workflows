@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { join } from "node:path";
@@ -49,6 +49,46 @@ async function generatedBridge(command) {
   const tools = new Map();
   module.default({ on(name, handler) { handlers.set(name, handler); }, registerTool(tool) { tools.set(tool.name, tool); } });
   return { extensionPath, handlers, tools };
+}
+async function captureLaunch({ prompt = "prompt", prepared = {}, contextFiles } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "herdr-inline-prompt-"));
+  const agentDir = join(root, "agent");
+  const sessionFile = join(root, "session.jsonl");
+  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
+  writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { herdr: { enableFullyInspectableMode: true } } }));
+  writeFileSync(sessionFile, "");
+  let runCommand;
+  let runCall;
+  const runner = async (args) => {
+    if (args[0] === "pane" && args[1] === "run") {
+      runCall = [...args];
+      const script = /sh '([^']+)'$/.exec(args[3]);
+      runCommand = script ? readFileSync(script[1], "utf8") : args[3];
+    }
+    if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
+    if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "idle" } } });
+    return "";
+  };
+  const extension = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
+  const session = {
+    reference: { transport: "local", sessionId: "session", locator: { sessionFile } },
+    ...(contextFiles === undefined ? {} : { getHerdrContextFiles: () => contextFiles }),
+    suspendForHandoff: async () => {},
+    resumeFromHandoff: async () => {},
+    abort: async () => {},
+    getLastAssistant: () => undefined,
+    prompt: async () => ({}),
+    steer: async () => {},
+    dispose: async () => {},
+    getState: () => ({ model: { provider: "fake", model: "model" }, tools: [] }),
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+  };
+  const agent = { transport: { id: "local", async createSession() { return session; } } };
+  const identity = { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 };
+  extension.agentSetupHooks.fullyInspectable.setup(agent, { identity, run: { runId: "run", workflow: { name: "flow" } }, signal: new AbortController().signal });
+  const preparedSession = { cwd: root, agentDir, model: { provider: "fake", model: "model" }, tools: [], initialPrompt: prompt, sessionLabel: "flow:review", piRuntime, ...prepared };
+  await agent.transport.createSession(preparedSession, { identity, attempt: 1, signal: new AbortController().signal });
+  return { command: runCommand, runCall, session, root };
 }
 async function createFixtureModel(agentDir) {
   const server = createServer((req, res) => {
@@ -258,8 +298,8 @@ void test("opens the active session after the handoff boundary and releases on c
   assert.ok(runCommand.includes("PI_CODING_AGENT_DIR='/agent'"));
   assert.ok(runCommand.includes("--model 'openai/gpt:high'"));
   assert.ok(runCommand.includes("--tools 'read'"));
-  assert.ok(runCommand.includes(`--system-prompt '${join(tmpdir(), "pi-herdr-system-prompt-")}`));
-  assert.ok(runCommand.includes(`--append-system-prompt '${join(tmpdir(), "pi-herdr-append-prompt-")}`));
+  assert.ok(runCommand.includes("--system-prompt 'system'"));
+  assert.ok(runCommand.includes("--append-system-prompt 'append'"));
   assert.ok(runCommand.includes("--skill '/skill'"));
   assert.ok(runCommand.includes("--extension '/allowed-extension.mjs'"));
   assert.ok(runCommand.includes("--skill '/allowed-skill/SKILL.md'"));
@@ -587,8 +627,8 @@ void test("delivers per-attempt turn control through the pane launch prompt with
     if (args[0] === "tab" && args[1] === "create") { tabCount += 1; return JSON.stringify({ result: { tab: { tab_id: `tab-${tabCount}` }, root_pane: { pane_id: `pane-${tabCount}` } } }); }
     if (args[0] === "pane" && args[1] === "run") {
       const script = /sh '([^']+)'/.exec(args[3])?.[1];
-      const file = script ? /@'?([^'\s]+)'?/.exec(readFileSync(script, "utf8"))?.[1] : undefined;
-      if (file) launchedPrompt = readFileSync(file, "utf8");
+      const command = script ? readFileSync(script, "utf8") : args[3];
+      if (command.includes("'the task\n\nRetry attempt 2'")) launchedPrompt = "the task\n\nRetry attempt 2";
       return "";
     }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
@@ -958,6 +998,54 @@ void test("materializes a fresh session before launching a fully inspectable age
     await rm(root, { recursive: true, force: true });
   }
 });
+void test("inlines safe prompt arguments and keeps the launcher artifacts bounded", async () => {
+  const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-herdr-prompt-")));
+  const contextPrompt = "<project_context>\n\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/repo/AGENTS.md\">\ncontext instructions\n</project_instructions>\n</project_context>\n";
+  const launch = await captureLaunch({
+    prompt: "ordinary prompt",
+    prepared: { systemPrompt: "system instructions", systemPromptAppend: "append instructions", contextFiles: ["project"], settings: { acme: { enabled: true } } },
+    contextFiles: [{ path: "/repo/AGENTS.md", content: "context instructions" }],
+  });
+  try {
+    assert.ok(launch.command);
+    assert.ok(launch.runCall);
+    assert.match(launch.command, /--session '[^']+\/session\.jsonl'/);
+    assert.match(launch.command, /--system-prompt 'system instructions'/);
+    assert.match(launch.command, /--append-system-prompt 'append instructions'/);
+    assert.ok(launch.command.includes(`--append-system-prompt '${contextPrompt}'`));
+    assert.match(launch.command, / 'ordinary prompt'\n?$/);
+    assert.doesNotMatch(launch.command, /@'ordinary prompt'/);
+    assert.doesNotMatch(launch.command, /pi-herdr-prompt-/);
+    assert.doesNotMatch(launch.command, /pi-herdr-[^'\s]+\.txt/);
+    assert.ok(launch.runCall[3].length < 4096);
+    const settingsPath = /PI_EXTENSIBLE_WORKFLOWS_SETTINGS_FILE='([^']+\.json)'/.exec(launch.command)?.[1];
+    assert.ok(settingsPath);
+    assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf8")), { acme: { enabled: true } });
+    const after = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-herdr-prompt-")));
+    assert.deepEqual([...after].filter((name) => !before.has(name)), []);
+  } finally {
+    await Promise.allSettled([launch.session.dispose()]);
+    await rm(launch.root, { recursive: true, force: true });
+  }
+});
+void test("falls back to one markdown prompt file for unsafe inline values", async () => {
+  for (const prompt of ["@literal", "- option", "x".repeat(65_537)]) {
+    const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-herdr-prompt-")));
+    const launch = await captureLaunch({ prompt });
+    try {
+      assert.ok(launch.command);
+      const promptPath = /@'([^']+\.md)'/.exec(launch.command)?.[1];
+      assert.ok(promptPath);
+      assert.equal(readFileSync(promptPath, "utf8"), prompt);
+      assert.doesNotMatch(launch.command, /pi-herdr-[^'\s]+\.txt/);
+      const after = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("pi-herdr-prompt-")));
+      assert.deepEqual([...after].filter((name) => !before.has(name)), [promptPath.split("/").at(-1)]);
+    } finally {
+      await Promise.allSettled([launch.session.dispose()]);
+      await rm(launch.root, { recursive: true, force: true });
+    }
+  }
+});
 void test("routes fully inspectable agents into child panes of the caller", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-full-"));
   const agentDir = join(root, "agent");
@@ -1007,9 +1095,8 @@ void test("routes fully inspectable agents into child panes of the caller", asyn
   assert.ok(runCall);
   assert.ok(runCommand.includes("--system-prompt '/repo/.pi/pi-extensible-workflows/SYSTEM.md'"));
   assert.match(runCommand, /--no-context-files/);
-  assert.match(runCommand, /--append-system-prompt '.*pi-herdr-context-prompt-/);
-  assert.ok(runCommand.includes(`@'${join(tmpdir(), "pi-herdr-prompt-")}`));
-  assert.ok(runCommand.length < 4096);
+  assert.match(runCommand, /--append-system-prompt '<project_context>/);
+  assert.ok(runCall[3].length < 4096);
   await rm(root, { recursive: true, force: true });
 });
 void test("hands off sequential fully inspectable prompts and cleans the active tab on abort", async () => {
