@@ -27,6 +27,14 @@ const verdicts: SpecVerdict[] = [
   { requirementId: "S2", verdict: "pass", evidence: ["logout test"] },
 ];
 
+function redGreenShell(): ShellResult[] {
+  return [
+    { exitCode: 0, stdout: spec, stderr: "" },
+    { exitCode: 1, stdout: "", stderr: "red failed" },
+    { exitCode: 0, stdout: "", stderr: "" },
+  ];
+}
+
 function contextFor(
   shellResults: readonly ShellResult[],
   options: { approved?: boolean; writtenVerdicts?: SpecVerdict[]; checkpointError?: Error; worktreeError?: Error; agentError?: Error } = {},
@@ -73,11 +81,7 @@ function contextFor(
 }
 
 void test("runs RED, writer, and GREEN and returns complete verdicts", async () => {
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ]);
+  const harness = contextFor(redGreenShell());
 
   const result = await specRedGreen.run(input, harness.context);
 
@@ -101,6 +105,23 @@ void test("returns the parser message without reaching the checkpoint", async ()
   const result = await specRedGreen.run(input, harness.context);
 
   assert.deepEqual(result, { ok: false, requirements: 0, verdicts: [], problems: ["Invalid spec line 2: expected an S-id requirement"] });
+  assert.equal(harness.checkpoints, 0);
+  assert.equal(harness.worktrees, 0);
+});
+
+void test("rejects a spec with no requirements before the checkpoint", async () => {
+  const harness = contextFor([
+    { exitCode: 0, stdout: "## Tasks\nT1 Spec: S1", stderr: "" },
+  ]);
+
+  const result = await specRedGreen.run(input, harness.context);
+
+  assert.deepEqual(result, {
+    ok: false,
+    requirements: 0,
+    verdicts: [],
+    problems: ["Spec has no requirements: expected a '## Specs' section with S-id lines."],
+  });
   assert.equal(harness.checkpoints, 0);
   assert.equal(harness.worktrees, 0);
 });
@@ -160,11 +181,7 @@ void test("reports a non-zero GREEN exit code", async () => {
 
 void test("returns coverage problems from the writer verdicts", async () => {
   const incompleteVerdicts = [verdicts[0] as SpecVerdict];
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ], { writtenVerdicts: incompleteVerdicts });
+  const harness = contextFor(redGreenShell(), { writtenVerdicts: incompleteVerdicts });
 
   const result = await specRedGreen.run(input, harness.context);
 
@@ -176,11 +193,7 @@ void test("rejects a writer verdict with empty evidence", async () => {
     { requirementId: "S1", verdict: "pass", evidence: [] },
     { requirementId: "S2", verdict: "pass", evidence: ["logout test"] },
   ];
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ], { writtenVerdicts: incompleteEvidenceVerdicts });
+  const harness = contextFor(redGreenShell(), { writtenVerdicts: incompleteEvidenceVerdicts });
 
   const result = await specRedGreen.run(input, harness.context);
 
@@ -197,11 +210,7 @@ void test("rejects a writer verdict recording a failure", async () => {
     { requirementId: "S1", verdict: "fail", evidence: ["login test failed"] },
     { requirementId: "S2", verdict: "pass", evidence: ["logout test"] },
   ];
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ], { writtenVerdicts: failedVerdicts });
+  const harness = contextFor(redGreenShell(), { writtenVerdicts: failedVerdicts });
 
   const result = await specRedGreen.run(input, harness.context);
 
@@ -214,11 +223,7 @@ void test("rejects a writer verdict recording a failure", async () => {
 });
 
 void test("trims the worktree name before handing it to withWorktree", async () => {
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ]);
+  const harness = contextFor(redGreenShell());
 
   const result = await specRedGreen.run({ ...input, worktree: "  spec-red-green  " }, harness.context);
 
@@ -227,11 +232,7 @@ void test("trims the worktree name before handing it to withWorktree", async () 
 });
 
 void test("quotes a semicolon-containing spec path as one shell argument", async () => {
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ]);
+  const harness = contextFor(redGreenShell());
 
   const result = await specRedGreen.run({ ...input, specPath: "/tmp/spec.md; echo INJECTED" }, harness.context);
 
@@ -240,11 +241,7 @@ void test("quotes a semicolon-containing spec path as one shell argument", async
 });
 
 void test("passes shell substitutions in commands through unchanged", async () => {
-  const harness = contextFor([
-    { exitCode: 0, stdout: spec, stderr: "" },
-    { exitCode: 1, stdout: "", stderr: "red failed" },
-    { exitCode: 0, stdout: "", stderr: "" },
-  ]);
+  const harness = contextFor(redGreenShell());
 
   const result = await specRedGreen.run({ ...input, redCommand: 'echo "$HOME"', greenCommand: "echo $(echo green)" }, harness.context);
 

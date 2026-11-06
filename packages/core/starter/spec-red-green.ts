@@ -15,19 +15,20 @@ const verdictSchema = Type.Object(
 export const specRedGreen = defineWorkflowFunction({
   description: "Run a pinned spec through RED, implementation, GREEN, and per-requirement verdict coverage",
   async run({ specPath, worktree, redCommand, greenCommand, timeoutMs = 120_000 }, context) {
-    if (/['\n\r`]/.test(specPath)) return { ok: false, requirements: 0, verdicts: [], problems: ["specPath contains forbidden shell characters."] };
+    const failure = (requirements: number, problems: string[]) => ({ ok: false, requirements, verdicts: [], problems });
+    if (/['\n\r`]/.test(specPath)) return failure(0, ["specPath contains forbidden shell characters."]);
     const normalizedWorktree = worktree.trim();
-    if (!normalizedWorktree) return { ok: false, requirements: 0, verdicts: [], problems: ["worktree must be non-empty."] };
-    if (normalizedWorktree.startsWith("-")) return { ok: false, requirements: 0, verdicts: [], problems: ["worktree must not start with '-'."] };
-    if (/[\\/]/.test(normalizedWorktree)) return { ok: false, requirements: 0, verdicts: [], problems: ["worktree must not contain path separators."] };
+    if (!normalizedWorktree) return failure(0, ["worktree must be non-empty."]);
+    if (normalizedWorktree.startsWith("-")) return failure(0, ["worktree must not start with '-'."]);
+    if (/[\\/]/.test(normalizedWorktree)) return failure(0, ["worktree must not contain path separators."]);
 
     let specText: string;
     try {
       const result = await context.shell(`cat -- '${specPath}'`, { timeoutMs });
-      if (result.exitCode !== 0) return { ok: false, requirements: 0, verdicts: [], problems: [`Failed to read spec with exit code ${String(result.exitCode)}.`] };
+      if (result.exitCode !== 0) return failure(0, [`Failed to read spec with exit code ${String(result.exitCode)}.`]);
       specText = result.stdout;
     } catch (error) {
-      return { ok: false, requirements: 0, verdicts: [], problems: [`Failed to read spec: ${errorText(error)}`] };
+      return failure(0, [`Failed to read spec: ${errorText(error)}`]);
     }
 
     let spec: ReturnType<typeof parseSpecDocument>;
@@ -36,8 +37,9 @@ export const specRedGreen = defineWorkflowFunction({
       spec = parseSpecDocument(specText);
       tasks = parseTaskSpecLinks(specText);
     } catch (error) {
-      return { ok: false, requirements: 0, verdicts: [], problems: [errorText(error)] };
+      return failure(0, [errorText(error)]);
     }
+    if (spec.length === 0) return failure(0, ["Spec has no requirements: expected a '## Specs' section with S-id lines."]);
 
     let approved: boolean;
     try {
@@ -47,9 +49,9 @@ export const specRedGreen = defineWorkflowFunction({
         context: { specPath, requirementIds: spec.map(({ id }) => id) },
       });
     } catch (error) {
-      return { ok: false, requirements: spec.length, verdicts: [], problems: [`Checkpoint failed: ${errorText(error)}`] };
+      return failure(spec.length, [`Checkpoint failed: ${errorText(error)}`]);
     }
-    if (!approved) return { ok: false, requirements: spec.length, verdicts: [], problems: ["Spec was not approved."] };
+    if (!approved) return failure(spec.length, ["Spec was not approved."]);
 
     try {
       return await context.withWorktree(normalizedWorktree, async (reference) => {
@@ -57,9 +59,9 @@ export const specRedGreen = defineWorkflowFunction({
         try {
           red = await context.shell(redCommand, { timeoutMs });
         } catch (error) {
-          return { ok: false, requirements: spec.length, verdicts: [], problems: [`RED failed: ${errorText(error)}`] };
+          return failure(spec.length, [`RED failed: ${errorText(error)}`]);
         }
-        if (red.exitCode === 0) return { ok: false, requirements: spec.length, verdicts: [], problems: ["RED passed, which proves nothing."] };
+        if (red.exitCode === 0) return failure(spec.length, ["RED passed, which proves nothing."]);
 
         const outputSchema = Type.Object({ verdicts: Type.Array(verdictSchema) }, { additionalProperties: false });
         const developerPolicy = contextPolicyFor("developer");
@@ -70,7 +72,7 @@ export const specRedGreen = defineWorkflowFunction({
             { label: "Spec writer", role: "developer", contextFiles: [...developerPolicy.contextFiles], skills: [...developerPolicy.skills], outputSchema, timeoutMs },
           );
         } catch (error) {
-          return { ok: false, requirements: spec.length, verdicts: [], problems: [`Agent failed: ${errorText(error)}`] };
+          return failure(spec.length, [`Agent failed: ${errorText(error)}`]);
         }
         const verdicts = written.verdicts;
         const serializableVerdicts = verdicts.map(({ requirementId, verdict, evidence }) => ({ requirementId, verdict, evidence: [...evidence] }));
@@ -87,7 +89,7 @@ export const specRedGreen = defineWorkflowFunction({
         return { ok: true, requirements: spec.length, verdicts: serializableVerdicts, problems: [] };
       });
     } catch (error) {
-      return { ok: false, requirements: spec.length, verdicts: [], problems: [`withWorktree failed: ${errorText(error)}`] };
+      return failure(spec.length, [`withWorktree failed: ${errorText(error)}`]);
     }
   },
   input: Type.Object(
