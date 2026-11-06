@@ -26,7 +26,7 @@ export const closureGate = defineWorkflowFunction({
       if (!/^[A-Za-z0-9]/.test(baseRef)) return { ok: false, head: "", digest: "", problems: ["baseRef must start with an alphanumeric character."] };
       if (!/^[A-Za-z0-9._/@^~-]*$/.test(baseRef)) return { ok: false, head: "", digest: "", problems: ["baseRef contains disallowed characters."] };
     }
-    //NOTE: HEAD is a literal we own; a caller-supplied ref is quoted like specPath in spec-red-green.ts.
+    //NOTE: HEAD is a literal we own; a caller-supplied ref is single-quoted to prevent shell expansion.
     const baseRefArgument = baseRef === undefined ? "HEAD" : `'${baseRef}'`;
     if (input.expectedDigest !== undefined && !/^[0-9a-f]+$/.test(input.expectedDigest)) return { ok: false, head: "", digest: "", problems: ["expectedDigest must be lowercase hexadecimal."] };
 

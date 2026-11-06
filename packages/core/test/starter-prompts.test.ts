@@ -32,5 +32,5 @@ void test("work-unit-commits.md slices work into reviewable commits", () => {
 void test("skill-usage.md follows supplied skills and defers to context policy", () => {
   const source = readPrompt("skill-usage.md");
   assert.match(source, /skill_resolution: none/, "skill-usage.md: does not report a missing skill");
-  assert.match(source, /`context-policy\.ts`/, "skill-usage.md: does not name context policy");
+  assert.match(source, /context policy/, "skill-usage.md: does not describe the context policy");
 });
