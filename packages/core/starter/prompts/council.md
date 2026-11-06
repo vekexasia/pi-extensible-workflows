@@ -5,6 +5,8 @@ argument-hint: "<question or decision>"
 
 Convene a bounded advisory council on this decision. You are the supervisor: you pick the lenses, you synthesize, you decide what feedback is valid. Advisors do not talk to each other.
 
+When a workflow applies the role policy, it launches a unit with that role's context files and skill paths. When you write the agent call yourself, pass those values explicitly.
+
 If the question is trivial or already settled, answer directly instead of convening a council.
 
 Pick 2-3 distinct lenses suited to the decision (for example: simplicity and maintenance cost, correctness and failure modes, migration and compatibility risk). Launch a named workflow whose script fans out one `agent(taskPrompt, { role: "oracle" })` per lens with `parallel(...)`, each given the decision, the relevant context, and its lens in `taskPrompt`. One pass only; do not run advisor rounds.
