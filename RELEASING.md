@@ -12,6 +12,16 @@ each publishable workspace version equal, then create the matching `vX.Y.Z`
 tag. The publish workflow verifies every package version, runs the root checks,
 packs every publishable workspace, then publishes core, CLI, and Herdr.
 
+## 6.3.1 fork-local Herdr release
+
+The operator authorized releasing `@piewf/herdr` 6.3.1 alone on the fork
+(`darkrei08/pi-extensible-workflows`, PR #396) to ship the inline agent directive
+fix (639f0a8), and installing the packed tarball into a local Pi install. Only the
+Herdr package version moves: the root, core, and CLI versions stay 6.3.0, so the
+lockstep gate in the publish workflow does not apply, publication remains
+unapproved and was not run, and the local install is a tarball extracted into the
+Pi npm tree rather than a registry install.
+
 ## 6.3.0 security exception
 
 The operator approved publishing 6.3.0 while deferring #354. Pi 1.0.0 still pins
