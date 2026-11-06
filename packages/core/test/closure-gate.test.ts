@@ -29,21 +29,16 @@ function contextFor(
   return { context, calls, get worktrees() { return worktrees; } };
 }
 
-function cleanHarness(): ReturnType<typeof contextFor> {
+function harnessWithStatus(status: string, diffOutput: string = diff): ReturnType<typeof contextFor> {
   return contextFor([
     { exitCode: 0, stdout: `${head}\n`, stderr: "" },
-    { exitCode: 0, stdout: "", stderr: "" },
-    { exitCode: 0, stdout: diff, stderr: "" },
+    { exitCode: 0, stdout: status, stderr: "" },
+    { exitCode: 0, stdout: diffOutput, stderr: "" },
   ]);
 }
 
-function untrackedHarness(): ReturnType<typeof contextFor> {
-  return contextFor([
-    { exitCode: 0, stdout: `${head}\n`, stderr: "" },
-    { exitCode: 0, stdout: "?? extra.txt\n", stderr: "" },
-    { exitCode: 0, stdout: diff, stderr: "" },
-  ]);
-}
+const cleanHarness = (): ReturnType<typeof contextFor> => harnessWithStatus("");
+const untrackedHarness = (): ReturnType<typeof contextFor> => harnessWithStatus("?? extra.txt\n");
 
 void test("a clean tree returns the exact head and digest", async () => {
   const harness = cleanHarness();
@@ -57,6 +52,17 @@ void test("a clean tree returns the exact head and digest", async () => {
     { command: "git diff --no-ext-diff --no-color HEAD --", timeoutMs: 120_000 },
   ]);
   assert.equal(harness.worktrees, 1);
+});
+
+void test("a status line trimmed by the host still names the whole path", async () => {
+  const harness = harnessWithStatus("M package-lock.json\n", "");
+
+  const result = await closureGate.run(input, harness.context);
+
+  assert.deepEqual(result.problems, [
+    "git diff produced no output while git status lists tracked modifications: package-lock.json",
+    "Tracked modifications without a pinned expectedDigest cannot establish provenance: package-lock.json",
+  ]);
 });
 
 void test("an untracked path not in the allowlist is a problem", async () => {

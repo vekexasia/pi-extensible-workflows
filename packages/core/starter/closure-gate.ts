@@ -4,6 +4,11 @@ import { defineWorkflowFunction, errorText } from "../src/index.js";
 
 const GIT_TIMEOUT_MS = 120_000;
 
+// The shell host trims stdout, which eats the leading status column of the first porcelain line.
+function statusPath(line: string): string {
+  return line.replace(/^\s*[A-Z?!]{1,2}\s+/, "");
+}
+
 function summarisePaths(paths: readonly string[]): string {
   return paths.length <= 10 ? paths.join(", ") : `${paths.slice(0, 10).join(", ")} (and ${String(paths.length - 10)} more)`;
 }
@@ -60,7 +65,7 @@ export const closureGate = defineWorkflowFunction({
         const trackedChanges = statusResult.stdout
           .split(/\r?\n/)
           .filter((line) => line.length > 0 && !line.startsWith("?? "))
-          .map((line) => line.slice(3));
+          .map(statusPath);
         const problems: string[] = [];
         if (trackedChanges.length > 0 && diffResult.stdout.trim() === "") {
           problems.push(`git diff produced no output while git status lists tracked modifications: ${summarisePaths(trackedChanges)}`);
@@ -72,7 +77,7 @@ export const closureGate = defineWorkflowFunction({
           ...statusResult.stdout
             .split(/\r?\n/)
             .filter((line) => line.startsWith("?? "))
-            .map((line) => line.slice(3))
+            .map(statusPath)
             .filter((path) => !allowedUntracked.includes(path))
             .map((path) => `Untracked path is not allowed: ${path}`),
         );
