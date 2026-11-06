@@ -130,7 +130,26 @@ void test("reports a missing verdict by spec id", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Spec S2 has no verdict."],
+    problems: [
+      "Spec S2 has no verdict.",
+      "Verdict for spec S1 has no evidence.",
+    ],
+  });
+});
+
+void test("reports duplicate verdicts by spec id", () => {
+  const result = validateSpecCoverage(
+    [{ id: "S1", statement: "First." }],
+    [{ taskId: "T1", specIds: ["S1"] }],
+    [
+      { requirementId: "S1", verdict: "pass", evidence: ["passed"] },
+      { requirementId: "S1", verdict: "fail", evidence: ["failed"] },
+    ],
+  );
+
+  assert.deepEqual(result, {
+    ok: false,
+    problems: ["Duplicate verdict for spec S1."],
   });
 });
 
@@ -146,7 +165,10 @@ void test("reports a verdict for an unknown spec id", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Verdict references unknown spec id S9."],
+    problems: [
+      "Verdict for spec S1 has no evidence.",
+      "Verdict references unknown spec id S9.",
+    ],
   });
 });
 
@@ -159,7 +181,10 @@ void test("reports a task that references an unknown spec id", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Task T1 references unknown spec id S9."],
+    problems: [
+      "Task T1 references unknown spec id S9.",
+      "Verdict for spec S1 has no evidence.",
+    ],
   });
 });
 
@@ -175,7 +200,11 @@ void test("reports a spec id referenced by no task", () => {
 
   assert.deepEqual(result, {
     ok: false,
-    problems: ["Spec S2 is referenced by no task."],
+    problems: [
+      "Spec S2 is referenced by no task.",
+      "Verdict for spec S1 has no evidence.",
+      "Verdict for spec S2 has no evidence.",
+    ],
   });
 });
 
@@ -191,6 +220,23 @@ void test("reports a task with no existing spec reference", () => {
     problems: [
       "Task T1 references no existing spec id.",
       "Spec S1 is referenced by no task.",
+      "Verdict for spec S1 has no evidence.",
     ],
+  });
+});
+
+void test("reports a verdict with no evidence by spec id", () => {
+  const result = validateSpecCoverage(
+    [{ id: "S1", statement: "First." }, { id: "S2", statement: "Second." }],
+    [{ taskId: "T1", specIds: ["S1", "S2"] }],
+    [
+      { requirementId: "S1", verdict: "pass", evidence: [] },
+      { requirementId: "S2", verdict: "fail", evidence: ["failed"] },
+    ],
+  );
+
+  assert.deepEqual(result, {
+    ok: false,
+    problems: ["Verdict for spec S1 has no evidence."],
   });
 });

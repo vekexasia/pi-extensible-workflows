@@ -85,7 +85,11 @@ export function validateSpecCoverage(
     if (!verdictIds.has(specId)) problems.push(`Spec ${specId} has no verdict.`);
   }
 
+  const seenVerdictIds = new Set<string>();
   for (const verdict of verdicts) {
+    if (seenVerdictIds.has(verdict.requirementId)) problems.push(`Duplicate verdict for spec ${verdict.requirementId}.`);
+    seenVerdictIds.add(verdict.requirementId);
+    if (verdict.evidence.length === 0) problems.push(`Verdict for spec ${verdict.requirementId} has no evidence.`);
     if (!specIds.has(verdict.requirementId)) problems.push(`Verdict references unknown spec id ${verdict.requirementId}.`);
   }
 
