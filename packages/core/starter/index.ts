@@ -1,3 +1,4 @@
+import { closureGate } from "./closure-gate.js";
 import {
   registerWorkflowExtension,
   type WorkflowExtension,
@@ -13,7 +14,7 @@ const extension: WorkflowExtension = {
   dependencies: ["typebox"],
   version: "1.0.0",
   headline: "Developer-review starter workflows",
-  functions: { reviewLoop, specRedGreen },
+  functions: { reviewLoop, specRedGreen, closureGate },
   modelAliases: {
     "reviewer-model": { resolve: resolveRootModel },
     "developer-model": { resolve: resolveRootModel },
