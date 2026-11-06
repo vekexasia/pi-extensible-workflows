@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
+import { canonicalPath } from "../src/paths.js";
 import { atomicWriteFile } from "../src/io.js";
 import { hasLiveSessionLease, listRunIds, projectStorageKey, RunStore, runsDirectory, structuralPath } from "../src/persistence.js";
 import { callUnchecked, decodeTestJsonRecord, isTestRecord } from "./support.js";
@@ -14,6 +15,59 @@ const snapshot = createLaunchSnapshot({ script: "export const meta={name:'x',des
 
 function run(cwd: string, sessionId = "session-a") {
   return { id: "run-a", workflowName: "x", cwd, sessionId, state: "running" as const, agents: [], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/sessions/native-a.jsonl" } }] };
+}
+function herdrFixture(mode: "success" | "create-fails" | "remove-fails" | "missing-listing" | "mismatched-listing" | "git-remove-fails") {
+  const home = mkdtempSync(join(tmpdir(), `pi-extensible-workflows-herdr-${mode}-`));
+  const repo = join(home, "repo");
+  mkdirSync(repo);
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  writeFileSync(join(repo, "tracked.txt"), "initial");
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  const tree = join(home, "herdr-worktrees", "agent");
+  const branchFile = join(home, "herdr-branch");
+  const herdrScript = join(home, "herdr.cjs");
+  const cleanupScript = join(home, "break-git-removal.cjs");
+  writeFileSync(herdrScript, String.raw`
+const { execFileSync } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+const [command, subcommand, ...args] = process.argv.slice(2);
+const env = process.env;
+const git = (gitArgs) => execFileSync("git", gitArgs, { encoding: "utf8" });
+const option = (name) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
+if (command !== "worktree") process.exit(1);
+if (subcommand === "create") {
+  if (env.HERDR_MODE === "create-fails" || env.HERDR_MODE === "git-remove-fails") process.exit(1);
+  const cwd = option("--cwd");
+  const branch = option("--branch");
+  const base = option("--base");
+  if (!cwd || !branch || !base) process.exit(1);
+  writeFileSync(env.HERDR_BRANCH_FILE, branch);
+  git(["-C", cwd, "branch", branch, base]);
+  git(["-C", cwd, "worktree", "add", "--no-checkout", env.HERDR_TREE_PATH, branch]);
+  git(["-C", env.HERDR_TREE_PATH, "checkout", "--force", branch]);
+  process.stdout.write(JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" }, worktree: { path: env.HERDR_TREE_PATH, branch } } }));
+} else if (subcommand === "list") {
+  const worktrees = env.HERDR_MODE === "missing-listing" ? [] : [{ open_workspace_id: "workspace-1", path: env.HERDR_MODE === "mismatched-listing" ? env.HERDR_REPO : env.HERDR_TREE_PATH, branch: env.HERDR_MODE === "mismatched-listing" ? "other-branch" : require("node:fs").readFileSync(env.HERDR_BRANCH_FILE, "utf8") }];
+  process.stdout.write(JSON.stringify({ result: { source: { repo_key: env.HERDR_REPO + "/.git" }, worktrees } }));
+} else if (subcommand === "remove") {
+  if (env.HERDR_MODE === "remove-fails") process.exit(1);
+  git(["-C", env.HERDR_REPO, "worktree", "remove", "--force", env.HERDR_TREE_PATH]);
+  process.stdout.write("{}");
+} else process.exit(1);
+`);
+  writeFileSync(cleanupScript, 'const { rmSync } = require("node:fs"); rmSync(".git"); process.exit(3);\n');
+  const previous = { HERDR_ENV: process.env.HERDR_ENV, HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH, HERDR_MODE: process.env.HERDR_MODE, HERDR_REPO: process.env.HERDR_REPO, HERDR_TREE_PATH: process.env.HERDR_TREE_PATH, HERDR_BRANCH_FILE: process.env.HERDR_BRANCH_FILE };
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_SOCKET_PATH = "fixture-socket";
+  process.env.HERDR_MODE = mode;
+  process.env.HERDR_REPO = repo;
+  process.env.HERDR_TREE_PATH = tree;
+  process.env.HERDR_BRANCH_FILE = branchFile;
+  const runner = async (args: readonly string[]): Promise<string> => execFileSync(process.execPath, [herdrScript, ...args], { encoding: "utf8", env: process.env });
+  return { home, repo, tree, cleanupScript, runner, restore: () => { for (const [name, value] of Object.entries(previous)) { if (value === undefined) Reflect.deleteProperty(process.env, name); else process.env[name] = value; } } };
 }
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> { return new Promise((resolve) => { const timer = setTimeout(() => { resolve(false); }, timeoutMs); promise.then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); resolve(true); }); }); }
 
@@ -177,12 +231,165 @@ void test("reclaims an orphaned worktree transaction before retrying", async () 
   const branch = `pi-extensible-workflows/run-a/${key}`;
   const base = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
   execFileSync("git", ["-C", repo, "branch", branch, base]);
-  writeFileSync(join(store.directory, `worktree-${key}.creating`), JSON.stringify({ owner: "agent", path, branch, base }));
+  writeFileSync(join(store.directory, `worktree-${key}.creating`), JSON.stringify({ owner: "agent", path, branch, base, branchCreated: true }));
   const worktree = await store.worktree("agent");
   assert.equal(worktree.path, path);
   const records = JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")) as Array<{ owner: string }>;
   assert.equal(records[0]?.owner, "agent");
 });
+void test("registers Herdr-created worktrees and removes them through Herdr", async () => {
+  const fixture = herdrFixture("success");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr" }, snapshot);
+    const worktree = await store.worktree("agent");
+    assert.equal(worktree.workspaceId, "workspace-1");
+    assert.equal(worktree.path, fixture.tree);
+    await store.delete(true);
+    assert.equal(existsSync(worktree.path), false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("fails instead of falling back to a Git worktree when Herdr creation fails", async () => {
+  const fixture = herdrFixture("create-fails");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-failure", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-failure" }, snapshot);
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.equal(execFileSync("git", ["-C", fixture.repo, "branch", "--list", "pi-extensible-workflows/run-herdr-failure/*"], { encoding: "utf8" }).trim(), "");
+    assert.equal(existsSync(fixture.tree), false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("deletes a run when Herdr already removed its workspace", async () => {
+  const fixture = herdrFixture("missing-listing");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-missing", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-missing" }, snapshot);
+    const worktree = await store.worktree("agent");
+    rmSync(worktree.path, { recursive: true, force: true });
+    await store.delete(true);
+    assert.equal(existsSync(store.directory), false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("rejects a Herdr record whose path is not a worktree of this repository and leaves it untouched", async () => {
+  const fixture = herdrFixture("success");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-path", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-path" }, snapshot);
+    const worktree = await store.worktree("agent");
+    const tampered = { ...worktree, path: fixture.home, cwd: fixture.home };
+    const recordsPath = join(store.directory, "worktrees.json");
+    writeFileSync(recordsPath, `${JSON.stringify([tampered])}\n`);
+    await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.deepEqual(JSON.parse(readFileSync(recordsPath, "utf8")), [tampered]);
+    assert.equal(existsSync(fixture.home), true);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("rejects a Herdr record whose workspace id does not own its path and leaves it untouched", async () => {
+  const fixture = herdrFixture("success");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-workspace", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-workspace" }, snapshot);
+    const worktree = await store.worktree("agent");
+    const tampered = { ...worktree, workspaceId: "workspace-other" };
+    const recordsPath = join(store.directory, "worktrees.json");
+    writeFileSync(recordsPath, `${JSON.stringify([tampered])}\n`);
+    await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.deepEqual(JSON.parse(readFileSync(recordsPath, "utf8")), [tampered]);
+    assert.equal(existsSync(worktree.path), true);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("rejects a missing Herdr record unless its listing matches the repository and branch", async () => {
+  const fixture = herdrFixture("mismatched-listing");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-listing", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-listing" }, snapshot);
+    const worktree = await store.worktree("agent");
+    rmSync(worktree.path, { recursive: true, force: true });
+    const recordsPath = join(store.directory, "worktrees.json");
+    const persisted = JSON.parse(readFileSync(recordsPath, "utf8")) as unknown;
+    await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.deepEqual(JSON.parse(readFileSync(recordsPath, "utf8")), persisted);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("preserves the Git worktree marker when removal fails after setup", async () => {
+  const fixture = herdrFixture("git-remove-fails");
+  try {
+    Reflect.deleteProperty(process.env, "HERDR_ENV");
+    Reflect.deleteProperty(process.env, "HERDR_SOCKET_PATH");
+    const store = new RunStore(fixture.repo, "session-a", "run-git-remove-fails", fixture.home, fixture.runner);
+    const cleanupCommand = `${JSON.stringify(process.execPath)} ${JSON.stringify(fixture.cleanupScript)}`;
+    await store.create({ ...run(fixture.repo), id: "run-git-remove-fails" }, createLaunchSnapshot({ ...snapshot, settings: { ...snapshot.settings, worktreeSetup: [cleanupCommand] } }));
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && /fatal|validation failed/i.test(error.message));
+    assert.equal(readdirSync(store.directory).some((name) => name.endsWith(".creating")), true);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("does not leave a Git worktree marker when Herdr creation fails", async () => {
+  const fixture = herdrFixture("git-remove-fails");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-git-remove-fails", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-git-remove-fails" }, snapshot);
+    await assert.rejects(store.worktree("agent"), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.equal(readdirSync(store.directory).some((name) => name.endsWith(".creating")), false);
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("preserves the Herdr workspace id when removal fails", async () => {
+  const fixture = herdrFixture("remove-fails");
+  try {
+    const store = new RunStore(fixture.repo, "session-a", "run-herdr-remove-fails", fixture.home, fixture.runner);
+    await store.create({ ...run(fixture.repo), id: "run-herdr-remove-fails" }, snapshot);
+    await store.worktree("agent");
+    await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
+    assert.equal(existsSync(store.directory), true);
+    const persisted = JSON.parse(readFileSync(join(store.directory, "worktrees.json"), "utf8")) as readonly { workspaceId?: string }[];
+    assert.equal(persisted[0]?.workspaceId, "workspace-1");
+  } finally {
+    fixture.restore();
+  }
+});
+
+void test("allows missing borrowed Herdr worktrees during cleanup validation", async () => {
+  const fixture = herdrFixture("success");
+  try {
+    const source = new RunStore(fixture.repo, "session-a", "run-herdr-source", fixture.home, fixture.runner);
+    await source.create({ ...run(fixture.repo), id: "run-herdr-source", state: "completed" }, snapshot);
+    const owner = structuralPath("worktree", "named", "banana");
+    const worktree = await source.worktree(owner);
+    const child = new RunStore(fixture.repo, "session-a", "run-herdr-child", fixture.home, fixture.runner);
+    await child.create({ ...run(fixture.repo), id: "run-herdr-child", parentRunId: "run-herdr-source", state: "completed" }, snapshot);
+    await child.worktree(owner);
+    rmSync(worktree.path, { recursive: true, force: true });
+    await child.validateBorrowedWorktrees(false);
+    await child.delete(true);
+    await source.delete(true);
+  } finally {
+    fixture.restore();
+  }
+});
+
 void test("stores exact cwd and Pi session snapshots and rejects cross-session loading", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-store-"));
   const cwd = join(home, "same-name");
@@ -554,7 +761,7 @@ void test("rejects worktree creation when the launch working tree has tracked or
   const staleBranch = `pi-extensible-workflows/run-a/${staleKey}`;
   const staleMarker = join(store.directory, `worktree-${staleKey}.creating`);
   execFileSync("git", ["-C", repo, "branch", staleBranch, head]);
-  writeFileSync(staleMarker, JSON.stringify({ owner: staleOwner, path: stalePath, branch: staleBranch, base: head }));
+  writeFileSync(staleMarker, JSON.stringify({ owner: staleOwner, path: stalePath, branch: staleBranch, base: head, branchCreated: true }));
   writeFileSync(join(repo, "tracked.txt"), "changed with stale marker");
   await assert.rejects(store.worktree(staleOwner), isDirtyFailure);
   assert.equal(execFileSync("git", ["-C", repo, "branch", "--list", staleBranch], { encoding: "utf8" }).trim(), "");
@@ -789,7 +996,7 @@ void test("worktreeSetup runs in order only when a worktree is physically create
   await store.create(run(repo), createLaunchSnapshot({ ...snapshot, settings: { ...snapshot.settings, worktreeSetup: setup } }));
   const created = await store.worktree("agent");
   assert.equal(readFileSync(join(created.path, ".env"), "utf8"), "SECRET=1");
-  assert.equal(readFileSync(join(created.path, "setup.log"), "utf8"), `${realpathSync(created.path)}|${created.path}|${created.branch}\n`);
+  assert.equal(readFileSync(join(created.path, "setup.log"), "utf8"), `${canonicalPath(created.path)}|${created.path}|${created.branch}\n`);
   await store.worktree("agent");
   assert.equal(readFileSync(join(created.path, "setup.log"), "utf8").split("\n").filter(Boolean).length, 1);
 
@@ -986,10 +1193,11 @@ void test("evidence deduplication verifies raw bytes and rejects non-JSON conten
   writeFileSync(record.path, Buffer.from([0xff]));
   await assert.rejects(store.saveEvidence("\uFFFD"), (error: unknown) => error instanceof WorkflowError && error.code === "RESULT_INVALID");
   assert.deepEqual([...readFileSync(record.path)], [0xff]);
+  assert.equal((await store.listEvidence()).length, 0);
   for (const bad of [undefined, Number.NaN, { value: Number.POSITIVE_INFINITY }, { value: undefined }, 1n, () => 1, Promise.resolve("x")]) {
     await assert.rejects(callUnchecked(store.saveEvidence.bind(store), undefined, [bad]), (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
-  assert.equal((await store.listEvidence()).length, 1);
+  assert.equal((await store.listEvidence()).length, 0);
 });
 void test("evidence deduplication rejects artifacts modified after saving", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-evidence-tamper-"));

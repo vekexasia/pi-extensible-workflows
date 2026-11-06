@@ -7,12 +7,22 @@
 
 ### New capabilities
 
+- Workflow and subagent worktrees are created with `herdr worktree create` when Pi runs inside a Herdr-managed pane, so the checkout appears in Herdr's own workspace list next to the agent that owns it. Teardown goes back through `herdr worktree remove`, the workspace id is recorded in the run's `worktrees.json` so an orphan is still reclaimed, and the plain Git path stays the fallback when Herdr is absent or the command fails.
+- The `agents` workspace shows the branch of each agent's worktree beside the agent, so the branch that an agent works on is visible in the session without opening its pane.
 - New `worktreeSetup` workflow setting: an array of shell commands that runs in order inside each newly created workflow or subagent worktree, for example `["wt step copy-ignored --require-include"]` with worktrunk to copy Git-ignored local context listed in `.worktreeinclude`. Commands get `PIEWF_WORKTREE_PATH`, `PIEWF_SOURCE_ROOT`, and `PIEWF_WORKTREE_BRANCH`. A failing or 10-minute-timed-out command fails with `WORKTREE_FAILED` and removes the worktree. Existing, borrowed, and inherited worktrees never run it again (#291).
 
 ### Fixes
 
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
 - The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
+
+## [6.3.1] - 2026-11-06
+
+`@piewf/herdr` only, released on the fork under explicit operator authorization (see [RELEASING.md](RELEASING.md)): the workspace, core, and CLI versions stay 6.3.0 and nothing is published to npm.
+
+### Fixes
+
+- Herdr's agent transport no longer writes a temporary `.txt` file for the agent directive. The directive travels inline in the spawned Pi's argv when it passes the new `inlineSafe` guard: non-empty, free of NUL, at most 65536 UTF-8 bytes, no leading `@` or `-`, and not the path of an existing file. Anything else is still written to a temporary file, and the remaining artifacts are `.json` (settings), `.sh` (launcher), and `.md` (system, append, context, and prompt text). The trade-off is that an inlined prompt is visible in the process argv ([639f0a8](https://github.com/vekexasia/pi-extensible-workflows/commit/639f0a84f409aa28dc606b4dec9a7ee5a9e7d1b8)).
 
 ## [6.3.0] - 2026-10-25
 

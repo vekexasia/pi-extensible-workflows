@@ -36,15 +36,12 @@ import type {
   HerdrAgentReporter,
   HerdrAgentStatus,
   HerdrCommandRunner,
-  HerdrWorkspacePane,
-  HerdrWorkspacePaneRequest,
   PreparedAgentSession,
   ContextFile,
   WorkflowAgentMessage,
   WorkflowAgentSession,
   WorkflowAgentSessionReference,
   WorkflowExtension,
-  WorkflowRunContext,
   WorkflowSettings,
   HerdrExtensionSettings,
 } from "pi-extensible-workflows";
@@ -60,20 +57,19 @@ type LifecycleState = "idle" | "working" | "blocked";
 type LifecycleReport = { state: LifecycleState; message: string | undefined };
 type HerdrBlockedEvent = { active: boolean; label?: string };
 type ExtensionBridge = { extensionPath: string; settled?: Promise<void>; close(): Promise<void> };
-type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; settingsFile: string; command(value: string): string; close(): Promise<void> };
+type CommandFiles = { systemPrompt: string | undefined; appendPrompt: string | undefined; contextPrompt: string | undefined; prompt: string | undefined; promptIsFile: boolean; settingsFile: string; command(value: string): string; close(): Promise<void> };
 type HerdrToolDefinition = NonNullable<PreparedAgentSession["customTools"]>[number];
 type HerdrCommandResult = Awaited<ReturnType<typeof openHerdrLivePane>>;
 type ToolBridgeRequest = { toolCallId: string; name: string; params: unknown };
 type LifecycleBridgeRequest = { type: "agent_settled" };
 type ToolBridgeMessage = { type: "update"; value: unknown } | { type: "error"; error: string } | { type: "result"; value: unknown } | { type: "ack" };
-type WorkspaceManager = { open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane>; close(runId: string): Promise<void>; closeAll(): Promise<void> };
-type LaunchPaneOptions = { session: HerdrSession; prepared: Readonly<PreparedAgentSession>; identity: Readonly<AgentIdentity>; run?: Readonly<WorkflowRunContext> | undefined; attempt: number; runner: HerdrCommandRunner; fullyInspectable: boolean; env: NodeJS.ProcessEnv; signal: AbortSignal; prompt?: string | undefined; workspaces?: WorkspaceManager | undefined; tuiIndex?: number | undefined; tuiLabel?: string | undefined; directPrompt?: boolean | undefined; onStatus?: ((state: HerdrAgentStatus) => void | Promise<void>) | undefined };
+type LaunchPaneOptions = { session: HerdrSession; prepared: Readonly<PreparedAgentSession>; identity: Readonly<AgentIdentity>; attempt: number; runner: HerdrCommandRunner; fullyInspectable: boolean; env: NodeJS.ProcessEnv; signal: AbortSignal; prompt?: string | undefined; tuiIndex?: number | undefined; tuiLabel?: string | undefined; directPrompt?: boolean | undefined; onStatus?: ((state: HerdrAgentStatus) => void | Promise<void>) | undefined };
 type PaneHandle = { pane: string; monitor: Promise<"closed" | "exited" | "idle" | "settled" | "aborted">; reporter: HerdrAgentReporter; closeRemote(): Promise<void>; close(): Promise<void> };
 type HerdrBreadcrumbIdentity = Omit<AgentIdentity, "structuralPath"> & { structuralPath?: readonly string[] };
 type CompletedSessionContext = { attempt?: { setup?: { cwd?: string } }; run?: { cwd?: string } };
 type HerdrAttemptActionContext = AgentAttemptActionContext | StandaloneAgentAttemptActionContext;
-export interface HerdrExtensionOptions { env?: NodeJS.ProcessEnv; runner?: HerdrCommandRunner; workspaces?: WorkspaceManager; agentDir?: string }
-type HerdrExtensionOverrides = Pick<HerdrExtensionOptions, "env" | "runner" | "workspaces">;
+export interface HerdrExtensionOptions { env?: NodeJS.ProcessEnv; runner?: HerdrCommandRunner; agentDir?: string }
+type HerdrExtensionOverrides = Pick<HerdrExtensionOptions, "env" | "runner">;
 export interface HerdrExtension extends WorkflowExtension { agentAttemptActions: { openSession: AgentAttemptAction; openLiveSession: AgentAttemptAction }; agentSetupHooks: { fullyInspectable: AgentSetupHook } }
 
 function agentDir(): string { return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"); }
@@ -101,6 +97,13 @@ export function breadcrumbLabel(identity: Readonly<HerdrBreadcrumbIdentity>, att
 }
 
 function quote(value: string): string { return `'${value.replace(/'/g, `'\\''`)}'`; }
+const MAX_INLINE_ARGUMENT_BYTES = 65_536;
+/*
+ * Inline only non-empty, NUL-free, bounded values: empty values are ambiguous, NUL cannot cross argv, the byte cap bounds launcher size, @ and - preserve Pi's file/option parsing, and existing paths must remain file references.
+ */
+function inlineSafe(text: string): boolean {
+  return text.length > 0 && !text.includes("\0") && Buffer.byteLength(text, "utf8") <= MAX_INLINE_ARGUMENT_BYTES && !text.startsWith("@") && !text.startsWith("-") && !existsSync(text);
+}
 function messageContent(message: unknown): unknown { return message !== null && typeof message === "object" && !Array.isArray(message) ? (message as Record<string, unknown>).content : undefined; }
 function hasToolCall(message: unknown): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall"); }
 function hasNamedToolCall(message: unknown, name: string): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall" && (part as ToolCallContent).name === name); }
@@ -113,20 +116,24 @@ function completedSessionCwd(context: Readonly<CompletedSessionContext>): string
 function formatContextFiles(files: readonly ContextFile[]): string { return files.length ? `<project_context>\n\nProject-specific instructions and guidelines:\n\n${files.map(({ path, content }) => `<project_instructions path="${path}">\n${content}\n</project_instructions>`).join("\n\n")}\n</project_context>\n` : ""; }
 function createCommandFiles(prepared: Readonly<PreparedAgentSession>, prompt: string | undefined, directPrompt: boolean, contextFiles: readonly ContextFile[] | undefined): CommandFiles {
   const paths: string[] = [];
-  const create = (kind: string, value: string): string => {
-    const path = join(tmpdir(), `pi-herdr-${kind}-${String(process.pid)}-${randomBytes(6).toString("hex")}.txt`);
+  const create = (kind: string, value: string, extension: string): string => {
+    const path = join(tmpdir(), `pi-herdr-${kind}-${String(process.pid)}-${randomBytes(6).toString("hex")}.${extension}`);
     writeFileSync(path, value, { encoding: "utf8", mode: 0o600 });
     paths.push(path);
     return path;
   };
+  const inlineOrFile = (kind: string, value: string): string => inlineSafe(value) ? value : create(kind, value, "md");
+  const contextPrompt = contextFiles ? formatContextFiles(contextFiles) : "";
+  const promptIsFile = prompt !== undefined && !directPrompt && !inlineSafe(prompt);
   const files = {
-    systemPrompt: prepared.systemPrompt === undefined ? undefined : create("system-prompt", prepared.systemPrompt),
-    appendPrompt: prepared.systemPromptAppend ? create("append-prompt", prepared.systemPromptAppend) : undefined,
-    contextPrompt: contextFiles && formatContextFiles(contextFiles) ? create("context-prompt", formatContextFiles(contextFiles)) : undefined,
-    prompt: prompt === undefined || directPrompt ? undefined : create("prompt", prompt),
-    settingsFile: create("settings", JSON.stringify(prepared.settings ?? {})),
+    systemPrompt: prepared.systemPrompt === undefined ? undefined : inlineOrFile("system-prompt", prepared.systemPrompt),
+    appendPrompt: prepared.systemPromptAppend ? inlineOrFile("append-prompt", prepared.systemPromptAppend) : undefined,
+    contextPrompt: contextPrompt ? inlineOrFile("context-prompt", contextPrompt) : undefined,
+    prompt: prompt === undefined || directPrompt ? undefined : promptIsFile ? create("prompt", prompt, "md") : prompt,
+    promptIsFile,
+    settingsFile: create("settings", JSON.stringify(prepared.settings ?? {}), "json"),
   };
-  return { ...files, command(value: string): string { return `sh ${quote(create("command", `${value}\n`))}`; }, async close(): Promise<void> { for (const path of paths) { try { unlinkSync(path); } catch { /* Cleanup is best effort after the child exits. */ } } } };
+  return { ...files, command(value: string): string { return `sh ${quote(create("command", `${value}\n`, "sh"))}`; }, async close(): Promise<void> { for (const path of paths) { try { unlinkSync(path); } catch { /* Cleanup is best effort after the child exits. */ } } } };
 }
 function resourcePaths(session: HerdrSession): HerdrResourcePaths {
   const value = session.getHerdrResourcePaths?.();
@@ -179,7 +186,7 @@ async function createBridgeContext(session: HerdrSession, prepared: Readonly<Pre
       if (property === "modelRegistry") return current?.modelRegistry ?? modelRegistry;
       if (property === "thinkingLevel") return prepared.model.thinking;
       if (property === "isIdle") return () => false;
-      if (property === "isProjectTrusted") return () => prepared.resourcePolicy?.projectTrusted ?? true;
+      if (property === "isProjectTrusted") return () => prepared.resourcePolicy?.projectTrusted ?? baseContext.isProjectTrusted();
       if (property === "signal") return signal;
       if (property === "abort") return abort;
       const reflected: unknown = Reflect.get(target, property, receiver);
@@ -187,9 +194,9 @@ async function createBridgeContext(session: HerdrSession, prepared: Readonly<Pre
     },
   });
 }
-function inspectSessionCommand(reference: WorkflowAgentSessionReference): string {
+function inspectSessionCommand(reference: WorkflowAgentSessionReference, tools: readonly string[] = ["read", "grep", "find", "ls"]): string {
   const source = sessionPath(reference) ?? reference.sessionId;
-  return `pi --session ${quote(source)} --tools ${quote("read,grep,find,ls")}`;
+  return `pi --session ${quote(source)} --tools ${quote(tools.join(","))}`;
 }
 function inlineFactorySource(extension: InlineExtension): string {
   const factory = typeof extension === "function" ? extension : typeof extension === "object" && typeof extension.factory === "function" ? extension.factory : undefined;
@@ -229,7 +236,7 @@ async function createToolBridge(session: HerdrSession, prepared: Readonly<Prepar
   const bridgeDirectory = mkdtempSync(join(tmpdir(), "pi-herdr-tools-"));
   const socketPath = join(bridgeDirectory, "bridge.sock");
   const extensionPath = join(bridgeDirectory, "bridge.mjs");
-  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return new Promise((resolve, reject) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const abort = () => finish(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ toolCallId, name, params }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch { continue; } if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); } });\n    socket.on("error", (error) => finish(error));\n    socket.on("close", () => finish(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nfunction reportSettled() {\n  return new Promise((resolve) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let finished = false;\n    const finish = () => { if (finished) return; finished = true; socket.destroy(); resolve(); };\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ type: "agent_settled" }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { if (JSON.parse(line).type === "ack") finish(); } catch {} } });\n    socket.on("error", finish);\n    socket.on("close", finish);\n  });\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); pi.on("agent_settled", reportSettled); }\n`;
+  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return new Promise((resolve, reject) => {\n    if (signal?.aborted) { reject(new Error("Herdr tool call aborted")); return; }\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const abort = () => finish(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ toolCallId, name, params }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch { continue; } if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); } });\n    socket.on("error", (error) => finish(error));\n    socket.on("close", () => finish(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nfunction reportSettled() {\n  return new Promise((resolve) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let finished = false;\n    const finish = () => { if (finished) return; finished = true; socket.destroy(); resolve(); };\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ type: "agent_settled" }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { if (JSON.parse(line).type === "ack") finish(); } catch {} } });\n    socket.on("error", finish);\n    socket.on("close", finish);\n  });\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); pi.on("agent_settled", reportSettled); }\n`;
   writeFileSync(extensionPath, source, { encoding: "utf8", mode: 0o600 });
   const sockets = new Set<Socket>();
   let markSettled = (): void => {};
@@ -262,7 +269,12 @@ async function createToolBridge(session: HerdrSession, prepared: Readonly<Prepar
     socket.on("close", close);
     socket.on("error", close);
   });
-  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); }); });
+  try {
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); }); });
+  } catch (error) {
+    rmSync(bridgeDirectory, { recursive: true, force: true });
+    throw error;
+  }
   let closed = false;
   return { extensionPath, settled, async close() {
     if (closed) return;
@@ -298,44 +310,16 @@ function sessionCommand(session: HerdrSession, prepared: Readonly<PreparedAgentS
   const skills = prepared.resourcePolicy ? ` --no-skills${allowedSkills.map((path) => ` --skill ${quote(path)}`).join("")}` : allowedSkills.map((path) => ` --skill ${quote(path)}`).join("");
   const allowedExtensions = [...new Set(loaded.extensions)];
   const bridgeExtensions = bridges.filter(Boolean).map(({ extensionPath }) => ` --extension ${quote(extensionPath)}`).join("");
-  const extensions = prepared.resourcePolicy ? ` --no-extensions${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}` : bridgeExtensions;
+  const extensions = prepared.resourcePolicy ? ` --no-extensions${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}` : `${allowedExtensions.map((path) => ` --extension ${quote(path)}`).join("")}${bridgeExtensions}`;
   const trust = prepared.resourcePolicy?.projectTrusted === false ? " --no-approve" : prepared.resourcePolicy?.projectTrusted === true ? " --approve" : "";
   const environment = [prepared.agentDir ? `PI_CODING_AGENT_DIR=${quote(prepared.agentDir)}` : "", `PI_EXTENSIBLE_WORKFLOWS_SETTINGS_FILE=${quote(files.settingsFile)}`, "PI_EXTENSIBLE_WORKFLOWS_HERDR_OWNER=1"].filter(Boolean).join(" ");
-  const message = prompt === undefined ? "" : directPrompt ? ` ${quote(prompt)}` : ` @${quote(files.prompt ?? "")}`;
+  const message = prompt === undefined ? "" : directPrompt ? ` ${quote(prompt)}` : files.promptIsFile ? ` @${quote(files.prompt ?? "")}` : ` ${quote(files.prompt ?? "")}`;
   return `${environment} ${quote(runtime.executable)}${entrypoint ? ` ${quote(entrypoint)}` : ""} ${sessionArg} --model ${quote(model)}${tools}${systemPrompt}${appendPrompt}${contextPrompt}${contextFiles}${skills}${extensions}${trust}${message}`;
 }
 
-function paneId(value: HerdrCommandResult): string { return typeof value === "string" ? value : value.paneId; }
+function paneId(value: HerdrCommandResult): string { return value; }
 
-function workspacePane(value: HerdrCommandResult): HerdrWorkspacePane {
-  if (typeof value === "string") throw new Error("Herdr did not create a workspace pane.");
-  return value;
-}
-
-function createWorkflowWorkspaces(runner: HerdrCommandRunner): WorkspaceManager {
-  const workspaces = new Map<string, Promise<string>>();
-  return {
-    async open(run: Readonly<WorkflowRunContext>, request: HerdrWorkspacePaneRequest): Promise<HerdrWorkspacePane> {
-      const existing = workspaces.get(run.runId);
-      if (existing) return workspacePane(await openHerdrLivePane({ ...request, workspaceId: await existing }, runner));
-      const opening = openHerdrLivePane({ ...request, workspaceLabel: `workflow ${run.workflow.name}` }, runner);
-      const workspace = opening.then((pane) => {
-        if (typeof pane === "string") throw new Error("Herdr did not create a workspace pane.");
-        return pane.workspaceId;
-      });
-      workspaces.set(run.runId, workspace);
-      try { return workspacePane(await opening); } catch (error) { workspaces.delete(run.runId); await workspace.catch(() => undefined); throw error; }
-    },
-    async close(runId: string): Promise<void> {
-      const workspace = workspaces.get(runId);
-      workspaces.delete(runId);
-      if (workspace) await workspace.then((id) => runner(["workspace", "close", id])).catch(() => undefined);
-    },
-    async closeAll(): Promise<void> { await Promise.all([...workspaces.keys()].map((runId) => this.close(runId))); },
-  };
-}
-
-async function launchPane({ session, prepared, identity, run, attempt, runner, fullyInspectable, env, signal, prompt, workspaces, tuiIndex, tuiLabel, directPrompt = false, onStatus }: LaunchPaneOptions): Promise<PaneHandle> {
+async function launchPane({ session, prepared, identity, attempt, runner, fullyInspectable, env, signal, prompt, tuiIndex, tuiLabel, directPrompt = false, onStatus }: LaunchPaneOptions): Promise<PaneHandle> {
   const label = fullyInspectable && typeof tuiIndex === "number" && Number.isInteger(tuiIndex) && tuiIndex > 0 && typeof tuiLabel === "string" && tuiLabel.trim() ? `#${String(tuiIndex)} ${tuiLabel}` : fullyInspectable ? breadcrumbLabel(identity, attempt) : prepared.sessionLabel;
   const bridge = await createToolBridge(session, prepared);
   let inlineBridge: ExtensionBridge | undefined;
@@ -343,17 +327,13 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
   let pane: string | undefined;
   try {
     inlineBridge = createInlineExtensionBridge(prepared);
-    const selectedContextFiles = prepared.contextFiles === undefined ? undefined : session.getHerdrContextFiles?.() ?? [];
+    if (prepared.contextFiles !== undefined && session.getHerdrContextFiles === undefined) throw new Error("Herdr cannot hand off a session with context files that are unavailable for transfer.");
+    const selectedContextFiles = prepared.contextFiles === undefined ? undefined : session.getHerdrContextFiles?.();
+    if (prepared.contextFiles !== undefined && selectedContextFiles === undefined) throw new Error("Herdr cannot hand off a session whose context files are unavailable for transfer.");
     commandFiles = createCommandFiles(prepared, prompt, directPrompt, selectedContextFiles);
     const bridges = [inlineBridge, bridge].filter((value): value is ExtensionBridge => Boolean(value));
     const command = commandFiles.command(sessionCommand(session, prepared, prompt, bridges, commandFiles, directPrompt));
-    let opened: HerdrCommandResult;
-    if (fullyInspectable) {
-      if (!workspaces || !run) throw new Error("Herdr fully inspectable mode is missing its workspace context.");
-      opened = await workspaces.open(run, { cwd: prepared.cwd, tabLabel: label, command });
-    } else {
-      opened = await openHerdrLivePane({ action: "live", cwd: prepared.cwd, command, ...(env.HERDR_PANE_ID ? { paneId: env.HERDR_PANE_ID } : {}) }, runner);
-    }
+    const opened = await openHerdrLivePane({ action: "live", cwd: prepared.cwd, command, ...(env.HERDR_PANE_ID ? { paneId: env.HERDR_PANE_ID } : {}) }, runner);
     pane = paneId(opened);
     if (!pane) throw new Error("Herdr did not create a pane.");
     let remoteClosed = false;
@@ -361,7 +341,7 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
     const closeRemote = async (): Promise<void> => {
       if (remoteClosed) return;
       remoteClosed = true;
-      await runner(fullyInspectable && typeof opened !== "string" ? ["tab", "close", opened.tabId] : ["pane", "close", openedPane]).catch(() => undefined);
+      await runner(["pane", "close", openedPane]).catch(() => undefined);
     };
     const reporter = createHerdrAgentReporter(openedPane, label, runner);
     const reference = session.reference;
@@ -379,10 +359,16 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
     else signal.addEventListener("abort", abortMonitor, { once: true });
     let cleanup: Promise<void> | undefined;
     const closeResources = (): Promise<void> => cleanup ??= (async () => {
-      await reporter.release();
-      await bridge.close();
-      await inlineBridge?.close();
-      await commandFiles?.close();
+      let firstError: unknown;
+      for (const close of [
+        () => reporter.release(),
+        () => bridge.close(),
+        () => inlineBridge?.close(),
+        () => commandFiles?.close(),
+      ]) {
+        try { await close(); } catch (error) { firstError ??= error; }
+      }
+      if (firstError !== undefined) throw firstError instanceof Error ? firstError : new Error(errorText(firstError));
     })();
     const monitor = waitForHerdrPane(openedPane, runner, { signal: monitorController.signal, ...(bridge.settled ? { settled: bridge.settled } : {}), ...(prepared.piRuntime?.entrypoint ? { originatingEntrypoint: prepared.piRuntime.entrypoint } : {}), ...(onStatus ? { onStatus } : {}) }).then(async (reason) => {
       await closeRemote();
@@ -395,7 +381,7 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
     }).finally(() => { signal.removeEventListener("abort", abortMonitor); });
     return { pane: openedPane, monitor, reporter, closeRemote, close: async () => { monitorController.abort(); await monitor.then(() => undefined, () => undefined); } };
   } catch (error) {
-    if (pane && !fullyInspectable) await runner(["pane", "close", pane]).catch(() => undefined);
+    if (pane) await runner(["pane", "close", pane]).catch(() => undefined);
     await bridge.close();
     await inlineBridge?.close();
     await commandFiles?.close();
@@ -403,7 +389,7 @@ async function launchPane({ session, prepared, identity, run, attempt, runner, f
   }
 }
 
-function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>, runner: HerdrCommandRunner, fullyInspectable: boolean, env: NodeJS.ProcessEnv, workspaces: WorkspaceManager) {
+function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>, runner: HerdrCommandRunner, fullyInspectable: boolean, env: NodeJS.ProcessEnv) {
   const local = agent.transport;
   const transport: AgentTransport = {
     id: "herdr",
@@ -415,7 +401,7 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
           if (session.suspendForHandoff) { await session.suspendForHandoff(); suspended = true; }
           else { await session.abort(); suspended = true; }
           materializeSessionForHandoff(session, prepared);
-          return await launchPane({ session, prepared, identity: context.identity, run: context.run, attempt: sessionContext.attempt, runner, fullyInspectable, env, signal: sessionContext.signal, prompt, workspaces, tuiIndex: context.tuiIndex, tuiLabel: context.tuiLabel });
+          return await launchPane({ session, prepared, identity: context.identity, attempt: sessionContext.attempt, runner, fullyInspectable, env, signal: sessionContext.signal, prompt, tuiIndex: context.tuiIndex, tuiLabel: context.tuiLabel });
         } catch (error) {
           if (suspended) { try { await session.resumeFromHandoff?.(); } catch { /* Preserve the pane launch failure. */ } }
           throw error;
@@ -441,13 +427,50 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
       let opened;
       const turnControlDelivered = prepared.turnControl !== undefined && prepared.initialPrompt !== undefined;
       try {
-        opened = await beginLaunch(turnControlDelivered ? `${prepared.initialPrompt}\n\n${prepared.turnControl}` : prepared.initialPrompt);
+        if (prepared.initialPrompt !== undefined) opened = await beginLaunch(turnControlDelivered ? `${prepared.initialPrompt}\n\n${prepared.turnControl}` : prepared.initialPrompt);
       } catch (error) {
         await session.dispose().catch(() => undefined);
         throw error;
       }
       let disposal: Promise<void> | undefined;
       let active: PaneHandle | undefined = opened;
+      let activeCompletion: { pane: PaneHandle; result: Promise<WorkflowAgentMessage | undefined> } | undefined;
+      const completePane = (current: PaneHandle): Promise<WorkflowAgentMessage | undefined> => {
+        if (activeCompletion?.pane === current) return activeCompletion.result;
+        const result = (async (): Promise<WorkflowAgentMessage | undefined> => {
+          const previousAssistant = session.getLastAssistant?.();
+          let monitorReason: "closed" | "exited" | "idle" | "settled" | "aborted" | undefined;
+          let monitorFailed = false;
+          let monitorError: unknown;
+          let resumeFailed = false;
+          let resumeError: unknown;
+          try {
+            monitorReason = await current.monitor;
+          } catch (error) {
+            monitorFailed = true;
+            monitorError = error;
+          } finally {
+            try { await session.resumeFromHandoff?.(); }
+            catch (error) { resumeFailed = true; resumeError = error; }
+            finally { if (active === current) active = undefined; }
+          }
+          if (monitorFailed) throw monitorError;
+          if (resumeFailed) throw resumeError;
+          if (monitorReason === "aborted") return undefined;
+          let assistant = session.getLastAssistant?.();
+          if (assistant === previousAssistant) return undefined;
+          const resultTool = prepared.resultTool;
+          const resultSubmitted = resultTool !== undefined && hasNamedToolCall(assistant, resultTool.name);
+          if (!resultSubmitted && needsContinuation(assistant)) {
+            await session.prompt("Continue the task from the current session state.");
+            assistant = session.getLastAssistant?.();
+          }
+          return assistant;
+        })();
+        activeCompletion = { pane: current, result };
+        void result.then(() => { if (activeCompletion?.result === result) activeCompletion = undefined; }, () => { if (activeCompletion?.result === result) activeCompletion = undefined; });
+        return result;
+      };
       return {
         ...session,
         getLastAssistant(this: HerdrSession): WorkflowAgentMessage | undefined { return session.getLastAssistant?.call(this); },
@@ -461,33 +484,10 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
             current = pending ? await pending : await beginLaunch(text, true);
           }
           active = current;
-          let monitorFailed = false;
-          let monitorError: unknown;
-          let resumeFailed = false;
-          let resumeError: unknown;
-          try {
-            await current.monitor;
-          } catch (error) {
-            monitorFailed = true;
-            monitorError = error;
-          } finally {
-            try { await session.resumeFromHandoff?.(); }
-            catch (error) { resumeFailed = true; resumeError = error; }
-            finally { if (active === current) active = undefined; }
-          }
-          if (monitorFailed) throw monitorError;
-          if (resumeFailed) throw resumeError;
-          let assistant = session.getLastAssistant?.();
-          const resultTool = prepared.resultTool;
-          const resultSubmitted = resultTool !== undefined && hasNamedToolCall(assistant, resultTool.name);
-          const incomplete = needsContinuation(assistant);
-          if (!resultSubmitted && incomplete) {
-            await session.prompt("Continue the task from the current session state.");
-            assistant = session.getLastAssistant?.();
-          }
+          const assistant = await completePane(current);
           return assistant ? { assistant } : {};
         },
-        async abort() { await session.abort(); },
+        async abort() { try { await session.abort(); } finally { await active?.close(); } },
         async dispose() {
           if (disposal) { await disposal; return; }
           disposed = true;
@@ -497,10 +497,12 @@ function herdrTransport(agent: AgentSetup, context: Readonly<AgentSetupContext>,
               const results = await Promise.allSettled(pendingLaunches);
               if (!active) { for (const result of results) { if (result.status === "fulfilled") { active = result.value; break; } } }
             }
+            try { await session.abort(); } catch { /* Disposal must continue after an abort failure. */ }
             if (active) {
               await active.closeRemote();
               await active.close();
             }
+            if (activeCompletion) await Promise.allSettled([activeCompletion.result]);
             await session.dispose();
           })();
           await disposal;
@@ -607,7 +609,6 @@ function registerLifecycleHooks(pi: ExtensionAPI | null | undefined, runner: Her
 export function createHerdrExtension(options: HerdrExtensionOptions = {}): HerdrExtension {
   const env = options.env ?? process.env;
   const runner = options.runner ?? herdrCommandRunner;
-  const workspaces = options.workspaces ?? createWorkflowWorkspaces(runner);
   const fullyInspectable = isFullyInspectableMode(options.agentDir);
   const fullyInspectableFor = (settings: Readonly<WorkflowSettings["extensionSettings"]> | undefined): boolean => settings === undefined ? fullyInspectable : settings.herdr?.enableFullyInspectableMode === true;
   type ActionContext = HerdrAttemptActionContext;
@@ -621,7 +622,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
     const session = context.session;
     const cwd = sessionCwd(context);
     if (!session || context.liveSession || !cwd) return;
-    await openHerdrLivePane({ action: "live", cwd, command: inspectSessionCommand(session), ...(env.HERDR_PANE_ID ? { paneId: env.HERDR_PANE_ID } : {}) }, runner);
+    await openHerdrLivePane({ action: "live", cwd, command: inspectSessionCommand(session, context.prepared?.tools ?? ["read", "grep", "find", "ls"]), ...(env.HERDR_PANE_ID ? { paneId: env.HERDR_PANE_ID } : {}) }, runner);
   };
   const openLiveVisible = (context: ActionContext): boolean => herdrAvailable(env) && !fullyInspectableFor(context.prepared?.settings) && Boolean(context.liveSession && sessionPath(context.liveSession.reference) && context.prepared && context.handoff);
   const openLive = async (context: ActionContext): Promise<void> => {
@@ -712,7 +713,7 @@ export function createHerdrExtension(options: HerdrExtensionOptions = {}): Herdr
       fullyInspectable: {
         setup(agent, context) {
           if (context.mode === "inspection" || !fullyInspectableFor(context.settings) || !herdrAvailable(env)) return;
-          agent.transport = herdrTransport(agent, context, runner, true, env, workspaces);
+          agent.transport = herdrTransport(agent, context, runner, true, env);
         },
       },
     },
@@ -729,23 +730,10 @@ export function registerHerdrExtension(options: HerdrExtensionOptions = {}): boo
 function isRunEvent(value: unknown): value is { runId: string } {
   return value !== null && typeof value === "object" && typeof (value as Record<string, unknown>).runId === "string";
 }
-function isTerminalRunState(value: unknown): value is "failed" | "stopped" | "interrupted" | "budget_exhausted" {
-  return value === "failed" || value === "stopped" || value === "interrupted" || value === "budget_exhausted";
-}
 function isLiveRunActiveState(value: unknown): boolean { return value === "running" || value === "pausing"; }
-function registerWorkspaceLifecycle(pi: ExtensionAPI | null | undefined, workspaces: WorkspaceManager): void {
-  if (!hasExtensionHooks(pi)) return;
-  pi.events.on(WORKFLOW_RUN_COMPLETED_EVENT, (event) => { if (isRunEvent(event)) void workspaces.close(event.runId); });
-  pi.events.on(WORKFLOW_RUN_STATE_CHANGED_EVENT, (event) => { if (isRunEvent(event) && isTerminalRunState((event as { state?: unknown }).state)) void workspaces.close(event.runId); });
-  pi.on("session_shutdown", async () => { await workspaces.closeAll(); });
-}
 
 export default function extension(pi: ExtensionAPI, overrides: HerdrExtensionOverrides = {}): void {
   const runner = overrides.runner ?? herdrCommandRunner;
-  const workspaces = overrides.workspaces ?? createWorkflowWorkspaces(runner);
-  const options = { env: overrides.env ?? process.env, runner, workspaces };
-  if (registerHerdrExtension(options)) {
-    registerLifecycleHooks(pi, runner, options.env);
-    registerWorkspaceLifecycle(pi, workspaces);
-  }
+  const options = { env: overrides.env ?? process.env, runner };
+  if (registerHerdrExtension(options)) registerLifecycleHooks(pi, runner, options.env);
 }

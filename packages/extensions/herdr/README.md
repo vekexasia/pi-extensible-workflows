@@ -43,9 +43,13 @@ Set the global workflow settings file, normally `~/.pi/agent/pi-extensible-workf
 
 `extensionSettings.herdr` is the only valid location for Herdr configuration. The obsolete `extensions.herdr` object is rejected with `INVALID_SETTINGS`; migrate it before launching.
 
-The effective value uses the global map unless a trusted project declares `extensionSettings`, in which case the project's complete map replaces it, including `{}`. Role settings are then applied by top-level-key replacement; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled, every workflow agent launches in a dedicated labeled Herdr workspace and the manual live-session action is hidden. Completed-session inspection remains available.
+The effective value uses the global map unless a trusted project declares `extensionSettings`, in which case the project's complete map replaces it, including `{}`. Role settings are then applied by top-level-key replacement; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled, every workflow agent launches in a child pane split from the caller's repository session; no top-level workspace or new tab is created. The manual live-session action is hidden. Completed-session inspection remains available.
 
 ## Live handoff and ownership
+
+### Worktrees
+
+When Pi runs inside a Herdr-managed pane (`HERDR_ENV=1` with a Herdr socket), a workflow or subagent worktree is created with `herdr worktree create` from the repository root, on the branch and base the run already planned. Herdr registers the linked checkout under the repository group, while the agent runs in a sibling pane inside the caller's tab. Teardown goes through `herdr worktree remove --workspace <id>`. The workspace id is recorded in the run's `worktrees.json` next to the worktree record, which is what lets an interrupted run be reclaimed. Outside Herdr, the plain Git path runs instead and nothing is registered. Herdr creation failures are terminal; they never fall back to an unregistered Git worktree.
 
 Live handoff pauses the local SDK at a turn boundary while the Herdr pane owns the task. A generated bridge reports Pi's `agent_settled` event directly to the transport, independently of user extension filters and Herdr screen detection. This returns ownership to the local SDK and closes the owned pane; accepting `workflow_result` alone does not end the execution. Pane exit, `/quit`, and cancellation remain fallback paths.
 
