@@ -7,6 +7,7 @@ import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonDigest
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
 import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type EvidenceRecord, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
+import type { CompletionDeliveryContext } from "./host-delivery.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
 export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -26,6 +27,12 @@ export type WorkflowRunRecord = {
   providerErrorRecovery?: (failure: AgentProviderFailure, signal: AbortSignal) => Promise<AgentProviderRecovery>;
   execution?: WorkflowExecution;
   completion?: Promise<unknown>;
+  /** The failure of a run whose terminal write failed, so a later repair can still persist and report its cause. */
+  parkedFailure?: WorkflowError;
+  /** The in-flight repair of a parked run, shared by concurrent stops so its event and delivery happen once. */
+  repair?: Promise<void> | undefined;
+  /** Launch or recovery context, so a later repair delivers the result as the run itself would have. */
+  deliveryContext?: CompletionDeliveryContext;
   foreground?: boolean;
   checkpointResolvers: Map<string, (value: boolean) => void>;
   update?: (result: WorkflowToolUpdate) => void;
