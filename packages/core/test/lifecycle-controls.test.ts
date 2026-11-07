@@ -9,6 +9,7 @@ import { testExtensionApi } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, RunLifecycle, RunStore, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError } from "../src/index.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
+import { setTrajectoryHost } from "../src/trajectory-host-handle.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { waitForIssue105 } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
@@ -1120,4 +1121,55 @@ void test("a run that ends while every terminal write fails is not left active a
     assert.equal(result.state, persisted.state);
     assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
   } finally { failing.restore(); }
+});
+void test("a failed paused state write keeps the duration budget running so usage keeps growing and the hard limit still applies", { timeout: 15_000 }, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-pause-write-budget-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const createSession = async (): Promise<TestPiSession> => ({
+    sessionId: "pause-write-budget", sessionFile: "/sessions/pause-write-budget.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, abort: async () => {}, steer: async () => {}, dispose() {},
+  });
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  let provider: ((context: unknown) => { handleAction(request: unknown): Promise<unknown> }) | undefined;
+  setTrajectoryHost({ open: async () => {}, close: async () => {}, autoAttach: (attached) => { provider = attached; } });
+  t.after(() => { setTrajectoryHost(undefined); });
+  // The live budget usage each lifecycle write carries; the first "paused" write fails once.
+  const durations: Record<string, number> = {};
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const original = RunStore.prototype.updateState;
+  let failed = false;
+  RunStore.prototype.updateState = function (this: RunStore, update) {
+    return original.call(this, async (run) => {
+      const next = await update(run);
+      if (next.state === "paused" || (next.state === "running" && failed)) durations[next.state] = next.usage?.durationMs ?? -1;
+      if (!failed && next.state === "paused") { failed = true; throw new Error("injected state.json write failure"); }
+      return next;
+    });
+  };
+  t.after(() => { RunStore.prototype.updateState = original; });
+  // Holds every worker call before it enters the lifecycle, so the pause below finds no active work and attempts the "paused" write itself.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const originalEnter = RunLifecycle.prototype.enter;
+  let openGate!: () => void;
+  const gate = new Promise<void>((resolve) => { openGate = resolve; });
+  RunLifecycle.prototype.enter = async function (this: RunLifecycle) { await gate; return originalEnter.call(this); };
+  t.after(() => { RunLifecycle.prototype.enter = originalEnter; });
+  const launched = jsonOf(await workflow.execute("id", { name: "pause-write-budget", script: "return agent('x');", budget: { durationMs: { hard: 500 } } }, new AbortController().signal, undefined, context));
+  const runId = launched.runId as string;
+  const store = new RunStore(cwd, "session", runId, home);
+  assert.ok(provider);
+  const act = async (action: string) => { await provider?.(context).handleAction({ action, target: { kind: "run", id: runId } }); };
+  await assert.rejects(act("pause"), /injected state.json write failure/);
+  openGate();
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await act("resume");
+  const { paused, running } = durations;
+  assert.ok(paused !== undefined && running !== undefined);
+  assert.ok(running - paused >= 700, `duration kept growing after the failed pause: ${String(paused)} -> ${String(running)}`);
+  await waitForIssue105(async () => (await store.load()).run.state === "budget_exhausted");
 });

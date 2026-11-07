@@ -734,12 +734,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const run = runs.get(store.runId) ?? unwrittenRuns.get(store.runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
     if (next !== "pausing") run.budget.transition(next);
+    // The lifecycle rolls back when this write fails, so the budget must keep matching it.
     const persisted = await store.updateState((current) => {
       const nextRun = { ...current, state: next, ...run.budget.snapshot() };
       if (next === "running" || next === "completed") { delete nextRun.error; delete nextRun.failedAt; }
       if (next === "running" && (previous === "paused" || previous === "interrupted" || previous === "budget_exhausted") && nextRun.delivery?.state === "delivered") nextRun.delivery = { ...nextRun.delivery, state: "pending" };
       return isHardTerminalRunState(next) ? withoutActiveShells(nextRun) : nextRun;
-    });
+    }).catch((error: unknown) => { run.budget.transition(previous === "pausing" ? "running" : previous); throw error; });
     // The write above is the commit; a failing notification must not undo it or the in-memory state.
     try {
       await eventPublisher.budget(store, metadata, persisted);
