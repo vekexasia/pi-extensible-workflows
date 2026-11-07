@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { testExtensionApi } from "./support.js";
 import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, RunLifecycle, RunStore, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError } from "../src/index.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
+import { setTrajectoryHost } from "../src/trajectory-host-handle.js";
 import { testTransport, type TestPiSession } from "./test-transport.js";
 import { waitForIssue105 } from "./support.js";
 import { contextualWorkflowAction } from "./support.js";
@@ -990,4 +991,212 @@ void test("interrupted lifecycle can cold-resume while completed and failed cann
   await interrupted.resume();
   assert.equal(interrupted.state, "running");
   for (const state of ["completed", "failed"] as const) await assert.rejects(new RunLifecycle(state).resume(), /Cannot resume/);
+});
+type TerminalWriteTools = { workflow: (...args: unknown[]) => Promise<unknown>; stop: (...args: unknown[]) => Promise<unknown>; status: (...args: unknown[]) => Promise<unknown> };
+function terminalWriteHarness(prefix: string): { home: string; context: unknown; tools: TerminalWriteTools; messages: string[]; completions: unknown[] } {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  const registered: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const messages: string[] = [];
+  const completions: unknown[] = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof registered)[number]) { registered.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, events: { emit(channel: string, data: unknown) { if (channel === "workflow:run-completed") completions.push(data); } }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const find = (name: string) => { const tool = registered.find((entry) => entry.name === name); assert.ok(tool); return tool.execute; };
+  return { home, context: { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, tools: { workflow: find("workflow"), stop: find("workflow_stop"), status: find("workflow_status") }, messages, completions };
+}
+const jsonOf = (result: unknown): Record<string, unknown> => JSON.parse((result as { content: [{ text: string }] }).content[0].text) as Record<string, unknown>;
+// Fails the first state.json write that carries `target`; later writes pass.
+function failTerminalWriteOnce(target: string): () => void {
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const original = RunStore.prototype.updateState;
+  let failed = false;
+  RunStore.prototype.updateState = function (this: RunStore, update) {
+    return original.call(this, async (run) => {
+      const next = await update(run);
+      if (!failed && next.state === target) { failed = true; throw new Error("injected state.json write failure"); }
+      return next;
+    });
+  };
+  return () => { RunStore.prototype.updateState = original; };
+}
+void test("a failed terminal state write is retried so stop cancels the in-flight shell and memory and disk agree", async () => {
+  const { home, context, tools } = terminalWriteHarness("pi-extensible-workflows-terminal-write-stop-");
+  const restore = failTerminalWriteOnce("stopped");
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "stuck-shell", script: "return await shell('sleep 30');" }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    const store = new RunStore(home, "session", runId, home);
+    for (let i = 0; i < 200 && !(await store.load()).run.activeShells; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal((await store.load()).run.activeShells, 1);
+    const stopped = jsonOf(await tools.stop("id", { runId }));
+    assert.deepEqual(stopped, { runId, state: "stopped", stopped: true });
+    const again = jsonOf(await tools.stop("id", { runId }));
+    assert.deepEqual(again, { runId, state: "stopped", stopped: false, reason: "already_terminal" });
+    assert.equal(jsonOf(await tools.status("id", { runId }, undefined, undefined, context)).state, "stopped");
+    const persisted = (await store.load()).run;
+    assert.equal(persisted.state, "stopped");
+    assert.equal(persisted.activeShells, undefined);
+  } finally { restore(); }
+});
+void test("a failed completed state write is retried so the run does not end terminal in memory but running on disk", async () => {
+  const { home, context, tools } = terminalWriteHarness("pi-extensible-workflows-terminal-write-done-");
+  const restore = failTerminalWriteOnce("completed");
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    const store = new RunStore(home, "session", runId, home);
+    for (let i = 0; i < 200 && (await store.load()).run.state === "running"; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    const persisted = (await store.load()).run;
+    assert.equal(persisted.state, "completed");
+    assert.equal(jsonOf(await tools.stop("id", { runId })).state, persisted.state);
+    assert.equal(jsonOf(await tools.status("id", { runId }, undefined, undefined, context)).state, persisted.state);
+  } finally { restore(); }
+});
+void test("a throwing run update after a successful terminal write keeps memory and disk both terminal", async () => {
+  const { home, context, tools } = terminalWriteHarness("pi-extensible-workflows-terminal-notify-");
+  let sawCompleted = false;
+  const onUpdate = (update: unknown) => { if (JSON.stringify(update).includes('"state":"completed"')) { sawCompleted = true; throw new Error("injected notification failure"); } };
+  await tools.workflow("id", { name: "notify", script: "return 1;", foreground: true }, new AbortController().signal, onUpdate, context);
+  const [runId] = await listRunIds(home, "session", home, false);
+  assert.ok(runId);
+  assert.ok(sawCompleted);
+  const persisted = (await new RunStore(home, "session", runId, home).load()).run;
+  assert.equal(persisted.state, "completed");
+  assert.equal(jsonOf(await tools.stop("id", { runId })).state, "completed");
+});
+// Fails every state.json write that carries a hard terminal state until `heal()` is called.
+function failTerminalWrites(): { heal: () => void; restore: () => void } {
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const original = RunStore.prototype.updateState;
+  let healed = false;
+  RunStore.prototype.updateState = function (this: RunStore, update) {
+    return original.call(this, async (run) => {
+      const next = await update(run);
+      if (!healed && ["completed", "failed", "stopped"].includes(next.state)) { await new Promise((resolve) => setTimeout(resolve, 50)); throw new Error("injected state.json write failure"); }
+      return next;
+    });
+  };
+  return { heal: () => { healed = true; }, restore: () => { RunStore.prototype.updateState = original; } };
+}
+void test("a persistently failing terminal write still cancels the work, stop reports it, and a later stop persists stopped", async () => {
+  const { home, context, tools } = terminalWriteHarness("pi-extensible-workflows-terminal-write-persistent-stop-");
+  const failing = failTerminalWrites();
+  const pidFile = join(home, "shell.pid");
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  let pid = 0;
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "stuck-shell", script: `return await shell('echo $$ > ${pidFile}; exec sleep 30');` }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    const store = new RunStore(home, "session", runId, home);
+    for (let i = 0; i < 200 && !(await store.load()).run.activeShells; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    for (let i = 0; i < 200 && !existsSync(pidFile); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    pid = Number((readFileSync(pidFile, "utf8")).trim());
+    assert.ok(pid > 0 && alive(pid), "shell is in flight before stop");
+    // Two concurrent stops: the second must not see the first one's transient "stopped" and answer already_terminal.
+    await Promise.all([assert.rejects(tools.stop("id", { runId }), /state\.json/), assert.rejects(tools.stop("id", { runId }), /state\.json/)]);
+    for (let i = 0; i < 200 && alive(pid); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(alive(pid), false, "the shell process was cancelled although the state write failed");
+    assert.equal(jsonOf(await tools.status("id", { runId }, undefined, undefined, context)).state, "running");
+    await assert.rejects(tools.stop("id", { runId }), /state\.json/);
+    failing.heal();
+    const stopped = jsonOf(await tools.stop("id", { runId }));
+    assert.equal(stopped.state, "stopped");
+    const persisted = (await store.load()).run;
+    assert.equal(persisted.state, "stopped");
+    assert.equal(persisted.activeShells, undefined);
+    assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
+    assert.equal(jsonOf(await tools.status("id", { runId }, undefined, undefined, context)).state, "stopped");
+  } finally { failing.restore(); if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL"); }
+});
+void test("a run that ends while every terminal write fails is not left active and a later stop persists its terminal state", async () => {
+  const { home, context, tools, messages } = terminalWriteHarness("pi-extensible-workflows-terminal-write-persistent-done-");
+  const failing = failTerminalWrites();
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    const store = new RunStore(home, "session", runId, home);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal((await store.load()).run.state, "running");
+    failing.heal();
+    const result = jsonOf(await tools.stop("id", { runId }));
+    assert.equal(result.stopped, false);
+    const persisted = (await store.load()).run;
+    assert.equal(persisted.state, "completed");
+    assert.equal(result.state, "completed");
+    assert.equal(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), 1);
+    assert.ok(messages.some((message) => message.includes("parked") && message.includes(`workflow_stop with runId ${runId}`)), messages.join("\n"));
+    assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
+  } finally { failing.restore(); }
+});
+void test("a repaired parked completed run delivers its result once and publishes one completion event", async () => {
+  const { context: base, tools, messages, completions } = terminalWriteHarness("pi-extensible-workflows-terminal-write-repair-delivery-");
+  const context = { ...(base as object), model: { provider: "openai", id: "gpt", maxTokens: 100, contextWindow: 100_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 100_000 }) };
+  const failing = failTerminalWrites();
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.ok(messages.some((message) => message.includes("parked")), messages.join("\n"));
+    const before = messages.length;
+    failing.heal();
+    assert.equal(completions.length, 0);
+    const stops = await Promise.all([tools.stop("id", { runId }), tools.stop("id", { runId })]);
+    assert.deepEqual(stops.map((stop) => jsonOf(stop).state), ["completed", "completed"]);
+    const delivered = messages.slice(before);
+    assert.equal(delivered.length, 1, delivered.join("\n"));
+    assert.match(delivered[0] ?? "", /completed: 1/);
+    assert.equal(completions.length, 1);
+    assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
+    assert.equal(messages.length, before + 1, messages.join("\n"));
+    assert.equal(completions.length, 1);
+  } finally { failing.restore(); }
+});
+void test("a failed paused state write keeps the duration budget running so usage keeps growing and the hard limit still applies", { timeout: 15_000 }, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-pause-write-budget-"));
+  const cwd = join(home, "project");
+  mkdirSync(cwd, { recursive: true });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const createSession = async (): Promise<TestPiSession> => ({
+    sessionId: "pause-write-budget", sessionFile: "/sessions/pause-write-budget.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, abort: async () => {}, steer: async () => {}, dispose() {},
+  });
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  assert.ok(workflow);
+  const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } };
+  let provider: ((context: unknown) => { handleAction(request: unknown): Promise<unknown> }) | undefined;
+  setTrajectoryHost({ open: async () => {}, close: async () => {}, autoAttach: (attached) => { provider = attached; } });
+  t.after(() => { setTrajectoryHost(undefined); });
+  // The live budget usage each lifecycle write carries; the first "paused" write fails once.
+  const durations: Record<string, number> = {};
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const original = RunStore.prototype.updateState;
+  let failed = false;
+  RunStore.prototype.updateState = function (this: RunStore, update) {
+    return original.call(this, async (run) => {
+      const next = await update(run);
+      if (next.state === "paused" || (next.state === "running" && failed)) durations[next.state] = next.usage?.durationMs ?? -1;
+      if (!failed && next.state === "paused") { failed = true; throw new Error("injected state.json write failure"); }
+      return next;
+    });
+  };
+  t.after(() => { RunStore.prototype.updateState = original; });
+  // Holds every worker call before it enters the lifecycle, so the pause below finds no active work and attempts the "paused" write itself.
+  // eslint-disable-next-line @typescript-eslint/unbound-method -- called back with the right `this` below
+  const originalEnter = RunLifecycle.prototype.enter;
+  let openGate!: () => void;
+  const gate = new Promise<void>((resolve) => { openGate = resolve; });
+  RunLifecycle.prototype.enter = async function (this: RunLifecycle) { await gate; return originalEnter.call(this); };
+  t.after(() => { RunLifecycle.prototype.enter = originalEnter; });
+  const launched = jsonOf(await workflow.execute("id", { name: "pause-write-budget", script: "return agent('x');", budget: { durationMs: { hard: 500 } } }, new AbortController().signal, undefined, context));
+  const runId = launched.runId as string;
+  const store = new RunStore(cwd, "session", runId, home);
+  assert.ok(provider);
+  const act = async (action: string) => { await provider?.(context).handleAction({ action, target: { kind: "run", id: runId } }); };
+  await assert.rejects(act("pause"), /injected state.json write failure/);
+  openGate();
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  await act("resume");
+  const { paused, running } = durations;
+  assert.ok(paused !== undefined && running !== undefined);
+  assert.ok(running - paused >= 700, `duration kept growing after the failed pause: ${String(paused)} -> ${String(running)}`);
+  await waitForIssue105(async () => (await store.load()).run.state === "budget_exhausted");
 });
