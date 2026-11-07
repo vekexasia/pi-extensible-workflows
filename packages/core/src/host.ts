@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
@@ -888,22 +888,41 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const terminalState = terminalRunStates.get(runId);
     if (!run) return terminalState ? { runId, state: terminalState, stopped: false, reason: "already_terminal" } : { runId, state: "unknown", stopped: false, reason: "unknown_run" };
     const state = run.lifecycle.state;
-    if (isHardTerminalRunState(state)) return { runId, state, stopped: false, reason: "already_terminal" };
-    const unwritten = run.lifecycle.unwritten;
-    // Start the write first so the ending execution sees the stopped state, but cancel the work whether or not it succeeds.
-    const written = run.lifecycle.terminal(unwritten?.state ?? "stopped", unwritten?.reason).then(() => undefined, (error: unknown) => ({ error }));
-    if (live) {
-      run.abortController.abort();
-      run.execution?.cancel();
-      await scheduler.cancelRun(run.store.runId);
-      await scheduler.flush(run.store.runId);
+    if (live && isHardTerminalRunState(state)) return { runId, state, stopped: false, reason: "already_terminal" };
+    // A parked run whose state is already written still owes its delivery: the entry stays until that succeeds, so a failed repair is retried.
+    if (!isHardTerminalRunState(state)) {
+      const unwritten = run.lifecycle.unwritten;
+      // Start the write first so the ending execution sees the stopped state, but cancel the work whether or not it succeeds.
+      const written = run.lifecycle.terminal(unwritten?.state ?? "stopped", unwritten?.reason).then(() => undefined, (error: unknown) => ({ error }));
+      if (live) {
+        run.abortController.abort();
+        run.execution?.cancel();
+        await scheduler.cancelRun(run.store.runId);
+        await scheduler.flush(run.store.runId);
+      }
+      const failure = await written;
+      if (failure) throw new WorkflowError("INTERNAL_ERROR", `Could not write the ${unwritten?.state ?? "stopped"} state to state.json for run ${runId}; the run was cancelled and workflow_stop retries the write: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`);
     }
-    const failure = await written;
-    if (failure) throw new WorkflowError("INTERNAL_ERROR", `Could not write the ${unwritten?.state ?? "stopped"} state to state.json for run ${runId}; the run was cancelled and workflow_stop retries the write: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`);
     if (!live) {
-      // The run ended earlier and was already cleaned up; only its terminal state was missing on disk.
-      unwrittenRuns.delete(runId);
+      // The run ended earlier and was already cleaned up; only its terminal state, and the delivery that followed it, were missing.
       const persisted = run.lifecycle.state as HardTerminalRunState;
+      const { store } = run;
+      run.repair ??= (async () => {
+        if (persisted === "completed") {
+          const resultPath = join(store.directory, "result.json");
+          const value = JSON.parse(await readFile(resultPath, "utf8")) as JsonValue;
+          // Built before deliverTerminal, which marks the run delivered ahead of evaluating a callback, so a failure here stays retryable.
+          const { content } = await completionDeliveryFromStore({ mode: "background", name: run.metadata.name, runId, value, resultPath, resultBytes: await store.resultBytes(), store, ...(run.deliveryContext === undefined ? {} : { context: run.deliveryContext }) });
+          await deliveryController.deliverTerminal(store, content);
+          await eventPublisher.runCompleted(store, run.metadata, resultPath);
+        } else {
+          const failure = run.parkedFailure;
+          if (failure) await persistRunState(store, run.metadata, (current) => persistedFailure(current, failure));
+          await deliverStaleTerminal(store, (await store.load()).run);
+        }
+      })();
+      try { await run.repair; } catch (error) { run.repair = undefined; throw error; }
+      unwrittenRuns.delete(runId);
       terminalRunStates.set(runId, persisted);
       return { runId, state: persisted, stopped: false, reason: "already_terminal" };
     }
@@ -1449,6 +1468,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch(), settings.extensionSettings);
       const execution = runWorkflow(script, args, withWorkflowFunctions({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name), evidence: evidenceBridge(store, lifecycle) }, store, runContext, registry, settings.extensionSettings), runController.signal);
       runRecord.execution = execution;
+      runRecord.deliveryContext = completionContext(ctx);
       await eventPublisher.runStarted(store, checked.metadata);
       let completed: { value: JsonValue; resultPath: string; resultBytes: number } | undefined;
       const finish = execution.result.then(async (value) => {
@@ -1470,6 +1490,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           await eventPublisher.runCompleted(store, checked.metadata, completed.resultPath);
           return completed;
         }
+        runRecord.parkedFailure = typed;
         if (pending || !isExternallyEndedRunState(lifecycle.state)) await terminalOrPark(lifecycle, runId, typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
         const persisted = await persistRunState(store, checked.metadata, (current) => persistedFailure({ ...current, ...budgetRuntime.snapshot() }, typed));
         const ended = lifecycle.state;

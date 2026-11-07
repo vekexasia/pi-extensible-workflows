@@ -135,6 +135,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     await run.lifecycle.resume();
     const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions({ tool: (identifier, args, signal, identity) => toolForRun(run.store, run.lifecycle, context?.toolContext, identifier, args, signal, identity), shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: workflowAgentHandler(run.store, run.metadata, run.lifecycle, run.executor, run.store.cwd, run.store.runId), worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, foreground, hasUI ? ui : undefined), phase: phaseBridge(run.store, run.metadata, run.lifecycle), log: logBridge(run.store, run.lifecycle, run.metadata.name), evidence: evidenceBridge(run.store, run.lifecycle) }, run.store, runContext, registry, snapshot.settings.extensionSettings), controller.signal);
     run.execution = execution;
+    if (context !== undefined) run.deliveryContext = context.deliveryContext;
     let completed: { value: JsonValue; resultPath: string; resultBytes: number } | undefined;
     const completion = execution.result.then(async (value) => {
       await scheduler.flush(run.store.runId);
@@ -160,6 +161,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
         const lineage = loaded.run.retry?.lineageRootRunId ?? run.store.runId;
         retryReservations.delete(lineage);
       }
+      run.parkedFailure = typed;
       if (pending || !isExternallyEndedRunState(run.lifecycle.state)) await terminalOrPark(run.lifecycle, run.store.runId, typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
       const persisted = await persistRunState(run.store, run.metadata, (current) => persistedFailure({ ...current, ...run.budget.snapshot() }, typed));
       const ended = run.lifecycle.state;
