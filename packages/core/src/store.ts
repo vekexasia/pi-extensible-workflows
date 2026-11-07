@@ -161,20 +161,20 @@ export class RunStore {
     return write;
   }
 
-  async saveAgentConfiguration(key: string, configuration: PreparedAgentConfiguration): Promise<void> {
+  private async updateLaunchSnapshot(update: (snapshot: LaunchSnapshot) => LaunchSnapshot): Promise<void> {
     await this.launchSnapshotLane.run(async () => {
       const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
       if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
-      await atomicJson(join(this.directory, "snapshot.json"), { ...snapshot, agentConfigurations: { ...snapshot.agentConfigurations, [key]: configuration } });
+      await atomicJson(join(this.directory, "snapshot.json"), update(snapshot));
     });
   }
 
+  async saveAgentConfiguration(key: string, configuration: PreparedAgentConfiguration): Promise<void> {
+    await this.updateLaunchSnapshot((snapshot) => ({ ...snapshot, agentConfigurations: { ...snapshot.agentConfigurations, [key]: configuration } }));
+  }
+
   async setLaunchMode(launchMode: WorkflowLaunchMode): Promise<void> {
-    await this.launchSnapshotLane.run(async () => {
-      const snapshot = decodeLaunchSnapshot(await json(join(this.directory, "snapshot.json")));
-      if (!snapshot) throw new WorkflowError("RESUME_INCOMPATIBLE", "Workflow launch snapshot identity version is incompatible");
-      await atomicJson(join(this.directory, "snapshot.json"), { ...snapshot, launchMode });
-    });
+    await this.updateLaunchSnapshot((snapshot) => ({ ...snapshot, launchMode }));
   }
 
   async saveSnapshot(snapshot: Readonly<LaunchSnapshot>): Promise<void> {
@@ -683,7 +683,8 @@ export class RunStore {
         await this.cleanupMarker(markerPath);
         const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
         if (dirty) {
-          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
+          // git() trims the whole output, which eats the leading status column of the first line.
+          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.replace(/^\s*[A-Z?!]{1,2}\s+/, ""));
           const shownPaths = dirtyPaths.slice(0, 10);
           const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
           throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
@@ -718,7 +719,10 @@ export class RunStore {
           const match = persisted.filter((candidate) => candidate.owner === owner);
           const candidate = match.length === 1 ? match[0] : undefined;
           if (candidate) { this.structuralWorktree(owner, candidate); records = persisted.filter((current) => current !== candidate); await atomicJson(recordsPath, records); }
-        } catch { /* Ownership changed or disappeared: do not delete anything. */ }
+        } catch (error: unknown) {
+          // Intentional: cleanup recovery is best-effort; preserve the original failure.
+          void error;
+        }
         throw new WorkflowError("WORKTREE_FAILED", errorText(error));
       }
     });
@@ -783,10 +787,16 @@ export class RunStore {
       const owner = record.owner;
       const name = this.worktreeName(owner);
       if (!name || owner !== this.namedWorktreeOwner(name) || boundOwners.has(owner)) continue;
-      try { await this.ownedWorktree(owner); names.add(name); } catch { /* Do not advertise stale or invalid records. */ }
+      try { await this.ownedWorktree(owner); names.add(name); } catch (error: unknown) {
+        // Intentional: stale records are omitted from the advertised names.
+        void error;
+      }
     }
     for (const binding of bindings) {
-      try { await this.resolveBorrowedWorktree(binding, new Set([this.runId])); names.add(binding.name); } catch { /* Do not advertise stale inherited records. */ }
+      try { await this.resolveBorrowedWorktree(binding, new Set([this.runId])); names.add(binding.name); } catch (error: unknown) {
+        // Intentional: stale inherited records are omitted from the advertised names.
+        void error;
+      }
     }
     return [...names];
   }
@@ -850,7 +860,10 @@ export class RunStore {
       try {
         const fileStat = await stat(targetPath);
         results.push({ ref: `ref:sha256:${sha256.slice(0, 16)}`, sha256, path: targetPath, bytes: fileStat.size });
-      } catch { /* Ignore concurrently removed files. */ }
+      } catch (error: unknown) {
+        // Intentional: concurrent removal only makes this evidence entry unavailable.
+        void error;
+      }
     }
     return results;
   }

@@ -5,6 +5,8 @@ argument-hint: "[target or focus]"
 
 Run an adversarial parallel review of the current work. Do not review it yourself and do not edit files.
 
+When a workflow applies the role policy, it launches a unit with that role's context files and skill paths. When you write the agent call yourself, pass those values explicitly.
+
 If a target or focus is given below, review that; otherwise review the current uncommitted diff.
 
 Choose 2-3 distinct review angles from the actual change (for example correctness and regressions, tests and validation, simplicity and maintainability; add security, performance, or docs when the change calls for it). Prefer three strong reviewers over many vague ones.

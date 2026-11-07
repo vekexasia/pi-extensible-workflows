@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import test from "node:test";
 import { acquireSessionLease, createLaunchSnapshot, DEFAULT_SETTINGS, FairAgentScheduler, WorkflowError } from "../src/index.js";
 import { atomicWriteFile } from "../src/io.js";
@@ -16,6 +16,21 @@ function run(cwd: string, sessionId = "session-a") {
   return { id: "run-a", workflowName: "x", cwd, sessionId, state: "running" as const, agents: [], agentSessions: [{ transport: "local", sessionId: "native-a", locator: { sessionFile: "/pi/sessions/native-a.jsonl" } }] };
 }
 function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> { return new Promise((resolve) => { const timer = setTimeout(() => { resolve(false); }, timeoutMs); promise.then(() => { clearTimeout(timer); resolve(true); }, () => { clearTimeout(timer); resolve(true); }); }); }
+
+function createGitRepository(repo: string, files: ReadonlyArray<{ path: string; content: string }> = [{ path: "tracked.txt", content: "initial" }]): string {
+  mkdirSync(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  for (const file of files) {
+    const target = join(repo, file.path);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, file.content);
+  }
+  execFileSync("git", ["-C", repo, "add", "."]);
+  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  return execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+}
 
 function windowsFileHolder(target: string) {
   const holder = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$fs = [IO.FileStream]::new($env:REPRO_TARGET, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None); [Console]::WriteLine('ready'); [Console]::Out.Flush(); [Console]::In.ReadLine() | Out-Null; $fs.Dispose()"], { env: { ...process.env, REPRO_TARGET: target }, stdio: ["pipe", "pipe", "pipe"] });
@@ -163,13 +178,7 @@ void test("partial run directories do not block sibling loading or deletion", as
 void test("reclaims an orphaned worktree transaction before retrying", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-recovery-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
@@ -478,14 +487,10 @@ void test("creates worktrees from clean HEAD, preserves launch subdirectories, a
   const repo = join(home, "repo");
   const cwd = join(repo, "packages", "app");
   mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(cwd, "tracked.txt"), "initial");
-  writeFileSync(join(repo, ".gitignore"), "ignored.txt\n");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
-  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const head = createGitRepository(repo, [
+    { path: "packages/app/tracked.txt", content: "initial" },
+    { path: ".gitignore", content: "ignored.txt\n" },
+  ]);
   writeFileSync(join(cwd, "ignored.txt"), "local only");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -512,19 +517,18 @@ void test("creates worktrees from clean HEAD, preserves launch subdirectories, a
 void test("rejects worktree creation when the launch working tree has tracked or untracked changes", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-dirty-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo, { recursive: true });
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
-  const head = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const head = createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const isDirtyFailure = (error: unknown): error is WorkflowError => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes");
   writeFileSync(join(repo, "tracked.txt"), "changed");
-  await assert.rejects(store.worktree("agent"), isDirtyFailure);
+  let trackedMessage = "";
+  await assert.rejects(store.worktree("agent"), (error: unknown) => {
+    if (!isDirtyFailure(error)) return false;
+    trackedMessage = error.message;
+    return true;
+  });
+  assert.match(trackedMessage, /first: tracked\.txt$/);
   execFileSync("git", ["-C", repo, "checkout", "--", "tracked.txt"]);
   execFileSync("git", ["-C", repo, "config", "status.showUntrackedFiles", "no"]);
   const untracked = Array.from({ length: 12 }, (_, index) => join(repo, `untracked-${String(index)}.txt`));
@@ -579,12 +583,7 @@ void test("creates worktrees from a symlinked repository cwd without rewriting t
   const repoCwd = join(repo, "packages", "app");
   const cwd = join(alias, "packages", "app");
   mkdirSync(repoCwd, { recursive: true });
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repoCwd, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo, [{ path: "packages/app/tracked.txt", content: "initial" }]);
   symlinkSync(repo, alias, "dir");
   const store = new RunStore(cwd, "session-a", "run-a", home);
   await store.create(run(cwd), snapshot);
@@ -597,12 +596,7 @@ void test("rejects a launch cwd outside the repository without rejecting dotted 
   const repo = join(home, "repo");
   const dotted = join(repo, "..foo");
   mkdirSync(dotted, { recursive: true });
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(dotted, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo, [{ path: "..foo/tracked.txt", content: "initial" }]);
   const dottedStore = new RunStore(dotted, "session-a", "run-a", home);
   await dottedStore.create(run(dotted), snapshot);
   const dottedWorktree = await dottedStore.worktree("agent");
@@ -625,13 +619,7 @@ void test("rejects a launch cwd outside the repository without rejecting dotted 
 void test("does not advertise non-canonical named worktree owners", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-non-canonical-named-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const owner = "worktree/named/%62anana";
@@ -642,13 +630,7 @@ void test("does not advertise non-canonical named worktree owners", async () => 
 void test("does not advertise owned named worktrees when borrowed bindings are malformed", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-invalid-borrowed-bindings-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   await store.worktree(structuralPath("worktree", "named", "banana"));
@@ -660,13 +642,7 @@ void test("does not advertise owned named worktrees when borrowed bindings are m
 void test("reuses named worktrees through durable follow-up bindings without deleting borrowed checkouts", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-borrowed-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const owner = structuralPath("worktree", "named", "banana");
   const source = new RunStore(repo, "session-a", "source", home);
   await source.create({ ...run(repo), id: "source", state: "completed" }, snapshot);
@@ -711,13 +687,7 @@ void test("reuses named worktrees through durable follow-up bindings without del
 void test("retry named worktrees fail closed when an inherited record disappears", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-stale-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const owner = structuralPath("worktree", "named", "banana");
   const source = new RunStore(repo, "session-a", "source", home);
   await source.create({ ...run(repo), id: "source", state: "failed" }, snapshot);
@@ -733,13 +703,7 @@ void test("retry named worktrees fail closed when an inherited record disappears
 void test("preserves a pre-existing deterministic branch when creation fails", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-branch-collision-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
@@ -754,13 +718,7 @@ void test("preserves a pre-existing deterministic branch when creation fails", a
 void test("cleans a created branch when worktree add fails before cwd exists", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-add-fail-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const key = createHash("sha256").update("session-a\0run-a\0agent").digest("hex").slice(0, 16);
@@ -777,12 +735,7 @@ void test("worktreeSetup runs in order only when a worktree is physically create
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-setup-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, ".gitignore"), ".env\nsetup.log\n");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo, [{ path: ".gitignore", content: ".env\nsetup.log\n" }]);
   writeFileSync(join(repo, ".env"), "SECRET=1");
   const setup = ['cp "$PIEWF_SOURCE_ROOT/.env" .env', 'printf "%s|%s|%s\\n" "$PWD" "$PIEWF_WORKTREE_PATH" "$PIEWF_WORKTREE_BRANCH" >> setup.log'];
   const store = new RunStore(repo, "session-a", "run-a", home);
@@ -813,13 +766,7 @@ void test("worktree creation failures are typed and never fall back", async () =
 void test("stale persisted worktree records fail as WORKTREE_FAILED", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-stale-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const worktree = await store.worktree("agent");
@@ -830,13 +777,7 @@ void test("stale persisted worktree records fail as WORKTREE_FAILED", async () =
 void test("malicious worktree metadata cannot trigger deletion", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-malicious-worktree-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   execFileSync("git", ["-C", repo, "branch", "keep-me"]);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
@@ -851,13 +792,7 @@ void test("malicious worktree metadata cannot trigger deletion", async () => {
 void test("snapshot git failures are typed as WORKTREE_FAILED", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-snapshot-fail-"));
   const repo = join(home, "repo");
-  mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
-  writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  createGitRepository(repo);
   const store = new RunStore(repo, "session-a", "run-a", home);
   await store.create(run(repo), snapshot);
   const worktree = await store.worktree("agent");
