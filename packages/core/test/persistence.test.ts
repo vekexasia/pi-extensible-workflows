@@ -522,7 +522,13 @@ void test("rejects worktree creation when the launch working tree has tracked or
   await store.create(run(repo), snapshot);
   const isDirtyFailure = (error: unknown): error is WorkflowError => error instanceof WorkflowError && error.code === "WORKTREE_FAILED" && error.message.includes("uncommitted changes");
   writeFileSync(join(repo, "tracked.txt"), "changed");
-  await assert.rejects(store.worktree("agent"), isDirtyFailure);
+  let trackedMessage = "";
+  await assert.rejects(store.worktree("agent"), (error: unknown) => {
+    if (!isDirtyFailure(error)) return false;
+    trackedMessage = error.message;
+    return true;
+  });
+  assert.match(trackedMessage, /first: tracked\.txt$/);
   execFileSync("git", ["-C", repo, "checkout", "--", "tracked.txt"]);
   execFileSync("git", ["-C", repo, "config", "status.showUntrackedFiles", "no"]);
   const untracked = Array.from({ length: 12 }, (_, index) => join(repo, `untracked-${String(index)}.txt`));

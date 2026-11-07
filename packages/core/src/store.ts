@@ -683,7 +683,8 @@ export class RunStore {
         await this.cleanupMarker(markerPath);
         const dirty = (await git(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
         if (dirty) {
-          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
+          // git() trims the whole output, which eats the leading status column of the first line.
+          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.replace(/^\s*[A-Z?!]{1,2}\s+/, ""));
           const shownPaths = dirtyPaths.slice(0, 10);
           const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
           throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
