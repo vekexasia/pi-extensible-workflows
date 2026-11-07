@@ -525,6 +525,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     return { ...subagent, request: live.request, mode: live.request.mode ?? subagent.mode, state: live.status.state, tools, ...(live.status.startedAt === undefined ? {} : { startedAt: live.status.startedAt }), ...(live.status.finishedAt === undefined ? {} : { finishedAt: live.status.finishedAt }), ...(live.status.attempts === undefined ? {} : { attempts: live.status.attempts }), ...(live.status.error === undefined ? {} : { error: live.status.error }), ...(live.status.worktree === undefined ? {} : { worktree: live.status.worktree }), ...(model === undefined ? {} : { model }), ...(live.status.progress === undefined ? {} : { progress: live.status.progress }), ...(attempt === undefined ? {} : { attempt }) };
   };
   const terminalRunStates = new Map<string, HardTerminalRunState>();
+  // Ended runs whose terminal state could not be written to state.json; workflow_stop retries the write.
+  const unwrittenRuns = new Map<string, WorkflowRunRecord>();
   let sessionLease: SessionLease | undefined;
   let sessionLeasePromise: Promise<SessionLease> | undefined;
   const ensureSessionLease = async (cwd: string, sessionId: string) => {
@@ -729,7 +731,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     } finally { registered(); await lifecycle.leave(); }
   };
   const lifecycleFor = (store: RunStore, state: RunState, metadata: WorkflowMetadata) => new RunLifecycle(state, async (next, previous, reason) => {
-    const run = runs.get(store.runId);
+    const run = runs.get(store.runId) ?? unwrittenRuns.get(store.runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
     if (next !== "pausing") run.budget.transition(next);
     const persisted = await store.updateState((current) => {
@@ -861,13 +863,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const cleanupTerminalRun = async (runId: string): Promise<void> => {
     const run = runs.get(runId);
     if (!run) return;
+    await run.lifecycle.settled();
     const state = run.lifecycle.state;
-    if (!isHardTerminalRunState(state)) return;
+    if (!isHardTerminalRunState(state) && !run.lifecycle.unwritten) return;
     await scheduler.cancelRun(runId);
     await scheduler.flush(runId);
     if (runs.get(runId) !== run) return;
     scheduler.removeRun(runId);
-    terminalRunStates.set(runId, state);
+    if (isHardTerminalRunState(state)) terminalRunStates.set(runId, state); else unwrittenRuns.set(runId, run);
     run.checkpointResolvers.clear();
     liveAgents.deleteRun(runId);
     eventPublisher.removeRun(runId);
@@ -875,16 +878,33 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   };
   type WorkflowStopResult = { runId: string; state: RunState | "unknown"; stopped: boolean; reason?: "unknown_run" | "already_terminal" };
   const stopWorkflowRun = async (runId: string): Promise<WorkflowStopResult> => {
-    const run = runs.get(runId);
+    // A concurrent stop's write may still be in flight with a transient terminal state that a failure rolls back.
+    // No await runs when nothing is writing, so the check below and the write start stay atomic.
+    for (let pending = runs.get(runId) ?? unwrittenRuns.get(runId); pending?.lifecycle.writing; pending = runs.get(runId) ?? unwrittenRuns.get(runId)) await pending.lifecycle.settled();
+    const live = runs.get(runId);
+    const run = live ?? unwrittenRuns.get(runId);
     const terminalState = terminalRunStates.get(runId);
     if (!run) return terminalState ? { runId, state: terminalState, stopped: false, reason: "already_terminal" } : { runId, state: "unknown", stopped: false, reason: "unknown_run" };
     const state = run.lifecycle.state;
     if (isHardTerminalRunState(state)) return { runId, state, stopped: false, reason: "already_terminal" };
-    await run.lifecycle.terminal("stopped");
-    run.abortController.abort();
-    run.execution?.cancel();
-    await scheduler.cancelRun(run.store.runId);
-    await scheduler.flush(run.store.runId);
+    const unwritten = run.lifecycle.unwritten;
+    // Start the write first so the ending execution sees the stopped state, but cancel the work whether or not it succeeds.
+    const written = run.lifecycle.terminal(unwritten?.state ?? "stopped", unwritten?.reason).then(() => undefined, (error: unknown) => ({ error }));
+    if (live) {
+      run.abortController.abort();
+      run.execution?.cancel();
+      await scheduler.cancelRun(run.store.runId);
+      await scheduler.flush(run.store.runId);
+    }
+    const failure = await written;
+    if (failure) throw new WorkflowError("INTERNAL_ERROR", `Could not write the ${unwritten?.state ?? "stopped"} state to state.json for run ${runId}; the run was cancelled and workflow_stop retries the write: ${failure.error instanceof Error ? failure.error.message : String(failure.error)}`);
+    if (!live) {
+      // The run ended earlier and was already cleaned up; only its terminal state was missing on disk.
+      unwrittenRuns.delete(runId);
+      const persisted = run.lifecycle.state as HardTerminalRunState;
+      terminalRunStates.set(runId, persisted);
+      return { runId, state: persisted, stopped: false, reason: "already_terminal" };
+    }
     await cleanupTerminalRun(runId);
     return { runId, state: "stopped", stopped: true };
   };

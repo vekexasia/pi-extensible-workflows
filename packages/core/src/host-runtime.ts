@@ -53,9 +53,13 @@ export class RunLifecycle {
   #state: RunState;
   #active = 0;
   #waiters: Array<() => void> = [];
+  #writing: Promise<void> | undefined;
+  #unwritten: { state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted"; reason: string } | undefined;
 
   constructor(state: RunState = "running", private readonly changed?: (state: RunState, previousState: RunState, reason?: string) => void | Promise<void>) { this.#state = state; }
   get state(): RunState { return this.#state; }
+  /** The terminal state whose state.json write failed twice; memory stays rolled back, a later `terminal()` call retries it. */
+  get unwritten(): { state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted"; reason: string } | undefined { return this.#unwritten; }
 
   async enter(): Promise<void> {
     while (this.#state === "pausing" || this.#state === "paused" || this.#state === "awaiting_input") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
@@ -100,10 +104,24 @@ export class RunLifecycle {
     await this.enter();
   }
 
+  /** Resolves once an in-flight `terminal()` write is done, so callers never read the transient terminal state a failing write rolls back. */
+  get writing(): boolean { return this.#writing !== undefined; }
+  async settled(): Promise<void> { await this.#writing; }
+
   async terminal(state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted", reason?: string): Promise<void> {
     if (HARD_TERMINAL_RUN_STATES.has(this.#state)) throw new WorkflowError("RESUME_INCOMPATIBLE", `${this.#state} runs are terminal`);
+    const write = this.#terminalWrite(state, reason);
+    const done: Promise<void> = write.then(() => undefined, () => undefined).then(() => { if (this.#writing === done) this.#writing = undefined; });
+    this.#writing = done;
+    await write;
+  }
+
+  async #terminalWrite(state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted", reason?: string): Promise<void> {
     // One retry: a failed write leaves the state unchanged, and callers like stop must not abort its run over a transient write error.
-    try { await this.#set(state, reason ?? state); } catch { await this.#set(state, reason ?? state); }
+    try { await this.#set(state, reason ?? state); } catch {
+      try { await this.#set(state, reason ?? state); } catch (error) { this.#unwritten = { state, reason: reason ?? state }; throw error; }
+    }
+    this.#unwritten = undefined;
     for (const resolve of this.#waiters.splice(0)) resolve();
   }
 
