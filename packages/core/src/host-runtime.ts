@@ -102,14 +102,19 @@ export class RunLifecycle {
 
   async terminal(state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted", reason?: string): Promise<void> {
     if (HARD_TERMINAL_RUN_STATES.has(this.#state)) throw new WorkflowError("RESUME_INCOMPATIBLE", `${this.#state} runs are terminal`);
-    await this.#set(state, reason ?? state);
+    // One retry: a failed write leaves the state unchanged, and callers like stop must not abort its run over a transient write error.
+    try { await this.#set(state, reason ?? state); } catch { await this.#set(state, reason ?? state); }
     for (const resolve of this.#waiters.splice(0)) resolve();
   }
 
   async #set(state: RunState, reason?: string): Promise<void> {
     const previousState = this.#state;
     this.#state = state;
-    await this.changed?.(state, previousState, reason);
+    try { await this.changed?.(state, previousState, reason); } catch (error) {
+      // `changed` throws only when the state.json write failed; side notifications are best-effort there.
+      if (this.#state === state) this.#state = previousState;
+      throw error;
+    }
   }
 }
 

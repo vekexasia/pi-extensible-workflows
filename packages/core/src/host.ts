@@ -644,6 +644,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const call: WorkflowScriptCall = { kind: "shell", name: "shell", path, ...scriptCallInput({ command, ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }), ...(options.env === undefined ? {} : { env: Object.keys(options.env) }), ...(identity.worktreeOwner ? { worktree: identity.worktreeOwner } : {}) }), startedAt: shellStartedAt };
       let failure: WorkflowError | undefined;
       const started = await persistRunState(store, metadata, (run) => {
+        // A call that entered before the terminal write must not re-add the active-shell counters the write cleared.
+        if (isHardTerminalRunState(run.state)) fail("CANCELLED", `Run is ${run.state}`);
         const current = startScriptCall(run, call);
         const history = current.phaseHistory ?? [];
         if (current.phase !== undefined) shellPhaseIndex = current.phaseHistoryIndex ?? (history.length ? history.length - 1 : 0);
@@ -730,14 +732,18 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     const run = runs.get(store.runId);
     if (!run) throw new WorkflowError("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
     if (next !== "pausing") run.budget.transition(next);
-    const persisted = await persistRunState(store, metadata, (current) => {
+    const persisted = await store.updateState((current) => {
       const nextRun = { ...current, state: next, ...run.budget.snapshot() };
       if (next === "running" || next === "completed") { delete nextRun.error; delete nextRun.failedAt; }
       if (next === "running" && (previous === "paused" || previous === "interrupted" || previous === "budget_exhausted") && nextRun.delivery?.state === "delivered") nextRun.delivery = { ...nextRun.delivery, state: "pending" };
-      return nextRun;
+      return isHardTerminalRunState(next) ? withoutActiveShells(nextRun) : nextRun;
     });
-    await eventPublisher.runState(store, metadata, previous, next, reason);
-    runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(persisted)));
+    // The write above is the commit; a failing notification must not undo it or the in-memory state.
+    try {
+      await eventPublisher.budget(store, metadata, persisted);
+      await eventPublisher.runState(store, metadata, previous, next, reason);
+      runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(persisted)));
+    } catch { /* best-effort */ }
   });
   const scheduler = new FairAgentScheduler(async ({ id, runId, tuiIndex, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
