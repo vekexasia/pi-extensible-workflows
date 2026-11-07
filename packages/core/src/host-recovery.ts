@@ -7,7 +7,7 @@ import { budgetUsage, budgetRelaxed, mergeBudget, resumeBudgetAllowed, validateB
 import { aliasDrift, createLaunchSnapshot, errorCode, errorText, jsonValue, object } from "./utils.js";
 import { LAUNCH_SNAPSHOT_IDENTITY_VERSION, WorkflowError, isExternallyEndedRunState, type AgentIdentity, type AgentResourcePolicy, type BudgetApprovalRequest, type JsonValue, type LaunchSnapshot, type ModelSpec, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowExtensionSettings, type WorkflowMetadata, type WorkflowRetryProvenance, type WorkflowWorktreeReference } from "./types.js";
 import { type WorkflowRegistryApi } from "./registry.js";
-import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
+import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, terminalOrPark, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { runWorkflow } from "./execution.js";
 import { createWorkflowFailureDiagnostics, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, failureDiagnosticsFrom, completionDeliveryFromStore, incompleteRetryPaths, markWorkflowFailureDiagnostics, workflowFailedAt, type CompletionDeliveryContext, type CompletionDeliveryResult } from "./host-delivery.js";
 
@@ -135,23 +135,32 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     await run.lifecycle.resume();
     const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions({ tool: (identifier, args, signal, identity) => toolForRun(run.store, run.lifecycle, context?.toolContext, identifier, args, signal, identity), shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: workflowAgentHandler(run.store, run.metadata, run.lifecycle, run.executor, run.store.cwd, run.store.runId), worktree: async (owner) => resolveWorktree(run.store, run.metadata, owner), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, foreground, hasUI ? ui : undefined), phase: phaseBridge(run.store, run.metadata, run.lifecycle), log: logBridge(run.store, run.lifecycle, run.metadata.name), evidence: evidenceBridge(run.store, run.lifecycle) }, run.store, runContext, registry, snapshot.settings.extensionSettings), controller.signal);
     run.execution = execution;
+    let completed: { value: JsonValue; resultPath: string; resultBytes: number } | undefined;
     const completion = execution.result.then(async (value) => {
       await scheduler.flush(run.store.runId);
       if (run.budget.hardExhausted) throw new WorkflowError("BUDGET_EXHAUSTED", "Budgeted work was attempted after hard exhaustion");
       const resultPath = await run.store.saveResult(value);
       const resultBytes = await run.store.resultBytes();
+      completed = { value, resultPath, resultBytes };
       await run.lifecycle.terminal("completed", "completed");
       await eventPublisher.runCompleted(run.store, run.metadata, resultPath);
-      return { value, resultPath, resultBytes };
+      return completed;
     }).catch(async (error: unknown) => {
       await scheduler.flush(run.store.runId);
+      // A terminal write that failed twice is retried as is, so a saved result never ends as failed.
+      const pending = run.lifecycle.unwritten;
+      if (pending?.state === "completed" && completed) {
+        await terminalOrPark(run.lifecycle, run.store.runId, "completed");
+        await eventPublisher.runCompleted(run.store, run.metadata, completed.resultPath);
+        return completed;
+      }
       const typed = error instanceof WorkflowError ? error : new WorkflowError(errorCode(error) ?? "INTERNAL_ERROR", errorText(error));
       if (!isExternallyEndedRunState(run.lifecycle.state) && typed.code !== "BUDGET_EXHAUSTED") {
         // Release before the failed state becomes visible so a retry issued on observing it is not rejected.
         const lineage = loaded.run.retry?.lineageRootRunId ?? run.store.runId;
         retryReservations.delete(lineage);
       }
-      if (!isExternallyEndedRunState(run.lifecycle.state)) await run.lifecycle.terminal(typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
+      if (pending || !isExternallyEndedRunState(run.lifecycle.state)) await terminalOrPark(run.lifecycle, run.store.runId, typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
       const persisted = await persistRunState(run.store, run.metadata, (current) => persistedFailure({ ...current, ...run.budget.snapshot() }, typed));
       const ended = run.lifecycle.state;
       const state = isExternallyEndedRunState(ended) ? ended : "failed";
@@ -166,6 +175,8 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
       trackDelivery(completion.then(async (result) => {
         await deliverTerminal(run.store, async () => (await completionDeliveryFromStore({ mode: "background", name: run.metadata.name, runId: run.store.runId, value: result.value, resultPath: result.resultPath, resultBytes: result.resultBytes, store: run.store, ...(context === undefined ? {} : { context: context.deliveryContext }) })).content);
       }, async (error: unknown) => {
+        // A parked run is not in a failure state on disk, so terminal delivery would drop the notice that tells the user how to repair it.
+        if (run.lifecycle.unwritten) { deliver(error instanceof Error ? error.message : String(error)); return; }
         const diagnostic = failureDiagnosticsFrom(error);
         await deliverTerminal(run.store, diagnostic ? formatWorkflowFailureDelivery(diagnostic) : formatWorkflowFailureDeliveryFallback(run.metadata.name, run.store.runId, run.store.directory, error), true);
       }));

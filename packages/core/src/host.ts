@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Type, type Api, type Model, type Static, type TSchema } from "@earendil-works/pi-ai";
 import { copyToClipboard, getAgentDir, ModelSelectorComponent, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
-import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
+import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, nextNamedOccurrence, terminalOrPark, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
 import { registerWorkflowNavigator, type WorkflowNavigatorDependencies } from "./host-navigator.js";
 import { acquireSessionLease, isPersistedRun, listPersistedSessionIds, listRunIds, RunStore, SessionLease, structuralPath as operationPath } from "./persistence.js";
@@ -746,7 +746,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       await eventPublisher.budget(store, metadata, persisted);
       await eventPublisher.runState(store, metadata, previous, next, reason);
       runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(persisted)));
-    } catch { /* best-effort */ }
+    } catch { //NOTE: deliberately silent: the state.json write above is committed, and a notification failure must neither undo it nor mask the run's own outcome.
+    }
   });
   const scheduler = new FairAgentScheduler(async ({ id, runId, tuiIndex, parentId, prompt, options, signal, setSteer }) => {
     const run = runs.get(runId);
@@ -1449,18 +1450,27 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const execution = runWorkflow(script, args, withWorkflowFunctions({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name), evidence: evidenceBridge(store, lifecycle) }, store, runContext, registry, settings.extensionSettings), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
+      let completed: { value: JsonValue; resultPath: string; resultBytes: number } | undefined;
       const finish = execution.result.then(async (value) => {
         await scheduler.flush(runId);
         if (budgetRuntime.hardExhausted) throw new WorkflowError("BUDGET_EXHAUSTED", "Budgeted work was attempted after hard exhaustion");
         const resultPath = await store.saveResult(value);
         const resultBytes = await store.resultBytes();
+        completed = { value, resultPath, resultBytes };
         await lifecycle.terminal("completed", "completed");
         await eventPublisher.runCompleted(store, checked.metadata, resultPath);
-        return { value, resultPath, resultBytes };
+        return completed;
       }).catch(async (error: unknown) => {
         await scheduler.flush(runId);
         const typed = error instanceof WorkflowError ? error : new WorkflowError("INTERNAL_ERROR", String(error));
-        if (!isExternallyEndedRunState(lifecycle.state)) await lifecycle.terminal(typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
+        // A terminal write that failed twice is retried as is, so a saved result never ends as failed.
+        const pending = lifecycle.unwritten;
+        if (pending?.state === "completed" && completed) {
+          await terminalOrPark(lifecycle, runId, "completed");
+          await eventPublisher.runCompleted(store, checked.metadata, completed.resultPath);
+          return completed;
+        }
+        if (pending || !isExternallyEndedRunState(lifecycle.state)) await terminalOrPark(lifecycle, runId, typed.code === "CANCELLED" ? "stopped" : typed.code === "BUDGET_EXHAUSTED" ? "budget_exhausted" : "failed", typed.code);
         const persisted = await persistRunState(store, checked.metadata, (current) => persistedFailure({ ...current, ...budgetRuntime.snapshot() }, typed));
         const ended = lifecycle.state;
         const state = isExternallyEndedRunState(ended) ? ended : "failed";
@@ -1483,6 +1493,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         deliveryController.trackDelivery(completion.then(async (result) => {
           await deliveryController.deliverTerminal(store, completionContent("background", result));
         }, async (error: unknown) => {
+          // A parked run is not in a failure state on disk, so terminal delivery would drop the notice that tells the user how to repair it.
+          if (lifecycle.unwritten) { deliver(pi, error instanceof Error ? error.message : String(error), !shuttingDown); return; }
           await deliveryController.deliverTerminal(store, deliverFailureContent(error), true);
         }));
         return { content: [{ type: "text" as const, text: JSON.stringify({ runId, state: "running" }) }], details: { runId, preview: `Started workflow ${runId}.` }, structuredContent: { runId, state: "running" } };

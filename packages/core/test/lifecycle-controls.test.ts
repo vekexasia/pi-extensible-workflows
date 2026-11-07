@@ -993,12 +993,13 @@ void test("interrupted lifecycle can cold-resume while completed and failed cann
   for (const state of ["completed", "failed"] as const) await assert.rejects(new RunLifecycle(state).resume(), /Cannot resume/);
 });
 type TerminalWriteTools = { workflow: (...args: unknown[]) => Promise<unknown>; stop: (...args: unknown[]) => Promise<unknown>; status: (...args: unknown[]) => Promise<unknown> };
-function terminalWriteHarness(prefix: string): { home: string; context: unknown; tools: TerminalWriteTools } {
+function terminalWriteHarness(prefix: string): { home: string; context: unknown; tools: TerminalWriteTools; messages: string[] } {
   const home = mkdtempSync(join(tmpdir(), prefix));
   const registered: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof registered)[number]) { registered.push(tool); }, registerCommand() {}, on() {}, sendMessage() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const messages: string[] = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof registered)[number]) { registered.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
   const find = (name: string) => { const tool = registered.find((entry) => entry.name === name); assert.ok(tool); return tool.execute; };
-  return { home, context: { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, tools: { workflow: find("workflow"), stop: find("workflow_stop"), status: find("workflow_status") } };
+  return { home, context: { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, tools: { workflow: find("workflow"), stop: find("workflow_stop"), status: find("workflow_status") }, messages };
 }
 const jsonOf = (result: unknown): Record<string, unknown> => JSON.parse((result as { content: [{ text: string }] }).content[0].text) as Record<string, unknown>;
 // Fails the first state.json write that carries `target`; later writes pass.
@@ -1105,7 +1106,7 @@ void test("a persistently failing terminal write still cancels the work, stop re
   } finally { failing.restore(); if (pid > 0 && alive(pid)) process.kill(pid, "SIGKILL"); }
 });
 void test("a run that ends while every terminal write fails is not left active and a later stop persists its terminal state", async () => {
-  const { home, context, tools } = terminalWriteHarness("pi-extensible-workflows-terminal-write-persistent-done-");
+  const { home, context, tools, messages } = terminalWriteHarness("pi-extensible-workflows-terminal-write-persistent-done-");
   const failing = failTerminalWrites();
   try {
     const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
@@ -1117,8 +1118,10 @@ void test("a run that ends while every terminal write fails is not left active a
     const result = jsonOf(await tools.stop("id", { runId }));
     assert.equal(result.stopped, false);
     const persisted = (await store.load()).run;
-    assert.ok(["completed", "failed", "stopped"].includes(persisted.state));
-    assert.equal(result.state, persisted.state);
+    assert.equal(persisted.state, "completed");
+    assert.equal(result.state, "completed");
+    assert.equal(JSON.parse(readFileSync(join(store.directory, "result.json"), "utf8")), 1);
+    assert.ok(messages.some((message) => message.includes("parked") && message.includes(`workflow_stop with runId ${runId}`)), messages.join("\n"));
     assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
   } finally { failing.restore(); }
 });

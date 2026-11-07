@@ -136,6 +136,14 @@ export class RunLifecycle {
   }
 }
 
+/** Writes the run's terminal state, or the one whose write already failed; a failure says the run is parked and how to repair it. */
+export async function terminalOrPark(lifecycle: RunLifecycle, runId: string, state: "completed" | "failed" | "stopped" | "interrupted" | "budget_exhausted", reason?: string): Promise<void> {
+  const target = lifecycle.unwritten ?? { state, reason: reason ?? state };
+  try { await lifecycle.terminal(target.state, target.reason); } catch (error) {
+    throw new WorkflowError("INTERNAL_ERROR", `Could not write the ${target.state} state to state.json for run ${runId}; the run is parked and workflow_stop with runId ${runId} persists the terminal state once state.json is writable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function safeEventError(error: unknown): WorkflowErrorShape {
   const code = errorCode(error) ?? "INTERNAL_ERROR";
   return { code, message: `Workflow execution failed (${code})` };
