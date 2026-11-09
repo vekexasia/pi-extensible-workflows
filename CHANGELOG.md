@@ -8,6 +8,7 @@
 ### New capabilities
 
 - New `worktreeSetup` workflow setting: an array of shell commands that runs in order inside each newly created workflow or subagent worktree, for example `["wt step copy-ignored --require-include"]` with worktrunk to copy Git-ignored local context listed in `.worktreeinclude`. Commands get `PIEWF_WORKTREE_PATH`, `PIEWF_SOURCE_ROOT`, and `PIEWF_WORKTREE_BRANCH`. A failing or 10-minute-timed-out command fails with `WORKTREE_FAILED` and removes the worktree. Existing, borrowed, and inherited worktrees never run it again (#291).
+- `reviewLoop` accepts `sharedReviewer: true` to keep one persistent reviewer handle across iterations, like the developer, instead of a fresh reviewer each iteration. Later review turns receive only the developer summary and rely on the reviewer's own transcript for the task and previous findings.
 
 ### Fixes
 

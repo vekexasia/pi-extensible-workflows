@@ -46,7 +46,7 @@ function reviewContext(
   const create = (options: Readonly<{ name: string; label?: string; role?: string }>) => {
     const handle = { name: options.name, label: options.label, role: options.role, sends: [] as string[] };
     handles.push(handle);
-    return { name: options.name, send: async (prompt: string) => { roles.push(options.role ?? "none"); handle.sends.push(prompt); return "implemented"; } };
+    return { name: options.name, send: async (prompt: string) => { roles.push(options.role ?? "none"); handle.sends.push(prompt); return options.role === "reviewer" ? reviews[reviewIndex++] ?? reviews.at(-1) : "implemented"; } };
   };
   const context = { agent: Object.assign(agent, { create }), prompt: (template: string, values: Readonly<Record<string, unknown>>) => template.replace(/\{(\w+)\}/g, (_match, key: string) => JSON.stringify(values[key])) } as unknown as WorkflowFunctionContext;
   return { context, roles, handles, reviewers };
@@ -92,6 +92,27 @@ void test("reviewLoop creates one developer handle and a fresh labelled reviewer
   assert.doesNotMatch(developer.sends[1] ?? "", /Implement the change/);
   assert.deepEqual(reviewers.map(({ label }) => label), ["Reviewer 1", "Reviewer 2"]);
   for (const { prompt } of reviewers) assert.match(prompt, /actual current implementation against the entire original task/);
+});
+
+void test("reviewLoop with sharedReviewer keeps one reviewer handle across iterations", async () => {
+  const { context, roles, handles, reviewers } = reviewContext([
+    { pass: false, findings: ["Fix the issue"] },
+    { pass: true, findings: [] },
+  ]);
+
+  const result = await reviewLoop.run({ task: "Implement the change", maxIterations: 3, sharedReviewer: true }, context);
+
+  assert.equal(result.pass, true);
+  assert.equal(result.iterations, 2);
+  assert.deepEqual(roles, ["developer", "reviewer", "developer", "reviewer"]);
+  assert.equal(reviewers.length, 0);
+  assert.deepEqual(handles.map(({ name, label, role }) => [name, label, role]), [["developer", "Developer", "developer"], ["reviewer", "Reviewer", "reviewer"]]);
+  const reviewer = handles[1];
+  assert.ok(reviewer);
+  assert.equal(reviewer.sends.length, 2);
+  assert.match(reviewer.sends[0] ?? "", /Implement the change/);
+  assert.match(reviewer.sends[1] ?? "", /addressed your previous findings/);
+  assert.doesNotMatch(reviewer.sends[1] ?? "", /Implement the change/);
 });
 
 void test("reviewLoop fails when the iteration limit is reached", async () => {

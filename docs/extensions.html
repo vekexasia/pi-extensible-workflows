@@ -84,7 +84,7 @@
         <div class="table-wrap"><table>
           <thead><tr><th>Piece</th><th>Name</th><th>Default</th></tr></thead>
           <tbody>
-            <tr><td>Function</td><td><code>reviewLoop</code></td><td>One persistent developer handle, then a fresh reviewer each iteration, until <code>pass</code> or <code>maxIterations</code> (default 5).</td></tr>
+            <tr><td>Function</td><td><code>reviewLoop</code></td><td>One persistent developer handle, then a fresh reviewer each iteration, until <code>pass</code> or <code>maxIterations</code> (default 5). With <code>sharedReviewer: true</code> the reviewer is also one persistent handle that continues its transcript across iterations.</td></tr>
             <tr><td>Alias</td><td><code>developer-model</code>, <code>reviewer-model</code>, <code>scout-model</code>, <code>oracle-model</code>, <code>researcher-model</code></td><td>Resolve to the launching session model when settings do not define them.</td></tr>
           </tbody>
         </table></div>

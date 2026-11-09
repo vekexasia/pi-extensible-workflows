@@ -361,6 +361,16 @@ void test("reviewLoop keeps one developer transcript, uses fresh reviewers, and 
   }
 });
 
+void test("reviewLoop with sharedReviewer continues one reviewer transcript", async () => {
+  const current = functionHost({ reviewLoop }, undefined, undefined, reviewerReplies([reviewSchemaReply(false, ["Fix A"]), reviewSchemaReply(true, [])]));
+  const { result, run } = await runFunction(current, "review-loop-shared", `return await reviewLoop({ task: "Build the widget", maxIterations: 5, sharedReviewer: true });`);
+  assert.deepEqual(result, { pass: true, iterations: 2, devResult: "reply-3", review: { pass: true, findings: [] } });
+  assert.deepEqual(run.agents.map((agent) => [labelOf(agent), agent.turn ?? null, agent.continuity ?? null]), [["Developer", 1, "fresh"], ["Reviewer", 1, "fresh"], ["Developer", 2, "continued"], ["Reviewer", 2, "continued"]]);
+  assert.match(current.prompts[1] ?? "", /Build the widget/);
+  assert.doesNotMatch(current.prompts[3] ?? "", /Build the widget/);
+  assert.match(current.openedInput[3] ?? "", /Build the widget/);
+});
+
 void test("reviewLoop returns the last failing review at the iteration limit", async () => {
   const current = functionHost({ reviewLoop }, undefined, undefined, reviewerReplies([reviewSchemaReply(false, ["Still wrong"])]));
   const { result, run } = await runFunction(current, "review-loop-limit", `return await reviewLoop({ task: "Build the widget", maxIterations: 2 });`);
