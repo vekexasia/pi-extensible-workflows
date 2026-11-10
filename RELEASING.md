@@ -12,17 +12,6 @@ each publishable workspace version equal, then create the matching `vX.Y.Z`
 tag. The publish workflow verifies every package version, runs the root checks,
 packs every publishable workspace, then publishes core, CLI, and Herdr.
 
-## 6.3.0 security exception
-
-The operator approved publishing 6.3.0 while deferring #354. Pi 1.0.0 still pins
-undici 8.10.2; no Pi fork or dependency remediation is included. Package
-verification warns and exempts only GHSA-4qv8-2p9j-2685,
-GHSA-f72v-6w45-q472 (moderate), and GHSA-xjj6-f33q-929c (high), in addition
-to the pre-existing brace-expansion exceptions. All other advisories still fail
-the gate. The undici exception applies only when the root version is 6.3.0 and
-expires at the next version. Keep #354 open until the dependency is actually fixed.
-A passing package gate does not mean `npm audit` is clean.
-
 ## Current optional roles verification gate
 
 Core and CLI must install and work without roles. Run `npm run check` and

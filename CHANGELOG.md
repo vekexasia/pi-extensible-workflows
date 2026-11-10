@@ -3,6 +3,7 @@
 
 ### Breaking changes
 
+- Pi 1.5.0 or later is required: the peer ranges are now `@earendil-works/pi-coding-agent`, `@earendil-works/pi-ai` and `@earendil-works/pi-tui` `>=1.5.0` and `typebox` `>=1.3.27`, and `@piewf/cli` installs Pi 1.5.0. Pi 1.5.0 ships undici 8.12.3, which fixes the undici advisories of #354. A portable bundle records the exact Pi version it was exported with, so a bundle exported with Pi 1.4 or older fails with `Bundle requires Pi <version>; found 1.5.0` after the upgrade: export it again with `piewf bundle` under Pi 1.5.
 - The extension no longer shows its own release notes notice at startup. Pi versions with earendil-works/pi#8790 show the package `CHANGELOG.md` under "Extension Updates" after an update of an npm or git install; older Pi versions, RPC mode, and extensions loaded by path show no release notes. `<agentDir>/pi-extensible-workflows/changelog-state.json` is no longer read or written and can be deleted.
 
 ### New capabilities
@@ -14,6 +15,8 @@
 
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
 - The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
+- Package verification no longer exempts any advisory: the brace-expansion and the 6.3.0 undici exceptions are removed, so a passing gate means `npm audit` is clean (#354).
+- The core package now depends on minimatch 11, which fixes GHSA-g3hv-75wg-m249 (denial of service through glob patterns).
 
 ## [6.3.0] - 2026-10-25
 

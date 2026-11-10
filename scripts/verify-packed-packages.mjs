@@ -96,26 +96,13 @@ try {
   `], { cwd: installRoot, encoding: "utf8", env: smokeEnv, timeout: 30_000 });
   if (importSmoke.error) throw importSmoke.error;
   if (importSmoke.status !== 0) throw new Error(`Generic API imports failed:\n${importSmoke.stderr}`);
-  // ponytail: npm audit has no per-advisory ignore. These brace-expansion advisories come from the
-  // npm-shrinkwrap.json of @earendil-works/pi-coding-agent@1.0.0, which pins 5.0.9 (fixed in 5.0.12)
-  // and cannot be overridden by a dependent. Drop them once Pi ships an updated shrinkwrap.
-  const ignoredAdvisories = new Set(["https://github.com/advisories/GHSA-q2hr-2g5m-vwhr", "https://github.com/advisories/GHSA-qhr7-859c-m2p7", "https://github.com/advisories/GHSA-6j4f-fj2g-mc7p"]);
-  // Release 6.3.0 explicitly defers Pi's undici 8.10.2 advisories (#354). This is not a fix;
-  // the exception expires with the next version, and every other advisory still blocks publication.
-  if (json(resolve(root, "package.json")).version === "6.3.0") {
-    for (const id of ["GHSA-4qv8-2p9j-2685", "GHSA-f72v-6w45-q472", "GHSA-xjj6-f33q-929c"]) {
-      ignoredAdvisories.add(`https://github.com/advisories/${id}`);
-    }
-    process.stderr.write("WARNING: release 6.3.0 accepts three known undici advisories (two moderate, one high); #354 remains open.\n");
-  }
   const audit = spawnSync("npm", ["audit", "--prefix", installRoot, "--omit=dev", "--json"], { encoding: "utf8", timeout: 60_000 });
   if (audit.error) throw audit.error;
   const report = JSON.parse(audit.stdout);
   if (report.error) throw new Error(`npm audit failed: ${JSON.stringify(report.error)}`);
   // Every vulnerable package traces back to an advisory object in some `via` list; string entries name other vulnerable packages.
   const advisories = Object.values(report.vulnerabilities ?? {}).flatMap(({ via }) => via.filter((entry) => typeof entry === "object"));
-  const reported = advisories.filter(({ url }) => !ignoredAdvisories.has(url));
-  if (reported.length) throw new Error(`npm audit found vulnerabilities:\n${[...new Set(reported.map(({ name, severity, url }) => `${name} (${severity}): ${url}`))].join("\n")}`);
+  if (advisories.length) throw new Error(`npm audit found vulnerabilities:\n${[...new Set(advisories.map(({ name, severity, url }) => `${name} (${severity}): ${url}`))].join("\n")}`);
 
   const localPackages = ["pi-extensible-workflows", "@piewf/herdr"].map((name) => packagePath(installRoot, name));
   const extensionCount = localPackages.reduce((count, directory) => count + strings(json(resolve(directory, "package.json")).pi?.extensions).length, 0);

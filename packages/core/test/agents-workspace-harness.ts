@@ -76,6 +76,7 @@ export class FakeTerminal implements Terminal {
   clearFromCursor(): void {}
   clearScreen(): void {}
   setTitle(): void {}
+  setProgramStatus(): void {}
   setProgress(): void {}
 }
 
