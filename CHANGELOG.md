@@ -45,6 +45,7 @@
 
 ### Fixes
 
+- Provider-error recovery now resolves a selected virtual `workflow/<alias>` model to its physical provider target before creating the retry session (#378).
 - Stopping a run (`workflow_stop`, `/workflow`) while one of its agents waits on the provider error dialog (Retry, Change model, Abort workflow) no longer waits for an answer: the attempt ends as cancelled and the dialog closes, as does Pi's searchable model picker opened from "Change model", so the next agent's provider error dialog is no longer held behind it.
 - The workflow widget no longer repaints every 125 ms: one tick a second, only while background work is live, moves its spinner and clocks, and Pi's renders on keystrokes and streamed tokens read no run file; an interrupted, paused, or budget-exhausted run, which nothing ticks, shows the runtime it recorded, as `/agents` does (#336).
 - A failed run releases its retry lineage before its `failed` state becomes visible, so a `workflow_retry` issued as soon as the state reads `failed` is no longer rejected with "An active retry already owns lineage".
