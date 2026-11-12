@@ -7,12 +7,13 @@ import test from "node:test";
 import { Type } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import type { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { createLocalPiSession, FairAgentScheduler, flushExtensionProviders, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
-import { AgentSession } from "@earendil-works/pi-coding-agent";
+import { captureRootSession, createLocalPiSession, FairAgentScheduler, flushExtensionProviders, localAgentTransport, prepareAgentSetupForInspection, WorkflowAgentExecutor, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type SessionInput } from "../src/agent-execution.js";
+import { AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { reachableTools, sumAccounting, WorkflowError, type AgentExecutionResult, type AgentToolCallProgress } from "../src/index.js";
 import type { AgentResourcePolicy, JsonSchema } from "../src/types.js";
 import type { RunStore } from "../src/persistence.js";
 import { testTransport, type TestPiSessionEvent } from "./test-transport.js";
+import { workflowRunContext } from "../src/host-runtime.js";
 import { executeTool, executeToolUnchecked, testTransportContext } from "./support.js";
 import { defaultWorkflowResultSchema } from "../src/runtime/workflow-result.js";
 type TestEventMessage = NonNullable<TestPiSessionEvent["message"]>;
@@ -71,7 +72,7 @@ async function createHangingLocalSession(extensionFactories: NonNullable<Session
     if (!address || typeof address === "string") throw new Error("fixture server did not open a TCP port");
     writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: `http://127.0.0.1:${String(address.port)}/v1`, api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", reasoning: false, input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
     writeFileSync(join(agentDir, "auth.json"), "{}");
-    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], sessionLabel: "hanging-session", ...(extensionFactories.length ? { extensionFactories } : {}) }, {} as never);
+    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], sessionLabel: "hanging-session", ...(extensionFactories.length ? { extensionFactories } : {}) }, testTransportContext);
     return { session, started, async close() { await closeServer(); rmSync(rootDir, { recursive: true, force: true }); } };
   } catch (error) {
     await closeServer().catch(() => undefined);
@@ -113,7 +114,7 @@ async function createRespondingLocalSession(extensionFactories: NonNullable<Sess
     if (!address || typeof address === "string") throw new Error("fixture server did not open a TCP port");
     writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { fixture: { baseUrl: `http://127.0.0.1:${String(address.port)}/v1`, api: "openai-completions", apiKey: "fixture", models: [{ id: "fixture-model", name: "Fixture model", reasoning: false, input: ["text"], contextWindow: 1_024, maxTokens: 128 }] } } }));
     writeFileSync(join(agentDir, "auth.json"), "{}");
-    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], sessionLabel: "responding-session", ...(extensionFactories.length ? { extensionFactories } : {}) }, {} as never);
+    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "fixture", model: "fixture-model" }, tools: [], sessionLabel: "responding-session", ...(extensionFactories.length ? { extensionFactories } : {}) }, testTransportContext);
     return { session, requests, async close() { await closeServer(); rmSync(rootDir, { recursive: true, force: true }); } };
   } catch (error) {
     await closeServer().catch(() => undefined);
@@ -1184,7 +1185,7 @@ void test("local session handoff reports resume lifecycle context", async () => 
   let session: Awaited<ReturnType<typeof localAgentTransport.createSession>> | undefined;
   let sessionFile: string | undefined;
   try {
-    session = await localAgentTransport.createSession(prepared, {} as never);
+    session = await localAgentTransport.createSession(prepared, testTransportContext);
     const locator = session.reference.locator;
     assert.equal(typeof locator, "object");
     sessionFile = locator && typeof locator === "object" && !Array.isArray(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
@@ -1208,7 +1209,7 @@ void test("local session can retry after a failed resume", async () => {
   let session: Awaited<ReturnType<typeof localAgentTransport.createSession>> | undefined;
   let sessionFile: string | undefined;
   try {
-    session = await localAgentTransport.createSession(prepared, {} as never);
+    session = await localAgentTransport.createSession(prepared, testTransportContext);
     const locator = session.reference.locator;
     sessionFile = locator && typeof locator === "object" && !Array.isArray(locator) && typeof locator.sessionFile === "string" ? locator.sessionFile : undefined;
     assert.ok(sessionFile);
@@ -1238,7 +1239,7 @@ void test("local session suspends after a concurrent resume completes", async ()
   let resume: Promise<void> | undefined;
   let suspend: Promise<void> | undefined;
   try {
-    session = await localAgentTransport.createSession(prepared, {} as never);
+    session = await localAgentTransport.createSession(prepared, testTransportContext);
     await session.suspendForHandoff?.();
     resume = session.resumeFromHandoff?.();
     await resumeStarted;
@@ -1266,7 +1267,7 @@ void test("local session emits resume then quit shutdown when terminal disposal 
   let dispose: Promise<void> | undefined;
   try {
     const prepared = { cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], sessionLabel: "overlapping-handoff-disposal", extensionFactories: [extensionFactory] } satisfies import("../src/types.js").PreparedAgentSession;
-    session = await localAgentTransport.createSession(prepared, {} as never);
+    session = await localAgentTransport.createSession(prepared, testTransportContext);
     suspend = session.suspendForHandoff?.();
     await shutdownStarted;
     dispose = session.dispose();
@@ -1293,7 +1294,7 @@ void test("local session rejects prompts while handoff teardown is in flight", a
   let session: Awaited<ReturnType<typeof localAgentTransport.createSession>> | undefined;
   let suspend: Promise<void> | undefined;
   try {
-    session = await localAgentTransport.createSession(prepared, {} as never);
+    session = await localAgentTransport.createSession(prepared, testTransportContext);
     suspend = session.suspendForHandoff?.();
     await shutdownReady;
     await assert.rejects(session.prompt("must not start"), (error: unknown) => error instanceof WorkflowError && error.code === "INTERNAL_ERROR");
@@ -1416,6 +1417,79 @@ void test("local session suspend and resume retain the session seam with a stubb
     }
   } finally {
     Object.defineProperty(AgentSession.prototype, "prompt", originalPrompt);
+  }
+});
+
+void test("local workflow sessions are published under their root host session while they exist", async () => {
+  const prepared = { cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], sessionLabel: "session-parents" } satisfies import("../src/types.js").PreparedAgentSession;
+  const map = new Map<string, string>();
+  const holder = globalThis as typeof globalThis & Record<symbol, Map<string, string> | undefined>;
+  const previous = holder[Symbol.for("pi.sessionParents")];
+  holder[Symbol.for("pi.sessionParents")] = map;
+  const child = await localAgentTransport.createSession(prepared, testTransportContext);
+  let grandchild: typeof child | undefined;
+  try {
+    assert.equal(map.get(child.reference.sessionId), "test-session");
+    // A nested run takes the child's id as its own run.sessionId; the grandchild still maps to the root.
+    grandchild = await localAgentTransport.createSession(prepared, { ...testTransportContext, run: captureRootSession({ ...testTransportContext.run, sessionId: child.reference.sessionId }) });
+    assert.equal(map.get(grandchild.reference.sessionId), "test-session");
+    // A persisted session keeps its id across suspend and resume, so the entry is the id the provider sends.
+    const originalPrompt = Object.getOwnPropertyDescriptor(AgentSession.prototype, "prompt");
+    assert.ok(originalPrompt);
+    AgentSession.prototype.prompt = function (text) {
+      const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      this.sessionManager.appendMessage({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+      this.sessionManager.appendMessage({ role: "assistant", content: [{ type: "text", text: "ok" }], api: "openai-responses", provider: "openai-codex", model: "gpt-5.6-sol", usage, stopReason: "stop", timestamp: Date.now() });
+      return Promise.resolve();
+    };
+    try { await grandchild.prompt("persist"); } finally { Object.defineProperty(AgentSession.prototype, "prompt", originalPrompt); }
+    await grandchild.suspendForHandoff?.();
+    assert.equal(map.size, 1);
+    await grandchild.resumeFromHandoff?.();
+    assert.equal(map.get(grandchild.reference.sessionId), "test-session");
+    await grandchild.dispose();
+    assert.equal(map.size, 1);
+  } finally {
+    await grandchild?.dispose();
+    await child.dispose();
+    holder[Symbol.for("pi.sessionParents")] = previous;
+  }
+  assert.equal(map.size, 0);
+});
+
+void test("a nested run keeps its root session after the child that started it is disposed", async () => {
+  const holder = globalThis as typeof globalThis & Record<symbol, Map<string, string> | undefined>;
+  const previous = holder[Symbol.for("pi.sessionParents")];
+  const map = new Map<string, string>();
+  holder[Symbol.for("pi.sessionParents")] = map;
+  const prepared = { cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol", thinking: "medium" }, tools: [], sessionLabel: "orphan" } satisfies import("../src/types.js").PreparedAgentSession;
+  try {
+    const child = await localAgentTransport.createSession(prepared, testTransportContext);
+    const nested = captureRootSession({ ...testTransportContext.run, sessionId: child.reference.sessionId });
+    const workflow = workflowRunContext("/repo", child.reference.sessionId, "nested-run", { name: "test" }, null, testTransportContext.signal);
+    await child.dispose();
+    for (const run of [nested, workflow]) {
+      const orphan = await localAgentTransport.createSession(prepared, { ...testTransportContext, run });
+      try { assert.deepEqual([...map.values()], ["test-session"]); } finally { await orphan.dispose(); }
+    }
+  } finally {
+    holder[Symbol.for("pi.sessionParents")] = previous;
+  }
+});
+
+void test("a session created without a host does not touch the parents map", async () => {
+  const manager = SessionManager.inMemory();
+  const key = Symbol.for("pi.sessionParents");
+  const map = new Map([[manager.getSessionId(), "other-host"]]);
+  const holder = globalThis as typeof globalThis & Record<symbol, Map<string, string> | undefined>;
+  const previous = holder[key];
+  holder[key] = map;
+  try {
+    const session = await createLocalPiSession({ cwd: process.cwd(), model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "no-host", sessionManager: manager });
+    await session.dispose();
+    assert.deepEqual([...map], [[manager.getSessionId(), "other-host"]]);
+  } finally {
+    holder[key] = previous;
   }
 });
 
@@ -2589,7 +2663,7 @@ void test("models registered by an extension are available to the agent", async 
   };
 
   try {
-    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "proxied", model: "proxied-model" }, tools: [], sessionLabel: "extension-provider", extensionFactories: [extensionFactory] }, {} as never);
+    const session = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "proxied", model: "proxied-model" }, tools: [], sessionLabel: "extension-provider", extensionFactories: [extensionFactory] }, testTransportContext);
     await session.dispose();
   } finally {
     rmSync(rootDir, { recursive: true, force: true });

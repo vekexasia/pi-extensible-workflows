@@ -5,7 +5,7 @@ import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { callUnchecked, contextualWorkflowAction, executeTool, executeToolCall, testExtensionContext, testExtensionContextFor, testExtensionApi } from "./support.js";
+import { callUnchecked, contextualWorkflowAction, executeTool, executeToolCall, testExtensionContext, testExtensionContextFor, testExtensionApi, testTransportContext } from "./support.js";
 import { Type, type TSchema } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import workflowExtension, { createLaunchSnapshot, FairAgentScheduler, formatNavigatorDashboard, formatNavigatorRun, loadingRegistry, localAgentTransport, persistActiveAgentAttempt, persistAgentAttempts, registerWorkflowExtension, runWorkflow, shellIdentityPath, structuralPath, WorkflowAgentExecutor, WorkflowError, type JsonValue, type PersistedRun, type WorkflowExtension } from "../src/index.js";
@@ -625,7 +625,7 @@ void test("production child discovery does not replace the frozen parent workflo
   let afterCreation: Awaited<ReturnType<typeof checkpoint>> | undefined;
   let afterDisposal: Awaited<ReturnType<typeof checkpoint>>;
   try {
-    child = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "registry-child", extensionFactories: [() => {}] }, {} as never);
+    child = await localAgentTransport.createSession({ cwd, agentDir, model: { provider: "openai-codex", model: "gpt-5.6-sol" }, tools: [], sessionLabel: "registry-child", extensionFactories: [() => {}] }, testTransportContext);
     afterCreation = await checkpoint();
   } finally {
     await child?.dispose();
