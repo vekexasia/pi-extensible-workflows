@@ -297,6 +297,8 @@ export interface SessionInput {
   sessionLabel: string;
   sessionPath?: string;
   sessionManager?: SessionManager;
+  /** Pi session that owns the run; the child is published under it in the `pi.sessionParents` map. */
+  hostSessionId?: string;
   agentDir?: string;
   customTools?: SessionCustomTools;
   resultTool?: ToolDefinition;

@@ -401,6 +401,16 @@ function discoveredSkillSelectors(selectors: readonly string[] | undefined, inve
   return selectors.filter((_selector, position) => !frozen.has(position));
 }
 
+const SESSION_PARENTS = Symbol.for("pi.sessionParents");
+/** Shared by every copy of the package in the process: child session id -> root host session id, read by the gateway provider. */
+function sessionParents(): Map<string, string> { return ((globalThis as typeof globalThis & Record<symbol, Map<string, string> | undefined>)[SESSION_PARENTS] ??= new Map<string, string>()); }
+const rootSessions = new WeakMap<object, string>();
+/** A nested run's sessionId is its parent child's; resolve the root now, because the map entry is gone once that child is disposed. */
+export function captureRootSession<T extends { sessionId: string }>(run: T): T {
+  const root = (globalThis as typeof globalThis & Record<symbol, Map<string, string> | undefined>)[SESSION_PARENTS]?.get(run.sessionId);
+  if (root !== undefined) rootSessions.set(run, root);
+  return run;
+}
 async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
@@ -480,6 +490,9 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
   }
   const effectiveSessionStartEvent = input.settings === undefined && sessionStartEvent === undefined ? undefined : { ...(sessionStartEvent ?? { type: "session_start" as const, reason: "startup" as const }), settings: input.settings ?? Object.freeze({}) };
   const { session } = await createAgentSession({ cwd: input.cwd, agentDir, modelRuntime, model, settingsManager, ...(input.model.thinking ? { thinkingLevel: input.model.thinking } : {}), tools, ...(customTools.length ? { customTools } : {}), ...(input.extensionFactories?.length ? { extensionFactories: input.extensionFactories } : {}), resourceLoader, ...(effectiveSessionStartEvent ? { sessionStartEvent: effectiveSessionStartEvent } : {}), sessionManager: manager });
+  const childId = manager.getSessionId();
+  const registered = input.hostSessionId !== undefined;
+  if (input.hostSessionId !== undefined) sessionParents().set(childId, input.hostSessionId);
   const nativeDispose = session.dispose.bind(session);
   let disposal: Promise<void> | undefined;
   const shutdown = (reason: LocalSessionShutdownReason, targetSessionFile?: string): Promise<void> => {
@@ -488,6 +501,7 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
       try {
         if (session.extensionRunner.hasHandlers("session_shutdown")) await session.extensionRunner.emit({ type: "session_shutdown", reason, ...(targetSessionFile === undefined ? {} : { targetSessionFile }) });
       } finally {
+        if (registered) sessionParents().delete(childId);
         nativeDispose();
       }
     })();
@@ -534,6 +548,8 @@ function notifyPiSessionEvent(notify: (event: WorkflowAgentSessionEvent) => Prom
 }
 export async function createLocalWorkflowAgentSession(prepared: Readonly<PreparedAgentSession>, context: Readonly<AgentTransportContext>): Promise<WorkflowAgentSession> {
   const input: SessionInput = {
+    // A context without a run (untyped direct transport callers) registers no parent, as before.
+    ...((context.run as Readonly<AgentTransportContext["run"]> | undefined)?.sessionId ? { hostSessionId: rootSessions.get(context.run) ?? context.run.sessionId } : {}),
     cwd: prepared.cwd, model: { ...prepared.model }, tools: [...prepared.tools] as SessionInput["tools"], sessionLabel: prepared.sessionLabel, ...(prepared.sessionPath ? { sessionPath: prepared.sessionPath } : {}),
     ...(prepared.agentDir ? { agentDir: prepared.agentDir } : {}), ...(prepared.customTools?.length ? { customTools: [...prepared.customTools] as NonNullable<SessionInput["customTools"]> } : {}),
     ...(prepared.resultTool ? { resultTool: prepared.resultTool } : {}), ...(prepared.systemPrompt === undefined ? {} : { systemPrompt: prepared.systemPrompt }),
