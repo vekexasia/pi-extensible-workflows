@@ -1973,22 +1973,55 @@ test("isolates concurrent real-git worktrees with the same name", async () => {
   fixtureGitSync(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   const storageDir = join(cwd, "subagents-storage");
   const pending = deferred();
+  const ready = deferred();
+  const finished = deferred();
   const references = [];
+  const notifications = [];
   const manager = createSubagentManager({
     storageDir,
     createExecutor(root) {
       return {
         async execute(_task, options) {
           references.push(await root.runStore.validateWorktree(options.worktreeOwner));
+          if (references.length === 2) ready.resolve();
           return pending.promise;
         },
       };
     },
+    notify(notification) {
+      notifications.push(notification);
+      // Failure before executor admission must fail readiness, not wait for its deadline.
+      if (notification.state === "failed") ready.resolve(notification);
+      // Notifications follow worktree cleanup and the terminal status write.
+      if (notifications.length === 2) finished.resolve();
+    },
   });
   const context = await managerContext(cwd);
+  let first;
+  let second;
+  async function awaitWorktreePhase(event, phase) {
+    let timer;
+    try {
+      // Real Git setup/cleanup competes with the default P20 runner. This is a test
+      // deadlock bound, not a one-second production worktree-creation SLA.
+      const failure = await Promise.race([event, new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for concurrent worktree ${phase}`)), 15_000);
+      })]);
+      if (failure) throw new Error(`Concurrent worktree ${phase} failed: ${JSON.stringify(failure)}`);
+    } catch (error) {
+      const diagnostics = await Promise.all([first, second].map(async ({ id }) => {
+        const status = await manager.inspect({ id }, context);
+        const failure = await readFile(join(storageDir, id, "failure.json"), "utf8").catch((error) => `unavailable: ${error.message}`);
+        return { id, status, failure };
+      }));
+      process.stderr.write(`Concurrent worktree ${phase} diagnostics: ${JSON.stringify(diagnostics)}\n`);
+      process.stderr.write(`Concurrent git worktrees:\n${fixtureGitSync(["worktree", "list", "--porcelain"], { cwd, encoding: "utf8", timeout: 2000 })}`);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   try {
-    let first;
-    let second;
     const originalDateNow = Date.now;
     Date.now = () => 1234;
     try {
@@ -1997,21 +2030,22 @@ test("isolates concurrent real-git worktrees with the same name", async () => {
     } finally {
       Date.now = originalDateNow;
     }
-    await waitFor(() => references.length === 2, async () => {
-      const diagnostics = await Promise.all([first, second].map(async ({ id }) => {
-        const status = await manager.inspect({ id }, context);
-        const failure = await readFile(join(storageDir, id, "failure.json"), "utf8").catch((error) => `unavailable: ${error.message}`);
-        return { id, status, failure };
-      }));
-      process.stderr.write(`Concurrent worktree diagnostics: ${JSON.stringify(diagnostics)}\n`);
-      process.stderr.write(`Concurrent git worktrees:\n${fixtureGitSync(["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" })}`);
-    });
+    await awaitWorktreePhase(ready.promise, "executor admission");
     assert.notEqual(references[0].cwd, references[1].cwd);
     assert.notEqual(references[0].branch, references[1].branch);
+    for (const reference of references) {
+      assert.equal((await stat(join(reference.cwd, ".git"))).isFile(), true);
+      assert.equal(fixtureGitSync(["branch", "--show-current"], { cwd: reference.cwd, encoding: "utf8" }).trim(), reference.branch);
+    }
     pending.resolve({ value: "done", attempts: [], cwd });
-    await waitFor(async () => (await manager.inspect({ id: first.id }, context)).state === "completed" && (await manager.inspect({ id: second.id }, context)).state === "completed");
-    await waitFor(async () => (await Promise.all(references.map(({ cwd: worktreeCwd }) => stat(worktreeCwd).then(() => true, () => false)))).every((exists) => !exists));
-    await waitFor(() => references.every(({ branch }) => fixtureGitSync(["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === ""));
+    await awaitWorktreePhase(finished.promise, "persisted completion and cleanup");
+    assert.deepEqual(notifications.map(({ id, state }) => ({ id, state })).sort((a, b) => a.id.localeCompare(b.id)), [first, second].map(({ id }) => ({ id, state: "completed" })).sort((a, b) => a.id.localeCompare(b.id)));
+    for (const { id } of [first, second]) {
+      assert.equal((await manager.inspect({ id }, context)).state, "completed");
+      assert.equal(JSON.parse(await readFile(join(storageDir, id, "status.json"), "utf8")).state, "completed");
+    }
+    assert.ok((await Promise.all(references.map(({ cwd: worktreeCwd }) => stat(worktreeCwd).then(() => true, () => false)))).every((exists) => !exists));
+    assert.ok(references.every(({ branch }) => fixtureGitSync(["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === ""));
   } finally {
     pending.resolve({ value: "cleanup", attempts: [], cwd });
     await manager.dispose();
