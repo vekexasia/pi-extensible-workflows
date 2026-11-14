@@ -14,6 +14,7 @@
 
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
 - The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
+- A workflow agent now refuses to run when the tool declarations its Pi session is about to send do not match the tools it was prepared with. The check reads the provider-facing declarations after extensions and loadout rules have run, so a tool the session lost no longer disappears silently: the attempt fails with `TOOL_LOADOUT_MISMATCH` before any model request, is neither retried nor moved to another model, and the child is disposed as usual. The diagnostic names the required, actual, missing and unexpected tools and the loaded extensions; it carries no prompt, tool input or credential.
 
 ## [6.3.0] - 2026-10-25
 

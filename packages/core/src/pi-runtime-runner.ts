@@ -345,6 +345,8 @@ export class PiRuntimeAgentRunner implements RuntimeAgentRunner {
         let promptError: unknown;
         try { await promptOnce(prompt, turnAlreadyStarted); }
         catch (error) { acceptAssistant(session?.getLastAssistant() ?? lastAssistant); promptFailed = true; promptError = error; }
+        // A prepared-declaration mismatch is not a provider failure: recovering would ask for a retry or a model the policy never allowed.
+        if (promptError instanceof WorkflowError && promptError.code === "TOOL_LOADOUT_MISMATCH") throw promptError;
         const handoffWasAttempted = runtimeHandoff.state !== "local-running";
         throwIfCancelled();
         throwIfProgressFailed();

@@ -3,7 +3,7 @@ import { copyFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Type } from "@earendil-works/pi-ai";
+import { Type, getCurrentTools } from "@earendil-works/pi-ai";
 import { Value } from "typebox/value";
 import { Compile } from "typebox/compile";
 import { createAgentSession, createCodemodeExtension, createMcpExtension, createToolSearchExtension, DefaultPackageManager, DefaultResourceLoader, defineTool, getAgentDir, ModelRuntime, SessionManager, SettingsManager, loadSkills, type InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -20,7 +20,12 @@ export interface PiSession {
   readonly model?: { provider: string; model?: string; id?: string } | undefined;
   readonly herdrModelContext?: HerdrModelContext;
   readonly thinkingLevel?: string;
-  readonly agent?: { state: { tools: readonly { name: string }[] }; subscribe?(listener: (event: unknown) => void | Promise<void>): () => void };
+  readonly agent?: {
+    state: { tools: readonly { name: string }[] };
+    /** Transcript conversion for the provider request; its output carries the tool declarations Pi will send. */
+    convertToLlm?(messages: readonly AgentMessage[]): readonly AgentMessage[] | Promise<readonly AgentMessage[]>;
+    subscribe?(listener: (event: unknown) => void | Promise<void>): () => void;
+  };
   readonly herdrResourcePaths?: { extensions: readonly string[]; skills: readonly string[] };
   readonly herdrContextFiles?: readonly import("./types.js").ContextFile[];
   preparePrompt(text: string): Promise<PiPromptInspection>;
@@ -62,6 +67,8 @@ import { agentIdentityPath } from "./execution.js";
 import type { RunStore } from "./persistence.js";
 type AgentExecutionRunStore = Pick<RunStore, "recordSystemPrompt" | "validateWorktree" | "worktree" | "snapshotWorktree"> & Partial<Pick<RunStore, "load" | "saveAgentConfiguration">>;
 const localToolTimingExtension = createToolTimingExtension();
+/** Errors no retry or model substitution can repair, so the attempt loop stops at the first one. */
+const TERMINAL_AGENT_ERRORS: ReadonlySet<WorkflowErrorCode> = new Set(["CANCELLED", "WORKTREE_FAILED", "RESUME_INCOMPATIBLE", "RESULT_INVALID", "TOOL_LOADOUT_MISMATCH"]);
 export type { AgentPreparation, AgentPreparationContext, PreparedAgentConfiguration, RegisteredAgentPreparationHook, AgentAccounting, AgentActivity, AgentInspectionMode, AgentSetup, AgentSetupContext, AgentSetupHook, AgentTransport, AgentTransportContext, PiRuntimeLaunchInfo, PreparedAgentSession, RegisteredAgentSetupHook, SessionInput, WorkflowAgentMessage, WorkflowAgentSession, WorkflowAgentSessionEvent, WorkflowAgentSessionReference, WorkflowAgentSessionState, WorkflowAgentSessionStats, WorkflowAgentTurnResult } from "./types.js";
 export interface AgentBudgetHooks {
   beforeAttempt(): void;
@@ -401,6 +408,54 @@ function discoveredSkillSelectors(selectors: readonly string[] | undefined, inve
   return selectors.filter((_selector, position) => !frozen.has(position));
 }
 
+/**
+ * `required` is the authorized concrete tool set; `allowed` adds the engine helpers a child may load beside it.
+ * Names outside both are unauthorized, and order or duplicates never matter.
+ */
+export interface ToolLoadoutPolicy { readonly required: readonly string[]; readonly allowed: readonly string[] }
+export interface ToolLoadoutContext { readonly label: string; readonly model: ModelSpec; readonly extensions: readonly string[] }
+const TOOL_LOADOUT_FAILURE = "Workflow agent tool loadout does not match the prepared tool policy";
+function toolNameList(names: readonly string[]): string { return names.length === 0 ? "none" : names.join(", "); }
+/** The tool declarations the request would carry, and how they differ from the prepared policy. */
+export function toolLoadoutDiff(policy: ToolLoadoutPolicy, messages: readonly { role: string }[]): { actual: string[]; missing: string[]; unexpected: string[] } {
+  const actual = getCurrentTools(messages).map(({ name }) => name);
+  const present = new Set(actual);
+  const allowed = new Set(policy.allowed);
+  return { actual, missing: [...new Set(policy.required)].filter((name) => !present.has(name)), unexpected: [...present].filter((name) => !allowed.has(name)) };
+}
+/** Throws TOOL_LOADOUT_MISMATCH when a request would drop an authorized tool declaration or add an unauthorized one. */
+export function assertPreparedTools(policy: ToolLoadoutPolicy, messages: readonly { role: string }[], context: ToolLoadoutContext): void {
+  const diff = toolLoadoutDiff(policy, messages);
+  if (diff.missing.length === 0 && diff.unexpected.length === 0) return;
+  throw new WorkflowError("TOOL_LOADOUT_MISMATCH", `Agent ${context.label} (${context.model.provider}/${context.model.model}) would send tools outside its prepared policy: required ${toolNameList(policy.required)}, actual ${toolNameList(diff.actual)}, missing ${toolNameList(diff.missing)}, unexpected ${toolNameList(diff.unexpected)}, extensions ${toolNameList(context.extensions)}`);
+}
+/**
+ * Checks the tool declarations of every provider-facing conversion, after extensions and loadout rules have run. Pi
+ * records a loop failure as an assistant error instead of rejecting the prompt, so the latch keeps the typed failure
+ * and the wrapped prompt rethrows it once the SDK settles. The error Pi sees stays fixed so retry heuristics cannot
+ * read the diagnostic as a transient provider failure.
+ */
+function installToolLoadoutGuard(session: PiSession, policy: ToolLoadoutPolicy, context: ToolLoadoutContext): void {
+  const agent = session.agent;
+  const convertToLlm = agent?.convertToLlm?.bind(agent);
+  if (!agent || !convertToLlm) throw new WorkflowError("INTERNAL_ERROR", "Pi session exposes no provider-facing tool declarations");
+  let mismatch: WorkflowError | undefined;
+  agent.convertToLlm = async (messages) => {
+    const converted = await convertToLlm(messages);
+    try { assertPreparedTools(policy, converted, context); }
+    catch (error) {
+      mismatch ??= error instanceof WorkflowError ? error : new WorkflowError("TOOL_LOADOUT_MISMATCH", errorText(error));
+      throw new Error(TOOL_LOADOUT_FAILURE, { cause: error });
+    }
+    return converted;
+  };
+  const prompt = session.prompt.bind(session);
+  session.prompt = async (...args: Parameters<typeof prompt>) => {
+    const settled = await prompt(...args).then(() => ({ failed: false as const }), (error: unknown) => ({ failed: true as const, error }));
+    if (mismatch) throw mismatch;
+    if (settled.failed) throw settled.error;
+  };
+}
 async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent?: WorkflowSessionStartEvent): Promise<LocalPiSessionHandle> {
   const agentDir = input.agentDir ?? getAgentDir();
   const systemPromptSource = workflowSystemPromptPath(input.cwd, agentDir, input.resourcePolicy?.projectTrusted ?? true);
@@ -494,13 +549,14 @@ async function createLocalPiSessionHandle(input: SessionInput, sessionStartEvent
     return disposal;
   };
   Object.assign(session, { dispose: () => shutdown("quit") });
+  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => extensionIdentity(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalPath(filePath)) };
   try {
     await session.bindExtensions({ mode: "print" });
+    installToolLoadoutGuard(session as unknown as PiSession, { required: input.tools, allowed: tools }, { label: input.sessionLabel, model: input.model, extensions: resourcePaths.extensions });
   } catch (error) {
     await shutdown("quit").catch(() => undefined);
     throw error;
   }
-  const resourcePaths = { extensions: resourceLoader.getExtensions().extensions.filter(({ path }) => !path.startsWith("<")).map(({ resolvedPath }) => extensionIdentity(resolvedPath)), skills: resourceLoader.getSkills().skills.map(({ filePath }) => canonicalPath(filePath)) };
   const resourceInspection = (): PiResourceInspection => {
     const extensions = resourceLoader.getExtensions();
     const skills = resourceLoader.getSkills();
@@ -1354,7 +1410,7 @@ export class WorkflowAgentExecutor {
           }
           throw errorWithAttempts(typed, attempts);
         }
-        if (attempt === maxAttempts || setupFailed || typed.code === "CANCELLED" || typed.code === "WORKTREE_FAILED" || typed.code === "RESUME_INCOMPATIBLE" || typed.code === "RESULT_INVALID") throw errorWithAttempts(typed, attempts);
+        if (attempt === maxAttempts || setupFailed || TERMINAL_AGENT_ERRORS.has(typed.code)) throw errorWithAttempts(typed, attempts);
         beforeRetry?.();
       }
     }

@@ -121,6 +121,7 @@ const WORKFLOW_ERROR_PROSE: Record<WorkflowErrorCode, (detail: string) => string
   RPC_LIMIT_EXCEEDED: (detail) => `The workflow communication data exceeded its size limit: ${detail}.`,
   SHELL_FAILED: (detail) => `The workflow shell command failed: ${detail}.`,
   TOOL_FAILED: (detail) => `The workflow tool call failed: ${detail}.`,
+  TOOL_LOADOUT_MISMATCH: (detail) => `The workflow agent was prepared with tools its provider request no longer carries: ${detail}.`,
   AGENT_TIMEOUT: (detail) => `The workflow agent timed out: ${detail}.`,
   AGENT_FAILED: (detail) => `The workflow agent failed: ${detail}.`,
   AGENT_RESULT_COLLECTED: (detail) => `The nested agent result was already collected: ${detail}.`,
