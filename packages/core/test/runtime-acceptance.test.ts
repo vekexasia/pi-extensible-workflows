@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -200,12 +200,12 @@ void test("cold resume replays completed agents by hidden structural identity", 
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-agent-replay-"));
   const cwd = join(home, "project");
   mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const script = `return withWorktree("recovery", async () => agent("must replay"));`;
   let replayPath = "";
   assert.equal(await runWorkflow(script, null, { agent: async (_prompt, _options, _signal, identity) => { replayPath = structuralPath("agent", ...identity.structuralPath, `callsite:${identity.callSite}`, `occurrence:${String(identity.occurrence)}`); return "original"; }, worktree: async () => ({ path: "/worktrees/recovery", branch: "recovery-branch" }) }).result, "original");
@@ -733,12 +733,12 @@ void test("registered function context exposes callback worktree references", as
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-reference-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown } }> }> = [];
   workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
   registerWorkflowExtension({
@@ -762,12 +762,12 @@ void test("shared worktree scopes persist one owner across production agents and
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-shared-worktree-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const extension: WorkflowExtension = {
     version: "1.0.0", headline: "Shared worktree",
     functions: {

@@ -1,8 +1,8 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import { canonicalPath } from "../src/paths.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,9 +11,92 @@ import { testExtensionApi } from "./support.js";
 
 function repository(): string {
   const directory = mkdtempSync(join(tmpdir(), "worktree-lease-"));
-  execFileSync("git", ["init", "-q", directory]);
-  execFileSync("git", ["-C", directory, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "initial"]);
+  initializeGitFixture(directory);
+  fixtureGitSync(["-C", directory, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "initial"]);
   return directory;
+}
+
+for (const mode of ["native", "registered"] as const) {
+  for (const request of ["subdirectory", "root", "alias"] as const) {
+    void test(`production subdirectory launch admits ${mode} lease requested through ${request}`, { timeout: 30_000 }, async () => {
+      const { PhysicalWorktreeLease, worktreeLeaseIdentity } = await import("../src/worktree-lease.js");
+      const cwd = repository(), home = mkdtempSync(join(tmpdir(), "subdirectory-lease-home-"));
+      const subdirectory = join(cwd, "tracked"), alias = `${cwd}-alias`;
+      mkdirSync(subdirectory);
+      writeFileSync(join(subdirectory, "input"), "tracked fixture\n");
+      fixtureGitSync(["-C", cwd, "add", "tracked/input"]);
+      fixtureGitSync(["-C", cwd, "commit", "-qm", "tracked subdirectory"]);
+      symlinkSync(cwd, alias);
+      const requested = request === "subdirectory" ? subdirectory : request === "root" ? cwd : join(alias, "tracked");
+      const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { value?: unknown } }> }> = [];
+      workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, undefined, undefined, home);
+      let entered = 0;
+      const observe = async (path: string, stdout: string) => {
+        entered += 1;
+        assert.equal(path, canonicalPath(cwd));
+        assert.equal(stdout.trim(), canonicalPath(cwd), "lease.shell runs at the documented worktree root, not the launch subdirectory");
+        assert.equal(existsSync(join(await physicalOwnerDirectory(cwd), "owner.json")), true);
+        await assert.rejects(PhysicalWorktreeLease.acquire(await worktreeLeaseIdentity(cwd), { runId: "competitor", sessionId: "same", executionId: "other" }), /physical owner/);
+        return { path, stdout };
+      };
+      const observeName = `subdirectoryLeaseObserve_${mode}_${request}`, registeredName = `subdirectoryLeaseRegistered_${mode}_${request}`;
+      registerWorkflowExtension({ version: "1.0.0", headline: "Subdirectory launch fixture", functions: {
+        [observeName]: { description: "Observe real native lease ownership", input: { type: "object" }, output: { type: "object" }, run: async (input) => {
+          assert.ok(typeof input.path === "string" && typeof input.stdout === "string");
+          return observe(input.path, input.stdout);
+        } },
+        [registeredName]: { description: "Lease the registered run cwd or an explicit root", input: { type: "object" }, output: { type: "object" }, run: async (input, ctx) => {
+          assert.equal(ctx.run.cwd, subdirectory);
+          assert.ok(typeof input.path === "string");
+          return ctx.withWorktreeLease(request === "subdirectory" ? ctx.run.cwd : input.path, async (lease) => {
+            assert.equal(Object.isFrozen(lease), true);
+            return observe(lease.path, (await lease.shell("pwd -P")).stdout);
+          });
+        } },
+      } });
+      const workflow = tools.find(({ name }) => name === "workflow"); assert.ok(workflow);
+      const context = { cwd: subdirectory, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "subdirectory" } };
+      try {
+        const script = mode === "registered" ? `return await ${registeredName}(args);` : `return await withWorktreeLease(args.path, async lease => { if (!Object.isFrozen(lease)) throw new Error('lease not frozen'); return await ${observeName}({path:lease.path,stdout:(await lease.shell('pwd -P')).stdout}); });`;
+        const result = await workflow.execute("start", { name: "subdirectory-lease", script, args: { path: requested }, foreground: true }, new AbortController().signal, undefined, context);
+        assert.deepEqual(result.details.value, { path: canonicalPath(cwd), stdout: `${canonicalPath(cwd)}\n` });
+        assert.equal(entered, 1, "the lease callback executes exactly once");
+        assert.equal(existsSync(await physicalOwnerDirectory(cwd)), false, "foreground completion waits for physical release");
+        const next = await PhysicalWorktreeLease.acquire(await worktreeLeaseIdentity(cwd), { runId: "next", sessionId: "same", executionId: "next" });
+        await next.verify();
+        await next.release();
+      } finally { rmSync(alias, { force: true }); rmSync(cwd, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const target of ["other repository", "linked sibling"] as const) {
+    void test(`production subdirectory launch rejects ${mode} lease in ${target} before writer`, { timeout: 30_000 }, async () => {
+      const cwd = repository(), other = target === "other repository" ? repository() : `${cwd}-linked`;
+      const home = mkdtempSync(join(tmpdir(), "subdirectory-restriction-home-")), subdirectory = join(cwd, "tracked");
+      mkdirSync(subdirectory);
+      writeFileSync(join(subdirectory, "input"), "tracked fixture\n");
+      fixtureGitSync(["-C", cwd, "add", "tracked/input"]);
+      fixtureGitSync(["-C", cwd, "commit", "-qm", "tracked subdirectory"]);
+      if (target === "linked sibling") fixtureGitSync(["-C", cwd, "worktree", "add", "-qb", "sibling", other]);
+      const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+      workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, undefined, undefined, home);
+      let entered = 0;
+      const writerName = `subdirectoryForbiddenWriter_${mode}_${target.replaceAll(" ", "_")}`, registeredName = `subdirectoryForbiddenLease_${mode}_${target.replaceAll(" ", "_")}`;
+      registerWorkflowExtension({ version: "1.0.0", headline: "Subdirectory restriction fixture", functions: {
+        [writerName]: { description: "Must never enter", input: { type: "object" }, output: { type: "null" }, run: async () => { entered += 1; return null; } },
+        [registeredName]: { description: "Reject an unrelated worktree", input: { type: "object" }, output: { type: "null" }, run: async (_input, ctx) => ctx.withWorktreeLease(other, async (lease) => { entered += 1; await lease.shell("touch forbidden"); return null; }) },
+      } });
+      const workflow = tools.find(({ name }) => name === "workflow"); assert.ok(workflow);
+      const context = { cwd: subdirectory, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "restriction" } };
+      try {
+        const script = mode === "registered" ? `return await ${registeredName}({});` : `return await withWorktreeLease(args, async lease => { await ${writerName}({}); await lease.shell('touch forbidden'); return null; });`;
+        await assert.rejects(workflow.execute("start", { name: "subdirectory-restriction", script, args: other, foreground: true }, new AbortController().signal, undefined, context), /launch root or active managed worktree/);
+        assert.equal(entered, 0);
+        assert.equal(existsSync(join(other, "forbidden")), false);
+        assert.equal(existsSync(await physicalOwnerDirectory(other)), false, "rejection must precede ownership acquisition");
+      } finally { rmSync(other, { recursive: true, force: true }); rmSync(cwd, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+    });
+  }
 }
 
 void test("production registered callbacks cannot overlap physical ownership in one session", { timeout: 30_000 }, async () => {
@@ -48,7 +131,7 @@ void test("physical leases collide through symlinks but linked worktrees remain 
   const diagnostics = { runId: "run", sessionId: "same", executionId: "execution" };
   try {
     symlinkSync(cwd, alias);
-    execFileSync("git", ["-C", cwd, "worktree", "add", "-qb", "linked", sibling]);
+    fixtureGitSync(["-C", cwd, "worktree", "add", "-qb", "linked", sibling]);
     const owner = await PhysicalWorktreeLease.acquire(await worktreeLeaseIdentity(cwd), diagnostics);
     try {
       await assert.rejects(PhysicalWorktreeLease.acquire(await worktreeLeaseIdentity(alias), diagnostics), /physical owner/);

@@ -1,3 +1,4 @@
+import { initializeGitFixture } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -21,7 +22,7 @@ function processes() {
 }
 function repo(): string {
   const cwd = mkdtempSync(join(tmpdir(), "lease-client-"));
-  execFileSync("git", ["init", "-q", cwd]);
+  initializeGitFixture(cwd);
   return cwd;
 }
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;

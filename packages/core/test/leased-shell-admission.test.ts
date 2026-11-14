@@ -1,6 +1,6 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -19,8 +19,8 @@ const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 void test("production leased recorded shell cannot self-deadlock pause behind phase persistence", { timeout: 15_000 }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "leased-shell-admission-")), cwd = join(home, "repo");
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "initial"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-qm", "initial"]);
   const marker = join(home, "forbidden-command"), phaseBlocked = barrier(), releasePhase = barrier();
   const verifiedShell = barrier(), shellSettled = barrier(), releaseCallback = barrier();
   const callbackSettled = barrier(), shellWaiting = barrier();
@@ -114,7 +114,7 @@ for (const mode of ["live", "broker"] as const) {
     const { executeShellCommand } = await import("../src/execution.js");
     const { spawn } = await import("node:child_process");
     const home = mkdtempSync(join(tmpdir(), "leased-live-admission-")), marker = join(home, "forbidden");
-    execFileSync("git", ["init", "-q", home]);
+    initializeGitFixture(home);
     const lifecycle = new RunLifecycle(), attempted = barrier(), controller = new AbortController();
     const ownership = new WorkflowOwnership(home, "paused", "s", controller.signal, executeShellCommand, undefined, {
       enter: (signal) => { attempted.release(); return lifecycle.enter(signal); },

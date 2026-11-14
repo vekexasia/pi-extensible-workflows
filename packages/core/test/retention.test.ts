@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -113,15 +113,15 @@ void test("retention deletes a borrower and its source after the borrowed worktr
   const paths = fixture();
   const repo = join(paths.home, "repo");
   mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "initial"]);
+  initializeGitFixture(repo);
+  fixtureGitSync(["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "initial"]);
   const repoPaths = { home: paths.home, cwd: repo };
   const owner = structuralPath("worktree", "named", "shared");
   const source = await makeRun(repoPaths, "source", "completed", NOW - 100 * DAY_MS);
   const original = await source.worktree(owner);
   const child = await makeRun(repoPaths, "child", "completed", NOW - 100 * DAY_MS, { parentRunId: source.runId });
   assert.deepEqual(await child.worktree(owner), original);
-  execFileSync("git", ["-C", repo, "worktree", "remove", "--force", original.path]);
+  fixtureGitSync(["-C", repo, "worktree", "remove", "--force", original.path]);
   const report = await retainTerminalRuns({ ...repoPaths, sessionId: "session", retention: { olderThanDays: 30 }, now: NOW });
   assert.deepEqual([...report.deleted].sort(), ["child", "source"]);
   assert.equal(existsSync(source.directory), false);

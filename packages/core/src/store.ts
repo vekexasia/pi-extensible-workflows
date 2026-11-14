@@ -16,6 +16,7 @@ import {
 import { atomicJson, atomicPrettyJson, atomicWriteFile, git, gitIdentity, json, runWorktreeSetup } from "./io.js";
 import { OwnedCommandCleanupError } from "./owned-process.js";
 import { managedGitCommand, runManagedWorktreeCommand } from "./managed-worktree.js";
+import { assertWorktreeGitEnvironment } from "./worktree-git-environment.js";
 import { validateWorktreeOptions } from "./validation.js";
 import { PhysicalWorktreeLease, sameWorktreeLeaseIdentity, worktreeLeaseIdentity, worktreeOwnerDirectory, type WorktreeLeaseIdentity } from "./worktree-lease.js";
 import { runsDirectory, canonicalPath, canonicalDescendantPath, safePart, structuralPath } from "./paths.js";
@@ -696,6 +697,7 @@ export class RunStore {
     if (typeof marker.owner !== "string" || typeof marker.base !== "string") return;
     const expected = this.expectedWorktree(marker.owner);
     if (marker.path !== expected.path || marker.branch !== expected.branch) return;
+    assertWorktreeGitEnvironment();
     assertCleanupProven(marker);
     if ((marker.fresh === true || marker.controlled === true) && !deleting) throw new WorkflowError("WORKTREE_FAILED", "Controlled or fresh worktree scope was already attempted; explicit recovery is required");
     const rootExists = await lstat(expected.path).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; });
@@ -757,6 +759,7 @@ export class RunStore {
     if (this.cleanupPoison) throw this.cleanupPoison;
     const options = validateWorktreeOptions(rawOptions);
     const controlled = rawOptions !== undefined;
+    if (controlled) assertWorktreeGitEnvironment();
     const ownedPlatform = process.platform === "darwin" || process.platform === "linux";
     // A signal requests conservative supervision, not ownership authority; only the external claim grants that.
     const supervised = controlled || signal !== undefined && ownedPlatform;

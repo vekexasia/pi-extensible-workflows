@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -669,12 +669,12 @@ void test("navigator bulk deletion protects borrowed worktrees of surviving retr
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-navigator-borrowed-worktree-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd);
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "tracked\n");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const snapshot = createLaunchSnapshot({ script: "return true", args: null, metadata: { name: "borrowed" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] });
   const source = new RunStore(cwd, "session", "failed-source", home);
   await source.create({ id: source.runId, workflowName: "source", cwd, sessionId: "session", state: "failed", agents: [], agentSessions: [] }, snapshot);

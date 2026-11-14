@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { executeShellCommand } from "./execution.js";
 import { LeaseCommandBroker } from "./lease-command.js";
 import { OwnedCommandCleanupError } from "./owned-process.js";
-import { sameFilesystemPath } from "./paths.js";
-import { PhysicalWorktreeLease, worktreeLeaseIdentity } from "./worktree-lease.js";
+import { PhysicalWorktreeLease, sameWorktreeLeaseIdentity, worktreeLeaseIdentity } from "./worktree-lease.js";
 import { WorkflowError, type ShellOptions, type LeaseCommandOptions, type ShellResult, type WorkflowBridge, type WorkflowLeaseBridge, type WorkflowWorktreeReference } from "./types.js";
 import { errorText } from "./utils.js";
 import { validateShellCommand, validateShellOptions, validateLeaseCommandOptions } from "./validation.js";
@@ -51,7 +50,7 @@ export class WorkflowOwnership implements WorkflowLeaseBridge {
     const entering = (async () => {
       const identity = await worktreeLeaseIdentity(path);
       const allowed = worktreeOwner ? (await this.resolveWorktree?.(worktreeOwner))?.path : this.root;
-      if (!allowed || !sameFilesystemPath(identity.path, allowed)) throw new WorkflowError("WORKTREE_FAILED", "Lease path must equal the launch root or active managed worktree");
+      if (!allowed || !sameWorktreeLeaseIdentity(identity, await worktreeLeaseIdentity(allowed))) throw new WorkflowError("WORKTREE_FAILED", "Lease path must equal the launch root or active managed worktree");
       const owner = await PhysicalWorktreeLease.acquire(identity, { runId: this.runId, sessionId: this.sessionId, executionId: this.#executionId });
       const scope: Scope = { id: randomUUID(), owner, controller: new AbortController(), pending: new Set(), open: true, retain: false };
       this.#scopes.set(scope.id, scope);

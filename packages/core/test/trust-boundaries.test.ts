@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,13 +23,13 @@ void test("forged worktree metadata cannot redirect cleanup", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-trust-worktree-"));
   const repo = join(home, "repo");
   mkdirSync(repo);
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(repo);
+  fixtureGitSync(["-C", repo, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", repo, "config", "user.email", "test@example.com"]);
   writeFileSync(join(repo, "tracked.txt"), "initial");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
-  execFileSync("git", ["-C", repo, "branch", "keep-me"]);
+  fixtureGitSync(["-C", repo, "add", "."]);
+  fixtureGitSync(["-C", repo, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", repo, "branch", "keep-me"]);
 
   const store = new RunStore(repo, "session", "run", home);
   await store.create({ id: "run", workflowName: "trust", cwd: repo, sessionId: "session", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return true;", args: null, metadata: { name: "trust" }, settings: { concurrency: 1 }, models: ["openai/gpt"], tools: [], agentConfigurations: {}, schemas: [] }));
@@ -39,7 +39,7 @@ void test("forged worktree metadata cannot redirect cleanup", async () => {
   await assert.rejects(store.delete(true), (error: unknown) => error instanceof WorkflowError && error.code === "WORKTREE_FAILED");
   assert.equal(existsSync(repo), true);
   assert.equal(existsSync(owned.path), true);
-  assert.doesNotThrow(() => execFileSync("git", ["-C", repo, "rev-parse", "--verify", "keep-me"], { stdio: "ignore" }));
+  assert.doesNotThrow(() => fixtureGitSync(["-C", repo, "rev-parse", "--verify", "keep-me"], { stdio: "ignore" }));
 });
 
 void test("accepted shell stays host-trusted while oversized RPC results are never journaled", async () => {

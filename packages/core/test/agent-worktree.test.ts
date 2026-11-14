@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +8,12 @@ import { worktreeDiff, worktreeHasUntracked } from "../src/agent-worktree.js";
 
 const roots: string[] = [];
 after(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
-const git = (cwd: string, ...args: string[]): string => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+const git = (cwd: string, ...args: string[]): string => fixtureGitSync(["-C", cwd, ...args], { encoding: "utf8" }).trim();
 
 function repository(): { path: string; base: string } {
   const path = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-worktree-"));
   roots.push(path);
-  git(path, "init", "-q");
+  initializeGitFixture(path);
   git(path, "config", "user.name", "test");
   git(path, "config", "user.email", "test@example.com");
   writeFileSync(join(path, "a.txt"), "one\n");

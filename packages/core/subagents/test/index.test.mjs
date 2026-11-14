@@ -1,6 +1,6 @@
+import { initializeGitFixture, fixtureGitSync } from "../../dist/test/git-fixture.js";
 /* global setTimeout, clearTimeout, setImmediate, structuredClone */
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import fsPromises, { mkdtemp, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
@@ -1110,12 +1110,12 @@ test("subagent worktrees receive the effective worktreeSetup and run it on creat
   }
 
   const repo = await mkdtemp(join(tmpdir(), "subagents-worktree-setup-repo-"));
-  execFileSync("git", ["init", "-q", repo]);
-  execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", repo, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(repo);
+  fixtureGitSync(["-C", repo, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", repo, "config", "user.email", "test@example.com"]);
   await writeFile(join(repo, ".gitignore"), "marker.txt\n");
-  execFileSync("git", ["-C", repo, "add", "."]);
-  execFileSync("git", ["-C", repo, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", repo, "add", "."]);
+  fixtureGitSync(["-C", repo, "commit", "-qm", "initial"]);
   const home = await mkdtemp(join(tmpdir(), "subagents-worktree-setup-home-"));
   const adapter = createRunStoreWorktreeAdapter(home);
   const handle = await adapter.create({ cwd: repo, sessionId: "session", runId: "run-setup", name: "setup", owner: "worktree/named/setup" }, ["echo created > marker.txt"]);
@@ -1898,9 +1898,9 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-"));
   await writeFile(join(cwd, "README.md"), "base\n");
   await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
-  execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
-  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+  initializeGitFixture(cwd);
+  fixtureGitSync(["add", "README.md", ".gitignore"], { cwd });
+  fixtureGitSync(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   let worktreePath;
   let branch;
   const manager = createSubagentManager({
@@ -1922,7 +1922,7 @@ test("uses RunStore worktrees and removes them after a standalone run", async ()
     await waitFor(async () => (await manager.inspect({ id: launched.id }, context)).state === "completed");
     assert.equal(typeof worktreePath, "string");
     await waitFor(async () => typeof worktreePath === "string" && !(await stat(worktreePath).then(() => true, () => false)));
-    await waitFor(() => typeof branch === "string" && execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
+    await waitFor(() => typeof branch === "string" && fixtureGitSync(["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === "");
   } finally {
     await manager.dispose();
     await rm(cwd, { recursive: true, force: true });
@@ -1936,9 +1936,9 @@ test("standalone worktree preparation sees the launch project root and dynamic a
   await writeFile(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ modelAliases: { fixed: "fixture/model", shared: "fixture/model" } }));
   await writeFile(join(cwd, "README.md"), "base\n");
   await writeFile(join(cwd, ".gitignore"), "subagents-storage/\nagent/\n");
-  execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
-  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+  initializeGitFixture(cwd);
+  fixtureGitSync(["add", "README.md", ".gitignore"], { cwd });
+  fixtureGitSync(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   const observed = [];
   registerWorkflowExtension({ version: "1.0.0", headline: "Standalone context observer", modelAliases: { dynamic: { resolve: () => "fixture/cheap" }, shared: { resolve: () => "fixture/cheap" } }, agentPreparationHooks: { observe: { prepare(_configuration, context) {
     observed.push({ cwd: context.cwd, projectCwd: context.projectCwd, dynamicModelAliasNames: context.defaults.dynamicModelAliasNames, modelAliases: { ...context.defaults.modelAliases } });
@@ -1968,9 +1968,9 @@ test("isolates concurrent real-git worktrees with the same name", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "subagents-runstore-worktree-concurrent-"));
   await writeFile(join(cwd, "README.md"), "base\n");
   await writeFile(join(cwd, ".gitignore"), "subagents-storage/\n");
-  execFileSync("git", ["init", "-q"], { cwd });
-  execFileSync("git", ["add", "README.md", ".gitignore"], { cwd });
-  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+  initializeGitFixture(cwd);
+  fixtureGitSync(["add", "README.md", ".gitignore"], { cwd });
+  fixtureGitSync(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   const storageDir = join(cwd, "subagents-storage");
   const pending = deferred();
   const references = [];
@@ -2004,14 +2004,14 @@ test("isolates concurrent real-git worktrees with the same name", async () => {
         return { id, status, failure };
       }));
       process.stderr.write(`Concurrent worktree diagnostics: ${JSON.stringify(diagnostics)}\n`);
-      process.stderr.write(`Concurrent git worktrees:\n${execFileSync("git", ["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" })}`);
+      process.stderr.write(`Concurrent git worktrees:\n${fixtureGitSync(["worktree", "list", "--porcelain"], { cwd, encoding: "utf8" })}`);
     });
     assert.notEqual(references[0].cwd, references[1].cwd);
     assert.notEqual(references[0].branch, references[1].branch);
     pending.resolve({ value: "done", attempts: [], cwd });
     await waitFor(async () => (await manager.inspect({ id: first.id }, context)).state === "completed" && (await manager.inspect({ id: second.id }, context)).state === "completed");
     await waitFor(async () => (await Promise.all(references.map(({ cwd: worktreeCwd }) => stat(worktreeCwd).then(() => true, () => false)))).every((exists) => !exists));
-    await waitFor(() => references.every(({ branch }) => execFileSync("git", ["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === ""));
+    await waitFor(() => references.every(({ branch }) => fixtureGitSync(["branch", "--list", branch], { cwd, encoding: "utf8" }).trim() === ""));
   } finally {
     pending.resolve({ value: "cleanup", attempts: [], cwd });
     await manager.dispose();

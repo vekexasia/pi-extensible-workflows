@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
@@ -101,12 +101,12 @@ void test("an action that steps aside loads its run once and the session's other
 
 async function agentFixture(actions: Readonly<Record<string, AgentAttemptAction>> = {}): Promise<{ f: Fixture; store: RunStore; branch: string; path: string }> {
   const f = fixture({ registry: { agentAttemptActions: () => actions } as unknown as WorkflowActionDependencies["registry"] });
-  execFileSync("git", ["init", "-q", f.cwd]);
-  execFileSync("git", ["-C", f.cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", f.cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(f.cwd);
+  fixtureGitSync(["-C", f.cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", f.cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(f.cwd, "tracked.txt"), "tracked\n");
-  execFileSync("git", ["-C", f.cwd, "add", "."]);
-  execFileSync("git", ["-C", f.cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", f.cwd, "add", "."]);
+  fixtureGitSync(["-C", f.cwd, "commit", "-qm", "initial"]);
   const store = await createRun(f, "agents", "completed", { agents: [agentRecord("agent-1", { prompt: "PROMPT", systemPrompt: "SYSTEM", resultPath: "agent/result", worktreeOwner: "owner" }), agentRecord("plain")] });
   await store.complete("agent/result", { answer: 42 });
   const { branch, path } = await store.worktree("owner");

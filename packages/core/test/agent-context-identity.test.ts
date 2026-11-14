@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,9 +26,9 @@ function fixture(t: TestContext, git: boolean): { home: string; cwd: string; age
   mkdirSync(cwd);
   if (git) {
     writeFileSync(join(cwd, "README.md"), "base\n");
-    execFileSync("git", ["init", "-q"], { cwd });
-    execFileSync("git", ["add", "README.md"], { cwd });
-    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
+    initializeGitFixture(cwd);
+    fixtureGitSync(["add", "README.md"], { cwd });
+    fixtureGitSync(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base"], { cwd });
   }
   t.after(() => { rmSync(home, { recursive: true, force: true }); loadingRegistry().freeze(); });
   return { home, cwd, agentDir };

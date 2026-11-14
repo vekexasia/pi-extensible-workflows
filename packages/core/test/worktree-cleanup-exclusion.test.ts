@@ -1,5 +1,6 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import childProcess, { execFileSync } from "node:child_process";
+import childProcess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
@@ -15,11 +16,11 @@ import { executeShellCommand } from "../src/execution.js";
 import { worktreeLeaseIdentity, worktreeOwnerDirectory } from "../src/worktree-lease.js";
 
 const barrier = () => { let release!: () => void; const reached = new Promise<void>((resolve) => { release = resolve; }); return { reached, release }; };
-const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+const git = (cwd: string, ...args: string[]) => fixtureGitSync(["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 async function fixture() {
   const home = mkdtempSync(join(tmpdir(), "cleanup-exclusion-")), cwd = join(home, "repo");
-  git(home, "init", "-q", cwd); git(cwd, "config", "user.name", "Fixture"); git(cwd, "config", "user.email", "fixture@example.invalid"); git(cwd, "commit", "--allow-empty", "-qm", "initial");
+  initializeGitFixture(cwd); git(cwd, "config", "user.name", "Fixture"); git(cwd, "config", "user.email", "fixture@example.invalid"); git(cwd, "commit", "--allow-empty", "-qm", "initial");
   const store = new RunStore(cwd, "s", "r", home);
   await store.create({ id: "r", sessionId: "s", cwd, workflowName: "exclusion", state: "failed", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return null;", args: null, metadata: { name: "exclusion" }, settings: DEFAULT_SETTINGS, models: [], tools: [], agentConfigurations: {}, schemas: [] }));
   const gate = await store.worktree("gate", { setup: "none" });

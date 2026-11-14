@@ -4,6 +4,7 @@ import { lstat, mkdir, open, readFile, rmdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { OwnedCommandCleanupError } from "./owned-process.js";
+import { assertWorktreeGitEnvironment } from "./worktree-git-environment.js";
 import { canonicalPath } from "./paths.js";
 import { WorkflowError } from "./types.js";
 import { errorText, isNodeError, object } from "./utils.js";
@@ -15,6 +16,7 @@ class AdmissionRejected extends WorkflowError { constructor(message: string) { s
 export interface WorktreeLeaseIdentity { path: string; gitDirectory: string; commonGitDirectory: string }
 const options = { encoding: "utf8" as const, maxBuffer: 64 * 1024 };
 export async function worktreeLeaseIdentity(path: string): Promise<WorktreeLeaseIdentity> {
+  assertWorktreeGitEnvironment();
   try {
     const cwd = canonicalPath(path);
     const root = await git("git", ["-C", cwd, "rev-parse", "--show-toplevel"], options);
@@ -34,6 +36,7 @@ async function exists(path: string): Promise<boolean> {
 }
 /** Cleanup may corroborate a missing checkout through its still-existing Git backlink, never a guessed metadata name. */
 export async function validateWorktreeLeaseIdentity(identity: WorktreeLeaseIdentity, purpose: "execution" | "cleanup"): Promise<void> {
+  assertWorktreeGitEnvironment();
   if (await exists(identity.path)) {
     if (!sameWorktreeLeaseIdentity(await worktreeLeaseIdentity(identity.path), identity)) throw new AdmissionRejected("Worktree resource identity changed before admission");
   } else {
@@ -51,6 +54,7 @@ export class PhysicalWorktreeLease {
   private constructor(readonly identity: WorktreeLeaseIdentity, readonly directory: string, private readonly nonce: string, private readonly inode: number) {}
   static async acquire(identity: WorktreeLeaseIdentity, diagnostics: { runId: string; sessionId: string; executionId: string }, purpose: "execution" | "cleanup" = "execution"): Promise<PhysicalWorktreeLease> {
     if (purpose === "execution" && process.platform !== "darwin" && process.platform !== "linux") throw new WorkflowError("WORKTREE_FAILED", "Worktree ownership requires macOS or Linux supervision");
+    assertWorktreeGitEnvironment();
     const namespace = join(identity.commonGitDirectory, "pi-worktree-owners");
     await mkdir(namespace, { recursive: true, mode: 0o700 });
     if (canonicalPath(namespace) !== namespace || !(await lstat(namespace)).isDirectory()) throw new WorkflowError("WORKTREE_FAILED", "Worktree owner namespace is not a canonical directory");

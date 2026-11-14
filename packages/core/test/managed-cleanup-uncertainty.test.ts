@@ -1,6 +1,7 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import assert from "node:assert/strict";
-import childProcess, { execFileSync } from "node:child_process";
+import childProcess from "node:child_process";
 import fsPromises from "node:fs/promises";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -16,11 +17,11 @@ import { WorkflowOwnership } from "../src/ownership.js";
 import { worktreeOwnerDirectory } from "../src/worktree-lease.js";
 import { WORKFLOW_CAPABILITIES } from "../src/types.js";
 
-const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+const git = (cwd: string, ...args: string[]) => fixtureGitSync(["-C", cwd, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 async function fixture(setup: readonly string[] = ["exit 7"]) {
   const home = mkdtempSync(join(tmpdir(), "cleanup-uncertainty-")), cwd = join(home, "repo");
-  git(home, "init", "-q", cwd); git(cwd, "config", "user.name", "Fixture"); git(cwd, "config", "user.email", "fixture@example.invalid");
+  initializeGitFixture(cwd); git(cwd, "config", "user.name", "Fixture"); git(cwd, "config", "user.email", "fixture@example.invalid");
   git(cwd, "commit", "--allow-empty", "-qm", "initial");
   const tip = git(cwd, "rev-parse", "HEAD"), store = new RunStore(cwd, "s", "r", home);
   await store.create({ id: "r", sessionId: "s", cwd, workflowName: "cleanup", state: "running", agents: [], agentSessions: [] }, createLaunchSnapshot({ script: "return null;", args: null, metadata: { name: "cleanup" }, settings: { ...DEFAULT_SETTINGS, worktreeSetup: setup }, models: [], tools: [], agentConfigurations: {}, schemas: [] }));

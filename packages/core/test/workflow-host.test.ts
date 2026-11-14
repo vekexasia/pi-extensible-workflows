@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -399,12 +399,12 @@ void test("failed retry children retain inherited and newly created named worktr
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-retry-named-union-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd);
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "tracked");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const script = `return parallel("named", { inherited: () => withWorktree("inherited", async () => agent("inherited")), fresh: () => withWorktree("fresh", async () => agent("fresh")) });`;
   const snapshot = createLaunchSnapshot({ script, args: null, metadata: { name: "named-retry", description: "named retry" }, settings: DEFAULT_SETTINGS, models: ["openai/gpt"], tools: ["agent"], agentConfigurations: {}, schemas: [] });
   const root = new RunStore(cwd, "session", "root", home);

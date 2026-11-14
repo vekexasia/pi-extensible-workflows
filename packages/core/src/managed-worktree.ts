@@ -1,4 +1,5 @@
 import { executeOwnedCommand } from "./owned-process.js";
+import { assertWorktreeGitEnvironment } from "./worktree-git-environment.js";
 import { WorkflowError, type ShellOptions } from "./types.js";
 
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
@@ -6,6 +7,8 @@ export function managedGitCommand(args: readonly string[]): string { return ["gi
 
 /** Materialization and setup use the same quiescent process boundary as leased commands, without Git policy overrides. */
 export async function runManagedWorktreeCommand(command: string, cwd: string, signal: AbortSignal, env?: Record<string, string>): Promise<string> {
+  assertWorktreeGitEnvironment();
+  if (env) assertWorktreeGitEnvironment(env);
   const stdout: Buffer[] = [], stderr: Buffer[] = [];
   let bytes = 0;
   const options: ShellOptions = { timeoutMs: 10 * 60 * 1000, ...(env ? { env } : {}) };

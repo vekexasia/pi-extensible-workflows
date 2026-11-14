@@ -1,3 +1,4 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -11,10 +12,10 @@ import { DEFAULT_SETTINGS } from "../src/settings.js";
 import { PhysicalWorktreeLease, worktreeLeaseIdentity } from "../src/worktree-lease.js";
 
 type Controls = import("../src/types.js").WorkflowWorktreeOptions;
-const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
+const git = (cwd: string, ...args: string[]) => fixtureGitSync(["-C", cwd, ...args], { encoding: "utf8" }).trim();
 async function fixture(setup: readonly string[] = []) {
   const home = mkdtempSync(join(tmpdir(), "managed-controls-")), cwd = join(home, "repo");
-  git(home, "init", "-q", cwd);
+  initializeGitFixture(cwd);
   git(cwd, "config", "user.name", "Fixture"); git(cwd, "config", "user.email", "fixture@example.invalid");
   writeFileSync(join(cwd, ".gitignore"), ".env\nsetup-head\n"); writeFileSync(join(cwd, "input"), "A");
   git(cwd, "add", "."); git(cwd, "commit", "-qm", "A"); const a = git(cwd, "rev-parse", "HEAD");

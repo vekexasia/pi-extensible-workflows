@@ -1,5 +1,5 @@
+import { initializeGitFixture, fixtureGitSync } from "./git-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -40,12 +40,12 @@ void test("orchestration lifecycle events cover phase, worktree, retry, checkpoi
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-orchestration-events-"));
   const cwd = join(home, "repo");
   mkdirSync(cwd);
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
   writeFileSync(join(cwd, "tracked.txt"), "tracked");
-  execFileSync("git", ["-C", cwd, "add", "."]);
-  execFileSync("git", ["-C", cwd, "commit", "-qm", "initial"]);
+  fixtureGitSync(["-C", cwd, "add", "."]);
+  fixtureGitSync(["-C", cwd, "commit", "-qm", "initial"]);
   const events: Array<{ channel: string; data: unknown }> = [];
   let sessions = 0;
   const createSession = async (): Promise<TestPiSession> => {
@@ -752,10 +752,10 @@ void test("pause blocks shell work at both shared and worktree operation boundar
   const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-pause-shell-"));
   const cwd = join(home, "project");
   mkdirSync(cwd, { recursive: true });
-  execFileSync("git", ["init", "-q", cwd]);
-  execFileSync("git", ["-C", cwd, "config", "user.name", "test"]);
-  execFileSync("git", ["-C", cwd, "config", "user.email", "test@example.com"]);
-  execFileSync("git", ["-C", cwd, "commit", "--allow-empty", "-qm", "initial"]);
+  initializeGitFixture(cwd);
+  fixtureGitSync(["-C", cwd, "config", "user.name", "test"]);
+  fixtureGitSync(["-C", cwd, "config", "user.email", "test@example.com"]);
+  fixtureGitSync(["-C", cwd, "commit", "--allow-empty", "-qm", "initial"]);
   const runBoundary = async (name: string, script: string, startPath: string, releasePath: string, afterPath: string) => {
     const sessionId = name;
     const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
