@@ -1,12 +1,13 @@
+import type { WorkflowOwnership } from "./ownership.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor } from "./agent-execution.js";
 import { type WorkflowBudgetRuntime } from "./budget.js";
 import { type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
 import { createWorkflowTools, encoded, FUNCTION_HANDLE_PREFIX } from "./execution.js";
 import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonDigest, jsonValue, object } from "./utils.js";
-import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
+import { validateAgentOptions, validateShellOptions, validateWorktreeOptions, validateLeaseCommandOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
-import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type EvidenceRecord, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type EvidenceRecord, type FunctionIdentity, type JsonValue, type LeaseCommandOptions, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeOptions, type WorkflowWorktreeReference } from "./types.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
 export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -25,6 +26,7 @@ export type WorkflowRunRecord = {
   projectTrusted: () => boolean;
   providerErrorRecovery?: (failure: AgentProviderFailure, signal: AbortSignal) => Promise<AgentProviderRecovery>;
   execution?: WorkflowExecution;
+  ownership?: WorkflowOwnership;
   completion?: Promise<unknown>;
   foreground?: boolean;
   checkpointResolvers: Map<string, (value: boolean) => void>;
@@ -57,8 +59,17 @@ export class RunLifecycle {
   constructor(state: RunState = "running", private readonly changed?: (state: RunState, previousState: RunState, reason?: string) => void | Promise<void>) { this.#state = state; }
   get state(): RunState { return this.#state; }
 
-  async enter(): Promise<void> {
-    while (this.#state === "pausing" || this.#state === "paused" || this.#state === "awaiting_input") await new Promise<void>((resolve) => { this.#waiters.push(resolve); });
+  async enter(signal?: AbortSignal): Promise<void> {
+    while (this.#state === "pausing" || this.#state === "paused" || this.#state === "awaiting_input") {
+      if (signal?.aborted) throw new WorkflowError("CANCELLED", "Run admission cancelled");
+      await new Promise<void>((resolve, reject) => {
+        const ready = () => { signal?.removeEventListener("abort", abort); resolve(); };
+        const abort = () => { this.#waiters = this.#waiters.filter((waiter) => waiter !== ready); reject(new WorkflowError("CANCELLED", "Run admission cancelled")); };
+        this.#waiters.push(ready);
+        signal?.addEventListener("abort", abort, { once: true });
+      });
+    }
+    if (signal?.aborted) throw new WorkflowError("CANCELLED", "Run admission cancelled");
     if (this.#state !== "running") throw new WorkflowError("CANCELLED", `Run is ${this.#state}`);
     this.#active += 1;
   }
@@ -208,12 +219,14 @@ function publicWorktreeReference(reference: WorkflowWorktreeReference): Readonly
   if (!object(reference) || typeof reference.path !== "string" || typeof reference.branch !== "string") fail("WORKTREE_FAILED", "Worktree reference is invalid");
   return Object.freeze({ path: reference.path, branch: reference.branch });
 }
-async function hostWithWorktree<Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>, resolveWorktree: ((owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>) | undefined, signal: AbortSignal): Promise<Result> {
+async function hostWithWorktree<Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>, resolveWorktree: WorkflowBridge["worktree"], signal: AbortSignal, options?: WorkflowWorktreeOptions, supported = false): Promise<Result> {
   if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "withWorktree name must be a non-empty string");
   if (typeof callback !== "function") fail("INVALID_METADATA", "withWorktree callback must be a function");
   if (!resolveWorktree) fail("WORKTREE_FAILED", "No worktree bridge is available");
   const owner = operationPath("worktree", "named", name.trim());
-  const reference = publicWorktreeReference(await resolveWorktree(owner, signal));
+  if (options !== undefined && !supported) fail("RESUME_INCOMPATIBLE", "Managed worktree controls are unavailable");
+  const controls = options === undefined ? undefined : validateWorktreeOptions(options);
+  const reference = publicWorktreeReference(await resolveWorktree(owner, signal, controls));
   return inheritedHostWorktreeOwner.run(owner, () => callback(reference));
 }
 export function workflowRunContext(cwd: string, sessionId: string, runId: string, workflow: WorkflowMetadata, args: JsonValue, signal: AbortSignal): Readonly<WorkflowRunContext> {
@@ -326,6 +339,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
     let closed = false;
     const parentBreadcrumb = breadcrumb ?? functionBreadcrumb(name, identity.occurrence);
     const context: WorkflowFunctionContext = {
+      ...(bridge.capabilities ? { capabilities: Object.freeze({ ...bridge.capabilities }) } : {}),
       settings: deepFreeze(structuredClone(settings)),
       run: runContext,
       tools: createWorkflowTools({
@@ -351,7 +365,8 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
         functionInvokeBreadcrumbOccurrences.set(breadcrumbKey, breadcrumbOccurrence);
         const nestedPath = operationPath("function", "nested", path, ...inherited, targetName, `occurrence:${String(occurrence)}`);
         const nestedIdentity: FunctionIdentity = { path: nestedPath, structuralPath: [...inherited], occurrence, ...(scopedWorktreeOwner ? { worktreeOwner: scopedWorktreeOwner } : {}) };
-        return invokeFunction(targetName, targetInput, signal, nestedIdentity, `${parentBreadcrumb} > ${functionBreadcrumb(breadcrumbName, breadcrumbOccurrence)}`);
+        const invoke = () => invokeFunction(targetName, targetInput, signal, nestedIdentity, `${parentBreadcrumb} > ${functionBreadcrumb(breadcrumbName, breadcrumbOccurrence)}`);
+        return bridge.leases ? bridge.leases.associate(undefined, invoke) : invoke();
       },
       agent: Object.assign(async (prompt: string, options?: Readonly<AgentOptions>) => {
         if (!bridge.agent || typeof prompt !== "string") fail("AGENT_FAILED", "No agent bridge is available");
@@ -368,6 +383,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
           const { name, ...rest } = created[0];
           if (typeof name !== "string" || !name.trim()) fail("INVALID_METADATA", "agent.create requires a stable explicit name");
           const config = deepFreeze(structuredClone(validateAgentOptions(rest)));
+          const scopedLease = bridge.leases?.current();
           const scopedStructuralPath = [...(inheritedHostAgentPath.getStore() ?? [])];
           const scopedWorktreeOwner = inheritedHostWorktreeOwner.getStore() ?? worktreeOwner;
           const scope = JSON.stringify([scopedStructuralPath, scopedWorktreeOwner ?? null]);
@@ -387,6 +403,7 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
             if (!object(sendOptions) || Object.keys(sendOptions).some((key) => key !== "outputSchema" && key !== "timeoutMs")) fail("INVALID_METADATA", "send options must contain only outputSchema and timeoutMs");
             const sendStructuralPath = [...(inheritedHostAgentPath.getStore() ?? [])];
             if (JSON.stringify([sendStructuralPath, inheritedHostWorktreeOwner.getStore() ?? worktreeOwner ?? null]) !== scope) fail("INVALID_METADATA", `Agent handle sends must run in the scope that created the handle: ${name}`);
+            if (bridge.leases?.current() !== scopedLease) fail("INVALID_METADATA", "Agent handle sends must remain in their creating lease scope");
             if (inflight) fail("INVALID_METADATA", "Concurrent send(...) calls on one agent handle are unsupported; await each turn");
             const validatedOptions = validateAgentOptions({ ...config, ...sendOptions });
             inflight = true;
@@ -412,7 +429,23 @@ export function withWorkflowFunctions(bridge: WorkflowBridge, store: RunStore, r
       prompt: workflowPrompt,
       parallel: <Tasks extends ParallelTasks>(operationName: string, tasks: Tasks) => hostParallel<Tasks>(operationName, tasks),
       pipeline: <Items extends PipelineItems, Output extends JsonValue>(operationName: string, items: Items, stages: PipelineStages<Items[keyof Items], Output>) => hostPipeline<Items, Output>(operationName, items, stages),
-      withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => hostWithWorktree(name, callback, bridge.worktree, signal),
+      withWorktreeLease: async (path, callback) => {
+        const leases = bridge.leases;
+        if (!leases) fail("WORKTREE_FAILED", "Worktree ownership capability is unavailable");
+        if (typeof callback !== "function") fail("INVALID_METADATA", "withWorktreeLease callback must be a function");
+        const reference = await leases.enter(path, inheritedHostWorktreeOwner.getStore() ?? worktreeOwner, signal);
+        try {
+          return await leases.associate(reference.scope, async () => callback(Object.freeze({ path: reference.path,
+            shell: (command: string, options = {}) => leases.shell(reference.scope, command, options),
+            command: (command: string, options: LeaseCommandOptions) => {
+              const validated = validateLeaseCommandOptions(options);
+              if (validated.reuse === "sequential" && !bridge.capabilities?.sequentialLeaseCommands) fail("RESUME_INCOMPATIBLE", "Sequential lease commands are unavailable");
+              return leases.command(reference.scope, command, validated);
+            },
+          })));
+        } finally { await leases.leave(reference.scope); }
+      },
+      withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>, options?: WorkflowWorktreeOptions) => hostWithWorktree(name, callback, bridge.worktree, signal, options, bridge.capabilities?.managedWorktreeControls),
       checkpoint: async (...args: readonly unknown[]) => {
         if (!bridge.checkpoint || !object(args[0]) || !jsonValue(args[0])) fail("INTERNAL_ERROR", "No checkpoint bridge is available");
         return bridge.checkpoint(args[0], signal);

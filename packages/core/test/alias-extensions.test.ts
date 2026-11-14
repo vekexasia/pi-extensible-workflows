@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import { join } from "node:path";
@@ -184,7 +184,7 @@ void test("registers global functions and replays each call as one validated ope
   const saved = new Map<string, JsonValue>();
   const journal = { get: (path: string) => saved.get(path), put: (path: string, value: JsonValue) => { saved.set(path, value); } };
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "test" }), args: null, signal: new AbortController().signal });
-  const context = { settings: { acme: { enabled: true } }, run, tools: {}, invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context = { settings: { acme: { enabled: true } }, run, tools: {}, invoke: async () => null, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, withWorktreeLease: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
   assert.deepEqual(await registry.invokeFunction("status", { short: true }, context, "function/status/1", journal), { clean: true });
   assert.deepEqual(await registry.invokeFunction("status", { short: false }, context, "function/status/1", journal), { clean: true });
   assert.equal(calls, 1);
@@ -194,7 +194,7 @@ void test("registers global functions and replays each call as one validated ope
   assert.ok(Object.isFrozen((receivedContext as { run: object }).run));
   assert.deepEqual((receivedContext as { settings: unknown }).settings, { acme: { enabled: true } });
   assert.ok(Object.isFrozen((receivedContext as { settings: object }).settings));
-  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "tools", "withWorktree"]);
+  assert.deepEqual(Object.keys(receivedContext as object).sort(), ["agent", "checkpoint", "invoke", "log", "parallel", "phase", "pipeline", "prompt", "run", "settings", "shell", "tools", "withWorktree", "withWorktreeLease"]);
   assert.ok(Object.isFrozen((receivedContext as { run: { workflow: object } }).run.workflow));
 });
 void test("registered function context.invoke validates nested calls and replays completed children", async () => {
@@ -212,7 +212,7 @@ void test("registered function context.invoke validates nested calls and replays
   const run = Object.freeze({ cwd: "/repo", sessionId: "session", runId: "run", workflow: Object.freeze({ name: "composition" }), args: null, signal: new AbortController().signal });
   const parentPath = "function/outer/1";
   const occurrences = new Map<string, number>();
-  const context: WorkflowFunctionContext = { settings: {}, run, tools: {}, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
+  const context: WorkflowFunctionContext = { settings: {}, run, tools: {}, invoke: async (name, input) => { const key = name; const occurrence = (occurrences.get(key) ?? 0) + 1; occurrences.set(key, occurrence); return registry.invokeFunction(name, input, context, `function/nested/${name}/${String(occurrence)}`, journal); }, agent: Object.assign(async () => null, { create: () => { throw new Error("unused"); } }), shell: async () => ({ exitCode: 0, stdout: "", stderr: "" }), prompt: (template: string) => template, parallel: async () => { throw new Error("unused"); }, pipeline: async () => { throw new Error("unused"); }, withWorktree: async () => { throw new Error("unused"); }, withWorktreeLease: async () => { throw new Error("unused"); }, checkpoint: async () => true, phase: () => {}, log: () => {} };
   await assert.rejects(registry.invokeFunction("outer", { value: "one", fail: true }, context, parentPath, journal), (error: unknown) => error instanceof WorkflowError && error.code === "AGENT_FAILED");
   assert.equal(leafCalls, 1);
   occurrences.clear();
@@ -448,7 +448,10 @@ void test("requires standalone agent action visibility and execution together", 
     assert.throws(() => { new WorkflowRegistry().register({ version: "1.0.0", headline: "Invalid action", agentAttemptActions: { standalone: action } }); }, (error: unknown) => error instanceof WorkflowError && error.code === "INVALID_METADATA");
   }
 });
-void test("shares the registry between package imports and Pi's jiti loader", () => {
+function runRegistrySharing(environment: NodeJS.ProcessEnv = process.env): void {
+  // A launching Pi may export aliases for a different SDK installation.
+  const env = { ...environment };
+  delete env.JITI_ALIAS;
   const script = `
 import { createRequire } from "node:module";
 import { join } from "node:path";
@@ -461,7 +464,20 @@ native.registerWorkflowExtension({ version: "1.0.0", headline: "Loader", functio
 const catalog = source.workflowCatalog();
 if (catalog.functions.length !== 1 || catalog.functions[0]?.name !== "verify") throw new Error(JSON.stringify(catalog));
 `;
-  execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe" });
+  execFileSync(process.execPath, ["--input-type=module", "-e", script], { cwd: process.cwd(), stdio: "pipe", env });
+}
+void test("shares the registry between package imports and Pi's jiti loader", () => { runRegistrySharing(); });
+void test("registry sharing subprocess ignores ambient SDK aliases", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-registry-alias-isolation-"));
+  try {
+    const alias = join(directory, "unexpected-sdk.mjs");
+    writeFileSync(alias, "throw new Error('ambient SDK alias must not be loaded');\n");
+    assert.doesNotThrow(() => {
+      runRegistrySharing({
+        ...process.env, JITI_ALIAS: JSON.stringify({ "@earendil-works/pi-ai": alias }),
+      });
+    });
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 void test("keeps workflow_catalog active after Pi session replacement", () => {
   const script = `

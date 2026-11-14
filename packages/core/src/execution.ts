@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { RunStore, structuralPath as operationPath } from "./persistence.js";
+import { executeOwnedCommand } from "./owned-process.js";
 import type { AgentAttempt } from "./agent-execution.js";
 import type { AgentIdentity, AgentAttemptSummary, FunctionIdentity, JsonValue, ShellIdentity, ShellOptions, ShellResult, ToolIdentity, WorkflowAgentSessionReference, WorkflowBridge, WorkflowErrorCode, WorkflowExecution, WorkflowFunctionContext } from "./types.js";
 import { WorkflowError, sumAccounting, zeroAccounting } from "./types.js";
 import { asWorkflowError, errorText, fail, isWorkflowAuthored, isWorkflowErrorCode, jsonDigest, jsonValue, markWorkflowAuthored, object, positiveInteger } from "./utils.js";
-import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions } from "./validation.js";
+import { instrumentWorkflow, validateAgentOptions, validateShellCommand, validateShellOptions, validateWorktreeOptions, validateLeaseCommandOptions } from "./validation.js";
 
 export const RPC_LIMIT_BYTES = 10 * 1024 * 1024;
 type WorkerErrorShape = { code?: string; message: string; authored?: boolean; failedAt?: string };
@@ -80,6 +81,26 @@ export function createWorkflowTools(scope: {
   });
 }
 
+const leaseFactorySource = String.raw`
+(enter) => async function withWorktreeLease(path, callback) {
+  const invalid = message => Object.assign(new Error(message), {code:"INVALID_METADATA"});
+  if (typeof path !== "string" || !path.trim()) throw invalid("withWorktreeLease path must be non-empty");
+  if (typeof callback !== "function") throw invalid("withWorktreeLease callback must be a function");
+  const response = JSON.parse(await enter(path, async (pathJson, invoke) => {
+    const call = async (method, command, options) => {
+      const response = JSON.parse(await invoke(method, JSON.stringify([command, options === undefined ? {} : options])));
+      if (!response.ok) throw Object.assign(new Error(response.error.message), {code:response.error.code});
+      return response.value;
+    };
+    const lease = Object.freeze({path:JSON.parse(pathJson), shell:(command, options) => call("leaseShell", command, options), command:(command, options) => call("leaseCommand", command, options)});
+    const value = await callback(lease);
+    return JSON.stringify(value === undefined ? null : value);
+  }));
+  if (!response.ok) throw Object.assign(new Error(response.error.message), {code:response.error.code});
+  return response.value;
+}
+`;
+
 const childSource = String.raw`
 "use strict";
 const { AsyncLocalStorage } = require("node:async_hooks");
@@ -146,6 +167,7 @@ const agentOccurrences = new Map();
 const agentInflight = new Set();
 const shellOccurrences = new Map();
 const worktreeOwners = new AsyncLocalStorage();
+const leaseScopes = new AsyncLocalStorage();
 const rejectAgent = () => { throw workError("INVALID_METADATA", "Workflow agent calls must use a direct agent(...) call; aliases and indirect calls are unsupported"); };
 // A pending result that reaches JSON.stringify or a template literal is a forgotten await; fail loudly instead of persisting "[object Promise]".
 const guardedResult = (result, kind) => Object.defineProperties(result, {
@@ -157,13 +179,14 @@ const guardedAgentResult = result => guardedResult(result, "agent");
 const rejectShell = () => { throw workError("INVALID_METADATA", "Workflow shell calls must use a direct shell(...) call; aliases and indirect calls are unsupported"); };
 const rejectWorktree = () => { throw workError("INVALID_METADATA", "withWorktree calls must use a direct withWorktree(...) call; aliases and indirect calls are unsupported"); };
 const internalWithWorktree = async (...values) => {
-  if (values.length !== 2) throw workError("INVALID_METADATA", "withWorktree requires a name and callback");
+  if (values.length !== 2 && values.length !== 3) throw workError("INVALID_METADATA", "withWorktree requires a name and callback (plus optional controls)");
+  if (values[2] !== undefined && !config.capabilities.managedWorktreeControls) throw workError("RESUME_INCOMPATIBLE", "Managed worktree controls are unavailable");
   const name = values[0];
   const callback = values[1];
   if (typeof name !== "string" || !name.trim()) throw workError("INVALID_METADATA", "withWorktree name must be a non-empty string");
   if (typeof callback !== "function") throw workError("INVALID_METADATA", "withWorktree callback must be a function");
   const owner = path("worktree", "named", name.trim());
-  const reference = await rpc("worktree", [owner]);
+  const reference = await rpc("worktree", [owner, values[2] === undefined ? null : values[2], null, leaseScopes.getStore() || null]);
   if (!reference || typeof reference !== "object" || typeof reference.path !== "string" || typeof reference.branch !== "string") throw workError("WORKTREE_FAILED", "Worktree reference is invalid");
   return await worktreeOwners.run(owner, () => callback(Object.freeze({ path: reference.path, branch: reference.branch })));
 };
@@ -181,7 +204,7 @@ const internalAgent = (...values) => {
   const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}) };
   let result;
   try {
-    result = rpc("agent", [values[0], options, identity]).then(unwrap);
+    result = rpc("agent", [values[0], options, identity, leaseScopes.getStore() || null]).then(unwrap);
   } catch (error) {
     agentInflight.delete(occurrenceKey);
     throw error;
@@ -203,6 +226,7 @@ const internalAgentCreate = (...values) => {
   // The turn counter is arrival-ordered, so a handle must stay in the scope that created it: sends racing across
   // parallel branches would otherwise take each other's journal path on replay.
   const scope = JSON.stringify(inheritedAgentPath.getStore() || []);
+  const creatingLease = leaseScopes.getStore();
   let turn = 0;
   const send = (...sent) => {
     if (sent.length < 1 || sent.length > 2) throw workError("INVALID_METADATA", "send requires a prompt and optional options");
@@ -210,13 +234,14 @@ const internalAgentCreate = (...values) => {
     const sendOptions = sent.length < 2 || sent[1] === undefined ? {} : sent[1];
     if (!sendOptions || typeof sendOptions !== "object" || Array.isArray(sendOptions) || Object.keys(sendOptions).some(key => key !== "outputSchema" && key !== "timeoutMs")) throw workError("INVALID_METADATA", "send options must contain only outputSchema and timeoutMs");
     if (JSON.stringify(inheritedAgentPath.getStore() || []) !== scope) throw workError("INVALID_METADATA", "Agent handle sends must run in the scope that created the handle: " + name);
+    if (leaseScopes.getStore() !== creatingLease) throw workError("INVALID_METADATA", "Agent handle sends must remain in their creating lease scope");
     if (agentHandleInflight.has(name)) throw workError("INVALID_METADATA", "Concurrent send(...) calls on one agent handle are unsupported; await each turn");
     agentHandleInflight.add(name);
     turn += 1;
     const identity = { structuralPath: [...(inheritedAgentPath.getStore() || [])], callSite: "handle:" + name, occurrence: turn, handle: name, turn, ...(worktreeOwner ? { worktreeOwner } : {}) };
     let result;
     try {
-      result = rpc("agent", [sent[0], { ...config, ...sendOptions }, identity]).then(unwrap);
+      result = rpc("agent", [sent[0], { ...config, ...sendOptions }, identity, leaseScopes.getStore() || null]).then(unwrap);
     } catch (error) {
       agentHandleInflight.delete(name);
       throw error;
@@ -242,7 +267,7 @@ const internalShell = (...values) => {
   const occurrence = (shellOccurrences.get(occurrenceKey) || 0) + 1;
   shellOccurrences.set(occurrenceKey, occurrence);
   const identity = { structuralPath: [...inherited], callSite, occurrence, ...(worktreeOwner ? { worktreeOwner } : {}) };
-  return guardedResult(rpc("shell", [command, options, identity]), "shell");
+  return guardedResult(rpc("shell", [command, options, identity, leaseScopes.getStore() || null]), "shell");
 };
 const shell = rejectShell;
 const agent = Object.freeze(Object.assign(rejectAgent, { create: internalAgentCreate }));
@@ -306,7 +331,7 @@ const functionIdentity = name => {
 const functions = Object.freeze(Object.fromEntries(Object.entries(config.functions || {}).map(([local, target]) => [local, (...values) => {
   if (values.length !== 1 || !values[0] || typeof values[0] !== "object" || Array.isArray(values[0])) throw workError("RESULT_INVALID", local + " requires exactly one JSON object argument");
   const identity = functionIdentity(target.name);
-  const result = rpc("function", [target.name, values[0], identity]).then(unwrap);
+  const result = rpc("function", [target.name, values[0], identity, leaseScopes.getStore() || null]).then(unwrap);
   Object.defineProperty(result, "toJSON", { value() { throw workError("INVALID_METADATA", "Workflow function result is a Promise; await it before serialization"); } });
   return result;
 }])));
@@ -317,7 +342,7 @@ const functions = Object.freeze(Object.fromEntries(Object.entries(config.functio
 const tools = (${createWorkflowTools.toString()})({
   structuralPath: () => inheritedAgentPath.getStore() || [],
   worktreeOwner: () => worktreeOwners.getStore(),
-  call: (id, args, identity) => rpc("tool", [id, args, identity]),
+  call: (id, args, identity) => rpc("tool", [id, args, identity, leaseScopes.getStore() || null]),
   invalid: message => workError("INVALID_METADATA", message),
 });
 const recordEntries = (value, kind) => {
@@ -390,6 +415,23 @@ const sandbox = { agent, shell, withWorktree: rejectWorktree, prompt, checkpoint
 for (const [name, fn] of Object.entries(functions)) Object.defineProperty(sandbox, name, { value: fn, writable: false, configurable: false });
 for (const name of ["Date","eval","Function","WebAssembly","process","require","module","exports","console","fetch","XMLHttpRequest","WebSocket","performance","crypto","setTimeout","setInterval","setImmediate","queueMicrotask","Intl","SharedArrayBuffer","Atomics"]) sandbox[name] = undefined;
 const context = vm.createContext(sandbox, { codeGeneration: { strings: false, wasm: false } });
+const enterLease = async (path, callback) => {
+  try {
+    const reference = await rpc("leaseEnter", [path, worktreeOwners.getStore() || null]);
+    let value;
+    try {
+      const result = await leaseScopes.run(reference.scope, () => callback(JSON.stringify(reference.path), async (method, argsJson) => {
+        try { const args = JSON.parse(argsJson); const value = await rpc(method, [reference.scope, ...args]); return JSON.stringify({ok:true, value}); }
+        catch (error) { return JSON.stringify({ok:false, error:workerError(error)}); }
+      }));
+      value = JSON.parse(result);
+    } finally { await rpc("leaseLeave", [reference.scope]); }
+    return JSON.stringify({ok:true, value});
+  } catch (error) { return JSON.stringify({ok:false, error:workerError(error)}); }
+};
+const leasePrimitive = new vm.Script(${JSON.stringify(leaseFactorySource)}).runInContext(context)(enterLease);
+Object.defineProperty(sandbox, "workflowCapabilities", {value:new vm.Script("Object.freeze(" + JSON.stringify(config.capabilities) + ")").runInContext(context), writable:false, configurable:false});
+Object.defineProperty(sandbox, "withWorktreeLease", {value:leasePrimitive, writable:false, configurable:false});
 const body = config.script;
 Promise.resolve().then(() => new vm.Script("(async(__pi_extensible_workflows_agent,__pi_extensible_workflows_withWorktree,__pi_extensible_workflows_shell)=>{" + body + "\n})", { filename: "workflow.js" }).runInContext(context)(internalAgent, internalWithWorktree, internalShell))
   .then(async value => { await Promise.all(inflight); send({ type: "result", value: value === undefined ? null : value }); })
@@ -460,12 +502,14 @@ export function readShellResult(value: unknown): ShellResult {
 export function agentWorktree(identity: AgentIdentity): { worktreeOwner?: string } {
   return identity.worktreeOwner ? { worktreeOwner: identity.worktreeOwner } : {};
 }
-function shellProcessKill(child: ChildProcess): void {
+// Ordinary shells on unsupported owned platforms retain legacy best-effort cleanup.
+// Neither taskkill nor the generic POSIX fallback acquires the owned guarantee.
+function killLegacyShellProcess(child: ChildProcess): void {
   let forceKill: ReturnType<typeof setTimeout> | undefined;
   const killProcessTree = (signal: "SIGTERM" | "SIGKILL") => {
     try {
       if (child.pid && process.platform !== "win32") process.kill(-child.pid, signal);
-      else if (child.pid && process.platform === "win32") {
+      else if (child.pid) {
         const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
         killer.unref();
       } else child.kill(signal);
@@ -478,7 +522,7 @@ function shellProcessKill(child: ChildProcess): void {
   forceKill = setTimeout(() => { forceKill = undefined; killProcessTree("SIGKILL"); }, 1000);
   forceKill.unref();
 }
-export function executeShellCommand(command: string, options: ShellOptions, signal: AbortSignal, cwd = process.cwd()): Promise<ShellResult> {
+function executeLegacyShellCommand(command: string, options: ShellOptions, signal: AbortSignal, cwd = process.cwd()): Promise<ShellResult> {
   return new Promise((resolve, reject) => {
     let child: ChildProcess;
     try { child = spawn(command, { shell: true, cwd, env: { ...process.env, ...(options.env ?? {}) }, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] }); }
@@ -499,7 +543,7 @@ export function executeShellCommand(command: string, options: ShellOptions, sign
       if (settled) return;
       settled = true;
       cleanup();
-      shellProcessKill(child);
+      killLegacyShellProcess(child);
       reject(error);
     };
     const onAbort = () => { failShell(new WorkflowError("CANCELLED", "Workflow cancelled")); };
@@ -526,8 +570,26 @@ export function executeShellCommand(command: string, options: ShellOptions, sign
     });
     if (signal.aborted) { onAbort(); return; }
     signal.addEventListener("abort", onAbort, { once: true });
-    if (options.timeoutMs !== undefined) timeout = setTimeout(() => { timedOut = true; shellProcessKill(child); }, options.timeoutMs);
+    if (options.timeoutMs !== undefined) timeout = setTimeout(() => { timedOut = true; killLegacyShellProcess(child); }, options.timeoutMs);
   });
+}
+export async function executeShellCommand(command: string, options: ShellOptions, signal: AbortSignal, cwd = process.cwd()): Promise<ShellResult> {
+  if (process.platform !== "darwin" && process.platform !== "linux") return executeLegacyShellCommand(command, options, signal, cwd);
+  let outputBytes = 0;
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
+  let stdout = "";
+  let stderr = "";
+  const exitCode = await executeOwnedCommand(command, options, signal, cwd, (target, chunk) => {
+    outputBytes += chunk.byteLength;
+    if (outputBytes > RPC_LIMIT_BYTES) throw new WorkflowError("RPC_LIMIT_EXCEEDED", "Shell result exceeds the 10 MB JSON boundary");
+    if (target === "stdout") stdout += stdoutDecoder.write(chunk); else stderr += stderrDecoder.write(chunk);
+  });
+  stdout += stdoutDecoder.end();
+  stderr += stderrDecoder.end();
+  const result = { exitCode, stdout, stderr };
+  try { encodedRpcResult(Number.MAX_SAFE_INTEGER, result); } catch (error) { throw error instanceof WorkflowError ? error : new WorkflowError("RPC_LIMIT_EXCEEDED", errorText(error)); }
+  return result;
 }
 /** The wire shape of a host-side failure: the code, the message, and the authored flag that tells the worker whether the text is safe to surface verbatim. */
 function workerErrorShape(typed: WorkflowError): WorkerErrorShape {
@@ -574,7 +636,7 @@ function startWorker(config: string): { child: ChildProcess; childDir: string } 
 }
 export function runWorkflow(script: string, args: JsonValue = null, bridge: WorkflowBridge = {}, signal?: AbortSignal): WorkflowExecution {
   encoded(args);
-  const config = JSON.stringify({ script: instrumentWorkflow(script), args: structuredClone(args), functions: bridge.functions ?? {} });
+  const config = JSON.stringify({ script: instrumentWorkflow(script), args: structuredClone(args), functions: bridge.functions ?? {}, capabilities: bridge.capabilities ?? {} });
   let worker: { child: ChildProcess; childDir: string };
   try { worker = startWorker(config); } catch (error) {
     // NOTE: the host persists a run as running before it launches it and records a failure only from `result`, so a worker that
@@ -627,6 +689,16 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
   let phasePending: Promise<void> | undefined;
   async function handleRpc(id: number, method: string, values: JsonValue[]) {
     try {
+      const scope = typeof values[3] === "string" ? values[3] : undefined;
+      if (bridge.leases && method === "function") await bridge.leases.associate(scope, () => dispatchRpc(id, method, values));
+      else if (bridge.leases && ["agent", "shell", "tool", "worktree"].includes(method)) await bridge.leases.within(scope, () => dispatchRpc(id, method, values));
+      else await dispatchRpc(id, method, values);
+    } catch (error) {
+      if (!settled && child.connected) child.send(encoded({ type: "rpcResult", id, ok: false, error: workerErrorShape(asWorkflowError(error)) }), () => undefined);
+    }
+  }
+  async function dispatchRpc(id: number, method: string, values: JsonValue[]) {
+    try {
       if (method !== "phase" && phasePending) {
         await phasePending;
         // The run ended while this call waited: its worker is gone, there is nothing to answer.
@@ -634,7 +706,18 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
       }
       encoded(values);
       let value: JsonValue = null;
-      if (method === "agent") {
+      if (method === "leaseEnter") {
+        if (!bridge.leases || typeof values[0] !== "string") fail("WORKTREE_FAILED", "Worktree ownership capability is unavailable");
+        value = await bridge.leases.enter(values[0], typeof values[1] === "string" ? values[1] : undefined, controller.signal);
+      } else if (method === "leaseShell" || method === "leaseCommand") {
+        if (!bridge.leases || typeof values[0] !== "string") fail("WORKTREE_FAILED", "Worktree ownership capability is unavailable");
+        const command = validateShellCommand(values[1]);
+        if (method === "leaseCommand" && object(values[2]) && values[2].reuse === "sequential" && !bridge.capabilities?.sequentialLeaseCommands) fail("RESUME_INCOMPATIBLE", "Sequential lease commands are unavailable");
+        value = method === "leaseShell" ? await bridge.leases.shell(values[0], command, validateShellOptions(values[2])) as unknown as JsonValue : await bridge.leases.command(values[0], command, validateLeaseCommandOptions(values[2]));
+      } else if (method === "leaseLeave") {
+        if (!bridge.leases || typeof values[0] !== "string") fail("WORKTREE_FAILED", "Worktree ownership capability is unavailable");
+        await bridge.leases.leave(values[0]);
+      } else if (method === "agent") {
         if (!bridge.agent) fail("AGENT_FAILED", "No agent bridge is available");
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "agent prompt must be a string");
         const opts = validateAgentOptions(values[1]);
@@ -690,7 +773,9 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         value = await bridge.tool(values[0], values[1], controller.signal, identity);
       } else if (method === "worktree") {
         if (!bridge.worktree || typeof values[0] !== "string" || !values[0]) fail("INTERNAL_ERROR", "worktree requires an active host bridge and scope");
-        value = await bridge.worktree(values[0], controller.signal);
+        if (values[1] !== null && values[1] !== undefined && !bridge.capabilities?.managedWorktreeControls) fail("RESUME_INCOMPATIBLE", "Managed worktree controls are unavailable");
+        const controls = values[1] === null || values[1] === undefined ? undefined : validateWorktreeOptions(values[1]);
+        value = await bridge.worktree(values[0], controller.signal, controls);
       } else if (method === "phase") {
         if (typeof values[0] !== "string") fail("INTERNAL_ERROR", "phase name must be a string");
         const name = values[0];
@@ -709,10 +794,10 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         value = stored as unknown as JsonValue;
       } else fail("INTERNAL_ERROR", `Unknown worker RPC method: ${method}`);
       encoded(value);
-      child.send(encodedRpcResult(id, value));
+      if (!settled && child.connected) child.send(encodedRpcResult(id, value), () => undefined);
     } catch (error) {
       const typed = asWorkflowError(error);
-      child.send(encoded({ type: "rpcResult", id, ok: false, error: workerErrorShape(typed) }));
+      if (!settled && child.connected) child.send(encoded({ type: "rpcResult", id, ok: false, error: workerErrorShape(typed) }), () => undefined);
     }
   }
   function cancel() {
@@ -722,7 +807,8 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
     stop("CANCELLED", "Workflow cancelled");
   }
   if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
-  return { result, cancel };
+  const finalized = result.then(async (value) => { await bridge.leases?.finalize(); return value; }, async (error: unknown) => { await bridge.leases?.finalize(); throw error; });
+  return { result: finalized, cancel };
 }
 function attemptSummary(attempt: AgentAttempt, accounting = attempt.accounting): AgentAttemptSummary {
   return { attempt: attempt.attempt, transport: attempt.transport, ...(attempt.session ? { session: attempt.session } : {}), ...(attempt.error ? { error: attempt.error } : {}), accounting, setup: attempt.setup };

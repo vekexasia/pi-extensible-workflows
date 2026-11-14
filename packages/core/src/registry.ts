@@ -5,7 +5,7 @@ import { byPriorityThenName, deepFreeze, errorCode, errorText, fail, jsonValue, 
 import { loadSettings, resolveWorkflowSettings } from "./settings.js";
 import { validateSchema } from "./utils.js";
 
-const RESERVED_GLOBALS = new Set(["agent", "shell", "tools", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog", "evidence"]);
+const RESERVED_GLOBALS = new Set(["agent", "shell", "tools", "prompt", "checkpoint", "parallel", "pipeline", "phase", "withWorktree", "withWorktreeLease", "workflowCapabilities", "log", "args", "Promise", "JSON", "Math", "Date", "eval", "Function", "WebAssembly", "process", "require", "module", "exports", "console", "fetch", "XMLHttpRequest", "WebSocket", "performance", "crypto", "setTimeout", "setInterval", "setImmediate", "queueMicrotask", "Intl", "SharedArrayBuffer", "Atomics", "globalThis", "global", "undefined", "NaN", "Infinity", "extensions", "workflow_catalog", "evidence"]);
 const IDENTIFIER = /^[A-Za-z_$][\w$]*$/;
 const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
@@ -186,7 +186,7 @@ export class WorkflowRegistry {
       if (!jsonValue(replayed) || !Value.Check(fn.output, replayed)) fail("RESULT_INVALID", `Invalid replay for ${name}`);
       return structuredClone(replayed);
     }
-    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ run: context.run, settings: deepFreeze(structuredClone(context.settings)), invoke: context.invoke, agent: context.agent, shell: context.shell, tools: context.tools, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, checkpoint: context.checkpoint, phase: context.phase, log: context.log, ...(context.evidence ? { evidence: context.evidence } : {}) }));
+    const result: unknown = await fn.run(deepFreeze(structuredClone(input)), Object.freeze({ ...(context.capabilities ? { capabilities: context.capabilities } : {}), run: context.run, settings: deepFreeze(structuredClone(context.settings)), invoke: context.invoke, agent: context.agent, shell: context.shell, tools: context.tools, prompt: context.prompt, parallel: context.parallel, pipeline: context.pipeline, withWorktree: context.withWorktree, withWorktreeLease: context.withWorktreeLease, checkpoint: context.checkpoint, phase: context.phase, log: context.log, ...(context.evidence ? { evidence: context.evidence } : {}) }));
     if (!jsonValue(result) || !Value.Check(fn.output, result)) fail("RESULT_INVALID", `Invalid output from ${name}`);
     const stored = structuredClone(result);
     journal.put(path, stored);

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as acorn from "acorn";
 import { Script } from "node:vm";
-import type { CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
+import type { CheckpointInput, JsonSchema, JsonValue, PreflightCapabilities, PreflightResult, ShellOptions, LeaseCommandOptions, WorkflowWorktreeOptions, StaticWorkflowCall, StaticWorkflowExecution, StaticWorkflowScope, ValidatedWorkflowLaunch, WorkflowCallKind, WorkflowErrorCode, WorkflowMetadata, WorkflowValidationContext, WorkflowValidationParameters } from "./types.js";
 import type { WorkflowRegistryApi } from "./registry.js";
 import { assertModelThinking, validateSchema, deepFreeze, errorText, fail, jsonObject, jsonValue, object, positiveInteger, resourcePatternHasMagic } from "./utils.js";
 import { WORKFLOW_CALL_KINDS } from "./types.js";
@@ -16,6 +16,23 @@ export function validateCheckpoint(value: unknown): CheckpointInput {
   if (Buffer.byteLength(value.prompt) > 1024) fail("INVALID_METADATA", "checkpoint prompt exceeds 1024 UTF-8 bytes");
   if (Buffer.byteLength(JSON.stringify(value.context)) > 4096) fail("INVALID_METADATA", "checkpoint context exceeds 4096 UTF-8 bytes");
   return { name: value.name, prompt: value.prompt, context: value.context };
+}
+
+export function validateWorktreeOptions(value: unknown): WorkflowWorktreeOptions {
+  if (value === undefined) return {};
+  if (!object(value) || Object.keys(value).some((key) => !["expectedTip", "fresh", "setup"].includes(key))) fail("INVALID_METADATA", "Unknown withWorktree controls");
+  if (value.expectedTip !== undefined && (typeof value.expectedTip !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.expectedTip))) fail("INVALID_METADATA", "expectedTip must be a full commit identity");
+  if (value.fresh !== undefined && typeof value.fresh !== "boolean") fail("INVALID_METADATA", "withWorktree fresh must be boolean");
+  if (value.setup !== undefined && value.setup !== "configured" && value.setup !== "none") fail("INVALID_METADATA", "withWorktree setup must be configured or none");
+  return { ...(value.expectedTip === undefined ? {} : { expectedTip: value.expectedTip }), ...(value.fresh === undefined ? {} : { fresh: value.fresh }), ...(value.setup === undefined ? {} : { setup: value.setup }) };
+}
+export function validateLeaseCommandOptions(value: unknown): LeaseCommandOptions {
+  if (!object(value)) fail("INVALID_METADATA", "Lease commands require options");
+  const { reuse, ...shell } = value;
+  if (reuse !== undefined && reuse !== "once" && reuse !== "sequential") fail("INVALID_METADATA", "Lease command reuse must be once or sequential");
+  const options = validateShellOptions(shell);
+  if (!Number.isSafeInteger(options.timeoutMs) || (options.timeoutMs ?? 0) <= 0 || (options.timeoutMs ?? Infinity) > 2_147_483_647) fail("INVALID_METADATA", "Lease tickets require timeoutMs between 1 and 2147483647");
+  return { ...options, timeoutMs: options.timeoutMs as number, ...(reuse === undefined ? {} : { reuse }) };
 }
 
 function validateWorkflowMetadata(value: unknown): WorkflowMetadata {
@@ -140,7 +157,8 @@ function validateDirectPrimitiveReferences(program: acorn.AnyNode, name: string)
     if (node.type === "Identifier" && node.name === name) {
       const directCall = parent?.type === "CallExpression" && parent.callee === node;
       const propertyKey = parent?.type === "Property" && parent.key === node && !parent.computed && !parent.shorthand;
-      if (!directCall && !propertyKey) fail("INVALID_METADATA", `${name} calls must use a direct ${name}(...) call; aliases and indirect calls are unsupported`);
+      const memberKey = parent?.type === "MemberExpression" && parent.property === node && !parent.computed;
+      if (!directCall && !propertyKey && !memberKey) fail("INVALID_METADATA", `${name} calls must use a direct ${name}(...) call; aliases and indirect calls are unsupported`);
     }
     for (const child of astChildren(node)) visit(child, node);
   };
@@ -518,7 +536,9 @@ function validateStaticShellOptions(call: WorkflowCall): void {
 
 function validateStaticWithWorktree(call: WorkflowCall, compatibility: boolean): void {
   if (call.arguments.some((argument) => argument.type === "SpreadElement")) return;
-  if (call.arguments.length !== 2) fail(compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA", "withWorktree requires a name and callback");
+  if (call.arguments.length !== 2 && call.arguments.length !== 3) fail(compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA", "withWorktree requires a name and callback (plus optional controls)");
+  const options = staticValue(callArgument(call, 2));
+  if (options.known) validateWorktreeOptions(options.value);
   const callback = call.arguments[1];
   if (staticValue(callback).known) fail("INVALID_METADATA", "withWorktree callback must be a function");
   const name = staticValue(callArgument(call, 0));
@@ -529,6 +549,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
   const program = parseWorkflow(script);
   assertNoReservedIdentifiers(program);
   validateDirectPrimitiveReferences(program, "withWorktree");
+  validateDirectPrimitiveReferences(program, "withWorktreeLease");
   validateRemovedWorkflowPrimitives(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
   validateDirectPrimitiveReferences(program, "shell");
   validateDirectAgentReferences(program, compatibility ? "RESUME_INCOMPATIBLE" : "INVALID_METADATA");
@@ -544,6 +565,7 @@ export function preflight(script: string, capabilities: PreflightCapabilities, s
     const operation = call.callee.name;
     if (operation === "agent") validateStaticAgentOptions(call.arguments[1]);
     if (operation === "withWorktree") validateStaticWithWorktree(call, compatibility);
+    if (operation === "withWorktreeLease") { if (call.arguments.length !== 2) fail("INVALID_METADATA", "withWorktreeLease requires a path and callback"); }
     if (operation === "shell") validateStaticShellOptions(call);
     if ((operation === "parallel" || operation === "pipeline") && call.arguments.some((argument) => argument.type === "SpreadElement")) continue;
     if (operation === "checkpoint" && stableName(call.arguments[0]) === false) fail("INVALID_METADATA", `${operation} requires a stable explicit name`);

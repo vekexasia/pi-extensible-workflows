@@ -14,7 +14,7 @@ export function isHardTerminalRunState(state: RunState): state is HardTerminalRu
 export type ExternallyEndedRunState = "stopped" | "interrupted" | "budget_exhausted";
 export function isExternallyEndedRunState(state: RunState): state is ExternallyEndedRunState { return state === "stopped" || state === "interrupted" || state === "budget_exhausted"; }
 export const SETTLED_AGENT_STATES: ReadonlySet<AgentState> = new Set(["completed", "failed", "cancelled"]);
-export const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "shell"] as const;
+export const WORKFLOW_CALL_KINDS = ["agent", "parallel", "pipeline", "checkpoint", "phase", "withWorktree", "withWorktreeLease", "shell"] as const;
 export type WorkflowCallKind = (typeof WORKFLOW_CALL_KINDS)[number];
 export const WORKFLOW_RUN_STARTED_EVENT = "workflow:run-started";
 export const WORKFLOW_RUN_RESUMED_EVENT = "workflow:run-resumed";
@@ -64,7 +64,30 @@ export type PipelineStage<Input extends JsonValue, Output extends JsonValue> = (
 export type PipelineStages<Input extends JsonValue, Output extends JsonValue> = Record<string, PipelineStage<Input, Output>>;
 export type PipelineResult<Items extends PipelineItems, Output extends JsonValue> = { [Key in keyof Items]: Output };
 export interface ShellOptions { timeoutMs?: number; env?: Record<string, string> }
+export interface LeaseCommandOptions extends ShellOptions { timeoutMs: number; reuse?: "once" | "sequential" }
+export interface WorkflowWorktreeOptions { expectedTip?: string; fresh?: boolean; setup?: "configured" | "none" }
+/** Host acknowledgements, not inferred from function presence or authored workflow results. */
+export interface WorkflowCapabilities { readonly managedWorktreeControls?: true; readonly sequentialLeaseCommands?: true }
+export const WORKFLOW_CAPABILITIES: Readonly<WorkflowCapabilities> = Object.freeze({ managedWorktreeControls: true, sequentialLeaseCommands: true });
 export interface ShellResult { exitCode: number | null; stdout: string; stderr: string }
+export interface WorkflowWorktreeLease {
+  readonly path: string;
+  shell(command: string, options?: ShellOptions): Promise<ShellResult>;
+  command(command: string, options: LeaseCommandOptions): Promise<string>;
+}
+export type WorkflowWorktreeLeaseCallback<Result extends JsonValue = JsonValue> = (lease: Readonly<WorkflowWorktreeLease>) => Result | Promise<Result>;
+/** Host-only capability; scope references never become public lease properties or journal identities. */
+export interface WorkflowLeaseBridge {
+  enter(path: string, worktreeOwner: string | undefined, signal: AbortSignal): Promise<{ scope: string; path: string }>;
+  shell(scope: string, command: string, options: ShellOptions): Promise<ShellResult>;
+  command(scope: string, command: string, options: LeaseCommandOptions): Promise<string>;
+  leave(scope: string): Promise<void>;
+  within<T>(scope: string | undefined, work: () => Promise<T>): Promise<T>;
+  associate<T>(scope: string | undefined, work: () => Promise<T>): Promise<T>;
+  current(): string | undefined;
+  finalize(): Promise<void>;
+}
+
 export const BUDGET_DIMENSIONS = ["tokens", "costUsd", "durationMs", "agentLaunches"] as const;
 export type BudgetDimension = (typeof BUDGET_DIMENSIONS)[number];
 export interface BudgetLimits { soft?: number; hard?: number }
@@ -240,7 +263,7 @@ export interface AgentHandle {
   readonly name: string;
   send: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentHandleSendOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentHandleSendOptions>): Promise<JsonValue> };
 }
-export interface WorkflowOrchestrationContext { agent: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentOptions>): Promise<JsonValue>; create: (options: Readonly<AgentOptions & { name: string }>) => AgentHandle }; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: <Tasks extends ParallelTasks>(operationName: string, tasks: Tasks) => Promise<ParallelResult<Tasks>>; pipeline: <Items extends PipelineItems, Output extends JsonValue>(operationName: string, items: Items, stages: PipelineStages<Items[keyof Items], Output>) => Promise<PipelineResult<Items, Output>>; withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>) => Promise<Result>; checkpoint: (input: CheckpointInput) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void; evidence?: (content: string | JsonValue) => Promise<EvidenceRecord> }
+export interface WorkflowOrchestrationContext { readonly capabilities?: Readonly<WorkflowCapabilities>; agent: { <Schema extends TSchema>(prompt: string, options: Readonly<AgentOptions<Schema> & { outputSchema: Schema }>): Promise<Static<Schema>>; (prompt: string, options?: Readonly<AgentOptions>): Promise<JsonValue>; create: (options: Readonly<AgentOptions & { name: string }>) => AgentHandle }; shell: (command: string, options?: ShellOptions) => Promise<ShellResult>; prompt: (template: string, values: Readonly<Record<string, JsonValue>>) => string; parallel: <Tasks extends ParallelTasks>(operationName: string, tasks: Tasks) => Promise<ParallelResult<Tasks>>; pipeline: <Items extends PipelineItems, Output extends JsonValue>(operationName: string, items: Items, stages: PipelineStages<Items[keyof Items], Output>) => Promise<PipelineResult<Items, Output>>; withWorktreeLease: <Result extends JsonValue>(path: string, callback: WorkflowWorktreeLeaseCallback<Result>) => Promise<Result>; withWorktree: <Result extends JsonValue>(name: string, callback: WorkflowWorktreeCallback<Result>, options?: WorkflowWorktreeOptions) => Promise<Result>; checkpoint: (input: CheckpointInput) => Promise<boolean>; phase: (name: string) => void; log: (message: string) => void; evidence?: (content: string | JsonValue) => Promise<EvidenceRecord> }
 export interface WorkflowRunContext { cwd: string; sessionId: string; runId: string; workflow: Readonly<WorkflowMetadata>; args: JsonValue; signal: AbortSignal }
 export interface WorkflowFunctionContext extends WorkflowOrchestrationContext { tools: Record<string, (args: Record<string, JsonValue>) => Promise<JsonValue>>; run: Readonly<WorkflowRunContext>; settings: Readonly<WorkflowExtensionSettings>; invoke: (name: string, input: Readonly<Record<string, JsonValue>>, label?: string) => Promise<JsonValue> }
 export type WorkflowWorktreeCallback<Result extends JsonValue = JsonValue> = (reference: Readonly<WorkflowWorktreeReference>) => Result | Promise<Result>;
@@ -410,7 +433,7 @@ export interface ShellIdentity { structuralPath: readonly string[]; callSite: st
 /** A script `tools.<id>(args)` call: the n-th call of that tool within one structural scope. */
 export interface ToolIdentity { structuralPath: readonly string[]; occurrence: number }
 export interface EvidenceRecord { ref: string; sha256: string; path: string; bytes: number }
-export interface WorkflowBridge { agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void>; tool?: (identifier: string, args: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: ToolIdentity) => Promise<JsonValue>; evidence?: (content: string | JsonValue, signal: AbortSignal) => Promise<EvidenceRecord> }
+export interface WorkflowBridge { capabilities?: Readonly<WorkflowCapabilities>; leases?: WorkflowLeaseBridge; agent?: (prompt: string, options: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: AgentIdentity) => Promise<JsonValue>; shell?: (command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity) => Promise<ShellResult>; checkpoint?: (input: Readonly<Record<string, JsonValue>>, signal: AbortSignal) => boolean | Promise<boolean>; function?: (name: string, input: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: FunctionIdentity) => Promise<JsonValue>; worktree?: (owner: string, signal: AbortSignal, options?: WorkflowWorktreeOptions) => Promise<Readonly<WorkflowWorktreeReference>>; functions?: Readonly<Record<string, { name: string }>>; phase?: (name: string) => void | Promise<void>; log?: (message: string) => void | Promise<void>; tool?: (identifier: string, args: Readonly<Record<string, JsonValue>>, signal: AbortSignal, identity: ToolIdentity) => Promise<JsonValue>; evidence?: (content: string | JsonValue, signal: AbortSignal) => Promise<EvidenceRecord> }
 export interface WorkflowExecution { result: Promise<JsonValue>; cancel: () => void }
 export interface StaticWorkflowScope { kind: "parallel" | "pipeline"; name: string | null; key: string | null }
 export type StaticWorkflowExecution = "parallel" | "sequential";

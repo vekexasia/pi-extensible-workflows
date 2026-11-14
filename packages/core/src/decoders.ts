@@ -521,7 +521,10 @@ function decodeOwnershipRecord(value: unknown): OwnershipRecord | undefined {
 export function decodeOwnershipRecords(value: unknown): OwnershipRecord[] | undefined { return decodeArray(value, decodeOwnershipRecord); }
 function decodeWorktreeReference(value: unknown): WorktreeReference | undefined {
   if (!object(value) || typeof value.owner !== "string" || typeof value.path !== "string" || typeof value.branch !== "string" || typeof value.cwd !== "string" || typeof value.base !== "string") return undefined;
-  return { owner: value.owner, path: value.path, branch: value.branch, cwd: value.cwd, base: value.base };
+  if (value.controls !== undefined && (!object(value.controls) || Object.keys(value.controls).some((key) => !["expectedTip", "fresh", "setup"].includes(key)) || value.controls.expectedTip !== undefined && (typeof value.controls.expectedTip !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.controls.expectedTip)) || value.controls.fresh !== undefined && typeof value.controls.fresh !== "boolean" || value.controls.setup !== undefined && value.controls.setup !== "none" && value.controls.setup !== "configured")) return undefined;
+  const identity = value.resourceIdentity;
+  if (identity !== undefined && (!object(identity) || Object.keys(identity).sort().join(",") !== "commonGitDirectory,gitDirectory,path" || typeof identity.path !== "string" || typeof identity.gitDirectory !== "string" || typeof identity.commonGitDirectory !== "string")) return undefined;
+  return { owner: value.owner, path: value.path, branch: value.branch, cwd: value.cwd, base: value.base, ...(identity === undefined ? {} : { resourceIdentity: identity as unknown as import("./worktree-lease.js").WorktreeLeaseIdentity }), ...(value.controls === undefined ? {} : { controls: value.controls }) };
 }
 export function decodeWorktreeReferences(value: unknown): WorktreeReference[] | undefined { return decodeArray(value, decodeWorktreeReference); }
 function decodeBorrowedWorktreeBinding(value: unknown): BorrowedWorktreeBinding | undefined {
@@ -577,6 +580,6 @@ export function decodeSystemPromptArtifact(value: unknown): { version: number; f
   if (value.entries !== undefined && !entries) return undefined;
   return { version: value.version, ...(value.format === undefined ? {} : { format: value.format }), ...(value.storage === undefined ? {} : { storage: value.storage }), ...(entries === undefined ? {} : { entries }) };
 }
-export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string }
+export interface WorktreeReference { owner: string; path: string; branch: string; cwd: string; base: string; controls?: import("./types.js").WorkflowWorktreeOptions; resourceIdentity?: import("./worktree-lease.js").WorktreeLeaseIdentity }
 export interface BorrowedWorktreeBinding { name: string; sourceRunId: string; owner: string }
 export type SessionOwner = { pid: number; token: string; startedAt: number };

@@ -1,15 +1,35 @@
 import { createHash } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WorkflowError } from "./types.js";
 import { isNodeError } from "./utils.js";
 
 export function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
 export function canonicalPath(path: string): string { const absolute = resolve(path); try { return realpathSync(absolute); } catch { return absolute; } }
+/** Canonical identity for a contained descendant, including missing suffixes, anchored to an existing directory. */
+export function canonicalDescendantPath(directory: string, path: string): string {
+  const root = realpathSync(directory);
+  if (!statSync(root).isDirectory() || !piResourceContains(directory, path)) throw new WorkflowError("WORKTREE_FAILED", "Descendant identity escapes its existing directory");
+  let existing = resolve(path);
+  const missing: string[] = [];
+  for (;;) {
+    try { lstatSync(existing); break; }
+    catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+      missing.unshift(basename(existing));
+      const parent = dirname(existing);
+      if (parent === existing) throw new WorkflowError("WORKTREE_FAILED", "Descendant identity has no existing anchor");
+      existing = parent;
+    }
+  }
+  const canonical = realpathSync(existing);
+  if (!piResourceContains(root, canonical)) throw new WorkflowError("WORKTREE_FAILED", "Descendant identity crosses a symlink boundary");
+  return join(canonical, ...missing);
+}
 export function extensionIdentity(path: string): string { return path.startsWith("builtin:") ? path : canonicalPath(path.startsWith("file:") ? fileURLToPath(path) : path); }
 export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
 /**

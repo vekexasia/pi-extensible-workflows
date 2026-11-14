@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type, type Static, type TSchema } from "typebox";
 import { copyToClipboard, getAgentDir, ModelSelectorComponent, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { WorkflowOwnership } from "./ownership.js";
 import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
 import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
@@ -31,7 +32,7 @@ import { openAgentsWorkspace, type OpenAgentsWorkspace } from "./agents-workspac
 import { createSessionAgentsSource, type SessionAgentsScope } from "./session-agents.js";
 import { openSessionTranscript } from "./session-transcript.js";
 import { createTranscriptView } from "./transcript-components.js";
-import { HARD_TERMINAL_RUN_STATES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WORKFLOW_CAPABILITIES, LAUNCH_SNAPSHOT_IDENTITY_VERSION, THINKING_LEVELS, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BLOCKED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WorkflowError, type WorkflowFunction, isContextFileScope, isExternallyEndedRunState, isHardTerminalRunState, type AgentAccounting, type AgentIdentity, type AgentRecord, type AgentResourcePolicy, type AgentTransport, type JsonValue, type LaunchSnapshot, type LiveSessionHandoff, type HardTerminalRunState, type ModelSpec, type PreparedAgentSession, type RunState, type ShellIdentity, type ShellOptions, type ShellResult, type ToolIdentity, type WorkflowAgentSession, type WorkflowErrorCode, type WorkflowMetadata, type WorkflowModelAliasResolverContext, type WorkflowSettings, type WorkflowScriptCall, type WorkflowSettingsResolution, type WorkflowWorktreeReference, type WorkflowWorktreeOptions } from "./types.js";
 import type { SubagentManagerContext } from "../subagents/src/contracts.js";
 import { SETTLED_AGENT_STATES, catalogResultValue, formatWorkflowCatalog, styledTextBlock, textBlock, workflowCatalogBlock, workflowControlCall, workflowControlResult, workflowProgressBlock, type WorkflowProgressRenderState } from "./host-view.js";
 import { DELIVERY_LIMIT_BYTES, ForegroundDeliveryController, markWorkflowFailureDiagnostics, WORKFLOW_LOG_ENTRY, completionDescriptor, completionDeliveryFromStore, createWorkflowFailureDiagnostics, failureDiagnosticsFrom, formatWorkflowFailure, formatWorkflowFailureDelivery, formatWorkflowFailureDeliveryFallback, formatWorkflowFailureDiagnostics, isWorkflowFailureDiagnostics, serializeWorkflowFailureDiagnostics, utf8Prefix, type CompletionDeliveryContext, type ForegroundDelivery, type ForegroundDetachResult, type WorkflowLogEntry } from "./host-delivery.js";
@@ -577,13 +578,13 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     return order;
   };
   /** Replaces `lifecycle.enter()` at the top of a call: registers synchronously, waits for earlier phase updates, and returns `registered` to call (idempotent) once the start is recorded. */
-  const enterCall = async (store: RunStore, lifecycle: RunLifecycle): Promise<() => void> => {
+  const enterCall = async (store: RunStore, lifecycle: RunLifecycle, signal?: AbortSignal): Promise<() => void> => {
     const order = phaseOrder(store);
     let registered = () => undefined;
     const starting = new Promise<void>((resolve) => { registered = () => { order.starting.delete(starting); resolve(); }; });
     order.starting.add(starting);
     await order.phase;
-    await lifecycle.enter().catch((error: unknown) => { registered(); throw error; });
+    await lifecycle.enter(signal).catch((error: unknown) => { registered(); throw error; });
     return registered;
   };
   const phaseBridge = (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle) => {
@@ -618,23 +619,24 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       } finally { await lifecycle.leave(); }
     }
   };
-  const persistWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<WorktreeReference> => {
+  const persistWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string, options?: WorkflowWorktreeOptions, signal?: AbortSignal): Promise<WorktreeReference> => {
     const existing = (await store.worktrees()).some((worktree) => worktree.owner === owner);
-    const worktree = await store.worktree(owner);
+    const scoped = runs.get(store.runId)?.ownership?.current() !== undefined;
+    const worktree = await store.worktree(owner, options, options !== undefined || scoped ? signal : undefined);
     if (!existing && await store.ownsWorktree(owner)) await eventPublisher.worktree(store, metadata, worktree);
     return worktree;
   };
-  const resolveWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string): Promise<Readonly<WorkflowWorktreeReference>> => {
+  const resolveWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string, options?: WorkflowWorktreeOptions, signal?: AbortSignal): Promise<Readonly<WorkflowWorktreeReference>> => {
     const run = runs.get(store.runId);
     if (!run) fail("INTERNAL_ERROR", `Unknown production run: ${store.runId}`);
-    await run.lifecycle.enter();
+    await run.lifecycle.enter(signal);
     try {
-      const worktree = await persistWorktree(store, metadata, owner);
+      const worktree = await persistWorktree(store, metadata, owner, options, signal);
       return { path: worktree.path, branch: worktree.branch };
     } finally { await run.lifecycle.leave(); }
   };
   const shellForRun = async (store: RunStore, metadata: WorkflowMetadata, lifecycle: RunLifecycle, command: string, options: ShellOptions, signal: AbortSignal, identity: ShellIdentity): Promise<ShellResult> => {
-    const registered = await enterCall(store, lifecycle);
+    const registered = await enterCall(store, lifecycle, signal);
     try {
       const path = shellIdentityPath(identity);
       const replayed = await store.replay(path);
@@ -659,7 +661,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       registered();
       runs.get(store.runId)?.update?.(workflowToolUpdate(withLiveActivities(started)));
       try {
-        const cwd = identity.worktreeOwner ? (await persistWorktree(store, metadata, identity.worktreeOwner)).cwd : store.cwd;
+        const cwd = identity.worktreeOwner ? (await persistWorktree(store, metadata, identity.worktreeOwner, undefined, signal)).cwd : store.cwd;
         const result = await executeShellCommand(command, options, signal, cwd);
         if (!jsonValue(result)) fail("SHELL_FAILED", "Shell result is not JSON-compatible");
         await store.complete(path, result);
@@ -880,6 +882,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     run.execution?.cancel();
     await scheduler.cancelRun(run.store.runId);
     await scheduler.flush(run.store.runId);
+    try { await run.ownership?.finalize(); } catch (error) { if (!(error instanceof WorkflowError) || error.code !== "CANCELLED") throw error; }
     await cleanupTerminalRun(runId);
     return { runId, state: "stopped", stopped: true };
   };
@@ -949,6 +952,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         if (signal.aborted) reject(new WorkflowError("CANCELLED", "Workflow cancelled"));
         else signal.addEventListener("abort", () => { run?.checkpointResolvers.delete(path); reject(new WorkflowError("CANCELLED", "Workflow cancelled")); }, { once: true });
       });
+      // Own cancellation while checkpoint I/O is pending; returning decision below still propagates it.
+      void decision.catch(() => undefined);
       const answered = await store.awaitCheckpoint({ ...input, name: label, path });
       if (answered !== undefined) {
         if ((await store.awaitingCheckpoints()).length === 0) await run?.lifecycle.resolveAwaitingInput();
@@ -1126,7 +1131,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
           const replayed = await store.replay(path);
           if (replayed) return { replayed };
           const worktree = agentWorktree(identity);
-          const agentCwd = worktree.worktreeOwner ? (await persistWorktree(store, metadata, worktree.worktreeOwner)).cwd : cwd;
+          const agentCwd = worktree.worktreeOwner ? (await persistWorktree(store, metadata, worktree.worktreeOwner, undefined, agentSignal)).cwd : cwd;
           const model = typeof options.model === "string" ? options.model : undefined;
           const requestedLabel = typeof options.label === "string" ? options.label : undefined;
           const skills = Array.isArray(options.skills) ? options.skills as string[] : undefined;
@@ -1416,11 +1421,12 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const providerPause = async () => { if (!foregroundAttached) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`, !shuttingDown); await lifecycle.providerPause(); };
       const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
       const executor = createAgentExecutor({ ...executorRoot, runStore: store, providerPause, runContext });
-      const runRecord: WorkflowRunRecord = { executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, foreground: foregroundAttached, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) };
+      const ownership = new WorkflowOwnership(ctx.cwd, runId, store.sessionId, runController.signal, executeShellCommand, (owner) => resolveWorktree(store, checked.metadata, owner), lifecycle);
+      const runRecord: WorkflowRunRecord = { ownership, executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, foreground: foregroundAttached, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) };
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));
       scheduler.addRun(runId, settings.concurrency, () => runs.get(runId)?.budget.checkAgentLaunch(), settings.extensionSettings);
-      const execution = runWorkflow(script, args, withWorkflowFunctions({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId), worktree: async (owner) => resolveWorktree(store, checked.metadata, owner), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name), evidence: evidenceBridge(store, lifecycle) }, store, runContext, registry, settings.extensionSettings), runController.signal);
+      const execution = runWorkflow(script, args, withWorkflowFunctions(ownership.decorate({ tool: (identifier, toolArgs, signal, identity) => toolForRun(store, lifecycle, toolContext, identifier, toolArgs, signal, identity), shell: (command, options, signal, identity) => shellForRun(store, checked.metadata, lifecycle, command, options, signal, identity), agent: workflowAgentHandler(store, checked.metadata, lifecycle, executor, ctx.cwd, runId), capabilities: WORKFLOW_CAPABILITIES, worktree: async (owner, signal, options) => resolveWorktree(store, checked.metadata, owner, options, signal), checkpoint: checkpointBridge(runId, store, checked.metadata, () => runs.get(runId)?.foreground ?? foregroundAttached, ctx.hasUI ? ctx.ui : undefined, headless), phase: phaseBridge(store, checked.metadata, lifecycle), log: logBridge(store, lifecycle, checked.metadata.name), evidence: evidenceBridge(store, lifecycle) }), store, runContext, registry, settings.extensionSettings), runController.signal);
       runRecord.execution = execution;
       await eventPublisher.runStarted(store, checked.metadata);
       const finish = execution.result.then(async (value) => {
