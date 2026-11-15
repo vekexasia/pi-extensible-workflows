@@ -134,7 +134,7 @@ export function createWorkflowRecovery(deps: WorkflowRecoveryDependencies) {
     run.executor.setRunContext(runContext);
     await scheduler.cancelRun(run.store.runId);
     await run.lifecycle.resume();
-    const ownership = new WorkflowOwnership(run.store.cwd, run.store.runId, run.store.sessionId, controller.signal, executeShellCommand, (owner) => resolveWorktree(run.store, run.metadata, owner), run.lifecycle);
+    const ownership = new WorkflowOwnership(run.store.cwd, run.store.runId, run.store.sessionId, controller.signal, executeShellCommand, (owner, admissionSignal) => resolveWorktree(run.store, run.metadata, owner, undefined, admissionSignal), run.lifecycle);
     run.ownership = ownership;
     const execution = runWorkflow(script, loaded.snapshot.args, withWorkflowFunctions(ownership.decorate({ tool: (identifier, args, signal, identity) => toolForRun(run.store, run.lifecycle, context?.toolContext, identifier, args, signal, identity), shell: (command, options, signal, identity) => shellForRun(run.store, run.metadata, run.lifecycle, command, options, signal, identity), agent: workflowAgentHandler(run.store, run.metadata, run.lifecycle, run.executor, run.store.cwd, run.store.runId), capabilities: WORKFLOW_CAPABILITIES, worktree: async (owner, signal, options) => resolveWorktree(run.store, run.metadata, owner, options, signal), checkpoint: checkpointBridge(run.store.runId, run.store, run.metadata, foreground, hasUI ? ui : undefined), phase: phaseBridge(run.store, run.metadata, run.lifecycle), log: logBridge(run.store, run.lifecycle, run.metadata.name), evidence: evidenceBridge(run.store, run.lifecycle) }), run.store, runContext, registry, snapshot.settings.extensionSettings), controller.signal);
     run.execution = execution;

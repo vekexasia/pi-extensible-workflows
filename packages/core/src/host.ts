@@ -1421,7 +1421,7 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const providerPause = async () => { if (!foregroundAttached) deliver(pi, `Workflow ${checked.metadata.name} paused: provider limit.`, !shuttingDown); await lifecycle.providerPause(); };
       const providerErrorRecovery = createProviderErrorRecovery(ctx, availableModels, () => { runController.abort(); });
       const executor = createAgentExecutor({ ...executorRoot, runStore: store, providerPause, runContext });
-      const ownership = new WorkflowOwnership(ctx.cwd, runId, store.sessionId, runController.signal, executeShellCommand, (owner) => resolveWorktree(store, checked.metadata, owner), lifecycle);
+      const ownership = new WorkflowOwnership(ctx.cwd, runId, store.sessionId, runController.signal, executeShellCommand, (owner, admissionSignal) => resolveWorktree(store, checked.metadata, owner, undefined, admissionSignal), lifecycle);
       const runRecord: WorkflowRunRecord = { ownership, executor, store, metadata: checked.metadata, model: rootModel, lifecycle, budget: budgetRuntime, abortController: runController, foreground: foregroundAttached, projectTrusted: () => projectTrusted(ctx), checkpointResolvers: new Map(), ...(providerErrorRecovery ? { providerErrorRecovery } : {}), ...(params.foreground && onUpdate ? { update: onUpdate } : {}) };
       runs.set(runId, runRecord);
       if (params.foreground && onUpdate) onUpdate(workflowToolUpdate((await store.load()).run));

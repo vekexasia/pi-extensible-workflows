@@ -3,15 +3,14 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { canonicalPath } from "./paths.js";
-import { executeOwnedCommand } from "./owned-process.js";
+import { executeOwnedCommand, OwnedCommandCleanupError } from "./owned-process.js";
 import { WorkflowError, type LeaseCommandOptions } from "./types.js";
 import { validateLeaseCommandOptions } from "./validation.js";
-import { object } from "./utils.js";
+import { errorText, isNodeError, object } from "./utils.js";
 
 // The generic client is embedded for source-loaded, bundled and packed runtimes.
 const clientSource = String.raw`
 "use strict";
-const fs = require("node:fs");
 const net = require("node:net");
 const ticket = globalThis.__piLeaseTicket;
 delete globalThis.__piLeaseTicket;
@@ -48,19 +47,37 @@ export class LeaseCommandBroker {
   #sockets = new Set<Socket>();
   #open = true;
   #counter = 0;
+  #listened = false;
+  #closing?: Promise<void>;
   private constructor(readonly directory: string, private readonly cwd: string, private readonly signal: AbortSignal, private readonly execute: (work: () => Promise<number | null>) => Promise<number | null>, private readonly taint: (error: Error) => void) {
     this.#server = createServer((socket) => { this.#accept(socket); });
     this.#server.maxConnections = 32;
   }
   static async create(cwd: string, signal: AbortSignal, execute: (work: () => Promise<number | null>) => Promise<number | null>, taint: (error: Error) => void): Promise<LeaseCommandBroker> {
-    // Deliberately bounded POSIX temp root, independent of long launch cwd/TMPDIR.
-    const directory = canonicalPath(await mkdtemp("/tmp/pi-lt-"));
-    const broker = new LeaseCommandBroker(directory, cwd, signal, execute, taint);
+    let directory: string | undefined;
+    let broker: LeaseCommandBroker | undefined;
     try {
+      // Deliberately bounded POSIX temp root, independent of long launch cwd/TMPDIR.
+      directory = canonicalPath(await mkdtemp("/tmp/pi-lt-"));
+      broker = new LeaseCommandBroker(directory, cwd, signal, execute, taint);
+      const server = broker.#server;
       await writeFile(join(directory, "client.cjs"), clientSource, { mode: 0o600 });
-      await new Promise<void>((resolve, reject) => { broker.#server.once("error", reject); broker.#server.listen(join(directory, "s"), () => { broker.#server.removeListener("error", reject); resolve(); }); });
+      const socketPath = join(directory, "s");
+      await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socketPath, () => { server.removeListener("error", reject); resolve(); }); });
+      broker.#listened = true;
       return broker;
-    } catch (error) { broker.#server.close(); await rm(directory, { recursive: true, force: true }); throw error; }
+    } catch (error) {
+      let failure: WorkflowError = new WorkflowError("SHELL_FAILED", `Lease command broker initialization failed: ${errorText(error)}`);
+      try {
+        if (broker) await broker.dispose();
+        else if (directory) await rm(directory, { recursive: true, force: true });
+      } catch (cleanup) {
+        failure = new OwnedCommandCleanupError(`${failure.message}; private rollback failed: ${errorText(cleanup)}`);
+      }
+      Object.defineProperty(failure, "cause", { value: error });
+      taint(failure);
+      throw failure;
+    }
   }
   #assertOpen(): void { if (!this.#open || this.signal.aborted) throw new WorkflowError("WORKTREE_FAILED", "Lease command admission is closed"); }
   async ticket(command: string, rawOptions: LeaseCommandOptions): Promise<string> {
@@ -78,11 +95,24 @@ export class LeaseCommandBroker {
     const launcher = `const fs=require("node:fs"),hash=b=>require("node:crypto").createHash("sha256").update(b).digest("hex");const client=fs.readFileSync(process.argv[1]),ticket=fs.readFileSync(process.argv[2]);if(hash(client)!==${JSON.stringify(digest(clientSource))}||hash(ticket)!==${JSON.stringify(digest(material))})throw Error("Lease client material changed");globalThis.__piLeaseTicket=JSON.parse(ticket);eval(client.toString("utf8"));`;
     return `exec ${process.versions.bun ? "env BUN_BE_BUN=1 " : ""}${quote(process.execPath)} -e ${quote(launcher)} ${quote(join(this.directory, "client.cjs"))} ${quote(file)}`;
   }
-  closeAdmission(): void { this.#open = false; this.#server.close(); }
+  closeAdmission(): Promise<void> {
+    this.#open = false;
+    this.#closing ??= new Promise<void>((resolve, reject) => {
+      this.#server.close((error?: Error) => {
+        // A failed initializer may own a server that never opened a listener.
+        if (error && !(isNodeError(error, "ERR_SERVER_NOT_RUNNING") && !this.#listened)) reject(error);
+        else resolve();
+      });
+    });
+    return this.#closing;
+  }
   async dispose(): Promise<void> {
-    this.closeAdmission();
+    const failures: unknown[] = [];
+    try { void this.closeAdmission(); } catch (error) { failures.push(error); }
     for (const socket of this.#sockets) socket.destroy();
-    await rm(this.directory, { recursive: true, force: true });
+    try { await this.#closing; } catch (error) { failures.push(error); }
+    try { await rm(this.directory, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    if (failures.length) throw new OwnedCommandCleanupError(`Lease command broker disposal failed: ${failures.map(errorText).join("; ")}`);
   }
   #accept(socket: Socket): void {
     if (!this.#open) { socket.destroy(); return; }

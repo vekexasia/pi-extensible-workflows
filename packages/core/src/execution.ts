@@ -807,7 +807,11 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
     stop("CANCELLED", "Workflow cancelled");
   }
   if (signal?.aborted) cancel(); else signal?.addEventListener("abort", cancel, { once: true });
-  const finalized = result.then(async (value) => { await bridge.leases?.finalize(); return value; }, async (error: unknown) => { await bridge.leases?.finalize(); throw error; });
+  const finalized = result.then(async (value) => { await bridge.leases?.finalize(); return value; }, async (error: unknown) => {
+    try { await bridge.leases?.finalize(); }
+    catch (cleanup) { if (!(cleanup instanceof WorkflowError && cleanup.code === "CANCELLED")) throw cleanup; }
+    throw error;
+  });
   return { result: finalized, cancel };
 }
 function attemptSummary(attempt: AgentAttempt, accounting = attempt.accounting): AgentAttemptSummary {

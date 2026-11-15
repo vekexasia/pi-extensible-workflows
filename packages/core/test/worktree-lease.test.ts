@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import workflowExtension, { registerWorkflowExtension } from "../src/index.js";
 import { testExtensionApi } from "./support.js";
@@ -457,6 +458,212 @@ for (const leased of [true, false]) {
     }
   });
 }
+
+function barrier() {
+  let release!: () => void;
+  const reached = new Promise<void>((resolve) => { release = resolve; });
+  return { reached, release };
+}
+
+// A test-owned bundle exposes existing internal classes for fault observation only.
+// The production host, registry, store and lifecycle still share one actual module graph.
+async function admissionHost(directory: string) {
+  const { build } = await import("esbuild");
+  const built = await build({
+    stdin: { contents: 'export {default, registerWorkflowExtension} from "./index.ts"; export {RunStore,listRunIds} from "./persistence.ts"; export {RunLifecycle} from "./host-runtime.ts";', resolveDir: fileURLToPath(new URL("../../src/", import.meta.url)), loader: "ts" },
+    bundle: true, platform: "node", format: "esm", write: false,
+    plugins: [{ name: "absolute-external-packages", setup(builder) {
+      builder.onResolve({ filter: /^[a-z@]/ }, (args) => ({ path: import.meta.resolve(args.path), external: true }));
+    } }],
+  });
+  const file = join(directory, "host-observation.mjs");
+  const output = built.outputFiles[0];
+  assert.ok(output);
+  writeFileSync(file, output.contents);
+  return await import(file) as typeof import("../src/index.js") & { RunLifecycle: typeof import("../src/host-runtime.js").RunLifecycle; listRunIds: typeof import("../src/persistence.js").listRunIds };
+}
+
+for (const mode of ["native", "registered"] as const) for (const recovery of [false, true]) for (const outcome of (mode === "registered" ? ["worker failure", "authored success"] : ["worker failure"])) {
+  void test(`production managed admission cancels before terminal persistence: ${mode}, ${recovery ? "cold recovery" : "launch"}, ${outcome}`, { timeout: 20_000 }, async (t) => {
+    const cwd = repository(), home = mkdtempSync(join(tmpdir(), "admission-host-"));
+    const fixtureId = `admission_${mode}_${recovery ? "recovery" : "launch"}_${outcome === "authored success" ? "success" : "failure"}`;
+    const names = { seed: `${fixtureId}Seed`, hold: `${fixtureId}Hold`, blocked: `${fixtureId}Blocked`, registered: `${fixtureId}Registered` };
+    const host = await admissionHost(home);
+    const gate = barrier(), failWorker = barrier();
+    const state = recovery ? "awaiting_input" : "paused";
+    let lifecycle: InstanceType<typeof host.RunLifecycle> | undefined;
+    let admissionSignal: AbortSignal | undefined;
+    let seed = recovery;
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- invoked below with the original lifecycle receiver.
+    const enter = host.RunLifecycle.prototype.enter;
+    const observeLifecycle = (current: InstanceType<typeof host.RunLifecycle>, signal?: AbortSignal) => {
+      lifecycle = current;
+      if (current.state === state) { admissionSignal = signal; gate.release(); }
+    };
+    t.mock.method(host.RunLifecycle.prototype, "enter", async function(this: InstanceType<typeof host.RunLifecycle>, signal?: AbortSignal) {
+      observeLifecycle(this, signal);
+      return enter.call(this, signal);
+    });
+    const hold = async () => {
+      assert.ok(lifecycle);
+      if (state === "paused") await lifecycle.pause(); else await lifecycle.enterAwaitingInput();
+      return true;
+    };
+    const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<{ details: { runId?: string } }> }> = [];
+    host.default(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand() {}, on() {}, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, undefined, undefined, home);
+    host.registerWorkflowExtension({ version: "1.0.0", headline: "Actual host admission fault fixture", functions: {
+      [names.seed]: { description: "Seed cold recovery", input: { type: "object" }, output: { type: "boolean" }, run: async () => { if (seed) { seed = false; throw new Error("seed failure"); } return true; } },
+      [names.hold]: { description: "Persist a lifecycle barrier", input: { type: "object" }, output: { type: "boolean" }, run: hold },
+      [names.blocked]: { description: "Wait for actual host resolver admission", input: { type: "object" }, output: { type: "boolean" }, run: async () => { await gate.reached; await failWorker.reached; return true; } },
+      [names.registered]: { description: "Enter a registered managed lease", input: { type: "object" }, output: { type: "string" }, run: async (_input, ctx) => ctx.withWorktree("managed", async (tree) => {
+        await hold();
+        const pending = ctx.withWorktreeLease(tree.path, async () => "forbidden writer");
+        if (outcome === "authored success") { void pending.catch(() => undefined); await gate.reached; await failWorker.reached; return "PASS"; }
+        return pending;
+      }) },
+    } });
+    const workflow = tools.find(({ name }) => name === "workflow"), retry = tools.find(({ name }) => name === "workflow_retry");
+    assert.ok(workflow && retry);
+    const context = { cwd, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "admission-host" } };
+    const body = mode === "native" ? `return await withWorktree("managed", async tree => { await ${names.hold}({}); const pending=withWorktreeLease(tree.path,async()=>"forbidden writer"); void pending.catch(()=>{}); await ${names.blocked}({}); throw new Error("original worker diagnostic"); });` : `const pending=${names.registered}({}); void pending.catch(()=>{}); await ${names.blocked}({}); throw new Error("original worker diagnostic");`;
+    const script = `await ${names.seed}({}); ${outcome === "authored success" ? `return await ${names.registered}({});` : body}`;
+    const controller = new AbortController();
+    let running: Promise<unknown> | undefined;
+    try {
+      if (recovery) await assert.rejects(workflow.execute("seed", { name: "admission", script, foreground: true }, controller.signal, undefined, context), /seed failure/);
+      const [source] = await host.listRunIds(cwd, "admission-host", home);
+      running = recovery ? retry.execute("retry", { runId: source, foreground: true }, controller.signal, undefined, context) : workflow.execute("start", { name: "admission", script, foreground: true }, controller.signal, undefined, context);
+      void running.catch(() => undefined);
+      await gate.reached;
+      const ids = await host.listRunIds(cwd, "admission-host", home);
+      const active = await Promise.all(ids.map((id) => new host.RunStore(cwd, "admission-host", id, home).load()));
+      assert.ok(active.some(({ run }) => run.state === state), "the real RunStore must persist the barrier before worker failure");
+      assert.ok(admissionSignal instanceof AbortSignal, "the production adapter must forward the admission signal");
+      assert.equal(admissionSignal.aborted, false);
+      failWorker.release();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await assert.rejects(Promise.race([running, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { reject(new Error("host finalization deadlock")); }, 3000); })]), outcome === "authored success" ? { code: "CANCELLED" } : /original worker diagnostic/);
+      } finally { if (timer) clearTimeout(timer); }
+      assert.equal(admissionSignal.aborted, true);
+      assert.ok(lifecycle);
+      assert.equal(lifecycle.state, outcome === "authored success" && !recovery ? "stopped" : "failed");
+      for (const id of ids) {
+        const store = new host.RunStore(cwd, "admission-host", id, home);
+        for (const tree of await store.worktrees()) assert.equal(existsSync(await physicalOwnerDirectory(tree.path)), false);
+      }
+    } finally {
+      failWorker.release();
+      controller.abort();
+      await running?.catch(() => undefined);
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const state of ["paused", "awaiting_input"] as const) {
+  void test(`finalization cancels managed admission at the real ${state} lifecycle gate`, { timeout: 10_000 }, async () => {
+    const { WorkflowOwnership } = await import("../src/ownership.js");
+    const { RunLifecycle } = await import("../src/host-runtime.js");
+    const { executeShellCommand } = await import("../src/execution.js");
+    const cwd = repository();
+    let reached!: () => void;
+    const blocked = new Promise<void>((resolve) => { reached = resolve; });
+    const lifecycle = new RunLifecycle();
+    if (state === "paused") await lifecycle.pause(); else await lifecycle.enterAwaitingInput();
+    const controller = new AbortController();
+    const ownership = new WorkflowOwnership(cwd, "finalizing", "s", controller.signal, executeShellCommand, async (_owner: string, signal?: AbortSignal) => {
+      reached();
+      await lifecycle.enter(signal);
+      await lifecycle.leave();
+      return { path: cwd, branch: "fixture" };
+    });
+    const admission = ownership.enter(cwd, "managed", controller.signal);
+    const rejected = assert.rejects(admission, { code: "CANCELLED" });
+    try {
+      await blocked;
+      const finalization = ownership.finalize();
+      // This bound detects the wait cycle; it is not a supervisor performance claim.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await assert.rejects(Promise.race([finalization, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { reject(new Error("finalizer deadlocked on managed admission")); }, 1500); })]), { code: "CANCELLED" });
+      } finally { if (timer) clearTimeout(timer); }
+      await rejected;
+      assert.equal(controller.signal.aborted, false, "only the private admission controller must be cancelled");
+      assert.equal(lifecycle.state, state, "terminal notification is not needed to wake admission");
+      assert.equal(existsSync(await physicalOwnerDirectory(cwd)), false);
+      await assert.rejects(ownership.finalize(), { code: "CANCELLED" });
+    } finally {
+      await lifecycle.terminal("failed");
+      await rejected;
+      await ownership.finalize().catch(() => undefined);
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+}
+
+void test("finalization owns a delayed physical acquisition receipt until proven release", { timeout: 10_000 }, async (t) => {
+  const { WorkflowOwnership } = await import("../src/ownership.js");
+  const { PhysicalWorktreeLease, worktreeLeaseIdentity } = await import("../src/worktree-lease.js");
+  const { executeShellCommand } = await import("../src/execution.js");
+  const cwd = repository(), acquired = barrier(), deliverReceipt = barrier();
+  const controller = new AbortController();
+  const ownership = new WorkflowOwnership(cwd, "delayed", "s", controller.signal, executeShellCommand);
+  const acquire = PhysicalWorktreeLease.acquire.bind(PhysicalWorktreeLease);
+  let delay = true;
+  t.mock.method(PhysicalWorktreeLease, "acquire", async (...args: Parameters<typeof acquire>) => {
+    const owner = await acquire(...args);
+    if (delay) { delay = false; acquired.release(); await deliverReceipt.reached; }
+    return owner;
+  });
+  const admission = ownership.enter(cwd, undefined, controller.signal);
+  const rejected = assert.rejects(admission, { code: "CANCELLED" });
+  let finalized: Promise<void> | undefined;
+  try {
+    await acquired.reached;
+    finalized = ownership.finalize();
+    const failure = assert.rejects(finalized, { code: "CANCELLED" });
+    assert.equal(ownership.finalize(), finalized, "finalization is memoized");
+    assert.equal(existsSync(await physicalOwnerDirectory(cwd)), true, "an undelivered receipt must not be abandoned");
+    deliverReceipt.release();
+    await rejected;
+    await failure;
+    assert.equal(existsSync(await physicalOwnerDirectory(cwd)), false);
+    const next = await PhysicalWorktreeLease.acquire(await worktreeLeaseIdentity(cwd), { runId: "next", sessionId: "s", executionId: "next" });
+    await next.release();
+  } finally { deliverReceipt.release(); await rejected; await finalized?.catch(() => undefined); rmSync(cwd, { recursive: true, force: true }); }
+});
+
+void test("admission-only finalization cancellation still waits for previously tracked scope cleanup", { timeout: 10_000 }, async () => {
+  const { WorkflowOwnership } = await import("../src/ownership.js");
+  const { RunLifecycle } = await import("../src/host-runtime.js");
+  const { executeShellCommand } = await import("../src/execution.js");
+  const cwd = repository(), gate = barrier(), started = barrier(), drained = barrier();
+  const controller = new AbortController(), lifecycle = new RunLifecycle();
+  const ownership = new WorkflowOwnership(cwd, "draining", "s", controller.signal, executeShellCommand, async (_owner, signal) => {
+    gate.release(); await lifecycle.enter(signal); await lifecycle.leave(); return { path: cwd, branch: "fixture" };
+  });
+  const prior = await ownership.enter(cwd, undefined, controller.signal);
+  const pending = ownership.associate(prior.scope, async () => { started.release(); await drained.reached; });
+  await started.reached;
+  await lifecycle.pause();
+  const admission = ownership.enter(cwd, "managed", controller.signal);
+  const rejected = assert.rejects(admission, { code: "CANCELLED" });
+  let finalization: Promise<void> | undefined;
+  try {
+    await gate.reached;
+    finalization = ownership.finalize();
+    const failure = assert.rejects(finalization, { code: "CANCELLED" });
+    await rejected;
+    assert.equal(existsSync(await physicalOwnerDirectory(cwd)), true, "pending scoped cleanup still holds the exact owner");
+    assert.equal(controller.signal.aborted, false);
+    drained.release();
+    await pending;
+    await failure;
+    assert.equal(existsSync(await physicalOwnerDirectory(cwd)), false);
+  } finally { drained.release(); await lifecycle.terminal("failed"); await pending; await rejected; await finalization?.catch(() => undefined); rmSync(cwd, { recursive: true, force: true }); }
+});
 
 void test("persistent handles keep lease affinity and cannot be used after closure", { timeout: 30_000 }, async () => {
   const cwd = repository();

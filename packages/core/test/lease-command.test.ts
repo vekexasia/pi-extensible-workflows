@@ -1,7 +1,8 @@
 import { initializeGitFixture } from "./git-fixture.js";
 import { physicalOwnerDirectory } from "./worktree-owner-fixture.js";
 import assert from "node:assert/strict";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,156 @@ function repo(): string {
   return cwd;
 }
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+for (const mode of ["retained-worktree", "retained-unknown", "drained-success", "error-while-pending", "never-close-pending"]) {
+  void test(`deferred broker closure preserves real ownership and bounded secondary evidence: ${mode}`, { timeout: 20_000 }, async () => {
+    const cwd = repo();
+    const fixture = join(cwd, "deferred-close.mjs");
+    writeFileSync(fixture, `
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import {existsSync,readFileSync} from "node:fs";
+import {Server} from "node:net";
+import {WorkflowOwnership} from ${JSON.stringify(new URL("../src/ownership.js", import.meta.url).href)};
+import {LeaseCommandBroker} from ${JSON.stringify(new URL("../src/lease-command.js", import.meta.url).href)};
+import {OwnedCommandCleanupError} from ${JSON.stringify(new URL("../src/owned-process.js", import.meta.url).href)};
+import {WorkflowError} from ${JSON.stringify(new URL("../src/types.js", import.meta.url).href)};
+import {PhysicalWorktreeLease,worktreeLeaseIdentity,worktreeOwnerDirectory} from ${JSON.stringify(new URL("../src/worktree-lease.js", import.meta.url).href)};
+import {runWorkflow} from ${JSON.stringify(new URL("../src/execution.js", import.meta.url).href)};
+const cwd=${JSON.stringify(cwd)},mode=${JSON.stringify(mode)};
+const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done});return {promise,resolve}};
+const closeStarted=deferred(),commandStarted=deferred(),commandRelease=deferred(),closingTurn=deferred();
+const originalClose=Server.prototype.close,originalDispose=LeaseCommandBroker.prototype.dispose;
+let releaseClose,privateDirectory,primaryFailure,disposals=0,commandFinished=false;
+Server.prototype.close=function(callback){return originalClose.call(this,error=>{releaseClose=()=>callback(mode==="drained-success"?error:new Error("secondary asynchronous listener failure"));closeStarted.resolve()})};
+LeaseCommandBroker.prototype.dispose=async function(){disposals++;return originalDispose.call(this)};
+const execute=async()=>{
+  if(mode.endsWith("pending")){commandStarted.resolve();await commandRelease.promise;commandFinished=true;return {exitCode:0,stdout:"",stderr:""}}
+  primaryFailure=mode==="retained-unknown"?new OwnedCommandCleanupError("original cleanup uncertainty"):new WorkflowError("WORKTREE_FAILED","original physical verification failure");
+  throw primaryFailure;
+};
+const ownership=new WorkflowOwnership(cwd,"deferred-close","s",new AbortController().signal,execute);
+try {
+const identity=await worktreeLeaseIdentity(cwd),ownerFile=worktreeOwnerDirectory(identity)+"/owner.json";
+const reference=await ownership.enter(cwd,undefined,new AbortController().signal);
+const ownerBefore=readFileSync(ownerFile,"utf8");
+const ticket=await ownership.command(reference.scope,"exit 0",{timeoutMs:1000});
+privateDirectory=/'([^']+)\\/client\\.cjs'/.exec(ticket)?.[1];assert.ok(privateDirectory);
+let command;
+if(mode.endsWith("pending")){
+  command=ownership.shell(reference.scope,"component barrier",{});await commandStarted.promise;
+}else if(mode!=="drained-success"){
+  await assert.rejects(ownership.shell(reference.scope,"injected adapter fault",{}),/original/);
+}
+const start=Date.now();
+const finalizing=ownership.finalize();let settled=false;
+void finalizing.then(()=>{settled=true},()=>{settled=true});
+await closeStarted.promise;
+assert.equal(ownership.finalize(),finalizing,"finalize must preserve promise identity");
+// A check-phase barrier distinguishes an observed pending close from a no-op rejection handler.
+setImmediate(()=>setImmediate(closingTurn.resolve));await closingTurn.promise;
+assert.equal(settled,false,"finalization must observe the deferred callback even after prior retention");
+assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore);
+if(mode!=="never-close-pending")releaseClose();
+if(mode==="error-while-pending"){
+  await new Promise(setImmediate);
+  assert.equal(settled,false,"listener failure must not skip an actual pending command");
+  assert.equal(commandFinished,false);assert.equal(disposals,0);
+  commandRelease.resolve();await command;
+}
+const execution=runWorkflow('try { throw new Error("authored catch"); } catch {} return "PASS";',null,ownership.decorate({}));
+void execution.result.catch(()=>undefined);
+const messages=(error,seen=new Set())=>{if(!error||seen.has(error))return [];seen.add(error);return [error.message,...messages(error.cause,seen),...(error.errors??[]).flatMap(item=>messages(item,seen))]};
+if(mode==="drained-success"){
+  await finalizing;assert.equal(await execution.result,"PASS");assert.equal(existsSync(ownerFile),false);assert.equal(disposals,1);
+}else{
+  let failure;
+  await assert.rejects(finalizing,error=>{failure=error;return error instanceof OwnedCommandCleanupError&&error.cleanupUnproven===true});
+  await assert.rejects(execution.result,error=>error===failure);
+  await assert.rejects(ownership.leave(reference.scope),error=>error===failure,"leave and finalize expose the same evidence");
+  assert.equal(ownership.finalize(),finalizing);
+  assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore);
+  assert.equal(disposals,0,"retained or undrained scope must not dispose broker resources");
+  assert.equal(existsSync(privateDirectory+"/client.cjs"),true);
+  await assert.rejects(PhysicalWorktreeLease.acquire(identity,{runId:"next",sessionId:"s",executionId:"next"}),/physical owner/);
+  if(mode==="never-close-pending"){
+    assert.ok(Date.now()-start>=10_000,"use the existing real drain deadline, not an invented shorter budget");
+    assert.match(failure.message,/lease drain failed/);assert.equal(commandFinished,false,"unknown command must still own its component lifeline");
+    releaseClose();await new Promise(setImmediate);
+    commandRelease.resolve();await command;
+    assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore,"late cleanup cannot release retained ownership");
+  }else if(mode==="error-while-pending"){
+    assert.match(failure.message,/secondary asynchronous listener failure/);assert.equal(commandFinished,true);
+  }else{
+    const original=mode==="retained-unknown"?"original cleanup uncertainty":"original physical verification failure";
+    assert.match(failure.message,/secondary asynchronous listener failure/);
+    assert.equal(failure.message.split(original).length-1,1,"original diagnostic must not be duplicated");
+    assert.equal(failure.message.split("secondary asynchronous listener failure").length-1,1,"secondary diagnostic must not be duplicated");
+    assert.ok(messages(failure).some(message=>message===primaryFailure.message),"original cause remains accessible");
+    assert.ok(messages(failure).some(message=>message==="secondary asynchronous listener failure"),"secondary callback cause remains accessible");
+  }
+}
+} finally {
+  Server.prototype.close=originalClose;LeaseCommandBroker.prototype.dispose=originalDispose;
+  if(privateDirectory)await fs.rm(privateDirectory,{recursive:true,force:true});
+}
+process.exit(0);
+`);
+    try { await promisify(execFile)(process.execPath, [fixture], { timeout: 17_000 }); }
+    finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["temp", "write", "listen", "rollback", "rollback-close", "server-close", "close", "dispose", "release"]) {
+  void test(`broker initialization/finalization fault is sticky and releases only proven cleanup: ${mode}`, { timeout: 15_000 }, async () => {
+    const cwd = repo();
+    const fixture = join(cwd, "broker-fault.mjs");
+    writeFileSync(fixture, `
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import {existsSync} from "node:fs";
+import {Server} from "node:net";
+import {syncBuiltinESMExports} from "node:module";
+import {WorkflowOwnership} from ${JSON.stringify(new URL("../src/ownership.js", import.meta.url).href)};
+import {LeaseCommandBroker} from ${JSON.stringify(new URL("../src/lease-command.js", import.meta.url).href)};
+import {PhysicalWorktreeLease,worktreeLeaseIdentity,worktreeOwnerDirectory} from ${JSON.stringify(new URL("../src/worktree-lease.js", import.meta.url).href)};
+import {runWorkflow,executeShellCommand} from ${JSON.stringify(new URL("../src/execution.js", import.meta.url).href)};
+const cwd=${JSON.stringify(cwd)}, mode=${JSON.stringify(mode)};
+const original={write:fs.writeFile,temp:fs.mkdtemp,rm:fs.rm,listen:Server.prototype.listen,close:Server.prototype.close};
+const fault=code=>Object.assign(new Error("injected "+code),{code});
+fs.mkdtemp=async(prefix,...args)=>{if(mode==="temp"&&prefix==="/tmp/pi-lt-")throw fault("ENOSPC");return original.temp(prefix,...args)};
+let privateDirectory;
+fs.writeFile=async(path,...args)=>{if(String(path).endsWith("/client.cjs")&&["write","rollback","rollback-close"].includes(mode)){privateDirectory=String(path).slice(0,-11);throw fault("EACCES")}return original.write(path,...args)};
+fs.rm=async(path,...args)=>{if(mode==="rollback"&&String(path).includes("/pi-lt-"))throw fault("EPERM");return original.rm(path,...args)};
+Server.prototype.listen=function(...args){if(mode==="listen"){queueMicrotask(()=>this.emit("error",fault("EMFILE")));return this}return original.listen.apply(this,args)};
+if(["rollback-close","server-close"].includes(mode))Server.prototype.close=function(callback){return original.close.call(this,()=>callback(fault("server close failed")))};
+if(mode==="close")LeaseCommandBroker.prototype.closeAdmission=function(){throw fault("close failed")};
+if(mode==="dispose")LeaseCommandBroker.prototype.dispose=async function(){throw fault("dispose failed")};
+if(mode==="release")PhysicalWorktreeLease.prototype.release=async function(){throw fault("release failed")};
+syncBuiltinESMExports();
+const ownership=new WorkflowOwnership(cwd,"fault","s",new AbortController().signal,executeShellCommand);
+const retained=["rollback","rollback-close","server-close","close","dispose","release"].includes(mode);
+let failure;
+try {
+  await assert.rejects(runWorkflow('try { await withWorktreeLease(args,async lease=>{try{await lease.command("touch forbidden",{timeoutMs:1000})}catch{}})}catch{} return "PASS";',cwd,ownership.decorate({})).result,error=>{failure=error;return error.code===(mode==="release"?"WORKTREE_FAILED":"SHELL_FAILED")});
+  assert.equal(failure.cleanupUnproven===true,["rollback","rollback-close","server-close","close","dispose"].includes(mode));
+  if(mode.startsWith("rollback"))assert.match(failure.message,/EACCES/);
+  await assert.rejects(ownership.finalize(),error=>error===failure);
+  assert.equal(existsSync(cwd+"/forbidden"),false);
+  const identity=await worktreeLeaseIdentity(cwd);
+  assert.equal(existsSync(worktreeOwnerDirectory(identity)),retained);
+  if(retained)await assert.rejects(PhysicalWorktreeLease.acquire(identity,{runId:"next",sessionId:"s",executionId:"next"}),/physical owner/);
+  else await (await PhysicalWorktreeLease.acquire(identity,{runId:"next",sessionId:"s",executionId:"next"})).release();
+} finally {
+  fs.writeFile=original.write;fs.mkdtemp=original.temp;fs.rm=original.rm;Server.prototype.listen=original.listen;Server.prototype.close=original.close;syncBuiltinESMExports();
+  if(privateDirectory)await original.rm(privateDirectory,{recursive:true,force:true});
+}
+process.exit(0);
+`);
+    try { await promisify(execFile)(process.execPath, [fixture], { timeout: 10_000 }); }
+    finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
 
 for (const reuse of ["once", "sequential"]) for (const mode of ["inherit", "ignore"]) for (const signal of ["SIGTERM", "SIGKILL", "deadline"] as const) {
   void test(`actual ticket client ${signal} drains a resistant adapter descendant with ${mode} stdio before scope release${reuse === "sequential" ? " (sequential)" : ""}`, { skip: process.platform !== "darwin" && process.platform !== "linux", timeout: 30_000 }, async (t) => {

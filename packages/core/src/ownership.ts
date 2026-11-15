@@ -19,9 +19,13 @@ export class WorkflowOwnership implements WorkflowLeaseBridge {
   #scopes = new Map<string, Scope>();
   #entering = new Set<Promise<unknown>>();
   #closed = false;
+  #admissionController = new AbortController();
+  #finalizing = false;
+  #finalization?: Promise<void>;
+  #cancelledAdmissionDuringFinalization = false;
   #taint: WorkflowError | undefined;
   readonly #executionId = randomUUID();
-  constructor(private readonly root: string, private readonly runId: string, private readonly sessionId: string, private readonly signal: AbortSignal, private readonly executeShell: typeof executeShellCommand, private readonly resolveWorktree?: (owner: string) => Promise<Readonly<WorkflowWorktreeReference>>, private readonly gate?: { enter(signal?: AbortSignal): Promise<void>; leave(): Promise<void> }) {
+  constructor(private readonly root: string, private readonly runId: string, private readonly sessionId: string, private readonly signal: AbortSignal, private readonly executeShell: typeof executeShellCommand, private readonly resolveWorktree?: (owner: string, admissionSignal: AbortSignal) => Promise<Readonly<WorkflowWorktreeReference>>, private readonly gate?: { enter(signal?: AbortSignal): Promise<void>; leave(): Promise<void> }) {
     signal.addEventListener("abort", () => {
       this.#closed = true;
       for (const scope of this.#scopes.values()) { this.#fail(scope, new WorkflowError("CANCELLED", "Worktree scope cancelled")); scope.open = false; scope.controller.abort(); }
@@ -34,36 +38,52 @@ export class WorkflowOwnership implements WorkflowLeaseBridge {
     if (scope.taint) throw scope.taint;
     return scope;
   }
-  #fail(scope: Scope, error: unknown): void {
+  #fail(scope: Scope, error: unknown, includePriorFailure = false): void {
     const typed = error instanceof WorkflowError ? error : new WorkflowError("WORKTREE_FAILED", errorText(error));
-    const unproven = error instanceof OwnedCommandCleanupError || error instanceof Error && "cleanupUnproven" in error && error.cleanupUnproven === true;
-    if (unproven || typed.code === "WORKTREE_FAILED" && !scope.retain) scope.taint = typed;
-    else scope.taint ??= typed;
-    if (unproven || typed.code === "WORKTREE_FAILED" && !(this.#taint instanceof OwnedCommandCleanupError)) this.#taint = typed;
-    else this.#taint ??= typed;
-    if (unproven || typed.code === "WORKTREE_FAILED") scope.retain = true;
+    const priority = (failure: WorkflowError | undefined) => !failure ? -1 : failure instanceof OwnedCommandCleanupError || "cleanupUnproven" in failure && failure.cleanupUnproven === true ? 3 : failure.code === "WORKTREE_FAILED" ? 2 : failure.code === "CANCELLED" ? 0 : 1;
+    const update = (prior: WorkflowError | undefined): WorkflowError => {
+      if (includePriorFailure && prior && prior !== typed && priority(typed) >= priority(prior)) {
+        const failure = new OwnedCommandCleanupError(`${typed.message}; prior failure: ${prior.message}`);
+        Object.defineProperty(failure, "cause", { value: new AggregateError([prior, typed], "Lease cleanup failures") });
+        return failure;
+      }
+      return !prior || priority(typed) > priority(prior) ? typed : prior;
+    };
+    const prior = scope.taint;
+    scope.taint = update(prior);
+    this.#taint = this.#taint === prior ? scope.taint : update(this.#taint);
+    if (priority(typed) >= 2) scope.retain = true;
   }
   async enter(path: string, worktreeOwner: string | undefined, signal: AbortSignal): Promise<{ scope: string; path: string }> {
     if (typeof path !== "string" || !path.trim()) throw new WorkflowError("INVALID_METADATA", "withWorktreeLease path must be non-empty");
     if (this.#closed || this.signal.aborted || signal.aborted) throw new WorkflowError("CANCELLED", "Worktree lease admission is closed");
     if (process.platform !== "darwin" && process.platform !== "linux") throw new WorkflowError("WORKTREE_FAILED", "Worktree ownership requires macOS or Linux supervision");
+    const admissionSignal = AbortSignal.any([signal, this.signal, this.#admissionController.signal]);
+    const assertAdmission = () => { if (admissionSignal.aborted) throw new WorkflowError("CANCELLED", "Worktree lease admission cancelled"); };
     const entering = (async () => {
+      assertAdmission();
       const identity = await worktreeLeaseIdentity(path);
-      const allowed = worktreeOwner ? (await this.resolveWorktree?.(worktreeOwner))?.path : this.root;
-      if (!allowed || !sameWorktreeLeaseIdentity(identity, await worktreeLeaseIdentity(allowed))) throw new WorkflowError("WORKTREE_FAILED", "Lease path must equal the launch root or active managed worktree");
+      assertAdmission();
+      const allowed = worktreeOwner ? (await this.resolveWorktree?.(worktreeOwner, admissionSignal))?.path : this.root;
+      assertAdmission();
+      const allowedIdentity = allowed ? await worktreeLeaseIdentity(allowed) : undefined;
+      assertAdmission();
+      if (!allowedIdentity || !sameWorktreeLeaseIdentity(identity, allowedIdentity)) throw new WorkflowError("WORKTREE_FAILED", "Lease path must equal the launch root or active managed worktree");
       const owner = await PhysicalWorktreeLease.acquire(identity, { runId: this.runId, sessionId: this.sessionId, executionId: this.#executionId });
       const scope: Scope = { id: randomUUID(), owner, controller: new AbortController(), pending: new Set(), open: true, retain: false };
       this.#scopes.set(scope.id, scope);
       const abort = () => { this.#fail(scope, new WorkflowError("CANCELLED", "Worktree scope cancelled")); scope.open = false; scope.controller.abort(); };
       signal.addEventListener("abort", abort, { once: true });
       scope.detachAbort = () => { signal.removeEventListener("abort", abort); };
-      if (this.#closed || this.signal.aborted || signal.aborted) { this.#fail(scope, new WorkflowError("CANCELLED", "Worktree lease admission closed during acquisition")); await this.leave(scope.id); throw new WorkflowError("CANCELLED", "Worktree lease cancelled"); }
+      if (admissionSignal.aborted || this.#closed) { this.#fail(scope, new WorkflowError("CANCELLED", "Worktree lease admission closed during acquisition")); await this.leave(scope.id); throw new WorkflowError("CANCELLED", "Worktree lease cancelled"); }
       return { scope: scope.id, path: identity.path };
     })();
     this.#entering.add(entering);
     try { return await entering; }
     catch (error) {
-      if (error instanceof OwnedCommandCleanupError) this.#taint = error;
+      const externallyAborted = [signal, this.signal].some((current) => current.aborted);
+      if (this.#finalizing && this.#admissionController.signal.aborted && !externallyAborted && error instanceof WorkflowError && error.code === "CANCELLED") this.#cancelledAdmissionDuringFinalization = true;
+      if (error instanceof OwnedCommandCleanupError && !(this.#taint instanceof OwnedCommandCleanupError)) this.#taint = error;
       else if (error instanceof WorkflowError && error.code === "WORKTREE_FAILED") this.#taint ??= error;
       throw error;
     } finally { this.#entering.delete(entering); }
@@ -125,27 +145,53 @@ export class WorkflowOwnership implements WorkflowLeaseBridge {
     scope.open = false;
     scope.detachAbort?.();
     scope.controller.abort();
-    if (scope.broker) (await scope.broker).closeAdmission();
+    const uncertain = (context: string, error: unknown) => {
+      const failure = new OwnedCommandCleanupError(`${context}: ${errorText(error)}`);
+      Object.defineProperty(failure, "cause", { value: error });
+      this.#fail(scope, failure, true);
+    };
+    let broker: LeaseCommandBroker | undefined;
+    const admissionClosed = (async () => {
+      if (!scope.broker) return;
+      try { broker = await scope.broker; }
+      catch (error) { this.#fail(scope, error); return; }
+      try { await broker.closeAdmission(); }
+      catch (error) { uncertain("broker admission closure failed", error); }
+    })();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
-        Promise.allSettled([...scope.pending]),
-        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { const error = new OwnedCommandCleanupError("lease work did not drain"); this.#fail(scope, error); reject(error); }, 10_000); }),
+        Promise.allSettled([...scope.pending, admissionClosed]),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { reject(new OwnedCommandCleanupError("lease work did not drain")); }, 10_000); }),
       ]);
-    } finally { if (timer) clearTimeout(timer); }
+    } catch (error) { uncertain("lease drain failed", error); }
+    finally { if (timer) clearTimeout(timer); }
+    if (!scope.retain && broker) {
+      try { await broker.dispose(); }
+      catch (error) { uncertain("broker disposal failed", error); }
+    }
     if (!scope.retain) {
-      try { await scope.owner.release(); }
+      try { await scope.owner.release(); this.#scopes.delete(scope.id); }
       catch (error) { this.#fail(scope, error); }
     }
-    if (!scope.retain && scope.broker) await (await scope.broker).dispose();
-    if (!scope.retain) this.#scopes.delete(scope.id);
     if (scope.taint) throw scope.taint;
   }
-  async finalize(): Promise<void> {
+  finalize(): Promise<void> {
+    if (this.#finalization) return this.#finalization;
     this.#closed = true;
-    await Promise.allSettled([...this.#entering]);
-    await Promise.allSettled([...this.#scopes.values()].map((scope) => this.leave(scope.id)));
-    if (this.#taint) throw this.#taint;
+    this.#finalizing = true;
+    // Admission only: owned commands keep their scope/supervisor lifelines until close drains them.
+    this.#admissionController.abort();
+    this.#finalization = (async () => {
+      await Promise.allSettled([...this.#entering]);
+      await Promise.all([...this.#scopes.values()].map(async (scope) => {
+        try { await this.leave(scope.id); }
+        catch (error) { this.#fail(scope, error instanceof WorkflowError ? error : new OwnedCommandCleanupError(`Lease closure failed: ${errorText(error)}`)); }
+      }));
+      if (this.#taint) throw this.#taint;
+      if (this.#cancelledAdmissionDuringFinalization) throw new WorkflowError("CANCELLED", "Pending worktree admission cancelled during finalization");
+    })();
+    return this.#finalization;
   }
   decorate(bridge: WorkflowBridge): WorkflowBridge {
     const tracked = <T>(work: (signal: AbortSignal) => Promise<T>, signal: AbortSignal) => this.associate(undefined, () => {
