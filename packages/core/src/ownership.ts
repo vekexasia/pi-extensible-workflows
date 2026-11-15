@@ -172,7 +172,7 @@ export class WorkflowOwnership implements WorkflowLeaseBridge {
     }
     if (!scope.retain) {
       try { await scope.owner.release(); this.#scopes.delete(scope.id); }
-      catch (error) { this.#fail(scope, error); }
+      catch (error) { this.#fail(scope, error, true); }
     }
     if (scope.taint) throw scope.taint;
   }

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { access, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent, type WorkflowWorktreeOptions } from "./types.js";
@@ -21,6 +21,13 @@ import { validateWorktreeOptions } from "./validation.js";
 import { PhysicalWorktreeLease, sameWorktreeLeaseIdentity, worktreeLeaseIdentity, worktreeOwnerDirectory, type WorktreeLeaseIdentity } from "./worktree-lease.js";
 import { runsDirectory, canonicalPath, canonicalDescendantPath, safePart, structuralPath } from "./paths.js";
 
+import { legacyWorktreeAdmission, RunWorktreeCoordinator, type RunWorktreeGuard } from "./run-worktree-coordinator.js";
+
+type MarkerReceipt = { path: string; dev: number; ino: number; bytes: string };
+async function pathExists(path: string): Promise<boolean> {
+  try { await lstat(path); return true; }
+  catch (error) { if (isNodeError(error, "ENOENT")) return false; throw error; }
+}
 function isCleanupUnproven(error: unknown): error is Error & { cleanupUnproven: true } {
   return error instanceof Error && "cleanupUnproven" in error && error.cleanupUnproven === true;
 }
@@ -65,9 +72,8 @@ export class RunStore {
   // ponytail: serializes one RunStore instance; cross-process run sharing remains unsupported.
   private stateLane = new SerialLane();
   private summaryLane = new SerialLane();
-  private worktreeLane = new SerialLane();
   private cleanupPoison: Error | undefined;
-  private borrowedWorktreeLane = new SerialLane();
+  private readonly worktreeCoordinator: RunWorktreeCoordinator;
   private snapshotLane = new SerialLane();
   private launchSnapshotLane = new SerialLane();
   // ponytail: the session lease prevents concurrent RunStore writers for one run.
@@ -75,12 +81,18 @@ export class RunStore {
   constructor(readonly cwd: string, readonly sessionId: string, readonly runId: string, readonly home = homedir()) {
     this.cwd = resolve(cwd);
     this.directory = join(runsDirectory(this.cwd, sessionId, home), safePart(runId));
+    this.worktreeCoordinator = new RunWorktreeCoordinator(this.directory);
   }
   #assertRunIdentity(run: PersistedRun, code: WorkflowErrorCode, message: string): void {
     if (resolve(run.cwd) !== this.cwd || run.sessionId !== this.sessionId || run.id !== this.runId) throw new WorkflowError(code, message);
   }
 
   async create(run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
+    await this.worktreeCoordinator.run(undefined, (guard) => this.#createUnderGuard(guard, run, snapshot));
+  }
+  #assertWorktreeGuard(guard: RunWorktreeGuard): void { guard.assertCurrent(canonicalDescendantPath(dirname(this.directory), this.directory)); }
+  async #createUnderGuard(guard: RunWorktreeGuard, run: PersistedRun, snapshot: Readonly<LaunchSnapshot>): Promise<void> {
+    this.#assertWorktreeGuard(guard);
     this.#assertRunIdentity(run, "INTERNAL_ERROR", "Run identity does not match its session-scoped store");
     const temporary = join(dirname(this.directory), `.${safePart(this.runId)}.${String(process.pid)}.${randomUUID()}.tmp`);
     await mkdir(dirname(this.directory), { recursive: true, mode: 0o700 });
@@ -466,12 +478,13 @@ export class RunStore {
     return records;
   }
 
-  async #saveWorktreeRecords(records: readonly WorktreeReference[]): Promise<void> {
-    await atomicJson(resolve(this.directory, "worktrees.json"), records);
+  async #updateWorktreeRecordsUnderGuard(guard: RunWorktreeGuard, update: (records: WorktreeReference[]) => readonly WorktreeReference[]): Promise<void> {
+    this.#assertWorktreeGuard(guard);
+    const records = await this.#loadWorktreeRecords(false);
+    await atomicJson(join(this.directory, "worktrees.json"), update(records));
   }
 
-  private async borrowedWorktreeRecords(wait = true): Promise<readonly BorrowedWorktreeBinding[]> {
-    if (wait) await this.borrowedWorktreeLane.run(async () => undefined);
+  private async borrowedWorktreeRecords(): Promise<readonly BorrowedWorktreeBinding[]> {
     const rawRecords = await json(join(this.directory, "borrowed-worktrees.json")).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return []; throw error; });
     const records = decodeBorrowedWorktreeBindings(rawRecords);
     if (!records) throw new WorkflowError("WORKTREE_FAILED", "Borrowed worktree bindings are invalid");
@@ -533,7 +546,10 @@ export class RunStore {
     if (!record) throw new Error(`Missing or duplicate worktree record for ${owner}`);
     const validated = this.structuralWorktree(owner, record);
     const marker = await json(this.markerPath(owner)).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return undefined; throw error; });
-    if (object(marker)) assertCleanupProven(marker);
+    if (marker !== undefined) {
+      if (!object(marker)) throw new WorkflowError("WORKTREE_FAILED", "Managed creation marker is malformed");
+      assertCleanupProven(marker);
+    }
     if (cwd !== undefined && resolve(cwd) !== resolve(validated.cwd)) throw new Error(`Invalid worktree record for ${owner}`);
     if (requireDirectory) await access(validated.cwd);
     return validated;
@@ -653,89 +669,163 @@ export class RunStore {
     return PhysicalWorktreeLease.acquire(identity, { runId: this.runId, sessionId: this.sessionId, executionId: randomUUID() }, "cleanup");
   }
 
-  private async cleanupResource(resource: WorktreeReference, markerPath: string, source: "marker" | "record", work: () => Promise<void>, complete: () => Promise<void>): Promise<void> {
+  async #readMarker(guard: RunWorktreeGuard, path: string): Promise<MarkerReceipt> {
+    this.#assertWorktreeGuard(guard);
+    const info = await lstat(path);
+    if (!info.isFile() || info.isSymbolicLink()) throw new WorkflowError("WORKTREE_FAILED", "Managed marker is not a regular file");
+    const bytes = await readFile(path, "utf8");
+    const receipt = { path, dev: info.dev, ino: info.ino, bytes };
+    await this.#verifyMarker(guard, receipt);
+    return receipt;
+  }
+  async #verifyMarker(guard: RunWorktreeGuard, receipt: MarkerReceipt): Promise<void> {
+    this.#assertWorktreeGuard(guard);
+    const info = await lstat(receipt.path);
+    if (!info.isFile() || info.isSymbolicLink() || info.dev !== receipt.dev || info.ino !== receipt.ino || await readFile(receipt.path, "utf8") !== receipt.bytes) throw new OwnedCommandCleanupError("Managed marker attempt identity changed");
+  }
+  async #createMarker(guard: RunWorktreeGuard, path: string, marker: Record<string, unknown>): Promise<MarkerReceipt> {
+    this.#assertWorktreeGuard(guard);
+    const file = await open(path, "wx", 0o600);
+    try {
+      try {
+        const info = await file.stat();
+        const bytes = `${JSON.stringify(marker)}\n`;
+        await file.writeFile(bytes);
+        const receipt = { path, dev: info.dev, ino: info.ino, bytes };
+        await this.#verifyMarker(guard, receipt);
+        return receipt;
+      } finally { await file.close(); }
+    } catch (error) {
+      const failure = Object.assign(new OwnedCommandCleanupError("Managed marker initial write is incomplete"), { cause: error });
+      guard.retain(failure);
+      throw failure;
+    }
+  }
+  async #replaceMarker(guard: RunWorktreeGuard, receipt: MarkerReceipt, marker: Record<string, unknown>): Promise<void> {
+    try {
+      await this.#verifyMarker(guard, receipt);
+      const bytes = `${JSON.stringify(marker)}\n`;
+      await atomicWriteFile(receipt.path, bytes);
+      const next = await this.#readMarker(guard, receipt.path);
+      if (next.bytes !== bytes) throw new Error("Marker replacement readback changed");
+      Object.assign(receipt, next);
+    } catch (error) {
+      // An unchanged receipt proves the replacement did not publish; the caller may settle its own reservation.
+      try { await this.#verifyMarker(guard, receipt); }
+      catch {
+        const failure = Object.assign(new OwnedCommandCleanupError(`Managed marker replacement is unproven: ${errorText(error)}`), { cause: error });
+        guard.retain(failure);
+        throw failure;
+      }
+      throw error;
+    }
+  }
+  async #removeMarker(guard: RunWorktreeGuard, receipt: MarkerReceipt): Promise<void> {
+    await this.#verifyMarker(guard, receipt);
+    await rm(receipt.path);
+  }
+
+  private async cleanupResource(guard: RunWorktreeGuard, resource: WorktreeReference, markerPath: string, source: "marker" | "record", work: () => Promise<void>, complete: () => Promise<void>): Promise<void> {
+    this.#assertWorktreeGuard(guard);
     const owner = await this.claimResource(resource);
     const intent = { ...resource, resourceIdentity: owner.identity, controlled: resource.controls !== undefined, cleanupProven: false };
     let current: unknown;
-    try { current = source === "record" ? (await this.#loadWorktreeRecords(false)).find((record) => record.owner === resource.owner) : await json(markerPath); }
-    catch { return this.retainCleanupUnproven(markerPath, intent, new OwnedCommandCleanupError("Managed cleanup record revalidation is unproven")); }
+    let receipt: MarkerReceipt | undefined;
+    try {
+      if (source === "marker") receipt = await this.#readMarker(guard, markerPath);
+      current = source === "record" ? (await this.#loadWorktreeRecords(false)).find((record) => record.owner === resource.owner) : JSON.parse(receipt?.bytes ?? "null") as unknown;
+    } catch { return this.retainCleanupUnproven(guard, receipt, intent, new OwnedCommandCleanupError("Managed cleanup record revalidation is unproven")); }
     if (!object(current) || current.owner !== resource.owner || current.path !== resource.path || current.branch !== resource.branch || current.base !== resource.base || current.resourceIdentity !== undefined && (!object(current.resourceIdentity) || !sameWorktreeLeaseIdentity(current.resourceIdentity as unknown as WorktreeLeaseIdentity, owner.identity))) {
       try { await owner.release(); }
-      catch { return this.retainCleanupUnproven(markerPath, intent, new OwnedCommandCleanupError("Rejected cleanup claim could not be safely released")); }
+      catch { return this.retainCleanupUnproven(guard, receipt, intent, new OwnedCommandCleanupError("Rejected cleanup claim could not be safely released")); }
       throw new WorkflowError("WORKTREE_FAILED", "Managed cleanup record changed before admission");
     }
     try {
-      await atomicJson(markerPath, intent);
+      if (!receipt) receipt = await this.#createMarker(guard, markerPath, intent);
+      await this.#replaceMarker(guard, receipt, intent);
+    } catch (error) {
+      if (isCleanupUnproven(error)) return this.retainCleanupUnproven(guard, receipt, intent, error);
+      try {
+        if (receipt) { await this.#verifyMarker(guard, receipt); if (source === "record") await this.#removeMarker(guard, receipt); }
+        await owner.release();
+      } catch { return this.retainCleanupUnproven(guard, receipt, intent, new OwnedCommandCleanupError("Rejected cleanup intent could not be safely rolled back")); }
+      throw error;
+    }
+    try {
       await work();
-      await this.proveCleanup(markerPath, intent);
+      await this.proveCleanup(guard, receipt, intent);
       await complete();
+      await this.#removeMarker(guard, receipt);
       await owner.release();
     } catch (error) {
       if (this.hasCleanupPoison(error)) throw error;
       const typed = isCleanupUnproven(error) ? error : new OwnedCommandCleanupError(`Managed cleanup transaction did not finish: ${errorText(error)}`);
-      return this.retainCleanupUnproven(markerPath, intent, typed);
+      return this.retainCleanupUnproven(guard, receipt, intent, typed);
     }
   }
 
   private hasCleanupPoison(error: unknown): boolean { return this.cleanupPoison === error; }
 
-  private async retainCleanupUnproven(markerPath: string, marker: Record<string, unknown>, error: Error): Promise<never> {
+  private async retainCleanupUnproven(guard: RunWorktreeGuard, receipt: MarkerReceipt | undefined, marker: Record<string, unknown>, error: Error): Promise<never> {
     this.cleanupPoison = error;
-    try { await atomicJson(markerPath, { ...marker, cleanupProven: false, cleanupUnproven: true }); }
-    catch { /* The pre-existing incomplete intent remains blocking, even in a new store. */ }
+    guard.retain(error);
+    try { if (receipt) await this.#replaceMarker(guard, receipt, { ...marker, cleanupProven: false, cleanupUnproven: true }); }
+    catch { /* Never overwrite a marker whose receipt no longer proves this attempt. */ }
     throw error;
   }
 
-  private async proveCleanup(markerPath: string, marker: Record<string, unknown>): Promise<void> {
-    try { await atomicJson(markerPath, { ...marker, cleanupProven: true }); }
-    catch { await this.retainCleanupUnproven(markerPath, marker, new OwnedCommandCleanupError("Managed worktree cleanup proof could not be persisted")); }
+  private async proveCleanup(guard: RunWorktreeGuard, receipt: MarkerReceipt, marker: Record<string, unknown>): Promise<void> {
+    try { await this.#replaceMarker(guard, receipt, { ...marker, cleanupProven: true }); }
+    catch { await this.retainCleanupUnproven(guard, receipt, marker, new OwnedCommandCleanupError("Managed worktree cleanup proof could not be persisted")); }
   }
 
-  private async cleanupMarker(markerPath: string, deleting = false): Promise<void> {
-    let marker: Record<string, unknown>;
-    try { const parsed = await json(markerPath); if (!object(parsed)) return; marker = parsed; } catch { return; }
-    if (typeof marker.owner !== "string" || typeof marker.base !== "string") return;
-    const expected = this.expectedWorktree(marker.owner);
-    if (marker.path !== expected.path || marker.branch !== expected.branch) return;
+  private async cleanupMarker(guard: RunWorktreeGuard, markerPath: string, deleting = false): Promise<void> {
+    if (!await pathExists(markerPath)) return;
+    const receipt = await this.#readMarker(guard, markerPath);
+    const parsed: unknown = JSON.parse(receipt.bytes);
+    if (!object(parsed) || typeof parsed.owner !== "string" || typeof parsed.base !== "string") throw new WorkflowError("WORKTREE_FAILED", "Managed creation marker is malformed");
+    const marker = parsed;
+    const expected = this.expectedWorktree(parsed.owner);
+    if (marker.path !== expected.path || marker.branch !== expected.branch) throw new WorkflowError("WORKTREE_FAILED", "Managed creation marker binding changed");
     assertWorktreeGitEnvironment();
     assertCleanupProven(marker);
     if ((marker.fresh === true || marker.controlled === true) && !deleting) throw new WorkflowError("WORKTREE_FAILED", "Controlled or fresh worktree scope was already attempted; explicit recovery is required");
-    const rootExists = await lstat(expected.path).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; });
+    const rootExists = await pathExists(expected.path);
     if (!rootExists && marker.resourceIdentity === undefined && marker.controlled !== true) {
       const entries = await git(this.cwd, ["worktree", "list", "--porcelain"]);
       if (entries.split("\n").some((line) => line.startsWith("worktree ") && canonicalPath(line.slice(9)) === canonicalPath(expected.path))) throw new WorkflowError("WORKTREE_FAILED", "Missing worktree resource identity requires explicit recovery");
       const base = (await git(this.cwd, ["rev-parse", "--verify", `${expected.branch}^{commit}`]).catch(() => "")).trim();
       if (base === marker.base) await git(this.cwd, ["branch", "-D", expected.branch]);
-      await rm(markerPath, { force: true });
+      await this.#removeMarker(guard, receipt);
       return;
     }
-    const resource: WorktreeReference = { owner: marker.owner, path: expected.path, branch: expected.branch, cwd: expected.path, base: marker.base,
+    const resource: WorktreeReference = { owner: parsed.owner, path: expected.path, branch: expected.branch, cwd: expected.path, base: parsed.base,
       ...(marker.controlled === true ? { controls: object(marker.controls) ? marker.controls : {} } : {}),
       ...(marker.resourceIdentity === undefined ? {} : { resourceIdentity: marker.resourceIdentity as WorktreeLeaseIdentity }) };
     // After proven completion, a missing root AND metadata allow only local bookkeeping, never Git or owner deletion.
-    if (marker.cleanupProven === true && resource.resourceIdentity && !await lstat(resource.path).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; }) && !await lstat(resource.resourceIdentity.gitDirectory).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; })) {
+    if (marker.cleanupProven === true && resource.resourceIdentity && !await pathExists(resource.path) && !await pathExists(resource.resourceIdentity.gitDirectory)) {
       const identity = await this.resourceIdentity(resource);
-      const claimed = await lstat(worktreeOwnerDirectory(identity)).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; });
+      const claimed = await pathExists(worktreeOwnerDirectory(identity));
       if (claimed) throw new WorkflowError("WORKTREE_FAILED", "Managed resource still has a physical owner");
-      await rm(markerPath, { force: true });
+      await this.#removeMarker(guard, receipt);
       return;
     }
     const cleanupGit = async (args: readonly string[]) => {
       try { return marker.controlled === true || process.platform === "darwin" || process.platform === "linux" ? await runManagedWorktreeCommand(managedGitCommand(marker.controlled === true ? args : ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgSign=false", ...args]), this.cwd, new AbortController().signal) : await git(this.cwd, args); }
       catch (error) { if (isCleanupUnproven(error)) throw error; return ""; }
     };
-    await this.cleanupResource(resource, markerPath, "marker", async () => {
+    await this.cleanupResource(guard, resource, markerPath, "marker", async () => {
       const branchBase = (await cleanupGit(["rev-parse", "--verify", `${resource.branch}^{commit}`])).trim();
       if (branchBase !== resource.base) throw new WorkflowError("WORKTREE_FAILED", "Managed cleanup branch identity changed");
       await cleanupGit(["worktree", "remove", "--force", resource.path]);
       await cleanupGit(["branch", "-D", resource.branch]);
       await rm(resource.path, { recursive: true, force: true });
-    }, () => rm(markerPath, { force: true }));
+    }, async () => undefined);
   }
 
-  private async cleanupOrphanWorktrees(): Promise<void> {
-    const entries = await readdir(this.directory).catch(() => [] as string[]);
-    for (const entry of entries.filter((name) => name.endsWith(".creating"))) await this.cleanupMarker(join(this.directory, entry), true);
+  private async cleanupOrphanWorktrees(guard: RunWorktreeGuard): Promise<void> {
+    const entries = await readdir(this.directory).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return []; throw error; });
+    for (const entry of entries.filter((name) => name.endsWith(".creating"))) await this.cleanupMarker(guard, join(this.directory, entry), true);
   }
 
   async validateWorktree(owner: string, cwd?: string): Promise<WorktreeReference> {
@@ -756,6 +846,14 @@ export class RunStore {
   }
 
   async worktree(owner: string, rawOptions?: WorkflowWorktreeOptions, signal?: AbortSignal): Promise<WorktreeReference> {
+    return this.worktreeCoordinator.run(signal, (guard) => this.#worktreeUnderGuard(guard, owner, rawOptions, signal, signal));
+  }
+  // Host-only legacy resolver admission: cancellation fences the queue without changing legacy setup policy.
+  async [legacyWorktreeAdmission](owner: string, admissionSignal?: AbortSignal): Promise<WorktreeReference> {
+    return this.worktreeCoordinator.run(admissionSignal, (guard) => this.#worktreeUnderGuard(guard, owner, undefined, admissionSignal, undefined));
+  }
+  async #worktreeUnderGuard(guard: RunWorktreeGuard, owner: string, rawOptions: WorkflowWorktreeOptions | undefined, admissionSignal: AbortSignal | undefined, signal: AbortSignal | undefined): Promise<WorktreeReference> {
+    this.#assertWorktreeGuard(guard);
     if (this.cleanupPoison) throw this.cleanupPoison;
     const options = validateWorktreeOptions(rawOptions);
     const controlled = rawOptions !== undefined;
@@ -771,162 +869,165 @@ export class RunStore {
       if (options.expectedTip && (await runGit(reference.path, ["rev-parse", "--verify", "HEAD^{commit}"])).trim() !== options.expectedTip) throw new WorkflowError("WORKTREE_FAILED", "Managed worktree HEAD does not equal expectedTip");
       return reference;
     };
-    const write = this.worktreeLane.run(async () => {
-      if (this.cleanupPoison) throw this.cleanupPoison;
-      if (signal?.aborted) throw new WorkflowError("CANCELLED", "Worktree creation cancelled");
-      const loaded = await this.load();
-      let records = await this.#loadWorktreeRecords();
-      const name = this.worktreeName(owner);
-      const binding = name ? await this.borrowedWorktree(name) : undefined;
-      if (binding) {
-        if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing borrowed scope");
-        return verifyTip((await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference);
+    if (admissionSignal?.aborted) throw new WorkflowError("CANCELLED", "Worktree creation cancelled");
+    const loaded = await this.load();
+    const records = await this.#loadWorktreeRecords(false);
+    const name = this.worktreeName(owner);
+    const binding = name ? await this.borrowedWorktree(name) : undefined;
+    if (binding) {
+      if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing borrowed scope");
+      return verifyTip((await this.resolveBorrowedWorktree(binding, new Set([this.runId]))).reference);
+    }
+    if (name && loaded.run.parentRunId !== undefined) {
+      const resolved = await this.resolveNamedWorktreeFromParent(name, loaded.run.parentRunId);
+      if (resolved) {
+        if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an inherited scope");
+        await this.bindBorrowedWorktree(guard, { name, sourceRunId: resolved.sourceRunId, owner: resolved.owner });
+        return verifyTip(resolved.reference);
       }
-      if (name && loaded.run.parentRunId !== undefined) {
-        const resolved = await this.resolveNamedWorktreeFromParent(name, loaded.run.parentRunId);
-        if (resolved) {
-          if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an inherited scope");
-          await this.bindBorrowedWorktree({ name, sourceRunId: resolved.sourceRunId, owner: resolved.owner });
-          return verifyTip(resolved.reference);
-        }
+    }
+    if (name && Array.isArray(loaded.run.retry?.namedWorktrees) && loaded.run.retry.namedWorktrees.includes(name)) throw new WorkflowError("WORKTREE_FAILED", `Missing inherited named worktree ${name}`);
+    const existing = records.find((record) => record.owner === owner);
+    if (existing) {
+      if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing used scope");
+      if (options.setup !== undefined && existing.controls?.setup !== undefined && options.setup !== existing.controls.setup) throw new WorkflowError("WORKTREE_FAILED", "Managed worktree setup policy cannot change");
+      return verifyTip(await this.validateWorktree(owner));
+    }
+    const { path, branch } = this.expectedWorktree(owner);
+    const markerPath = this.markerPath(owner);
+    let branchCreated = false;
+    let worktreeCreated = false;
+    let pathExistedBeforeAdd = false;
+    const attemptId = randomUUID();
+    let markerReceipt: MarkerReceipt | undefined;
+    let creation: Record<string, unknown> | undefined;
+    let materializationOwner: PhysicalWorktreeLease | undefined;
+    let resourceIdentity: WorktreeLeaseIdentity | undefined;
+    try {
+      const root = (await runGit(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
+      const [canonicalRoot, canonicalCwd] = [canonicalPath(root), canonicalPath(this.cwd)];
+      const launchRelative = relative(canonicalRoot, canonicalCwd);
+      if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
+      if (options.fresh) {
+        const used = await pathExists(markerPath);
+        const artifact = await pathExists(path);
+        const branchExists = await runGit(root, ["show-ref", "--verify", `refs/heads/${branch}`]).then(() => true).catch((error: unknown) => { if (!(error instanceof WorkflowError) || error.code !== "WORKTREE_FAILED") throw error; return false; });
+        if (used || artifact || branchExists) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing or used scope");
+      } else await this.cleanupMarker(guard, markerPath);
+      const dirty = (await runGit(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
+      if (dirty) {
+        const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
+        const shownPaths = dirtyPaths.slice(0, 10);
+        const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
+        throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
       }
-      if (name && Array.isArray(loaded.run.retry?.namedWorktrees) && loaded.run.retry.namedWorktrees.includes(name)) throw new WorkflowError("WORKTREE_FAILED", `Missing inherited named worktree ${name}`);
-      const existing = records.find((record) => record.owner === owner);
-      if (existing) {
-        if (options.fresh) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing used scope");
-        if (options.setup !== undefined && existing.controls?.setup !== undefined && options.setup !== existing.controls.setup) throw new WorkflowError("WORKTREE_FAILED", "Managed worktree setup policy cannot change");
-        return verifyTip(await this.validateWorktree(owner));
-      }
-      const { path, branch } = this.expectedWorktree(owner);
-      const markerPath = this.markerPath(owner);
-      let branchCreated = false;
-      let worktreeCreated = false;
-      let pathExistedBeforeAdd = false;
-      let markerWritten = false;
-      let creation: Record<string, unknown> | undefined;
-      let materializationOwner: PhysicalWorktreeLease | undefined;
-      let resourceIdentity: WorktreeLeaseIdentity | undefined;
+      let commit: string;
       try {
-        const root = (await runGit(this.cwd, ["rev-parse", "--show-toplevel"])).trim();
-        const [canonicalRoot, canonicalCwd] = [canonicalPath(root), canonicalPath(this.cwd)];
-        const launchRelative = relative(canonicalRoot, canonicalCwd);
-        if (launchRelative === ".." || launchRelative.startsWith(`..${sep}`)) throw new Error("launch cwd is outside the repository");
-        if (options.fresh) {
-          const used = await lstat(markerPath).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; });
-          const artifact = await lstat(path).then(() => true).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return false; throw error; });
-          const branchExists = await runGit(root, ["show-ref", "--verify", `refs/heads/${branch}`]).then(() => true).catch((error: unknown) => { if (!(error instanceof WorkflowError) || error.code !== "WORKTREE_FAILED") throw error; return false; });
-          if (used || artifact || branchExists) throw new WorkflowError("WORKTREE_FAILED", "Fresh worktree rejects an existing or used scope");
-        } else await this.cleanupMarker(markerPath);
-        const dirty = (await runGit(root, ["status", "--porcelain", "--untracked-files=normal"])).trim();
-        if (dirty) {
-          const dirtyPaths = dirty.split("\n").filter(Boolean).map((entry) => entry.slice(3));
-          const shownPaths = dirtyPaths.slice(0, 10);
-          const more = dirtyPaths.length > shownPaths.length ? `, and ${String(dirtyPaths.length - shownPaths.length)} more` : "";
-          throw new Error(`repository ${root} has uncommitted changes at worktree creation; commit or stash them first: ${shownPaths.join(", ")}${more}`);
-        }
-        let commit: string;
-        try {
-          commit = (await runGit(root, ["rev-parse", "--verify", `${options.expectedTip ?? "HEAD"}^{commit}`])).trim();
-          if (options.expectedTip && commit !== options.expectedTip) throw new Error("expectedTip does not identify the exact commit");
-        } catch (error) {
-          if (error instanceof WorkflowError && error.code !== "WORKTREE_FAILED") throw error;
-          throw new Error(options.expectedTip ? "expectedTip commit is missing or invalid" : "repository has no commits", { cause: error });
-        }
-        await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-        const record: WorktreeReference = { owner, path, branch, cwd: join(path, launchRelative), base: commit, ...(controlled ? { controls: { ...options, setup: options.setup ?? "configured" as const } } : {}) };
-        creation = { owner, path, branch, base: commit, controlled, ...(supervised ? { cleanupProven: false } : {}), ...(controlled ? { controls: record.controls } : {}), ...(options.fresh ? { fresh: true } : {}) };
-        await atomicJson(markerPath, creation);
-        markerWritten = true;
-        await runGit(root, ["branch", branch, commit]);
-        branchCreated = true;
-        pathExistedBeforeAdd = await lstat(path).then(() => true).catch((failure: unknown) => { if (isNodeError(failure, "ENOENT")) return false; throw failure; });
-        await runGit(root, ["worktree", "add", "--no-checkout", path, branch]);
-        worktreeCreated = true;
-        resourceIdentity = await this.resourceIdentity(record);
-        materializationOwner = await this.claimResource({ ...record, resourceIdentity });
-        materializationClaimed = true;
-        record.resourceIdentity = materializationOwner.identity;
-        creation = { ...creation, resourceIdentity: materializationOwner.identity, cleanupProven: false };
-        try { await atomicJson(markerPath, creation); }
-        catch { await this.retainCleanupUnproven(markerPath, creation, new OwnedCommandCleanupError("Managed creation identity could not be persisted")); }
-        await runGit(path, controlled ? ["checkout", branch] : ["checkout", "--force", branch]);
-        await verifyTip(record);
-        // Only a physically new worktree runs the launch's setup; existing, borrowed, and inherited worktrees returned above.
-        const setup = loaded.snapshot.settings.worktreeSetup;
-        if (options.setup !== "none" && setup?.length) {
-          const env = { PIEWF_WORKTREE_PATH: path, PIEWF_SOURCE_ROOT: root, PIEWF_WORKTREE_BRANCH: branch };
-          if (!supervised && !ownedPlatform) await runWorktreeSetup(setup, path, env);
-          else for (const command of setup) {
-            try { await runManagedWorktreeCommand(command, path, signal ?? new AbortController().signal, env); }
-            catch (setupError) {
-              if (isCleanupUnproven(setupError) || setupError instanceof WorkflowError && setupError.code !== "WORKTREE_FAILED") throw setupError;
-              throw new WorkflowError("WORKTREE_FAILED", `worktreeSetup command ${JSON.stringify(command)} ${errorText(setupError).replace(/^Managed worktree command /, "")}`);
-            }
-          }
-        }
-        await verifyTip(record);
-        if (signal?.aborted) throw new WorkflowError("CANCELLED", "Worktree creation cancelled");
-        try {
-          await this.#saveWorktreeRecords([...records, record]);
-          await rm(markerPath, { force: true });
-          await materializationOwner.release();
-        } catch (transitionError) {
-          return await this.retainCleanupUnproven(markerPath, creation, isCleanupUnproven(transitionError) ? transitionError : new OwnedCommandCleanupError(`Managed creation completion is unproven: ${errorText(transitionError)}`));
-        }
-        return record;
+        commit = (await runGit(root, ["rev-parse", "--verify", `${options.expectedTip ?? "HEAD"}^{commit}`])).trim();
+        if (options.expectedTip && commit !== options.expectedTip) throw new Error("expectedTip does not identify the exact commit");
       } catch (error) {
-        const failureCode = error instanceof WorkflowError ? error.code : "WORKTREE_FAILED";
-        const intent = { ...creation, ...(resourceIdentity ? { resourceIdentity } : {}), failureCode };
-        if (isCleanupUnproven(error)) {
-          if (this.hasCleanupPoison(error)) throw error;
-          this.cleanupPoison = error;
-          if (markerWritten) return this.retainCleanupUnproven(markerPath, intent, error);
-          throw error;
-        }
-        if (worktreeCreated && !materializationOwner) throw error; // A competing execution won; never set up or roll back its root.
-        if (!worktreeCreated && branchCreated && !pathExistedBeforeAdd && await lstat(path).then(() => true).catch((failure: unknown) => { if (isNodeError(failure, "ENOENT")) return false; throw failure; })) {
-          try {
-            resourceIdentity = await this.resourceIdentity({ owner, path, branch });
-            materializationOwner = await this.claimResource({ owner, path, branch, resourceIdentity });
-            materializationClaimed = true;
-            creation = { ...creation, resourceIdentity, cleanupProven: false };
-            await atomicJson(markerPath, creation);
-            worktreeCreated = true;
-          } catch (claimError) {
-            if (claimError instanceof WorkflowError && claimError.code === "WORKTREE_FAILED") throw claimError;
-            return this.retainCleanupUnproven(markerPath, { ...intent, resourceIdentity }, isCleanupUnproven(claimError) ? claimError : new OwnedCommandCleanupError("Partial worktree creation could not be safely claimed"));
-          }
-        }
-        if (materializationOwner) {
-          try { await materializationOwner.verify(); }
-          catch { return this.retainCleanupUnproven(markerPath, intent, new OwnedCommandCleanupError("Managed creation lost its cleanup authority")); }
-        }
-        const cleanupGit = async (args: readonly string[]) => {
-          try { await runGit(this.cwd, args, true); }
-          catch (cleanupError) {
-            if (isCleanupUnproven(cleanupError)) await this.retainCleanupUnproven(markerPath, intent, cleanupError);
-            // Proven ordinary nonzero cleanup remains best effort, as before.
-          }
-        };
-        try {
-          if (worktreeCreated) await cleanupGit(["worktree", "remove", "--force", path]);
-          if (branchCreated) await cleanupGit(["branch", "-D", branch]);
-          if (markerWritten && (supervised || materializationOwner)) await this.proveCleanup(markerPath, intent);
-          const persisted = await this.#loadWorktreeRecords();
-          const match = persisted.filter((candidate) => candidate.owner === owner);
-          const candidate = match.length === 1 ? match[0] : undefined;
-          if (candidate) { this.structuralWorktree(owner, candidate); records = persisted.filter((current) => current !== candidate); await this.#saveWorktreeRecords(records); }
-          if (markerWritten && !options.fresh) await rm(markerPath, { force: true });
-          await materializationOwner?.release();
-        } catch (cleanupError) {
-          if (this.hasCleanupPoison(cleanupError)) throw cleanupError;
-          return this.retainCleanupUnproven(markerPath, intent, isCleanupUnproven(cleanupError) ? cleanupError : new OwnedCommandCleanupError(`Managed rollback did not finish: ${errorText(cleanupError)}`));
-        }
-        if (error instanceof WorkflowError && (markerWritten || error.code === "CANCELLED" || error.code === "WORKTREE_FAILED")) throw error;
-        throw new WorkflowError("WORKTREE_FAILED", errorText(error));
+        if (error instanceof WorkflowError && error.code !== "WORKTREE_FAILED") throw error;
+        throw new Error(options.expectedTip ? "expectedTip commit is missing or invalid" : "repository has no commits", { cause: error });
       }
-    });
-    return write;
+      await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+      const record: WorktreeReference = { owner, path, branch, cwd: join(path, launchRelative), base: commit, ...(controlled ? { controls: { ...options, setup: options.setup ?? "configured" as const } } : {}) };
+      creation = { owner, path, branch, base: commit, controlled, ...(supervised ? { cleanupProven: false } : {}), ...(controlled ? { controls: record.controls } : {}), ...(options.fresh ? { fresh: true } : {}) };
+      markerReceipt = await this.#createMarker(guard, markerPath, creation);
+      await runGit(root, ["branch", branch, commit]);
+      branchCreated = true;
+      pathExistedBeforeAdd = await pathExists(path);
+      await runGit(root, ["worktree", "add", "--no-checkout", path, branch]);
+      worktreeCreated = true;
+      resourceIdentity = await this.resourceIdentity(record);
+      materializationOwner = await this.claimResource({ ...record, resourceIdentity });
+      materializationClaimed = true;
+      record.resourceIdentity = materializationOwner.identity;
+      creation = { ...creation, resourceIdentity: materializationOwner.identity, cleanupProven: false };
+      try { await this.#replaceMarker(guard, markerReceipt, creation); }
+      catch { await this.retainCleanupUnproven(guard, markerReceipt, creation, new OwnedCommandCleanupError("Managed creation identity could not be persisted")); }
+      await runGit(path, controlled ? ["checkout", branch] : ["checkout", "--force", branch]);
+      await verifyTip(record);
+      // Only a physically new worktree runs the launch's setup; existing, borrowed, and inherited worktrees returned above.
+      const setup = loaded.snapshot.settings.worktreeSetup;
+      if (options.setup !== "none" && setup?.length) {
+        const env = { PIEWF_WORKTREE_PATH: path, PIEWF_SOURCE_ROOT: root, PIEWF_WORKTREE_BRANCH: branch };
+        if (!supervised && !ownedPlatform) await runWorktreeSetup(setup, path, env);
+        else for (const command of setup) {
+          try { await runManagedWorktreeCommand(command, path, signal ?? new AbortController().signal, env); }
+          catch (setupError) {
+            if (isCleanupUnproven(setupError) || setupError instanceof WorkflowError && setupError.code !== "WORKTREE_FAILED") throw setupError;
+            throw new WorkflowError("WORKTREE_FAILED", `worktreeSetup command ${JSON.stringify(command)} ${errorText(setupError).replace(/^Managed worktree command /, "")}`);
+          }
+        }
+      }
+      await verifyTip(record);
+      if (admissionSignal?.aborted) throw new WorkflowError("CANCELLED", "Worktree creation cancelled");
+      try {
+        await this.#updateWorktreeRecordsUnderGuard(guard, (latest) => {
+          if (latest.some((candidate) => candidate.owner === owner)) throw new WorkflowError("WORKTREE_FAILED", "Managed creation publication conflicts with an existing record");
+          return [...latest, record];
+        });
+        await this.#removeMarker(guard, markerReceipt);
+        await materializationOwner.release();
+      } catch (transitionError) {
+        return await this.retainCleanupUnproven(guard, markerReceipt, creation, isCleanupUnproven(transitionError) ? transitionError : new OwnedCommandCleanupError(`Managed creation completion is unproven: ${errorText(transitionError)}`));
+      }
+      return record;
+    } catch (error) {
+      const failureCode = error instanceof WorkflowError ? error.code : "WORKTREE_FAILED";
+      const intent = { ...creation, ...(resourceIdentity ? { resourceIdentity } : {}), failureCode };
+      // attemptId is diagnostic only; authority is the non-reconstructible inode/bytes receipt.
+      const rollbackFailure = (message: string, cause: unknown = error) => {
+        const failure = new OwnedCommandCleanupError(`${message} (attempt ${attemptId}): ${errorText(cause).slice(0, 2000)}`);
+        Object.defineProperty(failure, "cause", { value: cause });
+        return failure;
+      };
+      if (isCleanupUnproven(error)) {
+        if (this.hasCleanupPoison(error)) throw error;
+        this.cleanupPoison = error;
+        guard.retain(error);
+        if (markerReceipt) return this.retainCleanupUnproven(guard, markerReceipt, intent, error);
+        throw error;
+      }
+      if (worktreeCreated && !materializationOwner) return this.retainCleanupUnproven(guard, markerReceipt, intent, rollbackFailure("Managed creation could not claim its materialized root")); // Never roll back a competing execution's root.
+      if (!worktreeCreated && branchCreated && !pathExistedBeforeAdd && await pathExists(path)) {
+        try {
+          resourceIdentity = await this.resourceIdentity({ owner, path, branch });
+          materializationOwner = await this.claimResource({ owner, path, branch, resourceIdentity });
+          materializationClaimed = true;
+          creation = { ...creation, resourceIdentity, cleanupProven: false };
+          if (!markerReceipt) throw rollbackFailure("Partial creation has no marker receipt");
+          await this.#replaceMarker(guard, markerReceipt, creation);
+          worktreeCreated = true;
+        } catch (claimError) {
+          return this.retainCleanupUnproven(guard, markerReceipt, { ...intent, resourceIdentity }, isCleanupUnproven(claimError) ? claimError : rollbackFailure("Partial worktree creation could not be safely claimed"));
+        }
+      }
+      if (materializationOwner) {
+        try { await materializationOwner.verify(); }
+        catch { return this.retainCleanupUnproven(guard, markerReceipt, intent, rollbackFailure("Managed creation lost its cleanup authority")); }
+      }
+      const cleanupGit = async (args: readonly string[]) => {
+        try { await runGit(this.cwd, args, true); }
+        catch (cleanupError) {
+          if (isCleanupUnproven(cleanupError)) await this.retainCleanupUnproven(guard, markerReceipt, intent, cleanupError);
+          // Proven ordinary nonzero cleanup remains best effort, as before.
+        }
+      };
+      try {
+        if (worktreeCreated) await cleanupGit(["worktree", "remove", "--force", path]);
+        if (branchCreated) await cleanupGit(["branch", "-D", branch]);
+        if (markerReceipt && (supervised || materializationOwner)) await this.proveCleanup(guard, markerReceipt, intent);
+        // Publication is last; any uncertain publication retains above. Unpublished attempts own no inventory insertion.
+        if (markerReceipt && !options.fresh) await this.#removeMarker(guard, markerReceipt);
+        await materializationOwner?.release();
+      } catch (cleanupError) {
+        if (this.hasCleanupPoison(cleanupError)) throw cleanupError;
+        return this.retainCleanupUnproven(guard, markerReceipt, intent, isCleanupUnproven(cleanupError) ? cleanupError : rollbackFailure(`Managed rollback did not finish: ${errorText(cleanupError)}`));
+      }
+      if (error instanceof WorkflowError && (markerReceipt || error.code === "CANCELLED" || error.code === "WORKTREE_FAILED")) throw error;
+      throw new WorkflowError("WORKTREE_FAILED", errorText(error));
+    }
   }
 
   private async resolveNamedWorktreeFromParent(name: string, parentRunId: string): Promise<{ reference: WorktreeReference; sourceRunId: string; owner: string } | undefined> {
@@ -934,18 +1035,16 @@ export class RunStore {
     return source.findNamedWorktree(name, new Set([this.runId]));
   }
 
-  private async bindBorrowedWorktree(binding: BorrowedWorktreeBinding): Promise<void> {
-    const write = this.borrowedWorktreeLane.run(async () => {
-      const records = [...await this.borrowedWorktreeRecords(false)];
-      const existing = records.find((candidate) => candidate.name === binding.name);
-      if (existing) {
-        if (JSON.stringify(existing) !== JSON.stringify(binding)) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree binding for ${binding.name} changed`);
-        return;
-      }
-      records.push(binding);
-      await atomicJson(join(this.directory, "borrowed-worktrees.json"), records);
-    });
-    await write;
+  private async bindBorrowedWorktree(guard: RunWorktreeGuard, binding: BorrowedWorktreeBinding): Promise<void> {
+    this.#assertWorktreeGuard(guard);
+    const records = [...await this.borrowedWorktreeRecords()];
+    const existing = records.find((candidate) => candidate.name === binding.name);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(binding)) throw new WorkflowError("WORKTREE_FAILED", `Borrowed worktree binding for ${binding.name} changed`);
+      return;
+    }
+    records.push(binding);
+    await atomicJson(join(this.directory, "borrowed-worktrees.json"), records);
   }
   async snapshotWorktree(owner: string): Promise<string> {
     try {
@@ -1081,26 +1180,30 @@ export class RunStore {
 
   async delete(confirmed: boolean): Promise<void> {
     if (!confirmed) throw new WorkflowError("CANCELLED", "Run deletion requires confirmation");
+    await this.worktreeCoordinator.run(undefined, (guard) => this.#deleteUnderGuard(guard));
+  }
+  async #deleteUnderGuard(guard: RunWorktreeGuard): Promise<void> {
+    this.#assertWorktreeGuard(guard);
     if (this.cleanupPoison) throw this.cleanupPoison;
     const records = await this.#loadWorktreeRecords();
     const validated = records.map((record) => {
       try { return this.structuralWorktree(record.owner, record); }
       catch (error) { throw new WorkflowError("WORKTREE_FAILED", errorText(error)); }
     });
-    await this.cleanupOrphanWorktrees();
+    await this.cleanupOrphanWorktrees(guard);
     await this.validateWorktreeInventory(validated);
     for (const record of validated) {
       if (!record.controls && record.resourceIdentity) {
         const identity = await this.resourceIdentity(record);
-        const absent = async (path: string) => lstat(path).then(() => false).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return true; throw error; });
-        if (await absent(record.path) && await absent(identity.gitDirectory)) {
-          if (!await absent(worktreeOwnerDirectory(identity))) throw new WorkflowError("WORKTREE_FAILED", "Dead managed resource still has a physical owner");
+        if (!await pathExists(record.path) && !await pathExists(identity.gitDirectory)) {
+          if (await pathExists(worktreeOwnerDirectory(identity))) throw new WorkflowError("WORKTREE_FAILED", "Dead managed resource still has a physical owner");
           // Legacy, independently missing root+metadata: remove only closed-inventory run bookkeeping.
           // No Git mutation, branch removal, root rm, guard removal or identity inference is permitted.
-          const current = await this.#loadWorktreeRecords(false);
-          const match = current.find((candidate) => candidate.owner === record.owner);
-          if (!match || match.path !== record.path || match.branch !== record.branch || match.base !== record.base || !match.resourceIdentity || !sameWorktreeLeaseIdentity(match.resourceIdentity, identity)) throw new WorkflowError("WORKTREE_FAILED", "Legacy dead-resource record changed");
-          await this.#saveWorktreeRecords(current.filter((candidate) => candidate.owner !== record.owner));
+          await this.#updateWorktreeRecordsUnderGuard(guard, (current) => {
+            const match = current.find((candidate) => candidate.owner === record.owner);
+            if (!match || JSON.stringify(match) !== JSON.stringify(record)) throw new WorkflowError("WORKTREE_FAILED", "Legacy dead-resource record changed");
+            return current.filter((candidate) => candidate !== match);
+          });
           continue;
         }
       }
@@ -1112,16 +1215,28 @@ export class RunStore {
         }
         catch (error) { if (record.controls || isCleanupUnproven(error)) throw error; }
       };
-      await this.cleanupResource(record, markerPath, "record", async () => {
+      await this.cleanupResource(guard, record, markerPath, "record", async () => {
         await cleanupGit(["worktree", "remove", "--force", record.path]);
         await cleanupGit(["branch", "-D", record.branch]);
         await rm(record.path, { recursive: true, force: true });
       }, async () => {
-        const current = await this.#loadWorktreeRecords(false);
-        await this.#saveWorktreeRecords(current.filter((candidate) => candidate.owner !== record.owner));
-        await rm(markerPath, { force: true });
+        await this.#updateWorktreeRecordsUnderGuard(guard, (current) => {
+          const match = current.find((candidate) => candidate.owner === record.owner);
+          if (!match || JSON.stringify(match) !== JSON.stringify(record)) throw new WorkflowError("WORKTREE_FAILED", "Managed cleanup record changed");
+          return current.filter((candidate) => candidate !== match);
+        });
       });
     }
-    await rm(this.directory, { recursive: true, force: true });
+    const remaining = await this.#loadWorktreeRecords();
+    if (remaining.length) throw new WorkflowError("WORKTREE_FAILED", "Managed worktree inventory is not empty");
+    await this.validateWorktreeInventory(remaining);
+    const entries = await readdir(this.directory).catch((error: unknown) => { if (isNodeError(error, "ENOENT")) return []; throw error; });
+    if (entries.some((entry) => entry.endsWith(".creating"))) throw new WorkflowError("WORKTREE_FAILED", "Managed worktree markers remain");
+    try { await rm(this.directory, { recursive: true, force: true }); }
+    catch (error) {
+      const failure = Object.assign(new OwnedCommandCleanupError("Run directory removal is unproven"), { cause: error });
+      guard.retain(failure);
+      throw failure;
+    }
   }
 }

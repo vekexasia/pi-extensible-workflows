@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { canonicalPath } from "./paths.js";
 import { executeOwnedCommand, OwnedCommandCleanupError } from "./owned-process.js";
 import { WorkflowError, type LeaseCommandOptions } from "./types.js";
-import { validateLeaseCommandOptions } from "./validation.js";
+import { validateLeaseCommandOptions, validateShellCommand } from "./validation.js";
 import { errorText, isNodeError, object } from "./utils.js";
 
 // The generic client is embedded for source-loaded, bundled and packed runtimes.
@@ -81,19 +81,29 @@ export class LeaseCommandBroker {
   }
   #assertOpen(): void { if (!this.#open || this.signal.aborted) throw new WorkflowError("WORKTREE_FAILED", "Lease command admission is closed"); }
   async ticket(command: string, rawOptions: LeaseCommandOptions): Promise<string> {
+    const validatedCommand = validateShellCommand(command);
     const options = validateLeaseCommandOptions(rawOptions);
     this.#assertOpen();
     const id = String(++this.#counter);
     const secret = randomUUID();
-    this.#tickets.set(id, { secret, command, options: structuredClone(options), used: false, active: false, failed: false });
+    const ticket: Ticket = { secret, command: validatedCommand, options: structuredClone(options), used: false, active: false, failed: false };
     const file = join(this.directory, `ticket-${id}.json`);
     const material = JSON.stringify({ id, secret, socket: join(this.directory, "s") });
-    await writeFile(file, material, { flag: "wx", mode: 0o600 });
+    try { await writeFile(file, material, { flag: "wx", mode: 0o600 }); }
+    catch (error) {
+      const failure = new WorkflowError("SHELL_FAILED", `Lease command ticket ${id} issuance failed`);
+      Object.defineProperty(failure, "cause", { value: error });
+      this.taint(failure);
+      throw failure;
+    }
     this.#assertOpen();
     const digest = (bytes: string) => createHash("sha256").update(bytes).digest("hex");
     // Authenticate and execute the same buffers. Digests are in the host-returned launcher, not mutable ticket material.
     const launcher = `const fs=require("node:fs"),hash=b=>require("node:crypto").createHash("sha256").update(b).digest("hex");const client=fs.readFileSync(process.argv[1]),ticket=fs.readFileSync(process.argv[2]);if(hash(client)!==${JSON.stringify(digest(clientSource))}||hash(ticket)!==${JSON.stringify(digest(material))})throw Error("Lease client material changed");globalThis.__piLeaseTicket=JSON.parse(ticket);eval(client.toString("utf8"));`;
-    return `exec ${process.versions.bun ? "env BUN_BE_BUN=1 " : ""}${quote(process.execPath)} -e ${quote(launcher)} ${quote(join(this.directory, "client.cjs"))} ${quote(file)}`;
+    const commandLine = `exec ${process.versions.bun ? "env BUN_BE_BUN=1 " : ""}${quote(process.execPath)} -e ${quote(launcher)} ${quote(join(this.directory, "client.cjs"))} ${quote(file)}`;
+    // Uncertain partial files stay private until disposal; only a completed, still-admitted issuance grants authority.
+    this.#tickets.set(id, ticket);
+    return commandLine;
   }
   closeAdmission(): Promise<void> {
     this.#open = false;

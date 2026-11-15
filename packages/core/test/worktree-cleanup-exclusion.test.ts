@@ -184,9 +184,19 @@ void test("creator loses shared admission after Git materialization and cannot s
     winner = new WorkflowOwnership(root, "winner", "s", controller.signal, executeShellCommand);
     scope = (await winner.enter(root, undefined, controller.signal)).scope;
     assert.equal((await winner.shell(scope, "printf winner", {})).stdout, "winner");
-    release.release(); await assert.rejects(creating, /physical owner/);
+    const ownerFile = join(worktreeOwnerDirectory(await worktreeLeaseIdentity(root)), "owner.json");
+    const ownerBytes = readFileSync(ownerFile), ownerInode = (await fsPromises.lstat(ownerFile)).ino;
+    release.release(); await assert.rejects(creating, (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal("cleanupUnproven" in error && error.cleanupUnproven, true);
+      assert.match(error.message, /physical owner/);
+      assert.ok(error.cause instanceof Error);
+      assert.match(error.cause.message, /physical owner/);
+      return true;
+    });
     assert.equal(existsSync(root), true); assert.equal(existsSync(setupMarker), false);
-    assert.equal(existsSync(join(worktreeOwnerDirectory(await worktreeLeaseIdentity(root)), "owner.json")), true);
+    assert.equal(readFileSync(ownerFile).equals(ownerBytes), true);
+    assert.equal((await fsPromises.lstat(ownerFile)).ino, ownerInode);
   } finally {
     if (scope) await winner?.leave(scope).catch(() => undefined);
     controller.abort(); await winner?.finalize().catch(() => undefined); release.release(); await creating?.catch(() => undefined);

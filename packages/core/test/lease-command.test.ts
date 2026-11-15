@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { WorkflowOwnership } from "../src/ownership.js";
 import { runWorkflow, executeShellCommand } from "../src/execution.js";
@@ -437,4 +438,146 @@ void test("infrastructure-failed sequential binding refuses later executions and
     await assert.rejects(ownership.leave(reference.scope), /signal/);
     await assert.rejects(ownership.finalize(), /signal/);
   } finally { controller.abort(); await ownership.finalize().catch(() => undefined); rmSync(cwd, { recursive: true, force: true }); }
+});
+
+// Bundle only this workspace's compiled production graph; package imports use the ESM SDK entry.
+async function ticketIssuanceFixture(cwd: string, parameters: Record<string, string>, body: string): Promise<void> {
+  const { build } = await import("esbuild");
+  const built = await build({
+    stdin: { contents: 'export {WorkflowOwnership} from "./ownership.js"; export {LeaseCommandBroker} from "./lease-command.js"; export {runWorkflow,executeShellCommand} from "./execution.js"; export {withWorkflowFunctions,workflowRunContext} from "./host-runtime.js"; export {WorkflowRegistry} from "./registry.js"; export {RunStore} from "./persistence.js"; export {createLaunchSnapshot} from "./validation.js"; export {PhysicalWorktreeLease,worktreeLeaseIdentity,worktreeOwnerDirectory} from "./worktree-lease.js"; export {WorkflowError} from "./types.js"; export {OwnedCommandCleanupError} from "./owned-process.js";', resolveDir: fileURLToPath(new URL("../src/", import.meta.url)), loader: "js" },
+    bundle: true, platform: "node", format: "esm", write: false,
+    plugins: [{ name: "esm-sdk-externals", setup(builder) {
+      builder.onResolve({ filter: /^[a-z@]/ }, (args) => ({ path: import.meta.resolve(args.path), external: true }));
+    } }],
+  });
+  const output = built.outputFiles[0]; assert.ok(output);
+  const bundle = join(cwd, "ticket-production.mjs"), fixture = join(cwd, "ticket-issuance.mjs");
+  writeFileSync(bundle, output.contents);
+  writeFileSync(fixture, `
+import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import {existsSync,readFileSync,statSync} from "node:fs";
+import {syncBuiltinESMExports} from "node:module";
+import {createConnection,Server} from "node:net";
+import {WorkflowOwnership,LeaseCommandBroker,runWorkflow,executeShellCommand,withWorkflowFunctions,workflowRunContext,WorkflowRegistry,RunStore,createLaunchSnapshot,PhysicalWorktreeLease,worktreeLeaseIdentity,worktreeOwnerDirectory,WorkflowError,OwnedCommandCleanupError} from ${JSON.stringify(bundle)};
+const cwd=${JSON.stringify(cwd)},parameters=${JSON.stringify(parameters)};
+const originalWrite=fs.writeFile,originalClose=Server.prototype.close,originalDispose=LeaseCommandBroker.prototype.dispose,originalRelease=PhysicalWorktreeLease.prototype.release;
+const fault=Object.assign(new Error("injected ticket failure; private-command private-env"),{code:parameters.fault??(parameters.mode==="EACCES"?"EACCES":"ENOSPC")});
+const deferred=()=>{let resolve;const promise=new Promise(done=>{resolve=done});return {promise,resolve}};
+const messages=(error,seen=new Set())=>{if(!error||seen.has(error))return [];seen.add(error);return [error,...messages(error.cause,seen),...(error.errors??[]).flatMap(item=>messages(item,seen))]};
+const request=ticket=>new Promise((resolve,reject)=>{const socket=createConnection(ticket.socket);let text="";socket.on("connect",()=>socket.write(JSON.stringify({id:ticket.id,secret:ticket.secret})+"\\n"));socket.on("data",chunk=>{text+=chunk});socket.once("error",reject);socket.once("close",()=>resolve(text));});
+let privateDirectory;
+try { ${body} }
+finally {fs.writeFile=originalWrite;Server.prototype.close=originalClose;LeaseCommandBroker.prototype.dispose=originalDispose;PhysicalWorktreeLease.prototype.release=originalRelease;syncBuiltinESMExports();if(privateDirectory)await fs.rm(privateDirectory,{recursive:true,force:true});}
+`);
+  await promisify(execFile)(process.execPath, [fixture], { timeout: 15_000 });
+}
+
+for (const entry of ["native", "registered"]) for (const reuse of ["once", "sequential"]) for (const fault of ["ENOSPC", "EACCES"]) {
+  void test(`ticket issuance failure remains sticky through caught ${entry} callbacks: ${reuse}, ${fault}`, { timeout: 20_000 }, async () => {
+    const cwd = repo();
+    try { await ticketIssuanceFixture(cwd, { entry, reuse, fault }, `
+const controller=new AbortController(),identity=await worktreeLeaseIdentity(cwd),ownerFile=worktreeOwnerDirectory(identity)+"/owner.json";
+let injected=0,launchers=0,issuanceFailure;
+fs.writeFile=async(path,...args)=>{if(/\\/ticket-\\d+\\.json$/.test(String(path))){assert.equal(existsSync(ownerFile),true,"actual physical claim precedes ticket material");privateDirectory=String(path).replace(/\\/ticket-\\d+\\.json$/,"");injected++;throw fault;}return originalWrite(path,...args)};syncBuiltinESMExports();
+const ownership=new WorkflowOwnership(cwd,"ticket-write","s",controller.signal,executeShellCommand);
+let bridge=ownership.decorate({agent:async()=>{launchers++;return "forbidden"}});
+let script='try { await withWorktreeLease(args.cwd,async lease=>{try {const launcher=await lease.command("touch forbidden; # private-command",{timeoutMs:1000,reuse:args.reuse,env:{PRIVATE:"private-env"}});await agent(launcher);}catch{} return "PASS";}); } catch {} return "PASS";';
+if(parameters.entry==="registered"){
+ const store=new RunStore(cwd,"s","ticket-write",cwd+"/home");
+ await store.create({id:"ticket-write",cwd,sessionId:"s",workflowName:"ticket-write",state:"running",agents:[],agentSessions:[]},createLaunchSnapshot({script:"return null;",args:null,metadata:{name:"ticket-write"},settings:{concurrency:1},models:[],tools:[],agentConfigurations:{},schemas:[]}));
+ const registry=new WorkflowRegistry();registry.register({version:"1.0.0",headline:"Ticket issuance",functions:{ticketWriter:{description:"Catch an actual registered lease issuance",input:{type:"object"},output:{type:"string"},run:async(_input,ctx)=>{try{await ctx.withWorktreeLease(cwd,async lease=>{try{await lease.command("touch forbidden; # private-command",{timeoutMs:1000,reuse:parameters.reuse,env:{PRIVATE:"private-env"}});launchers++;}catch(error){issuanceFailure=error;}return "PASS";});}catch{}return "PASS";}}}});
+ bridge=withWorkflowFunctions(bridge,store,workflowRunContext(cwd,"s","ticket-write",{name:"ticket-write"},null,controller.signal),registry);script='try { await ticketWriter({}); } catch {} return "PASS";';
+}
+const execution=runWorkflow(script,{cwd,reuse:parameters.reuse},bridge);
+let failure;await assert.rejects(execution.result,error=>{failure=error;return error.code==="SHELL_FAILED"});
+assert.equal(failure.cause,fault);if(issuanceFailure)assert.equal(issuanceFailure,failure);
+assert.equal(/private-command|private-env/.test(failure.message),false,"diagnostics exclude authored secrets and filesystem error text");
+assert.equal(injected,1);assert.equal(launchers,0);assert.equal(existsSync(cwd+"/forbidden"),false);assert.equal(existsSync(ownerFile),false);assert.equal(existsSync(privateDirectory),false);
+const finalizing=ownership.finalize();assert.equal(ownership.finalize(),finalizing);await assert.rejects(finalizing,error=>error===failure);
+await (await PhysicalWorktreeLease.acquire(identity,{runId:"next",sessionId:"s",executionId:"next"})).release();
+`); } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
+
+for (const reuse of ["once", "sequential"]) for (const mode of ["ENOSPC", "EACCES", "partial", "EEXIST"]) {
+  void test(`ticket issuance publishes no failed capability and preserves siblings: ${reuse}, ${mode}`, { timeout: 20_000 }, async () => {
+    const cwd = repo();
+    try { await ticketIssuanceFixture(cwd, { reuse, mode }, `
+const failures=[];let executions=0,material,file;
+const broker=await LeaseCommandBroker.create(cwd,new AbortController().signal,async()=>{executions++;return 0},error=>failures.push(error));privateDirectory=broker.directory;
+try {
+ const siblingLauncher=await broker.ticket("exit 0",{timeoutMs:1000,reuse:parameters.reuse});const siblingFile=privateDirectory+"/ticket-1.json",siblingBytes=readFileSync(siblingFile,"utf8"),sibling=JSON.parse(siblingBytes),siblingInode=statSync(siblingFile).ino;
+ fs.writeFile=async(path,data,...args)=>{if(String(path).endsWith("/ticket-2.json")){
+  file=String(path);material=JSON.parse(data);assert.equal(await request(material),"","no capability before material write settles");
+  if(parameters.mode==="partial")await originalWrite(path,String(data).slice(0,10),...args);
+  if(parameters.mode==="EEXIST"){await originalWrite(path,"other attempt material",...args);return originalWrite(path,data,...args);}
+  throw fault;
+ }return originalWrite(path,data,...args)};syncBuiltinESMExports();
+ let failure;await assert.rejects(broker.ticket("private-command",{timeoutMs:1000,reuse:parameters.reuse,env:{PRIVATE:"private-env"}}),error=>{failure=error;return error.code==="SHELL_FAILED"});
+ assert.equal(failures[0],failure);assert.equal(failure.cause.code,parameters.mode==="EEXIST"?"EEXIST":parameters.mode==="EACCES"?"EACCES":"ENOSPC");
+ assert.equal(await request(material),"");assert.equal(executions,0);
+ assert.equal(readFileSync(siblingFile,"utf8"),siblingBytes);assert.equal(statSync(siblingFile).ino,siblingInode);
+ if(parameters.mode==="EEXIST")assert.equal(readFileSync(file,"utf8"),"other attempt material");
+ if(parameters.mode==="partial")assert.equal(readFileSync(file,"utf8").length,10);
+ fs.writeFile=originalWrite;syncBuiltinESMExports();
+ assert.match(await request(sibling),/"exitCode":0/);assert.equal(executions,1,"unrelated capability is not revoked");
+ const next=await broker.ticket("exit 0",{timeoutMs:1000});assert.match(next,/ticket-3\\.json/);assert.equal(statSync(privateDirectory+"/ticket-3.json").mode&0o777,0o600);
+}finally{await broker.dispose()}
+`); } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["close", "cancel", "cancel-write-error"]) {
+  void test(`ticket issuance racing admission closure returns no launcher: ${mode}`, { timeout: 20_000 }, async () => {
+    const cwd = repo();
+    try { await ticketIssuanceFixture(cwd, { mode }, `
+const controller=new AbortController(),failures=[],started=deferred(),release=deferred();let material,executions=0;
+const broker=await LeaseCommandBroker.create(cwd,controller.signal,async()=>{executions++;return 0},error=>failures.push(error));privateDirectory=broker.directory;
+fs.writeFile=async(path,data,...args)=>{if(/\\/ticket-\\d+\\.json$/.test(String(path))){material=JSON.parse(data);started.resolve();await release.promise;if(parameters.mode==="cancel-write-error")throw fault;}return originalWrite(path,data,...args)};syncBuiltinESMExports();
+const issuing=broker.ticket("exit 0",{timeoutMs:1000});void issuing.catch(()=>{});await started.promise;
+assert.equal(await request(material),"");
+if(parameters.mode==="close")await broker.closeAdmission();else controller.abort();release.resolve();
+await assert.rejects(issuing,error=>{if(parameters.mode==="cancel-write-error"){assert.equal(error.cause,fault);assert.equal(failures[0],error);return error.code==="SHELL_FAILED"}return error.code==="WORKTREE_FAILED"});
+assert.equal(executions,0);assert.equal(failures.length,parameters.mode==="cancel-write-error"?1:0);await broker.dispose();
+`); } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
+
+for (const mode of ["delayed-close", "close-error", "dispose-error", "release-error"]) {
+  void test(`issuance cause survives cleanup priority and repeated finalize: ${mode}`, { timeout: 20_000 }, async () => {
+    const cwd = repo();
+    try { await ticketIssuanceFixture(cwd, { mode }, `
+const identity=await worktreeLeaseIdentity(cwd),ownerFile=worktreeOwnerDirectory(identity)+"/owner.json",closing=deferred(),continueClose=deferred();let ownerBefore,issuanceFailure;
+fs.writeFile=async(path,...args)=>{if(/\\/ticket-\\d+\\.json$/.test(String(path))){privateDirectory=String(path).replace(/\\/ticket-\\d+\\.json$/,"");ownerBefore=readFileSync(ownerFile,"utf8");throw fault;}return originalWrite(path,...args)};syncBuiltinESMExports();
+Server.prototype.close=function(callback){return originalClose.call(this,error=>{closing.resolve();void continueClose.promise.then(()=>callback(parameters.mode==="close-error"?new Error("uncertain listener close"):error))})};
+if(parameters.mode==="dispose-error")LeaseCommandBroker.prototype.dispose=async function(){throw new Error("uncertain private disposal")};
+if(parameters.mode==="release-error")PhysicalWorktreeLease.prototype.release=async function(){throw new WorkflowError("WORKTREE_FAILED","uncertain owner release")};
+const ownership=new WorkflowOwnership(cwd,"cleanup-issuance","s",new AbortController().signal,executeShellCommand);
+const reference=await ownership.enter(cwd,undefined,new AbortController().signal);
+await assert.rejects(ownership.command(reference.scope,"touch forbidden",{timeoutMs:1000}),error=>{issuanceFailure=error;return error.code==="SHELL_FAILED"});
+const execution=runWorkflow('try { throw new Error("caught"); } catch {} return "PASS";',null,ownership.decorate({}));void execution.result.catch(()=>{});
+await closing.promise;let settled=false;void execution.result.then(()=>{settled=true},()=>{settled=true});await new Promise(setImmediate);
+assert.equal(settled,false);assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore);continueClose.resolve();
+let failure;await assert.rejects(execution.result,error=>{failure=error;return true});
+assert.ok(messages(failure).includes(issuanceFailure));assert.ok(messages(failure).includes(fault),"original write cause survives stronger cleanup failure");
+const finalizing=ownership.finalize();assert.equal(ownership.finalize(),finalizing);await assert.rejects(finalizing,error=>error===failure);
+if(parameters.mode==="delayed-close"){assert.equal(failure,issuanceFailure);assert.equal(existsSync(ownerFile),false);assert.equal(existsSync(privateDirectory),false)}
+else {assert.equal(failure.cleanupUnproven,true);assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore);await assert.rejects(PhysicalWorktreeLease.acquire(identity,{runId:"next",sessionId:"s",executionId:"next"}),/physical owner/);await new Promise(setImmediate);assert.equal(readFileSync(ownerFile,"utf8"),ownerBefore);}
+assert.equal(existsSync(cwd+"/forbidden"),false);
+`); } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+}
+
+void test("authored ticket validation fails before minting without infrastructure taint", { timeout: 20_000 }, async () => {
+  const cwd = repo();
+  try { await ticketIssuanceFixture(cwd, {}, `
+const failures=[],broker=await LeaseCommandBroker.create(cwd,new AbortController().signal,work=>work(),error=>failures.push(error));privateDirectory=broker.directory;
+try {
+ await assert.rejects(broker.ticket(42,{timeoutMs:1000}),error=>error.code==="INVALID_METADATA");
+ await assert.rejects(broker.ticket("exit 0",{timeoutMs:0}),error=>error.code==="INVALID_METADATA");
+ assert.deepEqual(failures,[]);assert.deepEqual((await fs.readdir(privateDirectory)).sort(),["client.cjs","s"]);
+ assert.match(await broker.ticket("exit 0",{timeoutMs:1000}),/ticket-1\\.json/);
+} finally {await broker.dispose()}
+`); } finally { rmSync(cwd, { recursive: true, force: true }); }
 });

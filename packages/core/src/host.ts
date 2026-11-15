@@ -7,6 +7,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { Type, type Static, type TSchema } from "typebox";
 import { copyToClipboard, getAgentDir, ModelSelectorComponent, SettingsManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type ExtensionToolContext, type ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { WorkflowOwnership } from "./ownership.js";
+import { legacyWorktreeAdmission } from "./run-worktree-coordinator.js";
 import { FairAgentScheduler, getAgentAttempts, WorkflowAgentExecutor, localAgentTransport, type AgentActivity, type AgentAttempt, type AgentExecutionRoot, type AgentProgress, type AgentProviderFailure, type AgentProviderRecovery } from "./agent-execution.js";
 import { RunLifecycle, WorkflowEventPublisher, evidenceBridge, hostSessionContext, nextNamedOccurrence, withWorkflowFunctions, withoutActiveShells, workflowRunContext, type WorkflowEventSink, type WorkflowRunRecord, type WorkflowToolUpdate } from "./host-runtime.js";
 import { createWorkflowRecovery, persistedFailure, type ModelRegistryCapability } from "./host-recovery.js";
@@ -622,7 +623,9 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
   const persistWorktree = async (store: RunStore, metadata: WorkflowMetadata, owner: string, options?: WorkflowWorktreeOptions, signal?: AbortSignal): Promise<WorktreeReference> => {
     const existing = (await store.worktrees()).some((worktree) => worktree.owner === owner);
     const scoped = runs.get(store.runId)?.ownership?.current() !== undefined;
-    const worktree = await store.worktree(owner, options, options !== undefined || scoped ? signal : undefined);
+    const worktree = options !== undefined || scoped
+      ? await store.worktree(owner, options, signal)
+      : await store[legacyWorktreeAdmission](owner, signal);
     if (!existing && await store.ownsWorktree(owner)) await eventPublisher.worktree(store, metadata, worktree);
     return worktree;
   };
