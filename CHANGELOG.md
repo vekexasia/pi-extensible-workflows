@@ -12,6 +12,10 @@
 
 ### Fixes
 
+- `@piewf/cli` bundles Pi 1.5.2 instead of 1.0.0, so `piewf` resolves models added to Pi's catalog since 1.0. Build and test against Pi 1.5.2. This drops Pi 1.0.0's vulnerable undici and brace-expansion versions, so package verification no longer exempts any advisory (#354).
+- Core depends on `minimatch` 11.0.8 instead of 10.2.5, fixing GHSA-g3hv-75wg-m249.
+- Prompt inspection works again on Pi 1.2.0 and later, which changed the internal `before_agent_start` emitter signature.
+- In the agents workspace, plain Home and End (`\x1b[1~`, `\x1b[4~` from tmux and screen) end the notices again on Pi 1.5, where they no longer bind to an alt screen action.
 - `piewf doctor cleanup` and automatic retention no longer refuse a whole session as "corrupt or incomplete" when a worktree that one of its runs borrowed was already removed, for example with `git worktree remove`. Deletion counts the missing directory as already cleaned up; resuming or retrying that run still requires it.
 - The `subagents_run` tool description now tells the model that extensions may accept extra options and that their usage is described in the system prompt, so extension-owned options outside the core schema are discoverable (#368).
 

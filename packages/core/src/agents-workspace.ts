@@ -109,17 +109,17 @@ const BRACKETED_PASTE = /^\x1b\[200~([\s\S]*)\x1b\[201~$/;
 function isMouse(data: string): boolean { return SGR_MOUSE.test(data) || (data.length === 6 && data.startsWith("\x1b[M")); }
 /** What a filter keeps: `direct` matches, `shown` adds their ancestors. */
 interface MatchSets { readonly direct: ReadonlySet<string>; readonly shown: ReadonlySet<string> }
-/** The alt screen's own scroll and search actions: it acts on them before any input listener. */
-const ALT_SCREEN_ACTIONS = (Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[]).filter((id) => id.startsWith("tui.altScreen."));
+/** Every TUI keybinding action. */
+const TUI_ACTIONS = Object.keys(TUI_KEYBINDINGS) as (keyof typeof TUI_KEYBINDINGS)[];
 /**
- * A keypress: what parseKey names, what the alt screen takes for one of its actions (with the keybindings it reads, so also the
- * legacy home and end \x1b[1~ and \x1b[4~ of tmux and screen), text without a control character (é), or a bracketed paste. What
+ * A keypress: what parseKey names, what a TUI keybinding takes for one of its actions (so also the legacy home and end
+ * \x1b[1~ and \x1b[4~ of tmux and screen), text without a control character (é), or a bracketed paste. What
  * else the terminal sends, a focus report or a query's answer, is not one.
  */
 function isKey(data: string): boolean {
   if (parseKey(data) !== undefined || data.startsWith("\x1b[200~")) return true;
   const keybindings = getKeybindings();
-  return ALT_SCREEN_ACTIONS.some((id) => keybindings.matches(data, id)) || isText(data);
+  return TUI_ACTIONS.some((id) => keybindings.matches(data, id)) || isText(data);
 }
 function isText(data: string): boolean {
   if (data.length === 0) return false;

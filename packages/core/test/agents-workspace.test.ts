@@ -1872,7 +1872,9 @@ void test("an in-place label that asks for one of Pi's dialogs is reported in th
 void test("an exit listener restores the terminal while the workspace is open, and is gone once it closes", async (t) => {
   timers(t);
   const known = process.listeners("exit");
-  const added = (): NodeJS.ExitListener[] => process.listeners("exit").filter((listener) => !known.includes(listener));
+  // pi-tui 1.5 adds its own exit restore listener while the alt screen runs; only the workspace's is counted here.
+  const tuiRestore = (listener: NodeJS.ExitListener): boolean => listener.toString().includes("restoreOnExit");
+  const added = (): NodeJS.ExitListener[] => process.listeners("exit").filter((listener) => !known.includes(listener) && !tuiRestore(listener));
   const closed = await open([agent("alpha")]);
   assert.equal(added().length, 1, "one listener while the workspace is open");
   await leave(closed);

@@ -41,6 +41,7 @@ class FakeTerminal implements Terminal {
   clearScreen(): void { /* captured writes only */ }
   setTitle(): void { /* captured writes only */ }
   setProgress(): void { /* captured writes only */ }
+  setProgramStatus(): void { /* captured writes only */ }
 }
 
 const ESC = String.fromCharCode(27);

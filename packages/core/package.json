@@ -81,10 +81,9 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-coding-agent": "1.0.0",
-    "@earendil-works/pi-server": "1.0.0",
-    "@earendil-works/pi-tui": "1.0.0",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
     "@eslint/js": "10.0.1",
     "@types/node": "24.12.4",
     "esbuild": "^0.28.2",
@@ -98,7 +97,7 @@
   "license": "MIT",
   "dependencies": {
     "acorn": "^8.17.0",
-    "minimatch": "^10.2.5"
+    "minimatch": "^11.0.8"
   },
   "publishConfig": {
     "access": "public"

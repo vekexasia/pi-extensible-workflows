@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { Type } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { WorkflowRegistry, registerWorkflowExtension } from "../src/registry.js";
 import workflowExtension from "../src/index.js";

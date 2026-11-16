@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
+import { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 import { portableEngineVersion, writePortableWorkflowBundle } from "../src/bundles.js";
 import { readCliTestBundleState, readCliTestManifest, writeCliTestExtensionSource } from "./support.js";
 
@@ -219,7 +220,7 @@ void test("portable bundle setup and launch preserve generic requirements withou
   const environment = { ...process.env, PATH: `${resolve("../../node_modules/.bin")}${delimiter}${process.env.PATH ?? ""}`, HOME: root, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" };
   const create = async (command: string, extra: Partial<Parameters<typeof writePortableWorkflowBundle>[0]> = {}) => {
     const destination = join(root, command);
-    await writePortableWorkflowBundle({ destination, command, workflow, source, piVersion: "1.0.0", engineVersion: portableEngineVersion(), ...extra });
+    await writePortableWorkflowBundle({ destination, command, workflow, source, piVersion: PI_VERSION, engineVersion: portableEngineVersion(), ...extra });
     return destination;
   };
   const run = (directory: string, args: string[]) => spawnSync(process.execPath, [join(directory, "payload", "runner.mjs"), ...args], { cwd: root, env: environment, encoding: "utf8", timeout: 30_000 });
@@ -236,7 +237,7 @@ void test("portable bundle setup and launch preserve generic requirements withou
   writeFileSync(statePath, JSON.stringify({ ...state, engine: "0.0.0" }));
   assert.match(run(bundle, ["7"]).stderr, /Bundle setup is missing or stale/);
   const mismatch = await create("pi-mismatch", { piVersion: "0.82.0" });
-  assert.match(run(mismatch, ["setup", "--yes"]).stderr, /Bundle requires Pi 0\.82\.0; found 1\.0\.0/);
+  assert.match(run(mismatch, ["setup", "--yes"]).stderr, new RegExp(`Bundle requires Pi 0\\.82\\.0; found ${PI_VERSION.replaceAll(".", "\\.")}`));
   const missingEngine = await create("missing-engine", { engineVersion: "0.0.0" });
   assert.match(run(missingEngine, ["7"]).stderr, /no installation is performed during launch/);
   assert.match(run(missingEngine, ["setup"]).stderr, /compatible @piewf\/cli package is missing/);
