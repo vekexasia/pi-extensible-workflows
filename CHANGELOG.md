@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+## [6.4.0] - 2026-11-16
+
+**This minor version contains a breaking change.** Shipping it as 6.4.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
+
 ### Breaking changes
 
 - The extension no longer shows its own release notes notice at startup. Pi versions with earendil-works/pi#8790 show the package `CHANGELOG.md` under "Extension Updates" after an update of an npm or git install; older Pi versions, RPC mode, and extensions loaded by path show no release notes. `<agentDir>/pi-extensible-workflows/changelog-state.json` is no longer read or written and can be deleted.
