@@ -7,7 +7,9 @@ import { join } from "node:path";
 import workflowExtension, { widgetAgentsOpener } from "../src/host.js";
 import { createLaunchSnapshot, DEFAULT_SETTINGS, RunStore } from "../src/index.js";
 import { WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT } from "../src/types.js";
-import { executeCommand, testExtensionApi } from "./support.js";
+import { contextualWorkflowAction, executeCommand, testExtensionApi, waitForIssue105 } from "./support.js";
+import { listRunIds } from "../src/persistence.js";
+import { testTransport, type TestPiSession } from "./test-transport.js";
 import { leave, open as openHarness, settle, sidebarRows, title } from "./agents-workspace-harness.js";
 import { loadingRegistry } from "../src/registry.js";
 import { clearSubagentManager, setSubagentManager } from "../src/subagent-manager-handle.js";
@@ -187,4 +189,67 @@ void test("the workspace /agents opens hears this Pi's run events and subagent s
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+void test("a foreground run moved to the background from /workflow is drawn by the widget without any run event", { timeout: 10_000 }, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-widget-detach-"));
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let started = false;
+  const createSession = async (): Promise<TestPiSession> => ({
+    sessionId: "widget-detach-session", sessionFile: "/sessions/widget-detach.jsonl",
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => { started = true; await gate; }, abort: async () => { release(); }, steer: async () => {}, dispose() {},
+  });
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
+  const listeners = new Map<string, Array<(event: unknown) => void>>();
+  workflowExtension(testExtensionApi({
+    registerTool(tool: (typeof tools)[number]) { tools.push(tool); },
+    registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); },
+    on(name: string, handler: unknown) { handlers.set(name, [...(handlers.get(name) ?? []), handler as (event: unknown, ctx: unknown) => unknown]); },
+    registerEntryRenderer() {},
+    registerShortcut() {},
+    getActiveTools: () => ["workflow"],
+    events: {
+      on: ((name: string, listener: (event: unknown) => void) => { listeners.set(name, [...(listeners.get(name) ?? []), listener]); return () => {}; }),
+      emit: ((name: string, event: unknown) => { for (const listener of listeners.get(name) ?? []) listener(event); }),
+    },
+  }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && command);
+  const drawn = { lines: [] as string[] };
+  const ui = {
+    notify() {},
+    select: async () => undefined,
+    setWidget(_key: string, value: unknown) {
+      if (typeof value !== "function") { drawn.lines = []; return; }
+      const component = (value as (tui: object, theme: object) => { render(width: number): string[] })({ requestRender: () => { drawn.lines = component.render(100); } }, { fg: (_c: string, text: string) => text, bold: (text: string) => text, bg: (_c: string, text: string) => text });
+      drawn.lines = component.render(100);
+    },
+    onTerminalInput: () => () => {},
+  };
+  const context = { cwd: home, mode: "tui", hasUI: true, isProjectTrusted: () => false, model: { provider: "openai", id: "gpt", contextWindow: 1_000_000, maxTokens: 1_000 }, getContextUsage: () => ({ tokens: 0, contextWindow: 1_000_000 }), sessionManager: { getSessionId: () => "session", getEntries: () => [] }, ui };
+  for (const handler of handlers.get("session_start") ?? []) await handler(undefined, context);
+  const execution = workflow.execute("foreground-call", { name: "widget-detach", script: `return await agent("first", {label:"first"});`, foreground: true }, new AbortController().signal, () => {}, context);
+  t.after(async () => {
+    release();
+    await execution.catch(() => {});
+    // The detached run still finishes and delivers in the background, writing into home.
+    const [runId] = await listRunIds(home, "session", home);
+    if (runId) { const store = new RunStore(home, "session", runId, home); await waitForIssue105(async () => (await store.load()).run.delivery?.state === "delivered"); }
+    for (const handler of handlers.get("session_shutdown") ?? []) await handler(undefined, context);
+    rmSync(home, { recursive: true, force: true });
+  });
+  await waitForIssue105(() => started);
+  const runId = (await listRunIds(home, "session", home))[0];
+  assert.ok(runId);
+  assert.ok(!drawn.lines.some((line) => line.includes("widget-detach")), "the foreground run is left to the tool call");
+  // Events from here on would hide the missing notice: the move emits none, and nothing else changes.
+  listeners.clear();
+  await contextualWorkflowAction(command, context, runId, "Move to background");
+  await execution;
+  assert.ok(drawn.lines.some((line) => line.includes("widget-detach")), drawn.lines.join("\n"));
 });
