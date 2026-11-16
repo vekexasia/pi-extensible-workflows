@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { addAccounting, errorCode, errorText, finiteNumber, isNodeError, isThinkingLevel, jsonValue, object, loadingRegistry, physicalModel, resolveModelReference, localAgentTransport, modelCapability, resolveAgentResourcePolicy, resolveWorkflowSettings, sanitizeDisplayText, sumAccounting, structuralPath, validateModelAliasAvailability, WorkflowAgentExecutor, WorkflowError, workflowSettingsPath, type AgentAccounting, type AgentAttempt, type AgentAttemptSummary, type PreparedAgentConfiguration, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type AgentToolCallProgress, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowAgentSessionState, type WorkflowRunContext, SerialLane } from "../../src/index.js";
+import { addAccounting, errorCode, errorText, finiteNumber, isNodeError, isThinkingLevel, jsonValue, object, loadingRegistry, physicalModel, resolveModelReference, localAgentTransport, captureRootSession, modelCapability, resolveAgentResourcePolicy, resolveWorkflowSettings, sanitizeDisplayText, sumAccounting, structuralPath, validateModelAliasAvailability, WorkflowAgentExecutor, WorkflowError, workflowSettingsPath, type AgentAccounting, type AgentAttempt, type AgentAttemptSummary, type PreparedAgentConfiguration, type AgentExecutionOptions, type AgentExecutionRoot, type AgentProgress, type AgentToolCallProgress, type JsonSchema, type JsonValue, type ModelSpec, type WorkflowAgentSessionState, type WorkflowRunContext, SerialLane } from "../../src/index.js";
 import { decodePreparedAgentConfiguration } from "../../src/decoders.js";
 import { atomicJson, json as readJson, processAlive } from "../../src/persistence.js";
 import { accountingValue, activityValue, legacyAccountingValue, worktreeValue } from "./decode.js";
@@ -126,14 +126,14 @@ function executionRoot(context: Readonly<SubagentManagerContext>, dependencies: 
   const activeTools = dependencies.getActiveTools?.() ?? [];
   const tools = new Set(activeTools.filter((tool) => !EXCLUDED_TOOLS.has(tool)));
   const sessionId = extensionContext.sessionManager.getSessionId();
-  const run: WorkflowRunContext = {
+  const run: WorkflowRunContext = captureRootSession({
     cwd: extensionContext.cwd,
     sessionId,
     runId,
     workflow: { name: WORKFLOW_NAME },
     args: null,
     signal,
-  };
+  });
   const registry = loadingRegistry();
   if (settings.global.extensionSettings !== undefined) registry.validateExtensionSettings(settings.global.extensionSettings, { source: "global", cwd: extensionContext.cwd, projectTrusted: trustedProject, settingsPath: settings.globalSettingsPath });
   if (trustedProject && settings.project.extensionSettings !== undefined) registry.validateExtensionSettings(settings.project.extensionSettings, { source: "project", cwd: extensionContext.cwd, projectTrusted: true, settingsPath: settings.projectSettingsPath });

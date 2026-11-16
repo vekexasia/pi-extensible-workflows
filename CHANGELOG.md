@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- Workflow agent and `subagents_run` child sessions are now listed in a process-wide `Symbol.for("pi.sessionParents")` map from the child's Pi session id to the owning root Pi session id while they exist, so a provider can tell which sessions are sub-agents of which. The extension reads it only to resolve a nested run to its root session, and nothing changes for the child.
+
 ## [6.4.0] - 2026-11-16
 
 **This minor version contains a breaking change.** Shipping it as 6.4.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.

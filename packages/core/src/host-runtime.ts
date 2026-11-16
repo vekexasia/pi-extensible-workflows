@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor } from "./agent-execution.js";
+import { type AgentProviderFailure, type AgentProviderRecovery, WorkflowAgentExecutor, captureRootSession } from "./agent-execution.js";
 import { type WorkflowBudgetRuntime } from "./budget.js";
 import { type PersistedRun, type RunStore, type WorktreeReference } from "./persistence.js";
 import { createWorkflowTools, encoded, FUNCTION_HANDLE_PREFIX } from "./execution.js";
@@ -217,7 +217,7 @@ async function hostWithWorktree<Result extends JsonValue>(name: string, callback
   return inheritedHostWorktreeOwner.run(owner, () => callback(reference));
 }
 export function workflowRunContext(cwd: string, sessionId: string, runId: string, workflow: WorkflowMetadata, args: JsonValue, signal: AbortSignal): Readonly<WorkflowRunContext> {
-  return Object.freeze({ cwd, sessionId, runId, workflow: deepFreeze(structuredClone(workflow)), args: deepFreeze(structuredClone(args)), signal });
+  return captureRootSession(Object.freeze({ cwd, sessionId, runId, workflow: deepFreeze(structuredClone(workflow)), args: deepFreeze(structuredClone(args)), signal }));
 }
 function keyedJsonResult<Tasks extends ParallelTasks = ParallelTasks>(entries: readonly (readonly [string, JsonValue])[]): ParallelResult<Tasks> {
   return Object.fromEntries(entries) as ParallelResult<Tasks>;
