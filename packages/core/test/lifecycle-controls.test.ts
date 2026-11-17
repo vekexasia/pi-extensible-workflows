@@ -1087,8 +1087,11 @@ void test("a persistently failing terminal write still cancels the work, stop re
     const runId = launched.runId as string;
     const store = new RunStore(home, "session", runId, home);
     for (let i = 0; i < 200 && !(await store.load()).run.activeShells; i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    for (let i = 0; i < 200 && !existsSync(pidFile); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
-    pid = Number((readFileSync(pidFile, "utf8")).trim());
+    // The file exists before the shell has written its pid into it: wait for the number.
+    for (let i = 0; i < 200 && !(pid > 0); i += 1) {
+      if (existsSync(pidFile)) pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (!(pid > 0)) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.ok(pid > 0 && alive(pid), "shell is in flight before stop");
     // Two concurrent stops: the second must not see the first one's transient "stopped" and answer already_terminal.
     await Promise.all([assert.rejects(tools.stop("id", { runId }), /state\.json/), assert.rejects(tools.stop("id", { runId }), /state\.json/)]);
@@ -1113,7 +1116,7 @@ void test("a run that ends while every terminal write fails is not left active a
     const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
     const runId = launched.runId as string;
     const store = new RunStore(home, "session", runId, home);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (let i = 0; i < 400 && !messages.some((message) => message.includes("parked")); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal((await store.load()).run.state, "running");
     failing.heal();
     const result = jsonOf(await tools.stop("id", { runId }));
@@ -1133,7 +1136,7 @@ void test("a repaired parked completed run delivers its result once and publishe
   try {
     const launched = jsonOf(await tools.workflow("id", { name: "quick", script: "return 1;" }, new AbortController().signal, undefined, context));
     const runId = launched.runId as string;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    for (let i = 0; i < 400 && !messages.some((message) => message.includes("parked")); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
     assert.ok(messages.some((message) => message.includes("parked")), messages.join("\n"));
     const before = messages.length;
     failing.heal();
