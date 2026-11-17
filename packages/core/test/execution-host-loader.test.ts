@@ -44,9 +44,10 @@ void test("a workflow runs when the host process was started with a loader outsi
       assert.equal(run.stdout, "5", flags.join(" "));
     }
     // The same loaders set in NODE_OPTIONS (quoted, behind an empty "" Node drops), beside options that are not loaders: the worker
-    // keeps those (--disable-proto=throw is seen from the workflow; a quote written back wrong would stop the worker at start).
+    // keeps those (--disable-proto=throw is seen from the workflow). A value ending in a backslash must be written back escaped, or
+    // Node refuses the worker's NODE_OPTIONS as an unterminated string and the worker ends at start.
     rmSync(ran, { force: true });
-    const options = `-r "" "${cjs}" --experimental_loader=${pathToFileURL(esm).href} --title "\\a" --disable-proto=throw "--title=a \\"b\\""`;
+    const options = `-r "" "${cjs}" --experimental_loader=${pathToFileURL(esm).href} --disable-proto=throw "--title=a \\"b\\"" --title=a\\`;
     const proto = script.replace("return 2 + 3;", 'try { ({}).__proto__; return \\"proto\\"; } catch { return \\"no proto\\"; }');
     const run = spawnSync(process.execPath, ["--input-type=module", "-e", proto], { encoding: "utf8", timeout: 60_000, env: { ...process.env, NODE_OPTIONS: options } });
     assert.ok(existsSync(ran), "NODE_OPTIONS: control: the host's own loader did not run");
