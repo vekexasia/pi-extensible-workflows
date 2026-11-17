@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### Fixes
+
+- A run whose terminal state could not be written to `state.json` (for example after the machine slept) no longer ends as `already_terminal` in `workflow_stop` while `workflow_status` and `state.json` still say `running` with an active shell. The write is retried once, so `workflow_stop` still cancels the in-flight shell and the run reaches `stopped`, `completed`, or `failed` on disk; a failing event or update notification after a successful write no longer fails the run. If the write keeps failing, `workflow_stop` still cancels the run's work and then fails with an error naming the `state.json` write, `workflow_status` keeps reporting what `state.json` says, and an ended run is no longer treated as active; calling `workflow_stop` again once the write works persists the terminal state. A run whose result was saved stays `completed` in that case instead of ending as `failed`, and the error reported when the write keeps failing says the run is parked and that `workflow_stop` with its run id persists the terminal state once `state.json` is writable; that repair then delivers the run's saved result, or its failure notice, once.
+
 ## [6.4.0] - 2026-11-16
 
 **This minor version contains a breaking change.** Shipping it as 6.4.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
