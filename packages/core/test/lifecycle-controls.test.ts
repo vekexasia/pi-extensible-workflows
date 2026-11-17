@@ -993,14 +993,15 @@ void test("interrupted lifecycle can cold-resume while completed and failed cann
   for (const state of ["completed", "failed"] as const) await assert.rejects(new RunLifecycle(state).resume(), /Cannot resume/);
 });
 type TerminalWriteTools = { workflow: (...args: unknown[]) => Promise<unknown>; stop: (...args: unknown[]) => Promise<unknown>; status: (...args: unknown[]) => Promise<unknown> };
-function terminalWriteHarness(prefix: string): { home: string; context: unknown; tools: TerminalWriteTools; messages: string[]; completions: unknown[] } {
+function terminalWriteHarness(prefix: string, transport?: ReturnType<typeof testTransport>): { home: string; context: unknown; tools: TerminalWriteTools; messages: string[]; completions: unknown[]; events: string[] } {
   const home = mkdtempSync(join(tmpdir(), prefix));
   const registered: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
   const messages: string[] = [];
   const completions: unknown[] = [];
-  workflowExtension(testExtensionApi({ registerTool(tool: (typeof registered)[number]) { registered.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, events: { emit(channel: string, data: unknown) { if (channel === "workflow:run-completed") completions.push(data); } }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home);
+  const events: string[] = [];
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof registered)[number]) { registered.push(tool); }, registerCommand() {}, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, events: { emit(channel: string, data: unknown) { events.push(channel); if (channel === "workflow:run-completed") completions.push(data); } }, getThinkingLevel: () => "medium", getActiveTools: () => ["workflow"] }), home, async () => {}, transport);
   const find = (name: string) => { const tool = registered.find((entry) => entry.name === name); assert.ok(tool); return tool.execute; };
-  return { home, context: { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, tools: { workflow: find("workflow"), stop: find("workflow_stop"), status: find("workflow_status") }, messages, completions };
+  return { home, context: { cwd: home, hasUI: false, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" } }, tools: { workflow: find("workflow"), stop: find("workflow_stop"), status: find("workflow_status") }, messages, completions, events };
 }
 const jsonOf = (result: unknown): Record<string, unknown> => JSON.parse((result as { content: [{ text: string }] }).content[0].text) as Record<string, unknown>;
 // Fails the first state.json write that carries `target`; later writes pass.
@@ -1117,6 +1118,7 @@ void test("a run that ends while every terminal write fails is not left active a
     const runId = launched.runId as string;
     const store = new RunStore(home, "session", runId, home);
     for (let i = 0; i < 400 && !messages.some((message) => message.includes("parked")); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(messages.some((message) => message.includes("parked")), messages.join("\n"));
     assert.equal((await store.load()).run.state, "running");
     failing.heal();
     const result = jsonOf(await tools.stop("id", { runId }));
@@ -1150,6 +1152,66 @@ void test("a repaired parked completed run delivers its result once and publishe
     assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
     assert.equal(messages.length, before + 1, messages.join("\n"));
     assert.equal(completions.length, 1);
+  } finally { failing.restore(); }
+});
+void test("a repaired parked failed run publishes its run-failed event once and its budget events not again", async () => {
+  const session = async (): Promise<TestPiSession> => ({ sessionId: "repair-failed-session", sessionFile: "/sessions/repair-failed.jsonl", messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }), prompt: async () => {}, abort: async () => {}, steer: async () => {}, dispose() {} });
+  const { context, tools, messages, events } = terminalWriteHarness("pi-extensible-workflows-terminal-write-repair-failed-", testTransport(session));
+  const failing = failTerminalWrites();
+  try {
+    const launched = jsonOf(await tools.workflow("id", { name: "boom", script: "await agent('work'); throw new Error('boom');", budget: { agentLaunches: { soft: 1 } } }, new AbortController().signal, undefined, context));
+    const runId = launched.runId as string;
+    for (let i = 0; i < 400 && !messages.some((message) => message.includes("parked")); i += 1) await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(messages.some((message) => message.includes("parked")), messages.join("\n"));
+    const budgetEvents = events.filter((event) => event === WORKFLOW_BUDGET_EVENT).length;
+    assert.ok(budgetEvents > 0, "the soft agent budget was crossed before the run ended");
+    assert.equal(events.includes(WORKFLOW_RUN_FAILED_EVENT), false);
+    failing.heal();
+    assert.equal(jsonOf(await tools.stop("id", { runId })).state, "failed");
+    assert.equal(events.filter((event) => event === WORKFLOW_RUN_FAILED_EVENT).length, 1);
+    assert.equal(events.filter((event) => event === WORKFLOW_BUDGET_EVENT).length, budgetEvents);
+    assert.equal(jsonOf(await tools.stop("id", { runId })).reason, "already_terminal");
+    assert.equal(events.filter((event) => event === WORKFLOW_RUN_FAILED_EVENT).length, 1);
+  } finally { failing.restore(); }
+});
+void test("a foreground run moved to the background and parked tells the user how to repair it", { timeout: 15_000 }, async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-terminal-write-detached-"));
+  const tools: Array<{ name: string; execute: (...args: unknown[]) => Promise<unknown> }> = [];
+  const commands: Array<{ handler: (args: string, ctx: unknown) => Promise<void> }> = [];
+  const messages: string[] = [];
+  let agentStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { agentStarted = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const createSession = async (): Promise<TestPiSession> => ({
+    sessionId: "detached-parked-session", sessionFile: "/sessions/detached-parked.jsonl",
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }], getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }),
+    prompt: async () => { agentStarted(); await gate; }, abort: async () => { release(); }, steer: async () => {}, dispose() {},
+  });
+  workflowExtension(testExtensionApi({ registerTool(tool: (typeof tools)[number]) { tools.push(tool); }, registerCommand(_name: string, options: (typeof commands)[number]) { commands.push(options); }, on() {}, sendMessage(message: { content: string }) { messages.push(message.content); }, getThinkingLevel: () => "medium" as const, getActiveTools: () => ["workflow"] }), home, async () => {}, testTransport(createSession));
+  const workflow = tools.find(({ name }) => name === "workflow");
+  const stop = tools.find(({ name }) => name === "workflow_stop");
+  const command = commands[0]?.handler;
+  assert.ok(workflow && stop && command);
+  const context = { cwd: home, hasUI: true, model: { provider: "openai", id: "gpt" }, sessionManager: { getSessionId: () => "session" }, ui: { notify() {}, select: async (_prompt: string, options: string[]) => options.find((option) => option.includes("detached-parked")) } };
+  const execution = workflow.execute("foreground-parked-call", { name: "detached-parked", script: `await agent("first"); return 1;`, foreground: true }, new AbortController().signal, () => {}, context);
+  await started;
+  await waitForIssue105(async () => (await listRunIds(home, "session", home)).length === 1);
+  const runId = (await listRunIds(home, "session", home))[0];
+  assert.ok(runId);
+  t.after(async () => { release(); await execution.catch(() => {}); });
+  await contextualWorkflowAction(command, context, runId, "Move to background");
+  assert.equal(((await execution) as { details: { detached: boolean } }).details.detached, true);
+  const failing = failTerminalWrites();
+  try {
+    release();
+    await waitForIssue105(() => messages.some((message) => message.includes("parked") && message.includes(`workflow_stop with runId ${runId}`)));
+    assert.equal(messages.filter((message) => message.includes("parked")).length, 1, messages.join("\n"));
+    failing.heal();
+    assert.equal(jsonOf(await stop.execute("id", { runId })).state, "completed");
+    const delivered = messages.filter((message) => !message.includes("parked"));
+    assert.equal(delivered.length, 1, messages.join("\n"));
+    assert.equal((JSON.parse(delivered[0] ?? "{}") as { state?: string }).state, "completed");
   } finally { failing.restore(); }
 });
 void test("a failed paused state write keeps the duration budget running so usage keeps growing and the hard limit still applies", { timeout: 15_000 }, async (t) => {

@@ -876,7 +876,8 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
     if (isHardTerminalRunState(state)) terminalRunStates.set(runId, state); else unwrittenRuns.set(runId, run);
     run.checkpointResolvers.clear();
     liveAgents.deleteRun(runId);
-    eventPublisher.removeRun(runId);
+    // A parked run keeps the budget events already published, so the repair's terminal write does not publish them again.
+    if (isHardTerminalRunState(state)) eventPublisher.removeRun(runId);
     runs.delete(runId);
   };
   type WorkflowStopResult = { runId: string; state: RunState | "unknown"; stopped: boolean; reason?: "unknown_run" | "already_terminal" };
@@ -919,11 +920,14 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
         } else {
           const failure = run.parkedFailure;
           if (failure) await persistRunState(store, run.metadata, (current) => persistedFailure(current, failure));
+          // As the ending run would have, had its write succeeded: listeners hear of the failure once it is on disk.
+          if (failure) await eventPublisher.runFailed(store, run.metadata, failure, persisted);
           await deliverStaleTerminal(store, (await store.load()).run);
         }
       })();
       try { await run.repair; } catch (error) { run.repair = undefined; throw error; }
       unwrittenRuns.delete(runId);
+      eventPublisher.removeRun(runId);
       terminalRunStates.set(runId, persisted);
       return { runId, state: persisted, stopped: false, reason: "already_terminal" };
     }
@@ -1524,6 +1528,12 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       deliveryController.trackDelivery(completion.then(async (result) => {
         await deliveryController.deliverDetachedTerminal(toolCallId, completionContent("background", result));
       }, async (error: unknown) => {
+        // A parked run moved to the background: as on the background path, terminal delivery would drop its repair notice.
+        if (lifecycle.unwritten && deliveryController.foregroundDeliveries.get(toolCallId)?.detached) {
+          deliveryController.foregroundDeliveries.delete(toolCallId);
+          deliver(pi, error instanceof Error ? error.message : String(error), !shuttingDown);
+          return;
+        }
         await deliveryController.deliverDetachedTerminal(toolCallId, deliverFailureContent(error), true);
       }));
       const outcome = detachedResult === undefined
