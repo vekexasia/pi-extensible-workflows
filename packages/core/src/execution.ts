@@ -538,6 +538,53 @@ function workflowErrorFromWorker(error: WorkerErrorShape): WorkflowError {
   const typed = markWorkflowAuthored(new WorkflowError(code, error.message), Boolean(error.authored) || error.code === undefined);
   return error.failedAt === undefined ? typed : Object.assign(typed, { failedAt: error.failedAt });
 }
+const ENTRY_FLAGS = ["--input-type", "-e", "--eval", "-p", "--print"];
+// NOTE: under --permission the worker may read only its own directory, so a loader read from a file that the host process was started
+// with (PiG starts its extension host with --import <register-loader.mjs>; operators set --require in NODE_OPTIONS) cannot load there
+// and ended the worker at start. A loader that reads no file (a data: URL) is left out too. Node only: Bun has no permission model,
+// and its worker keeps what it was given.
+const LOADER_FLAGS = ["--import", "--require", "-r", "--loader", "--experimental-loader"];
+
+// withoutFlags drops each of flags and its value, given as `--flag value` or `--flag=value`, with `_` read as `-` in the name as Node
+// reads it; every other argument stays, in order.
+function withoutFlags(args: readonly string[], flags: readonly string[]): string[] {
+  const skip = new Set(flags);
+  const kept: string[] = [];
+  let skipNext = false;
+  for (const arg of args) {
+    if (skipNext) { skipNext = false; continue; }
+    const name = (arg.split("=")[0] ?? "").replace(/_/g, "-");
+    if (skip.has(name)) { if (!arg.includes("=")) skipNext = true; continue; }
+    kept.push(arg);
+  }
+  return kept;
+}
+
+// workerEnv is the host's environment for the Node worker, with the loader flags taken out of NODE_OPTIONS and every other option
+// kept. Node splits NODE_OPTIONS at unquoted spaces and reads double quotes with backslash escapes; a value it could not split the
+// same way is left as it is.
+function workerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const options = env.NODE_OPTIONS;
+  if (!options) return env;
+  const tokens: string[] = [];
+  let token = "", quoted = false, started = false;
+  for (let i = 0; i < options.length; i++) {
+    const char = options.charAt(i);
+    if (quoted && char === "\\" && i + 1 < options.length) { token += options.charAt(++i); started = true; continue; }
+    // An empty "" is no option: Node drops it.
+    if (char === "\"") { quoted = !quoted; continue; }
+    if (!quoted && char === " ") { if (started) tokens.push(token); token = ""; started = false; continue; }
+    token += char; started = true;
+  }
+  if (quoted) return env;
+  if (started) tokens.push(token);
+  const kept = withoutFlags(tokens, LOADER_FLAGS);
+  if (kept.length === tokens.length) return env;
+  const rest = { ...env };
+  delete rest.NODE_OPTIONS;
+  return kept.length === 0 ? rest : { ...rest, NODE_OPTIONS: kept.map((arg) => (/[\s"\\]/.test(arg) ? `"${arg.replace(/["\\]/g, "\\$&")}"` : arg)).join(" ") };
+}
+
 /** Forks the sandboxed worker in a new directory; a worker that cannot start leaves no directory behind. */
 function startWorker(config: string): { child: ChildProcess; childDir: string } {
   const childDir = realpathSync(mkdtempSync(join(tmpdir(), "pi-wf-")));
@@ -550,19 +597,12 @@ function startWorker(config: string): { child: ChildProcess; childDir: string } 
     writeFileSync(configFile, config);
     const child = fork(childFile, [String(RPC_LIMIT_BYTES), configFile], {
       execArgv: (() => {
-        const filtered: string[] = [];
-        const skip = new Set(["--input-type", "-e", "--eval", "-p", "--print"]);
-        let skipNext = false;
-        for (const arg of process.execArgv) {
-          if (skipNext) { skipNext = false; continue; }
-          if (skip.has(arg) || skip.has(arg.split("=")[0] ?? "")) { if (!arg.includes("=")) skipNext = true; continue; }
-          filtered.push(arg);
-        }
+        const filtered = withoutFlags(process.execArgv, process.versions.bun ? ENTRY_FLAGS : [...ENTRY_FLAGS, ...LOADER_FLAGS]);
         // NOTE: Bun has no --permission model and rejects/ignores these Node flags; the worker keeps only the vm sandbox there.
         return process.versions.bun ? filtered : [...filtered, "--max-old-space-size=128", "--permission", `--allow-fs-read=${childDir}`];
       })(),
       // NOTE: a Bun-compiled pi binary is process.execPath; BUN_BE_BUN makes it run child.cjs instead of the pi CLI.
-      env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : process.env,
+      env: process.versions.bun ? { ...process.env, BUN_BE_BUN: "1" } : workerEnv(process.env),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
       serialization: "advanced",
     });
