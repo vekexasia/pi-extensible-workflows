@@ -1297,9 +1297,16 @@ export default function workflowExtension(pi: WorkflowExtensionAPI, home?: strin
       const interrupted = [...runs.values()].filter((r) => r.lifecycle.state === "interrupted");
       if (interrupted.length > 0) {
         const labels = interrupted.map((r) => `Resume: ${r.metadata.name} (${r.store.runId.slice(0, 8)})`);
-        const options = [...labels, ...(interrupted.length > 1 ? ["Resume all"] : []), "Skip"];
+        const stopAll = interrupted.length > 1 ? "Stop all" : "Stop";
+        const options = [...labels, ...(interrupted.length > 1 ? ["Resume all"] : []), stopAll, "Skip"];
         const choice = await resumeSelect(`${String(interrupted.length)} interrupted workflow${interrupted.length > 1 ? "s" : ""} found`, options);
-        if (choice && choice !== "Skip") {
+        if (choice === stopAll) {
+          // Stopped runs are terminal: they keep their state and history but leave the interrupted list and the background widget.
+          for (const run of interrupted) {
+            try { await stopWorkflowRun(run.store.runId); ctx.ui.notify(`Stopped workflow ${run.metadata.name}.`, "info"); }
+            catch (error) { ctx.ui.notify(`Cannot stop ${run.metadata.name}: ${errorText(error)}`, "warning"); }
+          }
+        } else if (choice && choice !== "Skip") {
           const toResume = choice === "Resume all" ? interrupted : interrupted.filter((_, i) => labels[i] === choice);
           await Promise.all(toResume.map(async (run) => {
             try { await recovery.coldResumeRun(run, true, ctx.ui, projectTrusted(ctx), resumeHostContext(ctx), undefined, false); ctx.ui.notify(`Resumed workflow ${run.metadata.name}.`, "info"); }

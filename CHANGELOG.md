@@ -1,6 +1,10 @@
 # Changelog
 ## Unreleased
 
+### New capabilities
+
+- The interrupted workflows prompt at session start offers "Stop" (one run) or "Stop all": the runs are marked stopped instead of resumed, keep their state and history, and no longer show in the background widget or in the prompt at the next start.
+
 ## [6.4.0] - 2026-11-16
 
 **This minor version contains a breaking change.** Shipping it as 6.4.0 is an explicit operator choice, not a SemVer-compliant version. Read the breaking changes before upgrading.
