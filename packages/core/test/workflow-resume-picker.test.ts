@@ -96,3 +96,53 @@ void test("stop and delete dashboard actions retain confirmation", async () => {
   assert.ok(deleteSetup.notices.some((message) => message.includes("Deleted workflow delete-run")));
   await deleteSetup.shutdown?.();
 });
+
+async function startPicker(home: string, cwd: string, pick: (options: string[]) => string): Promise<{ testSetup: TestSetup; prompts: string[][] }> {
+  const testSetup = setup(home, cwd);
+  const prompts: string[][] = [];
+  const context = { ...testSetup.context, ui: { ...testSetup.context.ui, select: async (prompt: string, options: string[]) => { prompts.push([prompt, ...options]); return pick(options); } } };
+  await testSetup.start?.({}, context);
+  return { testSetup, prompts };
+}
+
+void test("the session start prompt stops interrupted runs instead of resuming them; Skip keeps them interrupted", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-start-stop-"));
+  const cwd = join(home, "project");
+  const one = await createRun(home, cwd, "stop-one", "interrupted");
+  const skipped = await startPicker(home, cwd, () => "Skip");
+  assert.deepEqual(skipped.prompts, [["1 interrupted workflow found", "Resume: stop-one (stop-one)", "Stop", "Skip"]]);
+  assert.equal((await one.load()).run.state, "interrupted");
+  await skipped.testSetup.shutdown?.();
+
+  const stopped = await startPicker(home, cwd, () => "Stop");
+  assert.equal((await one.load()).run.state, "stopped");
+  assert.ok(stopped.testSetup.notices.includes("Stopped workflow stop-one."));
+  await stopped.testSetup.shutdown?.();
+  const after = await startPicker(home, cwd, () => "Skip");
+  assert.deepEqual(after.prompts, [], "a stopped run is not offered again");
+  await after.testSetup.shutdown?.();
+});
+
+void test("Stop all stops every interrupted run and leaves other runs alone; Resume all still resumes", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-start-stop-all-"));
+  const cwd = join(home, "project");
+  const a = await createRun(home, cwd, "stop-a", "interrupted");
+  const b = await createRun(home, cwd, "stop-b", "interrupted");
+  const done = await createRun(home, cwd, "done", "completed");
+  const { testSetup, prompts } = await startPicker(home, cwd, () => "Stop all");
+  assert.deepEqual(prompts[0]?.slice(-3), ["Resume all", "Stop all", "Skip"]);
+  assert.equal((await a.load()).run.state, "stopped");
+  assert.equal((await b.load()).run.state, "stopped");
+  assert.equal((await done.load()).run.state, "completed");
+  await testSetup.shutdown?.();
+
+  const home2 = mkdtempSync(join(tmpdir(), "pi-extensible-workflows-start-resume-all-"));
+  const cwd2 = join(home2, "project");
+  const r1 = await createRun(home2, cwd2, "resume-a", "interrupted");
+  const r2 = await createRun(home2, cwd2, "resume-b", "interrupted");
+  const resumed = await startPicker(home2, cwd2, () => "Resume all");
+  for (let attempt = 0; attempt < 200 && ((await r1.load()).run.state !== "completed" || (await r2.load()).run.state !== "completed"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal((await r1.load()).run.state, "completed");
+  assert.equal((await r2.load()).run.state, "completed");
+  await resumed.testSetup.shutdown?.();
+});
