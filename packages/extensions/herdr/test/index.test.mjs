@@ -247,8 +247,8 @@ void test("opens the active session after the handoff boundary and releases on c
   assert.ok(runCommand.includes("PI_CODING_AGENT_DIR='/agent'"));
   assert.ok(runCommand.includes("--model 'openai/gpt:high'"));
   assert.ok(runCommand.includes("--tools 'read'"));
-  assert.ok(runCommand.includes(`--system-prompt '${join(tmpdir(), "pi-herdr-system-prompt-")}`));
-  assert.ok(runCommand.includes(`--append-system-prompt '${join(tmpdir(), "pi-herdr-append-prompt-")}`));
+  assert.ok(runCommand.includes("--system-prompt 'system'"));
+  assert.ok(runCommand.includes("--append-system-prompt 'append'"));
   assert.ok(runCommand.includes("--skill '/skill'"));
   assert.ok(runCommand.includes("--extension '/allowed-extension.mjs'"));
   assert.ok(runCommand.includes("--skill '/allowed-skill/SKILL.md'"));
@@ -576,8 +576,8 @@ void test("delivers per-attempt turn control through the pane launch prompt with
     if (args[0] === "tab" && args[1] === "create") { tabCount += 1; return JSON.stringify({ result: { tab: { tab_id: `tab-${tabCount}` }, root_pane: { pane_id: `pane-${tabCount}` } } }); }
     if (args[0] === "pane" && args[1] === "run") {
       const script = /sh '([^']+)'/.exec(args[3])?.[1];
-      const file = script ? /@'?([^'\s]+)'?/.exec(readFileSync(script, "utf8"))?.[1] : undefined;
-      if (file) launchedPrompt = readFileSync(file, "utf8");
+      const command = script ? readFileSync(script, "utf8") : args[3];
+      if (command.includes("'the task\n\nRetry attempt 2'")) launchedPrompt = "the task\n\nRetry attempt 2";
       return "";
     }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
@@ -997,9 +997,8 @@ void test("routes fully inspectable agents into one labeled workflow workspace",
   assert.ok(runCall);
   assert.ok(runCommand.includes("--system-prompt '/repo/.pi/pi-extensible-workflows/SYSTEM.md'"));
   assert.match(runCommand, /--no-context-files/);
-  assert.match(runCommand, /--append-system-prompt '.*pi-herdr-context-prompt-/);
-  assert.ok(runCommand.includes(`@'${join(tmpdir(), "pi-herdr-prompt-")}`));
-  assert.ok(runCommand.length < 4096);
+  assert.match(runCommand, /--append-system-prompt '<project_context>/);
+  assert.ok(runCall[3].length < 4096);
   await rm(root, { recursive: true, force: true });
 });
 void test("hands off sequential fully inspectable prompts and cleans the active tab on abort", async () => {
