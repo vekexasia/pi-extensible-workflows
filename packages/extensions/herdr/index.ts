@@ -109,6 +109,7 @@ function removeArtifact(path: string): void {
   }
 }
 const MAX_INLINE_ARGUMENT_BYTES = 65_536;
+const MAX_BRIDGE_FRAME_BYTES = 1_048_576;
 /*
  * Inline only non-empty, NUL-free, bounded values: empty values are ambiguous, NUL cannot cross argv, the byte cap bounds launcher size, @ and - preserve Pi's file/option parsing, and existing paths must remain file references.
  */
@@ -116,8 +117,9 @@ function inlineSafe(text: string): boolean {
   return text.length > 0 && !text.includes("\0") && Buffer.byteLength(text, "utf8") <= MAX_INLINE_ARGUMENT_BYTES && !text.startsWith("@") && !text.startsWith("-") && !existsSync(text);
 }
 function messageContent(message: unknown): unknown { return message !== null && typeof message === "object" && !Array.isArray(message) ? (message as Record<string, unknown>).content : undefined; }
-function hasToolCall(message: unknown): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall"); }
-function hasNamedToolCall(message: unknown, name: string): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part: unknown): part is ToolCallContent => part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall" && (part as ToolCallContent).name === name); }
+function isToolCall(part: unknown): part is ToolCallContent { return part !== null && typeof part === "object" && (part as { type?: unknown }).type === "toolCall"; }
+function hasToolCall(message: unknown): boolean { const content = messageContent(message); return Array.isArray(content) && content.some(isToolCall); }
+function hasNamedToolCall(message: unknown, name: string): boolean { const content = messageContent(message); return Array.isArray(content) && content.some((part) => isToolCall(part) && part.name === name); }
 function needsContinuation(message: WorkflowAgentMessage | undefined): boolean { return !message || message.stopReason === "aborted" || hasToolCall(message); }
 function usableCwd(cwd: string | undefined): boolean {
   if (typeof cwd !== "string" || !cwd.trim()) return false;
@@ -250,7 +252,7 @@ async function createToolBridge(session: HerdrSession, prepared: Readonly<Prepar
   const bridgeDirectory = mkdtempSync(join(tmpdir(), "pi-herdr-tools-"));
   const socketPath = join(bridgeDirectory, "bridge.sock");
   const extensionPath = join(bridgeDirectory, "bridge.mjs");
-  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return new Promise((resolve, reject) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const abort = () => finish(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ toolCallId, name, params }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch (error) { finish(error instanceof Error ? error : new Error("Invalid Herdr tool bridge message", { cause: error })); continue; } if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); } });\n    socket.on("error", (error) => finish(error));\n    socket.on("close", () => finish(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nfunction reportSettled() {\n  return new Promise((resolve) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let finished = false;\n    const finish = () => { if (finished) return; finished = true; socket.destroy(); resolve(); };\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify({ type: "agent_settled" }) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { if (JSON.parse(line).type === "ack") finish(); } catch (error) { finish(error instanceof Error ? error : new Error("Invalid Herdr settlement message", { cause: error })); } } });\n    socket.on("error", finish);\n    socket.on("close", finish);\n  });\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); pi.on("agent_settled", reportSettled); }\n`;
+  const source = `import net from "node:net";\nconst socketPath = ${JSON.stringify(socketPath)};\nconst tools = ${JSON.stringify(specs)};\nfunction bridgeRequest(request, handle, invalidMessage, signal, onFailure) {\n  return new Promise((resolve, reject) => {\n    const socket = net.createConnection(socketPath);\n    let buffer = "";\n    let settled = false;\n    const finish = (error, value) => { if (settled) return; settled = true; signal?.removeEventListener("abort", abort); socket.destroy(); error ? reject(error) : resolve(value); };\n    const fail = (error) => { if (onFailure) onFailure(finish, error); else finish(error); };\n    const abort = () => fail(new Error("Herdr tool call aborted"));\n    socket.setEncoding("utf8");\n    socket.on("connect", () => socket.write(JSON.stringify(request) + "\\n"));\n    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; let message; try { message = JSON.parse(line); } catch (error) { fail(error instanceof Error ? error : new Error(invalidMessage, { cause: error })); continue; } handle(message, finish); } });\n    socket.on("error", fail);\n    socket.on("close", () => fail(new Error("Herdr tool bridge closed")));\n    signal?.addEventListener("abort", abort, { once: true });\n  });\n}\nfunction callTool(toolCallId, name, params, signal, onUpdate) {\n  return bridgeRequest({ toolCallId, name, params }, (message, finish) => { if (message.type === "update") onUpdate?.(message.value); else if (message.type === "error") finish(new Error(message.error)); else if (message.type === "result") finish(undefined, message.value); }, "Invalid Herdr tool bridge message", signal);\n}\nfunction reportSettled() {\n  return bridgeRequest({ type: "agent_settled" }, (message, finish) => { if (message.type === "ack") finish(); }, "Invalid Herdr settlement message", undefined, (finish) => finish());\n}\nexport default function(pi) { for (const tool of tools) pi.registerTool({ ...tool, async execute(toolCallId, params, signal, onUpdate) { return callTool(toolCallId, tool.name, params, signal, onUpdate); } }); pi.on("agent_settled", reportSettled); }\n`;
   writeFileSync(extensionPath, source, { encoding: "utf8", mode: 0o600 });
   const sockets = new Set<Socket>();
   let markSettled = (): void => {};
@@ -261,7 +263,11 @@ async function createToolBridge(session: HerdrSession, prepared: Readonly<Prepar
     let buffer = "";
     let handled = false;
     let reportedSettled = false;
-    const send = (message: ToolBridgeMessage): void => { if (!socket.destroyed) socket.write(`${JSON.stringify(message)}\n`); };
+    const send = (message: ToolBridgeMessage): void => {
+      const frame = `${JSON.stringify(message)}\n`;
+      if (Buffer.byteLength(frame, "utf8") > MAX_BRIDGE_FRAME_BYTES) { socket.destroy(); return; }
+      if (!socket.destroyed) socket.write(frame);
+    };
     const handle = async (value: unknown): Promise<void> => {
       if (handled) return;
       handled = true;
@@ -279,7 +285,21 @@ async function createToolBridge(session: HerdrSession, prepared: Readonly<Prepar
     };
     const close = (): void => { controller.abort(); sockets.delete(socket); if (reportedSettled) markSettled(); };
     socket.setEncoding("utf8");
-    socket.on("data", (chunk) => { buffer += chunk.toString(); let newline; while ((newline = buffer.indexOf("\n")) >= 0) { const line = buffer.slice(0, newline); buffer = buffer.slice(newline + 1); if (!line) continue; try { void handle(JSON.parse(line)); } catch (error) { send({ type: "error", error: errorText(error) }); } } });
+    socket.on("data", (chunk) => {
+      buffer += chunk.toString();
+      if (Buffer.byteLength(buffer, "utf8") > MAX_BRIDGE_FRAME_BYTES) {
+        send({ type: "error", error: `Herdr tool bridge frame exceeds ${String(MAX_BRIDGE_FRAME_BYTES)} bytes` });
+        socket.destroy();
+        return;
+      }
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        try { void handle(JSON.parse(line)); } catch (error) { send({ type: "error", error: errorText(error) }); }
+      }
+    });
     socket.on("close", close);
     socket.on("error", close);
   });
