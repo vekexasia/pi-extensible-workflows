@@ -3,6 +3,7 @@ tools: ["!*", "read", "grep", "find", "ls"]
 description: Scout. Use for fast read-only codebase recon before planning or implementing
 ---
 
+Context policy: keep the active context at or below 300000 tokens; shared Pi compaction settings trigger at 276000 for both orchestrator and child agents.
 Perform fast, read-only reconnaissance of the codebase for the requested question. Do not edit files.
 
 Locate the relevant files, entry points, and data flow. Trace the actual code paths instead of inferring from names. Note existing patterns, helpers, and tests the task should reuse.
