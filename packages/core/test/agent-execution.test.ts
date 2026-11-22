@@ -797,6 +797,27 @@ void test("recovers a terminal provider error thrown by prompt before disposing 
   assert.equal(disposals, 1);
   assert.deepEqual(result.attempts.map(({ attempt, session }) => ({ attempt, sessionId: session?.sessionId })), [{ attempt: 1, sessionId: "thrown-provider" }]);
 });
+void test("changes model recovery to a physical alias target", async () => {
+  const sessions: SessionInput[] = [];
+  let created = 0;
+  const models = new Set([...(root.availableModels ?? []), "test/alt", "workflow/alt-model"]);
+  const executor = new WorkflowAgentExecutor({ ...root, modelAliases: { "alt-model": "test/alt" }, knownModels: models, availableModels: models }, testTransport(async (input) => {
+    sessions.push(input);
+    created += 1;
+    const messages = created === 1 ? [terminalAssistant("THROWN_PROVIDER_ERROR")] : [assistant("done")];
+    return {
+      sessionId: `model-recovery-${String(created)}`,
+      messages,
+      getSessionStats: sessionStats,
+      async prompt() { if (created === 1) throw new Error("provider request failed"); },
+      dispose() {},
+    };
+  }));
+  const result = await executor.execute("work", { label: "worker", workflowName: "flow", providerErrorRecovery: async () => ({ model: "workflow/alt-model" }) });
+  assert.equal(result.value, "done");
+  assert.deepEqual(sessions.map(({ model }) => model), [root.model, { provider: "test", model: "alt", thinking: "medium" }]);
+  assert.deepEqual(result.attempts.map(({ setup }) => setup.model), [root.model, { provider: "test", model: "alt", thinking: "medium" }]);
+});
 void test("a cancel while the provider-error recovery is still asking ends the attempt without an answer", async () => {
   const messages: Array<{ role: string; content: unknown; stopReason?: string; errorMessage?: string; usage?: typeof usage }> = [terminalAssistant("PROVIDER_DOWN")];
   let disposals = 0;
