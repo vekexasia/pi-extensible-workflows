@@ -6,7 +6,7 @@ import { createWorkflowTools, encoded, FUNCTION_HANDLE_PREFIX } from "./executio
 import { deepFreeze, errorCode, errorText, fail, isWorkflowErrorCode, jsonDigest, jsonValue, object } from "./utils.js";
 import { validateAgentOptions, validateShellOptions, workflowPrompt } from "./validation.js";
 import { type WorkflowRegistryApi } from "./registry.js";
-import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type EvidenceRecord, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WORKFLOW_AGENT_STATE_CHANGED_EVENT, WORKFLOW_BUDGET_EVENT, WORKFLOW_CHECKPOINT_STATE_CHANGED_EVENT, WORKFLOW_PHASE_CHANGED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_FAILED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, WORKFLOW_WORKTREE_CREATED_EVENT, WorkflowError, type AgentHandle, type AgentOptions, type AgentRecord, type BudgetEvent, type CheckpointResponseDetails, type EvidenceRecord, type FunctionIdentity, type JsonValue, type ModelSpec, type ParallelResult, type ParallelTasks, type PipelineItems, type PipelineResult, type PipelineStages, type RunState, type WorkflowBridge, type WorkflowCheckpointState, type WorkflowErrorShape, type WorkflowEventBase, type WorkflowExecution, type WorkflowExtensionSettings, type WorkflowFunctionContext, type WorkflowMetadata, type WorkflowRunContext, type WorkflowWorktreeCallback, type WorkflowWorktreeReference } from "./types.js";
 import { structuralPath as operationPath } from "./persistence.js";
 
 export type WorkflowEventSink = { emit: (name: string, payload: unknown) => unknown };
@@ -27,7 +27,7 @@ export type WorkflowRunRecord = {
   execution?: WorkflowExecution;
   completion?: Promise<unknown>;
   foreground?: boolean;
-  checkpointResolvers: Map<string, (value: boolean) => void>;
+  checkpointResolvers: Map<string, (value: boolean | CheckpointResponseDetails) => void>;
   update?: (result: WorkflowToolUpdate) => void;
 };
 

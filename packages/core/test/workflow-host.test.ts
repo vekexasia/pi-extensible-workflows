@@ -8,7 +8,7 @@ import { decodeTestJson, decodeTestJsonRecord, decodeTestRunDetails, decodeTestR
 import { Theme, type InlineExtension, type ThemeColor, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TObject, type TOptional, type TString } from "typebox";
 import { WORKFLOW_TOOL_DESCRIPTION, WORKFLOW_TOOL_PARAMETERS, WORKFLOW_TOOL_PROMPT_SNIPPET, navigatorAttentionSort } from "../src/host.js";
-import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, defineWorkflowFunction, formatWorkflowPreview, preflight, registerWorkflowExtension, RunStore, structuralPath, WorkflowError, WorkflowRegistry, type AgentOptions, type PersistedRun, type WorkflowExtension, type WorkflowFunctionContext, type WorkflowOrchestrationContext, type JsonValue } from "../src/index.js";
+import workflowExtension, { createLaunchSnapshot, DEFAULT_SETTINGS, defineWorkflowFunction, formatWorkflowPreview, preflight, registerWorkflowExtension, RunStore, structuralPath, WorkflowError, WorkflowRegistry, type AgentOptions, type CheckpointResponseDetails, type PersistedRun, type WorkflowExtension, type WorkflowFunctionContext, type WorkflowOrchestrationContext, type JsonValue } from "../src/index.js";
 import { loadingRegistry } from "../src/registry.js";
 import type { SessionInput } from "../src/agent-execution.js";
 import { listRunIds } from "../src/persistence.js";
@@ -47,7 +47,7 @@ const typeCheckAgentContext = (context: WorkflowOrchestrationContext): void => {
   void worktreeResult;
   const parallelResult: Promise<{ first: Static<typeof outputSchema>; second: number }> = context.parallel("batch", { first: () => context.agent("prompt", { outputSchema }), second: () => 2 });
   void parallelResult;
-  const checkpointResult: Promise<boolean> = context.checkpoint({ name: "ship", prompt: "Approve shipment", context: { artifact: "build" } });
+  const checkpointResult: Promise<boolean | CheckpointResponseDetails> = context.checkpoint({ name: "ship", prompt: "Approve shipment", context: { artifact: "build" } });
   void checkpointResult;
   // @ts-expect-error checkpoint requires a CheckpointInput
   void context.checkpoint("ship");
