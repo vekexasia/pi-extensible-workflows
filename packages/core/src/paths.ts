@@ -10,6 +10,7 @@ import { isNodeError } from "./utils.js";
 export function safePart(value: string): string { return value.replace(/[^a-zA-Z0-9._-]/g, "_"); }
 
 export function canonicalPath(path: string): string { const absolute = resolve(path); try { return realpathSync(absolute); } catch { return absolute; } }
+export function canonicalPathFrom(path: string, cwd: string): string { return canonicalPath(isAbsolute(path) ? path : join(cwd, path)); }
 export function extensionIdentity(path: string): string { return path.startsWith("builtin:") ? path : canonicalPath(path.startsWith("file:") ? fileURLToPath(path) : path); }
 export function sameFilesystemPath(left: string, right: string): boolean { return canonicalPath(left) === canonicalPath(right); }
 /**
@@ -18,8 +19,8 @@ export function sameFilesystemPath(left: string, right: string): boolean { retur
  */
 export function piResourcePath(path: string, cwd: string): string {
   //NOTE: Pi also rewrites Windows shell paths and `~\` on win32; those forms are not mirrored here and fail closed.
-  if (path.startsWith("<") || path.startsWith("builtin:")) return path;
   const trimmed = path.trim();
+  if (trimmed.startsWith("<") || trimmed.startsWith("builtin:")) return trimmed;
   const expanded = trimmed === "~" ? homedir() : trimmed.startsWith("~/") ? join(homedir(), trimmed.slice(2)) : /^file:\/\//.test(trimmed) ? fileURLToPath(trimmed) : trimmed;
   return isAbsolute(expanded) ? resolve(expanded) : resolve(cwd, expanded);
 }

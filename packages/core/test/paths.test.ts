@@ -14,6 +14,7 @@ const identitySources = [
   resolve(sourceRoot, "registry.ts"),
   resolve(sourceRoot, "agent-execution.ts"),
   resolve(sourceRoot, "validation.ts"),
+  resolve(sourceRoot, "store.ts"),
   resolve(sourceRoot, "../trajectory/src/server.ts"),
   resolve(sourceRoot, "../../cli/src/doctor.ts"),
   resolve(sourceRoot, "../../cli/src/cli.ts"),
@@ -48,6 +49,8 @@ void test("physical path identity has one canonicalization owner", async () => {
   for (const source of sources.slice(1)) assert.doesNotMatch(source, /realpathSync|export function (?:canonicalPath|sameFilesystemPath)\(/);
   for (const source of sources) assert.doesNotMatch(source, /function\s+(?:canonicalSourcePath|canonicalRoleDirectory|canonical)\s*\(/);
   assert.doesNotMatch(sources[5] ?? "", /realpathSync/);
+  assert.doesNotMatch(sources[5] ?? "", /\brealpath\(/);
+  assert.doesNotMatch(sources[5] ?? "", /\bresolve\([^)]*\)\s*[!=]==?/);
 });
 
 void test("contributed resource paths are normalized and contained exactly as Pi's resource loader attributes them", (t) => {

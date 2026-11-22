@@ -9,7 +9,9 @@ import { agentIsLeftover, agentIsLive, agentLastActivity, agentSilence, type Sil
 import { formatCost, formatTokens } from "./background-widget.js";
 import { buildWorkflowPhaseModel, buildWorkflowPhaseTree, workflowPhaseTreeInitialExpanded, workflowPhaseTreeVisibleNodes, type WorkflowPhaseTreeNode } from "./host-phases.js";
 import { agentActivityLabel, formatWorkflowNodeDetails, formatWorkflowRuntime, formatWorkflowTreeLine, navigatorAttentionSort, navigatorAttentionSortByState, progressStyleForState, runStateGlyph, type WorkflowProgressStyles } from "./host-view.js";
-import { sameFilesystemPath } from "./paths.js";
+import { piResourceContains, sameFilesystemPath } from "./paths.js";
+import { decodeWorktreeReferences, type WorktreeReference } from "./decoders.js";
+import { json } from "./io.js";
 import { listRunIds, RunStore, type PersistedRun } from "./persistence.js";
 import { isHardTerminalRunState, SETTLED_AGENT_STATES, type AgentAccounting, type AgentSpeed, type AgentAttemptError, type AgentAttemptSummary, type AgentRecord, type LaunchSnapshot, type ModelSpec, type RunState, type WorkflowAgentSession, type WorkflowAgentSessionReference } from "./types.js";
 import { budgetUsage } from "./budget.js";
@@ -25,6 +27,7 @@ export interface SessionAgent {
   readonly summary: string;
   /** Working directory of the attempt; tool renderers resolve paths against it. */
   readonly cwd: string;
+  readonly branch?: string;
   /** Latest attempt number; a change shows a fresh transcript. */
   readonly attempt: number | undefined;
   /** The record belongs to this Pi session (and project); when false the session file is never opened. */
@@ -221,7 +224,7 @@ function unavailableGroup(reason: string): SessionTreeNode {
  * The identity (modification time, size, inode) of the run files a listing reads: equal stamps mean none was written again.
  */
 async function runStamp(directory: string): Promise<string | undefined> {
-  const infos = await Promise.all(["state.json", "journal.json"].map((name) => stat(join(directory, name)).catch(() => undefined)));
+  const infos = await Promise.all(["state.json", "journal.json", "snapshot.json", "worktrees.json", "summary.json"].map((name) => stat(join(directory, name)).catch(() => undefined)));
   return infos[0] === undefined ? undefined : infos.map((info) => info === undefined ? "-" : `${String(info.mtimeMs)}:${String(info.size)}:${String(info.ino)}`).join("|");
 }
 
@@ -232,22 +235,25 @@ async function summaryIsFresh(directory: string): Promise<boolean> {
 }
 
 /** What a listing reads of a run; createdAt is NaN without a readable summary. */
-type ReadRun = { readonly loaded: { readonly run: PersistedRun; readonly snapshot: Readonly<LaunchSnapshot>; readonly waitingFor: string | undefined }; readonly resolvedAt: number | undefined; readonly createdAt: number };
+type ReadRun = { readonly loaded: { readonly run: PersistedRun; readonly snapshot: Readonly<LaunchSnapshot>; readonly waitingFor: string | undefined; readonly worktrees: readonly WorktreeReference[] }; readonly resolvedAt: number | undefined; readonly createdAt: number };
 
 export function createSessionAgentsSource(context: ExtensionContext, deps: SessionAgentsDependencies, scope: SessionAgentsScope = "all"): SessionAgentsSource {
   /** Every run read: its state, snapshot and summary are read again only when its stamp changes. */
   const runs = new Map<string, ReadRun & { readonly stamp: string }>();
-  /** Every subagent inspected and described: a settled one is inspected and described again only when its listed state or finishedAt changes. */
-  const subagentsSeen = new Map<string, { readonly state: SubagentStatus["state"]; readonly finishedAt: number | undefined; readonly record: unknown; readonly described: boolean; readonly presentation: SubagentPresentation | undefined }>();
-  const runAgent = (run: PersistedRun, agent: AgentRecord, cache: Map<string, number | undefined>): SessionAgent => {
+  /** Every subagent inspected and described: a settled one is inspected again when its listed state or finishedAt changes, and owned records are revalidated before transcript access. */
+  const subagentsSeen = new Map<string, { readonly state: SubagentStatus["state"]; readonly finishedAt: number | undefined; readonly record: unknown; readonly inspectedCwd: string | undefined; readonly described: boolean; readonly presentation: SubagentPresentation | undefined }>();
+  const runAgent = (run: PersistedRun, agent: AgentRecord, worktrees: readonly WorktreeReference[], cache: Map<string, number | undefined>): SessionAgent => {
     const attempt = latestAttempt(agent.attemptDetails);
     const running = agentIsLive(agent.state, run.state);
+    const cwd = attempt?.setup.cwd ?? context.cwd;
+    const branch = worktrees.find((tree) => piResourceContains(tree.path, cwd) && (agent.worktreeOwner === undefined || tree.owner === agent.worktreeOwner))?.branch;
     return {
       key: `run:${run.id}:${agentKeyPart(agent.id)}`,
       name: sanitizeDisplayText(agent.label ?? agent.name),
       state: agent.state,
       summary: agentSummary(agent.model, agent.accounting),
-      cwd: attempt?.setup.cwd ?? context.cwd,
+      cwd,
+      ...(branch === undefined ? {} : { branch }),
       attempt: attempt?.attempt,
       // The run comes from this Pi session's RunStore, so its owner is confirmed; the reader checks the file.
       owned: true,
@@ -262,7 +268,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     };
   };
   /** The run's /workflow tree, every node in the order /workflow draws them, under a header row for the run. */
-  const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, waitingFor: string | undefined, now: number, cache: Map<string, number | undefined>): SessionTreeNode[] => {
+  const runNodes = (run: PersistedRun, snapshot: Readonly<LaunchSnapshot>, waitingFor: string | undefined, worktrees: readonly WorktreeReference[], now: number, cache: Map<string, number | undefined>): SessionTreeNode[] => {
     const model = buildWorkflowPhaseModel(run, snapshot);
     const tree = buildWorkflowPhaseTree(model);
     const expanded = workflowPhaseTreeInitialExpanded(tree);
@@ -312,7 +318,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
           return timeline.length === 0 ? base : [...base, "", ...timeline];
         },
         title: (styles) => nodeTitle(shown.label, state, styles),
-        agent: agent && runAgent(run, agent, cache),
+        agent: agent && runAgent(run, agent, worktrees, cache),
         target: agent ? { kind: "workflow-agent", runId: run.id, agentId: agent.id } : runTarget,
         ...(needsPerson === undefined ? {} : { needsPerson }),
       };
@@ -346,13 +352,14 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
         const parsed = terminalAt === undefined ? Number.NaN : Date.parse(terminalAt);
         const resolvedAt = Number.isFinite(parsed) ? parsed : undefined;
         const waitingFor = run.state === "awaiting_input" ? (await store.awaitingCheckpoints().catch(() => []))[0]?.name : undefined;
-        const entry = { loaded: { run, snapshot, waitingFor }, resolvedAt, createdAt: summary === undefined ? Number.NaN : Date.parse(summary.createdAt) };
+        const worktrees = decodeWorktreeReferences(await json(join(store.directory, "worktrees.json")).catch(() => undefined)) ?? [];
+        const entry = { loaded: { run, snapshot, waitingFor, worktrees }, resolvedAt, createdAt: summary === undefined ? Number.NaN : Date.parse(summary.createdAt) };
         // A settled run is kept only once summary.json has caught up with it: until then the time it settled may be stale.
         if (stamp !== undefined && (!isHardTerminalRunState(run.state) || await summaryIsFresh(store.directory))) runs.set(runId, { ...entry, stamp });
         return shown(entry);
       } catch { return undefined; }
     }));
-    return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor } }) => runNodes(run, snapshot, waitingFor, now, cache));
+    return navigatorAttentionSort(loaded.filter((entry) => entry !== undefined)).flatMap(({ loaded: { run, snapshot, waitingFor, worktrees } }) => runNodes(run, snapshot, waitingFor, worktrees, now, cache));
   };
   /** The row of the listed subagent `id`: its key, name and target address that id; `status` gives its state and attempt. */
   const subagent = (manager: SubagentManager, id: string, status: SubagentStatus, owned: boolean, presentation: SubagentPresentation | undefined, now: number): SessionTreeNode => {
@@ -370,6 +377,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
       state: status.state,
       summary: agentSummary(status.progress?.state?.model ?? attempt?.setup.model, status.progress?.accounting),
       cwd: attempt?.setup.cwd ?? context.cwd,
+      ...(status.worktree === undefined ? {} : { branch: status.worktree.branch }),
       attempt: attempt?.attempt,
       owned,
       session: attempt?.session,
@@ -415,15 +423,16 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     for (const id of [...subagentsSeen.keys()]) if (!statuses.some((status) => status.id === id)) { subagentsSeen.delete(id); changed = true; }
     const entries = await Promise.all(statuses.map(async (row) => {
       const seen = subagentsSeen.get(row.id);
-      const fresh = seen === undefined || row.state === "running" || seen.state !== row.state || seen.finishedAt !== row.finishedAt;
+      // A cached explicit cwd carries the transcript trust decision: re-inspect it before allowing access again.
+      const fresh = seen === undefined || row.state === "running" || seen.state !== row.state || seen.finishedAt !== row.finishedAt || seen.inspectedCwd !== undefined;
       if (fresh) changed = true;
       const record = fresh ? await manager.inspect({ id: row.id }, managerContext("agents-command", command, true)).catch(() => undefined) : seen.record;
-      //NOTE: an inspection names the id it was asked for: one naming another id is not checked for here.
       const own = statusValue(record);
       // The inspected record, not the list row, proves the owner; the storage directory proves nothing (it may be a custom storageDir).
       const cwd = isObject(record) ? record.cwd : undefined;
-      const owned = own !== undefined && own.sessionId === sessionId && safeSubagentId(row.id) && (typeof cwd !== "string" || sameFilesystemPath(cwd, context.cwd));
-      return { id: row.id, row, status: own ?? row, owned, record };
+      const inspectedCwd = typeof cwd === "string" ? cwd : undefined;
+      const owned = own !== undefined && own.id === row.id && own.sessionId === sessionId && safeSubagentId(row.id) && inspectedCwd !== undefined && sameFilesystemPath(inspectedCwd, context.cwd);
+      return { id: row.id, row, status: own ?? row, owned, record, inspectedCwd };
     }));
     // As /subagents names its rows (loadEntries): every subagent this Pi session lists with a safe id, whatever its
     // inspection shows; owned decides only the transcript and the live stream. The presenter gets what was read here.
@@ -434,7 +443,7 @@ export function createSessionAgentsSource(context: ExtensionContext, deps: Sessi
     const presentations = !changed ? new Map([...subagentsSeen].map(([id, { presentation }]) => [id, presentation]))
       : requested.size > 0 ? await Promise.resolve().then(() => deps.subagentPresenter?.()?.describe([...requested.keys()], statuses, requested) ?? null).catch(() => null) : undefined;
     // A failed inspection is kept as one: it is inspected again only when its listed state or finishedAt changes.
-    if (changed) for (const { id, row, record } of entries) subagentsSeen.set(id, { state: row.state, finishedAt: row.finishedAt, record, described: presentations !== null, presentation: requested.has(id) ? presentations?.get(id) : undefined });
+    if (changed) for (const { id, row, record, inspectedCwd } of entries) subagentsSeen.set(id, { state: row.state, finishedAt: row.finishedAt, record, inspectedCwd, described: presentations !== null, presentation: requested.has(id) ? presentations?.get(id) : undefined });
     const sorted = navigatorAttentionSortByState(entries, ({ status }) => status.state, ({ status }) => status.finishedAt, SUBAGENT_ATTENTION_ORDER);
     if (sorted.length === 0) return [];
     // Each row is its listed id: its key, name, presentation and target; a presentation for an id not asked for is ignored.

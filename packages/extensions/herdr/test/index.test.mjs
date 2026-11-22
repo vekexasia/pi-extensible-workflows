@@ -7,8 +7,8 @@ import { pathToFileURL } from "node:url";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import extension, { breadcrumbLabel, createHerdrExtension, isFullyInspectableMode } from "../dist/index.js";
-import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, createLiveSessionHandoff, loadingRegistry, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
+import extension, { breadcrumbLabel, createHerdrExtension as createHerdrExtensionImpl, isFullyInspectableMode } from "../dist/index.js";
+import { WORKFLOW_BLOCKED_EVENT, WORKFLOW_RUN_COMPLETED_EVENT, WORKFLOW_RUN_RESUMED_EVENT, WORKFLOW_RUN_STARTED_EVENT, WORKFLOW_RUN_STATE_CHANGED_EVENT, createLiveSessionHandoff, localAgentTransport, resetWorkflowRegistry } from "pi-extensible-workflows";
 
 const SANDBOX = mkdtempSync(join(tmpdir(), "hd-"));
 const SOCKET_PATH = join(SANDBOX, "h.sock");
@@ -19,6 +19,17 @@ const COMPLETED_SESSION_FILE = join(SANDBOX, "completed session.jsonl");
 process.on("exit", () => { rmSync(SANDBOX, { recursive: true, force: true }); });
 
 const piRuntime = { executable: process.execPath, entrypoint: "/originating/pi-coding-agent/dist/cli.js" };
+function withPaneTopology(runner) {
+  let paneNumber = 0;
+  return async (args) => {
+    const output = await runner(args);
+    if (output) return output;
+    if (args[0] === "pane" && args[1] === "layout") return JSON.stringify({ result: { layout: { panes: [{ pane_id: args[3], rect: { width: 80, height: 20 } }] } } });
+    if (args[0] === "pane" && args[1] === "split") return JSON.stringify({ result: { pane: { pane_id: `pane-${++paneNumber}` } } });
+    return output;
+  };
+}
+function createHerdrExtension(options) { return createHerdrExtensionImpl(options.runner ? { ...options, runner: withPaneTopology(options.runner) } : options); }
 function writeFixtureStream(res, id = "fixture") {
   const chunk = (choices) => `data: ${JSON.stringify({ id, object: "chat.completion.chunk", model: "fixture-model", choices })}`;
   res.writeHead(200, { "Connection": "close", "Content-Type": "text/event-stream" });
@@ -882,7 +893,7 @@ void test("disposes a Herdr wrapper while a subsequent pane is still launching",
     if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "workspace" }, tab: { tab_id: "root-tab" }, root_pane: { pane_id: "root-pane" } } });
     if (args[0] === "tab" && args[1] === "create") { const number = calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create").length; return JSON.stringify({ result: { tab: { tab_id: `tab-${number}` }, root_pane: { pane_id: `pane-${number}` } } }); }
     if (args[0] === "pane" && args[1] === "run") { paneRuns += 1; if (paneRuns === 2) { await launchGate; launchReleased = true; } return ""; }
-    if (args[0] === "tab" && args[1] === "close") { if (args[2] === "tab-2") secondClosed = true; return ""; }
+    if (args[0] === "pane" && args[1] === "close") { if (args[2] === "pane-2") secondClosed = true; return ""; }
     if (args[0] === "pane" && args[1] === "process-info") {
       if (args[3] === "pane-1") return firstProcessReports++ === 0 ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } }) : JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
       if (!launchReleased || secondProcessReports++ > 0) return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
@@ -947,7 +958,7 @@ void test("materializes a fresh session before launching a fully inspectable age
     await rm(root, { recursive: true, force: true });
   }
 });
-void test("routes fully inspectable agents into one labeled workflow workspace", async () => {
+void test("routes fully inspectable agents into child panes of the caller", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-full-"));
   const agentDir = join(root, "agent");
   const sessionFile = join(root, "session.jsonl");
@@ -984,15 +995,14 @@ void test("routes fully inspectable agents into one labeled workflow workspace",
   const secondSession = await agent.transport.createSession(prepared, { identity, attempt: 2, signal: new AbortController().signal });
   const secondLifecycle = await generatedBridge(runCommand);
   await secondLifecycle.handlers.get("agent_settled")?.({}, {});
-  assert.deepEqual(calls[0], ["workspace", "create", "--cwd", "/repo", "--label", "workflow flow", "--no-focus"]);
-  assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create"), [
-    ["tab", "create", "--workspace", "workspace", "--cwd", "/repo", "--label", "#1 reviewer", "--no-focus"],
-    ["tab", "create", "--workspace", "workspace", "--cwd", "/repo", "--label", "#1 reviewer", "--no-focus"],
-  ]);
+  assert.equal(calls.some(([command]) => command === "workspace" || command === "tab"), false);
+  const splitCalls = calls.filter(([command, subcommand]) => command === "pane" && subcommand === "split");
+  assert.ok(splitCalls.length >= 2);
+  assert.equal(splitCalls.every(([, , pane]) => pane === "parent"), true);
   await secondSession.prompt("continue");
   await session.dispose();
   await secondSession.dispose();
-  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 2);
+  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 0);
   const runCall = calls.find(([command, subcommand]) => command === "pane" && subcommand === "run");
   assert.ok(runCall);
   assert.ok(runCommand.includes("--system-prompt '/repo/.pi/pi-extensible-workflows/SYSTEM.md'"));
@@ -1042,9 +1052,9 @@ void test("hands off sequential fully inspectable prompts and cleans the active 
   while (!calls.some(([command, subcommand, pane]) => command === "pane" && subcommand === "run" && pane === "pane-3")) await new Promise((resolve) => globalThis.setImmediate(resolve));
   controller.abort();
   await activePrompt;
-  assert.equal(calls.filter(([command, subcommand, tab]) => command === "tab" && subcommand === "close" && tab === "tab-3").length, 1);
+  assert.equal(calls.filter(([command, subcommand, pane]) => command === "pane" && subcommand === "close" && pane === "pane-3").length, 1);
   await session.dispose();
-  assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").map((args) => args[2]), ["tab-1", "tab-2", "tab-3"]);
+  assert.deepEqual(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "close").map((args) => args[2]), ["pane-1", "pane-2", "pane-3"]);
   await rm(root, { recursive: true, force: true });
 });
 void test("hands back an idle restricted child only after the generated bridge reports agent_settled", { timeout: 10_000 }, async () => {
@@ -1058,15 +1068,14 @@ void test("hands back an idle restricted child only after the generated bridge r
   const calls = [];
   const runner = async (args) => {
     calls.push([...args]);
+    if (args[0] === "pane" && args[1] === "run") {
+      const commandFile = /sh '([^']+)'$/.exec(args[3])?.[1];
+      runCommand = commandFile ? readFileSync(commandFile, "utf8") : args[3];
+    }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
     if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "idle" } } });
     return "";
   };
-  const workspaces = { open: async (_run, request) => {
-    const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1];
-    runCommand = commandFile ? readFileSync(commandFile, "utf8") : request.command;
-    return { workspaceId: "workspace", tabId: "tab", paneId: "pane" };
-  } };
   let resultAccepted = false;
   const resultTool = {
     name: "workflow_result", label: "Workflow Result", description: "Submit result", parameters: { type: "object", properties: { result: { type: "string" } }, required: ["result"], additionalProperties: false },
@@ -1089,7 +1098,7 @@ void test("hands back an idle restricted child only after the generated bridge r
     abort: async () => {},
     dispose: async () => {},
   };
-  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner, workspaces });
+  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
   const agent = { transport: { id: "local", createSession: async () => localSession } };
   const run = { runId: "run", workflow: { name: "flow" } };
   const identity = { structuralPath: ["worker"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 };
@@ -1121,7 +1130,7 @@ void test("hands back an idle restricted child only after the generated bridge r
     await session.dispose();
     await session.dispose();
     assert.equal(resumes, 1);
-    assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 1);
+    assert.equal(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "close").length, 1);
     assert.equal(calls.filter(([command, subcommand]) => command === "pane" && subcommand === "release-agent").length, 1);
     assert.equal(existsSync(bridge.extensionPath), false);
   } finally {
@@ -1139,18 +1148,17 @@ void test("retains early duplicate settlement per generated bridge without leaki
   const controller = new AbortController();
   const lifecycleHandlers = [];
   let paneNumber = 0;
-  const workspaces = { open: async (_run, request) => {
-    paneNumber += 1;
-    const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1];
-    const command = commandFile ? readFileSync(commandFile, "utf8") : request.command;
-    const bridge = await generatedBridge(command);
-    const childSettled = bridge.handlers.get("agent_settled");
-    assert.ok(childSettled);
-    lifecycleHandlers.push(childSettled);
-    if (paneNumber === 1) { await childSettled({}, {}); await childSettled({}, {}); }
-    return { workspaceId: "workspace", tabId: `tab-${paneNumber}`, paneId: `pane-${paneNumber}` };
-  } };
   const runner = async (args) => {
+    if (args[0] === "pane" && args[1] === "run") {
+      paneNumber += 1;
+      const commandFile = /sh '([^']+)'$/.exec(args[3])?.[1];
+      const command = commandFile ? readFileSync(commandFile, "utf8") : args[3];
+      const bridge = await generatedBridge(command);
+      const childSettled = bridge.handlers.get("agent_settled");
+      assert.ok(childSettled);
+      lifecycleHandlers.push(childSettled);
+      if (paneNumber === 1) { await childSettled({}, {}); await childSettled({}, {}); }
+    }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
     if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "idle" } } });
     return "";
@@ -1173,7 +1181,7 @@ void test("retains early duplicate settlement per generated bridge without leaki
       prompt: async () => { throw new Error("missing result must be left for core repair"); }, steer: async () => {}, abort: async () => {}, dispose: async () => {},
     };
   } } };
-  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner, workspaces });
+  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
   const run = { runId: "run", workflow: { name: "flow" } };
   const identity = { structuralPath: ["worker"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 };
   herdr.agentSetupHooks.fullyInspectable.setup(agent, { identity, run, signal: controller.signal });
@@ -1240,64 +1248,6 @@ void test("bridges unknown tools and aborts forwarded tool calls", async () => {
     controller.abort(); await assert.rejects(pending, /Herdr tool call aborted/);
   } finally { controller.abort(); await session.dispose(); await new Promise((resolve) => globalThis.setTimeout(resolve, 0)); await rm(root, { recursive: true, force: true }); }
 });
-void test("closes workspaces for every terminal run state and session shutdown", async () => {
-  const handlers = new Map(); const closed = []; let closeAll = 0;
-  let releaseCloseAll;
-  const closeAllFinished = new Promise((resolve) => { releaseCloseAll = resolve; });
-  const workspaces = { close: async (runId) => { closed.push(runId); }, closeAll: async () => { closeAll += 1; await closeAllFinished; } };
-  const pi = { events: { on(name, handler) { handlers.set(name, handler); } }, on(name, handler) { handlers.set(name, handler); } };
-  resetWorkflowRegistry();
-  extension(pi, { env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "pane" }, workspaces });
-  for (const state of ["failed", "stopped", "interrupted", "budget_exhausted"]) await handlers.get("workflow:run-state-changed")({ runId: state, state });
-  await handlers.get("workflow:run-completed")({ runId: "completed" });
-  const shutdown = handlers.get("session_shutdown")();
-  let shutdownFinished = false;
-  shutdown.then(() => { shutdownFinished = true; });
-  await Promise.resolve();
-  assert.equal(shutdownFinished, false);
-  releaseCloseAll();
-  await shutdown;
-  assert.deepEqual(closed, ["failed", "stopped", "interrupted", "budget_exhausted", "completed"]); assert.equal(closeAll, 1);
-});
-void test("default workspace manager reuses one workspace and closes it once on completion", async () => {
-  resetWorkflowRegistry();
-  const root = mkdtempSync(join(tmpdir(), "herdr-extension-workspace-lifecycle-"));
-  const agentDir = join(root, "agent");
-  const sessionFile = join(root, "session.jsonl");
-  mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
-  writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { herdr: { enableFullyInspectableMode: true } } }));
-  const handlers = new Map();
-  const calls = [];
-  let tabNumber = 0;
-  const runner = async (args) => {
-    calls.push([...args]);
-    if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "workspace" }, tab: { tab_id: "root-tab" }, root_pane: { pane_id: "root-pane" } } });
-    if (args[0] === "tab" && args[1] === "create") { const number = ++tabNumber; return JSON.stringify({ result: { tab: { tab_id: `tab-${number}` }, root_pane: { pane_id: `pane-${number}` } } }); }
-    return "";
-  };
-  const pi = { events: { on(name, handler) { handlers.set(name, handler); } }, on(name, handler) { handlers.set(name, handler); } };
-  const env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" };
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = agentDir;
-  try { extension(pi, { env, runner }); } finally { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; }
-  const hook = loadingRegistry().agentSetupHooks().find(({ name }) => name === "fullyInspectable");
-  assert.ok(hook);
-  const run = { runId: "run", workflow: { name: "flow" } };
-  const agent = { transport: { id: "local", async createSession(value) { return { reference: { transport: "local", sessionId: `session-${value.initialPrompt}`, locator: { sessionFile } }, suspendForHandoff: async () => {}, getLastAssistant: () => ({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }), dispose: async () => {}, getState: () => ({ model: value.model, tools: value.tools }), getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0 }) }; } } };
-  hook.setup(agent, { identity: { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 }, run, signal: new AbortController().signal });
-  const prepared = { cwd: "/repo", model: { provider: "fake", model: "model" }, tools: [], initialPrompt: "work", sessionLabel: "flow:review", piRuntime };
-  const first = await agent.transport.createSession(prepared, { attempt: 1, signal: new AbortController().signal });
-  const second = await agent.transport.createSession(prepared, { attempt: 2, signal: new AbortController().signal });
-  await first.dispose();
-  await second.dispose();
-  await handlers.get("workflow:run-completed")({ runId: run.runId });
-  await handlers.get("session_shutdown")();
-  assert.equal(calls.filter(([command, subcommand]) => command === "workspace" && subcommand === "create").length, 1);
-  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create").length, 2);
-  assert.equal(calls.filter(([command, subcommand]) => command === "workspace" && subcommand === "close").length, 1);
-  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 2);
-  await rm(root, { recursive: true, force: true });
-});
 void test("relays generated tool bridge results, errors, and updates", async () => {
   const root = mkdtempSync(join(tmpdir(), "herdr-extension-tool-bridge-"));
   const agentDir = join(root, "agent"); mkdirSync(join(agentDir, "pi-extensible-workflows"), { recursive: true });
@@ -1305,11 +1255,14 @@ void test("relays generated tool bridge results, errors, and updates", async () 
   writeFileSync(join(agentDir, "pi-extensible-workflows", "settings.json"), JSON.stringify({ extensionSettings: { herdr: { enableFullyInspectableMode: true } } }));
   let runCommand;
   const runner = async (args) => {
+    if (args[0] === "pane" && args[1] === "run") {
+      const commandFile = /sh '([^']+)'$/.exec(args[3])?.[1];
+      runCommand = commandFile ? readFileSync(commandFile, "utf8") : args[3];
+    }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
     if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "working" } } });
     return "";
   };
-  const workspaces = { open: async (_run, request) => { const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1]; runCommand = commandFile ? readFileSync(commandFile, "utf8") : request.command; return { workspaceId: "workspace", tabId: "tab", paneId: "pane" }; } };
   const calls = [];
   let bridgeContext;
   const tool = { name: "bridge", label: "Bridge", description: "Bridge", parameters: { type: "object", properties: {}, additionalProperties: false }, async execute(toolCallId, params, _signal, onUpdate, context) {
@@ -1319,7 +1272,7 @@ void test("relays generated tool bridge results, errors, and updates", async () 
     onUpdate({ state: "working" });
     return { content: [{ type: "text", text: "tool result" }] };
   } };
-  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner, workspaces });
+  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
   const resolvedModel = { provider: "inline-only", id: "inline-model" };
   const resolvedRegistry = { find: (provider, model) => provider === resolvedModel.provider && model === resolvedModel.id ? resolvedModel : undefined };
   // The shared registry can arrive before the live session exposes its model.
@@ -1355,11 +1308,14 @@ void test("bridges a custom tool with a model supplied only by an inline extensi
   writeFileSync(join(agentDir, "auth.json"), "{}");
   let runCommand;
   const runner = async (args) => {
+    if (args[0] === "pane" && args[1] === "run") {
+      const commandFile = /sh '([^']+)'$/.exec(args[3])?.[1];
+      runCommand = commandFile ? readFileSync(commandFile, "utf8") : args[3];
+    }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
     if (args[0] === "agent" && args[1] === "get") return JSON.stringify({ result: { agent: { agent_status: "working" } } });
     return "";
   };
-  const workspaces = { open: async (_run, request) => { const commandFile = /sh '([^']+)'$/.exec(request.command)?.[1]; runCommand = commandFile ? readFileSync(commandFile, "utf8") : request.command; return { workspaceId: "workspace", tabId: "tab", paneId: "pane" }; } };
   let bridgeContext;
   const tool = { name: "bridge", label: "Bridge", description: "Bridge", parameters: { type: "object", properties: {}, additionalProperties: false }, async execute(_id, _params, _signal, _onUpdate, context) { bridgeContext = context; return { content: [{ type: "text", text: "ok" }] }; } };
   const extensionFactory = (pi) => {
@@ -1370,7 +1326,7 @@ void test("bridges a custom tool with a model supplied only by an inline extensi
       models: [{ id: "inline-model", name: "Inline model", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 1_024, maxTokens: 128 }],
     });
   };
-  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner, workspaces });
+  const herdr = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
   const agent = { transport: { id: "local", createSession: (prepared, context) => localAgentTransport.createSession(prepared, context) } };
   const controller = new AbortController();
   herdr.agentSetupHooks.fullyInspectable.setup(agent, { identity: { structuralPath: ["review"], parentBreadcrumb: "flow", callSite: "agent", occurrence: 1 }, run: { runId: "run", workflow: { name: "flow" } }, signal: controller.signal });
