@@ -86,19 +86,20 @@ export async function openHerdrWorkspacePane(request: HerdrWorkspacePaneRequest,
     ? ["tab", "create", "--workspace", request.workspaceId, "--cwd", request.cwd, "--label", request.tabLabel, "--no-focus"]
     : ["workspace", "create", "--cwd", request.cwd, "--label", request.workspaceLabel ?? "", "--no-focus"]));
   const workspaceId = request.workspaceId ?? resourceId(created, "workspace", "workspace_id");
-  let tabId = resourceId(created, "tab", "tab_id");
-  let paneId = resourceId(created, "root_pane", "pane_id");
+  let tabId: string | undefined;
   try {
-    if (!request.workspaceId) {
-      await runner(["tab", "rename", tabId, request.workspaceLabel ?? ""]);
-      const tab = json(await runner(["tab", "create", "--workspace", workspaceId, "--cwd", request.cwd, "--label", request.tabLabel, "--no-focus"]));
-      tabId = resourceId(tab, "tab", "tab_id");
-      paneId = resourceId(tab, "root_pane", "pane_id");
-    }
+    tabId = resourceId(created, "tab", "tab_id");
+    const paneId = resourceId(created, "root_pane", "pane_id");
+    //NOTE: `workspace create` already returns one tab and one root pane, so the first agent takes them over instead of leaving an empty sibling tab behind.
+    if (!request.workspaceId) await runner(["tab", "rename", tabId, request.tabLabel]);
     await runner(["pane", "run", paneId, commandFor({ action: "live", cwd: request.cwd, command: request.command })]);
     return { workspaceId, tabId, paneId };
   } catch (error) {
-    await runner(request.workspaceId ? ["tab", "close", tabId] : ["workspace", "close", workspaceId]).catch(() => undefined);
+    // A workspace this call created is closed whole; an existing one only loses the tab this call created.
+    if (request.workspaceId) {
+      if (tabId) await runner(["tab", "close", tabId]).catch(() => undefined);
+    }
+    else await runner(["workspace", "close", workspaceId]).catch(() => undefined);
     throw error;
   }
 }

@@ -614,7 +614,7 @@ void test("clears the active pane after a failed pane monitor so the next prompt
     if (args[0] === "tab" && args[1] === "create") { tabCount += 1; return JSON.stringify({ result: { tab: { tab_id: `tab-${tabCount}` }, root_pane: { pane_id: `pane-${tabCount}` } } }); }
     if (args[0] === "pane" && args[1] === "run") { paneRuns += 1; return ""; }
     if (args[0] === "pane" && args[1] === "process-info") {
-      if (args[3] === "pane-1") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
+      if (args[3] === "pane-root") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
       return secondProcessReports++ === 0
         ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } })
         : JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
@@ -803,7 +803,7 @@ void test("does not launch a replacement after Herdr disposal starts", { timeout
     if (args[0] === "tab" && args[1] === "create") { tabCount += 1; return JSON.stringify({ result: { tab: { tab_id: `tab-${tabCount}` }, root_pane: { pane_id: `pane-${tabCount}` } } }); }
     if (args[0] === "pane" && args[1] === "run") { paneRuns += 1; if (paneRuns === 2) { await failureGate; throw new Error("shared launch failed"); } if (paneRuns > 2) replacementLaunches += 1; return ""; }
     if (args[0] === "pane" && args[1] === "process-info") {
-      if (args[3] === "pane-1") return firstProcessReports++ === 0
+      if (args[3] === "pane-root") return firstProcessReports++ === 0
         ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } })
         : JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
       return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
@@ -882,10 +882,10 @@ void test("disposes a Herdr wrapper while a subsequent pane is still launching",
     if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "workspace" }, tab: { tab_id: "root-tab" }, root_pane: { pane_id: "root-pane" } } });
     if (args[0] === "tab" && args[1] === "create") { const number = calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create").length; return JSON.stringify({ result: { tab: { tab_id: `tab-${number}` }, root_pane: { pane_id: `pane-${number}` } } }); }
     if (args[0] === "pane" && args[1] === "run") { paneRuns += 1; if (paneRuns === 2) { await launchGate; launchReleased = true; } return ""; }
-    if (args[0] === "tab" && args[1] === "close") { if (args[2] === "tab-2") secondClosed = true; return ""; }
+    if (args[0] === "tab" && args[1] === "close") { if (args[2] === "tab-1") secondClosed = true; return ""; }
     if (args[0] === "pane" && args[1] === "process-info") {
-      if (args[3] === "pane-1") return firstProcessReports++ === 0 ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } }) : JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
-      if (!launchReleased || secondProcessReports++ > 0) return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
+      if (args[3] === "root-pane") return firstProcessReports++ === 0 ? JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } }) : JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
+      if (!launchReleased || args[3] !== "pane-1" || secondProcessReports++ > 0) return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
       return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
     }
     return "";
@@ -985,14 +985,14 @@ void test("routes fully inspectable agents into one labeled workflow workspace",
   const secondLifecycle = await generatedBridge(runCommand);
   await secondLifecycle.handlers.get("agent_settled")?.({}, {});
   assert.deepEqual(calls[0], ["workspace", "create", "--cwd", "/repo", "--label", "workflow flow", "--no-focus"]);
+  assert.deepEqual(calls[1], ["tab", "rename", "tab", "#1 reviewer"]);
   assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create"), [
-    ["tab", "create", "--workspace", "workspace", "--cwd", "/repo", "--label", "#1 reviewer", "--no-focus"],
     ["tab", "create", "--workspace", "workspace", "--cwd", "/repo", "--label", "#1 reviewer", "--no-focus"],
   ]);
   await secondSession.prompt("continue");
   await session.dispose();
   await secondSession.dispose();
-  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 2);
+  assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").map((args) => args[2]), ["tab", "tab-2"]);
   const runCall = calls.find(([command, subcommand]) => command === "pane" && subcommand === "run");
   assert.ok(runCall);
   assert.ok(runCommand.includes("--system-prompt '/repo/.pi/pi-extensible-workflows/SYSTEM.md'"));
@@ -1015,14 +1015,14 @@ void test("hands off sequential fully inspectable prompts and cleans the active 
     calls.push([...args]);
     if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "workspace" }, tab: { tab_id: "root-tab" }, root_pane: { pane_id: "root-pane" } } });
     if (args[0] === "tab" && args[1] === "create") { const number = ++tabNumber; return JSON.stringify({ result: { tab: { tab_id: `tab-${number}` }, root_pane: { pane_id: `pane-${number}` } } }); }
-    if (args[0] === "pane" && args[1] === "run" && args[2] !== "pane-3") {
+    if (args[0] === "pane" && args[1] === "run" && args[2] !== "pane-2") {
       const commandFile = /sh '([^']+)'$/.exec(args[3])?.[1];
       const command = commandFile ? readFileSync(commandFile, "utf8") : args[3];
       const lifecycle = await generatedBridge(command);
       await lifecycle.handlers.get("agent_settled")?.({}, {});
     }
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [{ name: "node", argv: [process.execPath, piRuntime.entrypoint] }] } } });
-    if (args[0] === "agent" && args[1] === "get") { const pane = args[2]; const reports = (statusReports.get(pane) ?? 0) + 1; statusReports.set(pane, reports); return JSON.stringify({ result: { agent: { agent_status: pane === "pane-3" ? "working" : reports === 1 ? "working" : "idle" } } }); }
+    if (args[0] === "agent" && args[1] === "get") { const pane = args[2]; const reports = (statusReports.get(pane) ?? 0) + 1; statusReports.set(pane, reports); return JSON.stringify({ result: { agent: { agent_status: pane === "pane-2" ? "working" : reports === 1 ? "working" : "idle" } } }); }
     return "";
   };
   const extension = createHerdrExtension({ agentDir, env: { HERDR_ENV: "1", HERDR_SOCKET_PATH: SOCKET_PATH, HERDR_PANE_ID: "parent" }, runner });
@@ -1039,12 +1039,12 @@ void test("hands off sequential fully inspectable prompts and cleans the active 
   await session.prompt("second");
   assert.deepEqual(ownership, ["suspend", "resume", "suspend", "resume"]);
   const activePrompt = session.prompt("third");
-  while (!calls.some(([command, subcommand, pane]) => command === "pane" && subcommand === "run" && pane === "pane-3")) await new Promise((resolve) => globalThis.setImmediate(resolve));
+  while (!calls.some(([command, subcommand, pane]) => command === "pane" && subcommand === "run" && pane === "pane-2")) await new Promise((resolve) => globalThis.setImmediate(resolve));
   controller.abort();
   await activePrompt;
-  assert.equal(calls.filter(([command, subcommand, tab]) => command === "tab" && subcommand === "close" && tab === "tab-3").length, 1);
+  assert.equal(calls.filter(([command, subcommand, tab]) => command === "tab" && subcommand === "close" && tab === "tab-2").length, 1);
   await session.dispose();
-  assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").map((args) => args[2]), ["tab-1", "tab-2", "tab-3"]);
+  assert.deepEqual(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").map((args) => args[2]), ["root-tab", "tab-1", "tab-2"]);
   await rm(root, { recursive: true, force: true });
 });
 void test("hands back an idle restricted child only after the generated bridge reports agent_settled", { timeout: 10_000 }, async () => {
@@ -1293,7 +1293,7 @@ void test("default workspace manager reuses one workspace and closes it once on 
   await handlers.get("workflow:run-completed")({ runId: run.runId });
   await handlers.get("session_shutdown")();
   assert.equal(calls.filter(([command, subcommand]) => command === "workspace" && subcommand === "create").length, 1);
-  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create").length, 2);
+  assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "create").length, 1);
   assert.equal(calls.filter(([command, subcommand]) => command === "workspace" && subcommand === "close").length, 1);
   assert.equal(calls.filter(([command, subcommand]) => command === "tab" && subcommand === "close").length, 2);
   await rm(root, { recursive: true, force: true });

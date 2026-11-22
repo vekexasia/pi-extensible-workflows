@@ -83,19 +83,19 @@ void test("creates a dedicated labeled workspace and reports ordered agent lifec
     if (args[0] === "pane" && args[1] === "process-info") return JSON.stringify({ result: { process_info: { foreground_processes: [] } } });
     return "";
   };
-  const pane = await openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow > review #1", tabLabel: "flow > review #1", command: "pi --session /tmp/session.jsonl" }, runner);
-  assert.deepEqual(pane, { workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-2" });
+  const pane = await openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow > review #1", tabLabel: "#1 review", command: "pi --session /tmp/session.jsonl" }, runner);
+  assert.deepEqual(pane, { workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1" });
   const reporter = createHerdrAgentReporter(pane.paneId, "review", runner);
   await reporter.reportSession({ sessionPath: "/tmp/session.jsonl" }, "workflow-agent");
   await reporter.reportState("working", undefined, { sessionPath: "/tmp/session.jsonl" });
   await reporter.release();
   await reporter.release();
-  assert.deepEqual(calls.slice(0, 4), [
+  assert.deepEqual(calls.slice(0, 3), [
     ["workspace", "create", "--cwd", "/repo", "--label", "flow > review #1", "--no-focus"],
-    ["tab", "rename", "tab-1", "flow > review #1"],
-    ["tab", "create", "--workspace", "workspace-1", "--cwd", "/repo", "--label", "flow > review #1", "--no-focus"],
-    ["pane", "run", "pane-2", "cd '/repo' && pi --session /tmp/session.jsonl"],
+    ["tab", "rename", "tab-1", "#1 review"],
+    ["pane", "run", "pane-1", "cd '/repo' && pi --session /tmp/session.jsonl"],
   ]);
+  assert.equal(calls.some(([command, subcommand]) => command === "tab" && subcommand === "create"), false);
   const reportCalls = calls.filter(([command, subcommand]) => command === "pane" && ["report-agent-session", "report-agent", "release-agent"].includes(subcommand ?? ""));
   assert.equal(reportCalls.length, 3);
   const sequences = reportCalls.map((call) => Number(call[call.indexOf("--seq") + 1]));
@@ -107,6 +107,30 @@ void test("creates a dedicated labeled workspace and reports ordered agent lifec
       else process.env[name] = value;
     }
   }
+});
+void test("adds one tab per later agent in an existing workspace", async () => {
+  const calls: string[][] = [];
+  const runner = async (args: readonly string[]): Promise<string> => {
+    calls.push([...args]);
+    if (args[0] === "tab" && args[1] === "create") return JSON.stringify({ result: { tab: { tab_id: "tab-2" }, root_pane: { pane_id: "pane-2" } } });
+    return "";
+  };
+  const pane = await openHerdrWorkspacePane({ cwd: "/repo", workspaceId: "workspace-1", tabLabel: "#2 tests", command: "pi --session /tmp/second.jsonl" }, runner);
+  assert.deepEqual(pane, { workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-2" });
+  assert.deepEqual(calls, [
+    ["tab", "create", "--workspace", "workspace-1", "--cwd", "/repo", "--label", "#2 tests", "--no-focus"],
+    ["pane", "run", "pane-2", "cd '/repo' && pi --session /tmp/second.jsonl"],
+  ]);
+});
+void test("closes a workspace it created when the response omits the tab", async () => {
+  const calls: string[][] = [];
+  const runner = async (args: readonly string[]): Promise<string> => {
+    calls.push([...args]);
+    if (args[0] === "workspace" && args[1] === "create") return JSON.stringify({ result: { workspace: { workspace_id: "workspace-1" } } });
+    return "";
+  };
+  await assert.rejects(openHerdrWorkspacePane({ cwd: "/repo", workspaceLabel: "flow", tabLabel: "#1 review", command: "pi" }, runner), /invalid tab ID/);
+  assert.deepEqual(calls.at(-1), ["workspace", "close", "workspace-1"]);
 });
 void test("waits for Pi startup before reporting an exit", async () => {
   let processReports = 0;

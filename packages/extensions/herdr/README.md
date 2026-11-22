@@ -43,7 +43,7 @@ Set the global workflow settings file, normally `~/.pi/agent/pi-extensible-workf
 
 `extensionSettings.herdr` is the only valid location for Herdr configuration. The obsolete `extensions.herdr` object is rejected with `INVALID_SETTINGS`; migrate it before launching.
 
-The effective value uses the global map unless a trusted project declares `extensionSettings`, in which case the project's complete map replaces it, including `{}`. Role settings are then applied by top-level-key replacement; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled, every workflow agent launches in a dedicated labeled Herdr workspace and the manual live-session action is hidden. Completed-session inspection remains available.
+The effective value uses the global map unless a trusted project declares `extensionSettings`, in which case the project's complete map replaces it, including `{}`. Role settings are then applied by top-level-key replacement; nested objects and arrays are not merged. Untrusted project settings are ignored. When enabled, every workflow agent launches in a dedicated labeled Herdr workspace and the manual live-session action is hidden. The first agent of a run takes over the workspace's own tab and root pane, so a run opens one tab per agent instead of an empty sibling tab. With the setting off, workflow agents open as sibling panes inside the caller's current tab instead. Completed-session inspection remains available.
 
 ## Live handoff and ownership
 
