@@ -662,8 +662,9 @@ export function runWorkflow(script: string, args: JsonValue = null, bridge: Work
         const name = typeof values[0].name === "string" ? values[0].name : "checkpoint";
         try {
           const result = await bridge.checkpoint(values[0], controller.signal);
-          if (typeof result !== "boolean") fail("INTERNAL_ERROR", "checkpoint must return a boolean");
-          value = branded({ name, ok: true, value: result ? "approved" : "rejected" });
+          if (typeof result !== "boolean" && (!object(result) || typeof (result as Record<string, unknown>).approved !== "boolean")) fail("INTERNAL_ERROR", "checkpoint must return a boolean or approval object");
+          const resolved: JsonValue = typeof result === "boolean" ? (result ? "approved" : "rejected") : (result as unknown as JsonValue);
+          value = branded({ name, ok: true, value: resolved });
         } catch (error) {
           const typed = asWorkflowError(error);
           if (!OUTCOME_ERRORS.has(typed.code)) throw typed;

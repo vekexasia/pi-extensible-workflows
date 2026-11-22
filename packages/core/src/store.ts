@@ -2,11 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { access, lstat, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
-import { HARD_TERMINAL_RUN_STATES, WorkflowError, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
+import { HARD_TERMINAL_RUN_STATES, WorkflowError, type CheckpointResponseDetails, type PreparedAgentConfiguration, type JsonValue, type LaunchSnapshot, type WorkflowErrorCode, type WorkflowLaunchMode, type WorkflowRunEvent } from "./types.js";
 import { coerceWorkflowError, errorText, isNodeError, jsonValue, loadLaunchSnapshot, object, positiveInteger, SerialLane } from "./utils.js";
 import { budgetUsage } from "./budget.js";
 import {
-  decodeBooleanCheckpointResult, decodeBorrowedWorktreeBindings, decodeJournal, decodeLaunchSnapshot,
+  decodeBorrowedWorktreeBindings, decodeCheckpointResult, decodeJournal, decodeLaunchSnapshot,
   decodeOwnershipRecords, decodePersistedRun, decodeSummaryProjection, decodeSystemPromptArtifact,
   decodeWorktreeReferences,
   type AwaitingCheckpoint, type BorrowedWorktreeBinding, type CompletedOperation, type EffectiveSystemPrompt,
@@ -360,17 +360,17 @@ export class RunStore {
     return [...operations.values()].map((operation) => structuredClone(operation));
   }
 
-  async awaitCheckpoint(checkpoint: AwaitingCheckpoint): Promise<boolean | undefined> {
+  async awaitCheckpoint(checkpoint: AwaitingCheckpoint): Promise<boolean | CheckpointResponseDetails | undefined> {
     const replayed = await this.replay(checkpoint.path);
     if (replayed) {
-      const result = decodeBooleanCheckpointResult(replayed.value);
+      const result = decodeCheckpointResult(replayed.value);
       if (result === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted checkpoint result is invalid");
       return result;
     }
     return this.updateJournal((journal) => {
       const completed = journal.completed[checkpoint.path];
       if (completed) {
-        const result = decodeBooleanCheckpointResult(completed.value);
+        const result = decodeCheckpointResult(completed.value);
         if (result === undefined) throw new WorkflowError("RESUME_INCOMPATIBLE", "Persisted checkpoint result is invalid");
         return result;
       }
@@ -399,11 +399,14 @@ export class RunStore {
     });
   }
 
-  async answerCheckpoint(name: string, approved: boolean): Promise<AwaitingCheckpoint | undefined> {
+  async answerCheckpoint(name: string, approved: boolean, choice?: string, feedback?: string): Promise<AwaitingCheckpoint | undefined> {
     return this.updateJournal((journal) => {
       const checkpoint = Object.values(journal.awaiting ?? {}).find((item) => item.name === name);
       if (!checkpoint || journal.completed[checkpoint.path]) return undefined;
-      journal.completed[checkpoint.path] = { path: checkpoint.path, value: approved };
+      const value: JsonValue = (choice !== undefined || feedback !== undefined)
+        ? { approved, ...(choice !== undefined ? { choice } : {}), ...(feedback !== undefined ? { feedback } : {}) }
+        : approved;
+      journal.completed[checkpoint.path] = { path: checkpoint.path, value };
       journal.awaiting = Object.fromEntries(Object.entries(journal.awaiting ?? {}).filter(([path]) => path !== checkpoint.path));
       return checkpoint;
     });
